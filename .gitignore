@@ -1,0 +1,39 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Framework-spezifisch
+.env
+.env.local
+*.db
+*.sqlite
+logs/
+uploads/
+belege_temp/
+
+# OAuth-Tokens und Secrets
+*token*.json
+*credentials*.json
+vertex-key.json
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python-Cache (falls nicht schon drin)
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
