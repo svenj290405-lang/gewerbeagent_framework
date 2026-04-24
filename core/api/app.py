@@ -117,3 +117,68 @@ async def webhook_dispatch(
             status_code=500,
             detail=f"Fehler im Plugin {plugin_name}: {str(e)}",
         )
+
+# ============================================================
+# OAUTH ENDPOINTS
+# ============================================================
+
+from fastapi import Query
+from fastapi.responses import RedirectResponse, HTMLResponse
+
+from core.security.oauth_flow import generate_auth_url, handle_callback
+
+
+@app.get("/oauth/start")
+async def oauth_start(
+    tenant: str = Query(..., description="Tenant-Slug, z.B. 'dietz'"),
+    provider: str = Query("google", description="OAuth-Provider"),
+) -> RedirectResponse:
+    """
+    Startet den OAuth-Flow: leitet Nutzer zu Google-Login weiter.
+    """
+    try:
+        auth_url = generate_auth_url(tenant_slug=tenant, provider=provider)
+        return RedirectResponse(url=auth_url, status_code=302)
+    except Exception as e:
+        logger.exception(f"OAuth-Start fehlgeschlagen: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/oauth/callback")
+async def oauth_callback(
+    code: str = Query(...),
+    state: str = Query(...),
+) -> HTMLResponse:
+    """
+    OAuth-Callback von Google.
+    Tauscht code gegen Token, speichert verschluesselt in DB.
+    """
+    try:
+        oauth_token = await handle_callback(code=code, state=state)
+        return HTMLResponse(
+            content=f"""
+            <html>
+            <body style="font-family: sans-serif; padding: 2em;">
+                <h1>✅ Verknuepfung erfolgreich!</h1>
+                <p>Google-Account <b>{oauth_token.account_email}</b> wurde mit
+                dem Gewerbeagent-Framework verknuepft.</p>
+                <p>Du kannst dieses Fenster jetzt schliessen.</p>
+            </body>
+            </html>
+            """,
+            status_code=200,
+        )
+    except Exception as e:
+        logger.exception(f"OAuth-Callback fehlgeschlagen: {e}")
+        return HTMLResponse(
+            content=f"""
+            <html>
+            <body style="font-family: sans-serif; padding: 2em;">
+                <h1>❌ Verknuepfung fehlgeschlagen</h1>
+                <p>Fehler: {str(e)}</p>
+                <p>Bitte erneut versuchen oder an Sven wenden.</p>
+            </body>
+            </html>
+            """,
+            status_code=500,
+        )
