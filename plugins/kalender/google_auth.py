@@ -1,4 +1,4 @@
-﻿"""
+"""
 Google-OAuth-Service fuer Kalender-Plugin.
 
 Laedt verschluesselte OAuth-Tokens aus der DB, refresht wenn noetig,
@@ -7,7 +7,7 @@ und gibt einen authentifizierten Calendar-Service zurueck.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import timezone
 
 from google.auth.transport.requests import Request as GRequest
 from google.oauth2.credentials import Credentials
@@ -16,6 +16,14 @@ from sqlalchemy import select
 
 from core.database import AsyncSessionLocal
 from core.models import OAuthToken
+from core.security.oauth_flow import _load_client_config
+
+
+def _get_google_client_creds() -> tuple[str, str]:
+    """Holt client_id und client_secret aus oauth_client_secret.json."""
+    cfg = _load_client_config()
+    web_cfg = cfg.get("web") or cfg.get("installed") or {}
+    return web_cfg.get("client_id", ""), web_cfg.get("client_secret", "")
 
 
 async def get_calendar_service(tenant_id: uuid.UUID):
@@ -39,15 +47,14 @@ async def get_calendar_service(tenant_id: uuid.UUID):
                 f"Kein Google-OAuth-Token fuer Tenant {tenant_id} in der DB"
             )
 
-        # Credentials aus verschluesselten Token-Daten bauen
-        # Client-ID/Secret kommen normalerweise aus einer zentralen Config
-        # Vereinfacht: aus OAuth-Token's Scopes
+        client_id, client_secret = _get_google_client_creds()
+
         creds = Credentials(
             token=oauth_token.access_token,
             refresh_token=oauth_token.refresh_token,
             token_uri="https://oauth2.googleapis.com/token",
-            # client_id/secret muessen beim OAuth-Flow gespeichert worden sein
-            # Fuer Dietz-Migration nutzen wir erstmal eine zentrale Config
+            client_id=client_id,
+            client_secret=client_secret,
             scopes=oauth_token.scopes.split(",") if oauth_token.scopes else [],
         )
 
