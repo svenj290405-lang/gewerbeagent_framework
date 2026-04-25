@@ -1,0 +1,18 @@
+gewerbeagent.de, www.gewerbeagent.de {
+    encode gzip
+
+    reverse_proxy framework:8001 {
+        header_up Host {host}
+        header_up X-Real-IP {remote}
+        header_up X-Forwarded-For {remote}
+        header_up X-Forwarded-Proto {scheme}
+    }
+
+    log {
+        output file /var/log/caddy/access.log {
+            roll_size 10mb
+            roll_keep 5
+        }
+        format console
+    }
+}
