@@ -96,7 +96,7 @@ async def onboard_tenant(
         tenant_id = tenant.id
 
     # OAuth-URL generieren (ausserhalb der Session, braucht keinen DB-Zugriff)
-    oauth_url = generate_auth_url(tenant_slug=slug, provider="google")
+    oauth_url = await generate_auth_url(tenant_slug=slug, provider="google")
 
     # Checkliste ausgeben
     print()

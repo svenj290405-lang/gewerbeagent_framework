@@ -1,11 +1,4 @@
-﻿"""
-Google-OAuth-Flow fuer Multi-Tenant-Setup.
-
-Workflow:
-1. generate_auth_url(tenant_slug, provider) -> URL zum Google-Login
-2. User klickt URL, meldet sich bei Google an
-3. Google redirected zu /oauth/callback?code=...&state=...
-4. handle_callback(code, state) -> speichert Token verschluesselt in DB
+"""Google-OAuth-Flow mit persistenter State-Speicherung in DB.
 
 Secrets kommen aus oauth_client_secret.json (nicht in Git).
 """
@@ -14,21 +7,16 @@ from __future__ import annotations
 import json
 import logging
 import secrets
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from google_auth_oauthlib.flow import Flow
-from sqlalchemy import select
+from sqlalchemy import delete, select
 
 from config.settings import settings
 from core.database import AsyncSessionLocal
-from core.models import OAuthToken, Tenant
+from core.models import OAuthState, OAuthToken, Tenant
 
 logger = logging.getLogger(__name__)
-
-# Temporaerer State-Store (in Production: Redis oder DB)
-# Mapping: state -> {tenant_slug, provider, code_verifier}
-# code_verifier wird fuer PKCE benoetigt beim Token-Austausch
-_STATE_STORE: dict[str, dict] = {}
 
 # OAuth Scopes fuer Google Calendar
 GOOGLE_SCOPES = [
@@ -36,6 +24,8 @@ GOOGLE_SCOPES = [
     "https://www.googleapis.com/auth/userinfo.email",
     "openid",
 ]
+
+STATE_LIFETIME_MINUTES = 30
 
 
 def _load_client_config() -> dict:
@@ -55,8 +45,8 @@ def _get_redirect_uri() -> str:
     return f"{settings.public_url.rstrip('/')}/oauth/callback"
 
 
-def generate_auth_url(tenant_slug: str, provider: str = "google") -> str:
-    """Generiert die Google-Login-URL fuer einen Tenant."""
+async def generate_auth_url(tenant_slug: str, provider: str = "google") -> str:
+    """Erzeugt OAuth-Autorisierungs-URL und persistiert State in DB."""
     if provider != "google":
         raise NotImplementedError(f"Provider {provider} noch nicht unterstuetzt")
 
@@ -68,7 +58,6 @@ def generate_auth_url(tenant_slug: str, provider: str = "google") -> str:
     )
 
     state = secrets.token_urlsafe(32)
-
     auth_url, _ = flow.authorization_url(
         access_type="offline",
         include_granted_scopes="true",
@@ -76,28 +65,50 @@ def generate_auth_url(tenant_slug: str, provider: str = "google") -> str:
         state=state,
     )
 
-    # State + PKCE-Verifier speichern
-    _STATE_STORE[state] = {
-        "tenant_slug": tenant_slug,
-        "provider": provider,
-        "code_verifier": flow.code_verifier,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    }
+    async with AsyncSessionLocal() as session:
+        # Alte States aufraeumen
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=STATE_LIFETIME_MINUTES)
+        await session.execute(delete(OAuthState).where(OAuthState.created_at < cutoff))
 
-    logger.info(f"OAuth-URL generiert fuer Tenant {tenant_slug}")
+        oauth_state = OAuthState(
+            state=state,
+            tenant_slug=tenant_slug,
+            provider=provider,
+            code_verifier=flow.code_verifier or "",
+        )
+        session.add(oauth_state)
+        await session.commit()
+
+    logger.info(
+        f"OAuth-URL generiert fuer Tenant {tenant_slug} (state={state[:8]}...)"
+    )
     return auth_url
 
 
 async def handle_callback(code: str, state: str) -> OAuthToken:
-    """Verarbeitet den OAuth-Callback von Google."""
-    if state not in _STATE_STORE:
-        raise ValueError(f"Unbekannter oder abgelaufener State: {state}")
+    """Verarbeitet OAuth-Callback: tauscht Code gegen Token, speichert in DB."""
+    # State aus DB laden + loeschen
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            select(OAuthState).where(OAuthState.state == state)
+        )
+        oauth_state = result.scalar_one_or_none()
+        if not oauth_state:
+            raise ValueError(f"Unbekannter oder abgelaufener State: {state[:8]}...")
 
-    state_data = _STATE_STORE.pop(state)
-    tenant_slug = state_data["tenant_slug"]
-    provider = state_data["provider"]
-    code_verifier = state_data.get("code_verifier")
+        age = datetime.now(timezone.utc) - oauth_state.created_at
+        if age > timedelta(minutes=STATE_LIFETIME_MINUTES):
+            await session.delete(oauth_state)
+            await session.commit()
+            raise ValueError("State abgelaufen")
 
+        tenant_slug = oauth_state.tenant_slug
+        provider = oauth_state.provider
+        code_verifier = oauth_state.code_verifier
+        await session.delete(oauth_state)
+        await session.commit()
+
+    # Token von Google holen
     client_config = _load_client_config()
     flow = Flow.from_client_config(
         client_config,
@@ -105,13 +116,10 @@ async def handle_callback(code: str, state: str) -> OAuthToken:
         redirect_uri=_get_redirect_uri(),
         state=state,
     )
-
-    # PKCE-Verifier wieder anhaengen (wichtig!)
     if code_verifier:
         flow.code_verifier = code_verifier
 
     flow.fetch_token(code=code)
-
     creds = flow.credentials
 
     # User-Info holen

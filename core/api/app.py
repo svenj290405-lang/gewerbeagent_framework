@@ -137,7 +137,7 @@ async def oauth_start(
     Startet den OAuth-Flow: leitet Nutzer zu Google-Login weiter.
     """
     try:
-        auth_url = generate_auth_url(tenant_slug=tenant, provider=provider)
+        auth_url = await generate_auth_url(tenant_slug=tenant, provider=provider)
         return RedirectResponse(url=auth_url, status_code=302)
     except Exception as e:
         logger.exception(f"OAuth-Start fehlgeschlagen: {e}")

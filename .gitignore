@@ -42,3 +42,4 @@ __pycache__/
 oauth_client_secret.json
 oauth_*.json
 client_secret*.json
+.env.save
