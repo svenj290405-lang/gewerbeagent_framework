@@ -14,6 +14,7 @@ from typing import Any
 from core.plugin_system import BasePlugin
 from plugins.kalender.google_auth import get_calendar_service
 from plugins.kalender.manifest import MANIFEST
+from plugins.telegram_notify.handler import TelegramNotifier
 
 
 class Plugin(BasePlugin):
@@ -161,6 +162,21 @@ class Plugin(BasePlugin):
                 calendarId=self.config["calendar_id"],
                 body=event,
             ).execute()
+
+            # Telegram-Push (silent fail, blockiert nie den Termin)
+            telefon_line = f"\n<b>Telefon:</b> {telefon}" if telefon else ""
+            adresse_line = f"\n<b>Adresse:</b> {adresse}" if adresse and adresse != "Adresse nicht angegeben" else ""
+            await TelegramNotifier.send_for_tenant(
+                self.tenant_id,
+                (
+                    "📅 <b>Neuer Termin</b>\n"
+                    f"<b>Kunde:</b> {name}\n"
+                    f"<b>Anliegen:</b> {anliegen}\n"
+                    f"<b>Wann:</b> {start.strftime('%a %d.%m.%Y, %H:%M')} Uhr"
+                    f"{adresse_line}"
+                    f"{telefon_line}"
+                ),
+            )
 
             return {
                 "erfolg": True,
