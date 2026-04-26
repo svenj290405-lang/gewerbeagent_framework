@@ -77,6 +77,118 @@ async def load_global_config() -> dict | None:
         return {**MANIFEST.default_config, **(tc.config or {})}
 
 
+# ---------- Konversations-Memory ----------
+
+async def find_conversation(
+    tenant_id: uuid.UUID,
+    kunde_email: str,
+    in_reply_to: str | None = None,
+):
+    """
+    Findet eine bestehende Konversation:
+    - Bevorzugt: per In-Reply-To Header (last_message_id match)
+    - Fallback: per (tenant_id, kunde_email) — nimmt die aktuellste offene
+    Returns EmailConversation oder None.
+    """
+    from core.models import EmailConversation, STATE_CLOSED
+
+    async with AsyncSessionLocal() as s:
+        if in_reply_to:
+            result = await s.execute(
+                select(EmailConversation).where(
+                    EmailConversation.last_message_id == in_reply_to
+                )
+            )
+            conv = result.scalar_one_or_none()
+            if conv:
+                return conv
+
+        # Fallback: per Email + Tenant, nicht-closed, neueste
+        result = await s.execute(
+            select(EmailConversation)
+            .where(
+                EmailConversation.tenant_id == tenant_id,
+                EmailConversation.kunde_email == kunde_email.lower(),
+                EmailConversation.state != STATE_CLOSED,
+            )
+            .order_by(EmailConversation.updated_at.desc())
+            .limit(1)
+        )
+        return result.scalar_one_or_none()
+
+
+async def upsert_conversation(
+    tenant_id: uuid.UUID,
+    kunde_email: str,
+    kunde_name: str | None = None,
+    gcal_event_id: str | None = None,
+    termin_datum=None,
+    last_message_id: str | None = None,
+    last_subject: str | None = None,
+    state: str | None = None,
+    proposed_slots=None,
+    existing=None,
+):
+    """
+    Erstellt eine neue Konversation oder aktualisiert eine bestehende
+    (wenn `existing` uebergeben wird).
+    """
+    from core.models import EmailConversation, STATE_AWAITING_CONFIRMATION
+
+    async with AsyncSessionLocal() as s:
+        if existing is not None:
+            # Re-Fetch in dieser Session (existing kommt aus anderer Session)
+            result = await s.execute(
+                select(EmailConversation).where(EmailConversation.id == existing.id)
+            )
+            conv = result.scalar_one_or_none()
+        else:
+            conv = None
+
+        if conv is None:
+            conv = EmailConversation(
+                tenant_id=tenant_id,
+                kunde_email=kunde_email.lower(),
+                kunde_name=kunde_name,
+                state=state or STATE_AWAITING_CONFIRMATION,
+            )
+            s.add(conv)
+
+        # Update-Felder (nur wenn explizit gegeben, None heisst "nicht aendern")
+        if kunde_name is not None:
+            conv.kunde_name = kunde_name
+        if gcal_event_id is not None:
+            conv.gcal_event_id = gcal_event_id
+        if termin_datum is not None:
+            conv.termin_datum = termin_datum
+        if last_message_id is not None:
+            conv.last_message_id = last_message_id
+        if last_subject is not None:
+            conv.last_subject = last_subject[:500]
+        if state is not None:
+            conv.state = state
+        if proposed_slots is not None:
+            conv.proposed_slots = proposed_slots
+
+        await s.commit()
+        await s.refresh(conv)
+        return conv
+
+
+async def close_conversation(conv_id: uuid.UUID) -> None:
+    """Markiert Konversation als closed. Wird nicht geloescht (Cleanup-Job)."""
+    from core.models import EmailConversation, STATE_CLOSED
+
+    async with AsyncSessionLocal() as s:
+        result = await s.execute(
+            select(EmailConversation).where(EmailConversation.id == conv_id)
+        )
+        conv = result.scalar_one_or_none()
+        if conv:
+            conv.state = STATE_CLOSED
+            await s.commit()
+
+
 # ---------- Brevo Outbound (Auto-Reply) ----------
 
 async def send_reply_via_brevo(
@@ -88,6 +200,7 @@ async def send_reply_via_brevo(
     subject: str,
     html_body: str,
     in_reply_to: str | None = None,
+    reply_to_email: str | None = None,
 ) -> bool:
     """Schickt Mail ueber Brevo Outbound API. silent fail bei Fehler."""
     payload = {
@@ -96,8 +209,15 @@ async def send_reply_via_brevo(
         "subject": subject,
         "htmlContent": html_body,
     }
+    headers = {}
     if in_reply_to:
-        payload["headers"] = {"In-Reply-To": in_reply_to}
+        headers["In-Reply-To"] = in_reply_to
+        headers["References"] = in_reply_to
+    if reply_to_email:
+        # Brevo erwartet replyTo als top-level field
+        payload["replyTo"] = {"email": reply_to_email, "name": sender_name}
+    if headers:
+        payload["headers"] = headers
 
     try:
         async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
@@ -128,6 +248,7 @@ async def extract_termin_aus_mail(
     sender_name: str,
     subject: str,
     body: str,
+    proposed_slots: list | None = None,
 ) -> dict[str, Any]:
     """
     Nutzt Gemini um Mail-Inhalt zu strukturieren.
@@ -175,7 +296,8 @@ Antworte AUSSCHLIESSLICH mit gueltigem JSON in diesem Format:
   "wunschtermin_uhrzeit": "HH:MM oder null",
   "telefon": "+49... oder null",
   "klar_genug_zum_buchen": true oder false,
-  "begruendung": "warum klar oder unklar (max 120 Zeichen)"
+  "begruendung": "warum klar oder unklar (max 120 Zeichen)",
+  "gewaehlter_slot_index": null
 }}
 
 WICHTIG fuer klar_genug_zum_buchen=true:
@@ -185,19 +307,85 @@ WICHTIG fuer klar_genug_zum_buchen=true:
 
 Bei "wann passt es Ihnen?", "rufen Sie mich an", "ich melde mich nochmal" oder vagen Anfragen -> klar_genug_zum_buchen=false.
 
+WICHTIG: Bei JEDER Form von Verschiebung, Umbuchung, Stornierung oder Aenderung
+eines bestehenden Termins -> klar_genug_zum_buchen=false und in begruendung
+unterscheide:
+
+  - "STORNO": Reine Absage ohne neuen Wunschtermin. Trigger:
+    "absagen", "stornieren", "muss leider absagen", "schaffe es doch nicht",
+    "nicht mehr noetig", "hat sich erledigt", "doch keinen Termin", "abbrechen",
+    "Termin loeschen", "krankheitsbedingt absagen".
+    -> begruendung beginnt mit "STORNO: ..."
+
+  - "VERSCHIEBUNG": Aenderung mit oder ohne neuen Wunschtermin. Trigger:
+    "verschieben", "umbuchen", "verlegen", "passt doch nicht, koennen wir...",
+    "anders", "umlegen", "stattdessen", "anstatt", "frueher machen",
+    "spaeter machen", "anderer Tag".
+    -> begruendung beginnt mit "VERSCHIEBUNG: ..."
+
+  - Wenn unklar zwischen den beiden: STORNO wenn KEIN neuer Wunschtermin
+    erkennbar ist, sonst VERSCHIEBUNG.
+
+Auch bei Antwort-Mails (Subject startet mit "Re:") immer extra vorsichtig pruefen
+ob es eine Aenderung des bestehenden Termins ist. Im Zweifel: klar=false.
+
 Heutiges Datum: {datetime.now().strftime('%A, %d.%m.%Y')}
+"""
+
+    # Wenn Slots vorgeschlagen wurden, erweitere den Prompt
+    if proposed_slots:
+        slot_lines = "\n".join([
+            f"  [{i}] {s['wochentag']} {s['datum']} um {s['uhrzeit']} Uhr"
+            for i, s in enumerate(proposed_slots)
+        ])
+        prompt += f"""
+
+KONTEXT: Dem Kunden wurden vorher folgende Termin-Slots vorgeschlagen:
+{slot_lines}
+
+Wenn die Mail einen dieser Slots auswaehlt (auch wenn er nur die Uhrzeit nennt
+oder "der erste"/"der letzte"/"Donnerstag" sagt), setze das Feld
+"gewaehlter_slot_index" auf die Index-Nummer (0, 1, 2, ...).
+
+Wenn der Kunde keinen der Slots will und einen ANDEREN Termin nennt, lass
+gewaehlter_slot_index = null und behandle es als neuen Termin-Wunsch.
+
+Wenn unklar: gewaehlter_slot_index = null, klar_genug_zum_buchen = false.
+
+Erweitere das JSON um:
+  "gewaehlter_slot_index": int oder null
 """
 
     try:
         response_text = await call_gemini(prompt)
-        # JSON aus Antwort extrahieren
+        logger.info(f"Gemini-Rohantwort (erste 500 Zeichen): {response_text[:500]!r}")
+
         import json
-        # Gemini gibt manchmal ```json ... ``` zurueck
         cleaned = response_text.strip()
+
+        # Code-Fences entfernen (```json ... ```)
         if cleaned.startswith("```"):
             cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
             cleaned = re.sub(r"\s*```\s*$", "", cleaned)
-        data = json.loads(cleaned)
+
+        # Falls Gemini Text VOR oder NACH dem JSON schreibt, isoliere das JSON
+        first_brace = cleaned.find("{")
+        last_brace = cleaned.rfind("}")
+        if first_brace >= 0 and last_brace > first_brace:
+            cleaned = cleaned[first_brace : last_brace + 1]
+
+        try:
+            data = json.loads(cleaned)
+        except json.JSONDecodeError as parse_err:
+            # Versuche Rescue: kontroll-zeichen entfernen
+            logger.warning(f"JSON-Parse fehlgeschlagen, versuche Rescue: {parse_err}")
+            import unicodedata
+            sanitized = "".join(
+                ch for ch in cleaned
+                if unicodedata.category(ch)[0] != "C" or ch in ("\n", "\t", " ")
+            )
+            data = json.loads(sanitized)
+
         return data
     except Exception as e:
         logger.exception(f"Gemini-Extraction fehlgeschlagen: {e}")
@@ -242,6 +430,12 @@ class Plugin(BasePlugin):
 
     async def _process_one_mail(self, item: dict[str, Any]) -> dict[str, Any]:
         """Verarbeitet eine einzelne Mail aus dem Brevo-Payload."""
+        from core.models import (
+            STATE_AWAITING_CONFIRMATION,
+            STATE_BOOKED,
+            STATE_PROPOSING_SLOTS,
+        )
+
         # Daten extrahieren
         from_obj = item.get("From", {})
         sender_email = from_obj.get("Address", "")
@@ -249,11 +443,11 @@ class Plugin(BasePlugin):
         subject = item.get("Subject", "(kein Betreff)")
         text_body = item.get("ExtractedMarkdownMessage") or item.get("RawTextBody", "")
         message_id = item.get("MessageId")
+        in_reply_to = item.get("InReplyTo")
         spam_score = (item.get("Spam") or {}).get("Score") or item.get("SpamScore") or 0
         recipients = item.get("Recipients", [])
         to_list = item.get("To", [])
 
-        # Empfaenger-Adresse: bevorzugt aus Recipients (RCPT TO), sonst To
         recipient_addr = ""
         if recipients:
             recipient_addr = recipients[0] if isinstance(recipients[0], str) else recipients[0].get("Address", "")
@@ -262,7 +456,7 @@ class Plugin(BasePlugin):
 
         logger.info(
             f"Mail empfangen: from={sender_email} to={recipient_addr} "
-            f"subject='{subject[:50]}' spam={spam_score}"
+            f"subject='{subject[:50]}' spam={spam_score} in_reply_to={in_reply_to}"
         )
 
         # 1. Spam-Filter
@@ -278,25 +472,253 @@ class Plugin(BasePlugin):
 
         logger.info(f"Mail-Routing: {recipient_addr} -> tenant '{tenant.slug}'")
 
-        # 3. Globale Konfig laden (Brevo-Credentials)
+        # 3. Globale Konfig laden
         global_cfg = await load_global_config()
         if not global_cfg:
             logger.error("Globale mail_intake-Config fehlt!")
             return {"status": "config_missing"}
 
-        # 4. Gemini-Extraction
-        extracted = await extract_termin_aus_mail(sender_name, subject, text_body)
+        # 4. Bestehende Konversation finden
+        conv = await find_conversation(tenant.id, sender_email, in_reply_to)
+        if conv:
+            logger.info(
+                f"Konversation gefunden: id={conv.id} state={conv.state} "
+                f"termin={conv.termin_datum}"
+            )
+
+        # 5. Gemini-Extraction (mit proposed_slots-Kontext falls vorhanden)
+        extracted = await extract_termin_aus_mail(
+            sender_name,
+            subject,
+            text_body,
+            proposed_slots=conv.proposed_slots if conv and conv.state == STATE_PROPOSING_SLOTS else None,
+        )
         logger.info(f"Extracted: {extracted}")
 
-        # 5. Telegram-Push an Tenant (immer, egal ob klar oder nicht)
-        await self._notify_tenant_telegram(tenant, sender_email, sender_name, subject, extracted)
+        klar = extracted.get("klar_genug_zum_buchen", False)
+        begruendung = (extracted.get("begruendung") or "").upper()
+        ist_storno = begruendung.startswith("STORNO") or "REINE ABSAGE" in begruendung
+        ist_verschiebung = (
+            ("VERSCHIEBUNG" in begruendung or "STORNO" in begruendung)
+            and not ist_storno
+        )
+        slot_idx = extracted.get("gewaehlter_slot_index")
 
-        # 6. Wenn klar -> Buchungsversuch
+        # 6. State-Machine
         booking_result = None
-        if extracted.get("klar_genug_zum_buchen"):
-            booking_result = await self._versuche_buchung(tenant, sender_name, extracted)
+        action = "neu"  # fuer Logging/Telegram
 
-        # 7. Auto-Reply an Kunden
+        # Fall STORNO: Kunde sagt ab, kein neuer Termin
+        if ist_storno:
+            if conv and conv.gcal_event_id:
+                logger.info(f"Storno: cancel event {conv.gcal_event_id}")
+                await self._cancel_via_kalender(tenant, conv.gcal_event_id)
+                action = "storniert"
+                # Konversation als closed markieren
+                conv = await upsert_conversation(
+                    tenant_id=tenant.id,
+                    kunde_email=sender_email,
+                    kunde_name=sender_name,
+                    last_message_id=message_id,
+                    last_subject=subject,
+                    state="closed",
+                    existing=conv,
+                )
+                # Telegram-Push + Auto-Reply
+                await self._notify_tenant_telegram(
+                    tenant, sender_email, sender_name, subject, extracted, action="storniert"
+                )
+                await self._send_storno_reply(
+                    global_cfg, tenant, sender_email, sender_name, subject, message_id
+                )
+                return {"status": "storniert", "tenant": tenant.slug, "event_id": conv.gcal_event_id if conv else None}
+            else:
+                # Kein bestehender Termin gefunden - nur eskalieren
+                action = "storno_ohne_termin"
+                await self._notify_tenant_telegram(
+                    tenant, sender_email, sender_name, subject, extracted, action="storno_ohne_termin"
+                )
+                await self._send_auto_reply(
+                    global_cfg=global_cfg,
+                    tenant=tenant,
+                    sender_email=sender_email,
+                    sender_name=sender_name,
+                    original_subject=subject,
+                    extracted=extracted,
+                    booking_result=None,
+                    in_reply_to=message_id,
+                )
+                return {"status": "storno_ohne_termin", "tenant": tenant.slug}
+
+        # Fall A: Kunde hat einen vorgeschlagenen Slot gewaehlt
+        if conv and conv.state == STATE_PROPOSING_SLOTS and slot_idx is not None:
+            slots = conv.proposed_slots or []
+            if 0 <= slot_idx < len(slots):
+                gewaehlter_slot = slots[slot_idx]
+                logger.info(f"Kunde waehlt Slot {slot_idx}: {gewaehlter_slot}")
+                # Alten Termin canceln (falls vorhanden)
+                if conv.gcal_event_id:
+                    await self._cancel_via_kalender(tenant, conv.gcal_event_id)
+                # Neuen Termin buchen
+                booking_result = await self._versuche_buchung(
+                    tenant,
+                    sender_name,
+                    {
+                        "anliegen": "Termin (per Mail bestaetigt)",
+                        "wunschtermin_datum": gewaehlter_slot["datum"],
+                        "wunschtermin_uhrzeit": gewaehlter_slot["uhrzeit"],
+                        "telefon": extracted.get("telefon"),
+                    },
+                )
+                action = "slot_gewaehlt"
+
+        # Fall B: Verschiebung mit konkretem Wunsch
+        elif ist_verschiebung and klar and conv and conv.gcal_event_id:
+            logger.info("Verschiebungs-Wunsch mit konkretem Termin")
+            # Erst Slot-Verfuegbarkeit pruefen
+            verfuegbar = await self._check_slot(
+                tenant,
+                extracted["wunschtermin_datum"],
+                extracted["wunschtermin_uhrzeit"],
+            )
+            if verfuegbar:
+                # Alten canceln, neuen buchen
+                await self._cancel_via_kalender(tenant, conv.gcal_event_id)
+                booking_result = await self._versuche_buchung(tenant, sender_name, extracted)
+                action = "verschoben"
+            else:
+                # Wunsch belegt -> Slots vorschlagen
+                slots = await self._slot_alternativen(
+                    tenant,
+                    extracted["wunschtermin_datum"],
+                    extracted["wunschtermin_uhrzeit"],
+                )
+                conv = await upsert_conversation(
+                    tenant_id=tenant.id,
+                    kunde_email=sender_email,
+                    kunde_name=sender_name,
+                    last_message_id=message_id,
+                    last_subject=subject,
+                    state=STATE_PROPOSING_SLOTS,
+                    proposed_slots=slots,
+                    existing=conv,
+                )
+                action = "slots_vorgeschlagen"
+                # Auto-Reply mit Slot-Vorschlaegen
+                await self._send_slot_proposals(global_cfg, tenant, sender_email, sender_name, subject, message_id, extracted, slots)
+                await self._notify_tenant_telegram(tenant, sender_email, sender_name, subject, extracted, action="slots_vorgeschlagen")
+                return {"status": "slots_proposed", "tenant": tenant.slug, "slots_count": len(slots)}
+
+        # Fall C: Verschiebung vage (kein Wunschtermin) oder ohne bestehenden Termin
+        elif ist_verschiebung:
+            # Eskalation an Tenant, kein Auto-Buchen
+            action = "verschiebung_eskaliert"
+
+        # Fall D: Klare Neue Anfrage
+        elif klar and not conv:
+            # Erst Slot pruefen
+            verfuegbar = await self._check_slot(
+                tenant,
+                extracted["wunschtermin_datum"],
+                extracted["wunschtermin_uhrzeit"],
+            )
+            if verfuegbar:
+                booking_result = await self._versuche_buchung(tenant, sender_name, extracted)
+                action = "neu_gebucht"
+            else:
+                # Slot belegt -> Alternativen
+                slots = await self._slot_alternativen(
+                    tenant,
+                    extracted["wunschtermin_datum"],
+                    extracted["wunschtermin_uhrzeit"],
+                )
+                conv = await upsert_conversation(
+                    tenant_id=tenant.id,
+                    kunde_email=sender_email,
+                    kunde_name=sender_name,
+                    last_message_id=message_id,
+                    last_subject=subject,
+                    state=STATE_PROPOSING_SLOTS,
+                    proposed_slots=slots,
+                )
+                action = "slots_vorgeschlagen"
+                await self._send_slot_proposals(global_cfg, tenant, sender_email, sender_name, subject, message_id, extracted, slots)
+                await self._notify_tenant_telegram(tenant, sender_email, sender_name, subject, extracted, action="slots_vorgeschlagen")
+                return {"status": "slots_proposed", "tenant": tenant.slug, "slots_count": len(slots)}
+
+        # Fall E: Klare Anfrage aber Konversation existiert (Kunde mailt nochmal)
+        elif klar and conv:
+            # Behandeln wie neue Anfrage, aber alten Termin ggf. ueberschreiben
+            verfuegbar = await self._check_slot(
+                tenant,
+                extracted["wunschtermin_datum"],
+                extracted["wunschtermin_uhrzeit"],
+            )
+            if verfuegbar:
+                if conv.gcal_event_id:
+                    await self._cancel_via_kalender(tenant, conv.gcal_event_id)
+                booking_result = await self._versuche_buchung(tenant, sender_name, extracted)
+                action = "neu_gebucht"
+            else:
+                slots = await self._slot_alternativen(
+                    tenant,
+                    extracted["wunschtermin_datum"],
+                    extracted["wunschtermin_uhrzeit"],
+                )
+                conv = await upsert_conversation(
+                    tenant_id=tenant.id,
+                    kunde_email=sender_email,
+                    kunde_name=sender_name,
+                    last_message_id=message_id,
+                    last_subject=subject,
+                    state=STATE_PROPOSING_SLOTS,
+                    proposed_slots=slots,
+                    existing=conv,
+                )
+                action = "slots_vorgeschlagen"
+                await self._send_slot_proposals(global_cfg, tenant, sender_email, sender_name, subject, message_id, extracted, slots)
+                await self._notify_tenant_telegram(tenant, sender_email, sender_name, subject, extracted, action="slots_vorgeschlagen")
+                return {"status": "slots_proposed", "tenant": tenant.slug, "slots_count": len(slots)}
+
+        # 7. Konversation persistieren (bei Buchung mit event_id)
+        if booking_result and booking_result.get("erfolg"):
+            from datetime import datetime
+            try:
+                termin_dt = datetime.strptime(
+                    extracted.get("wunschtermin_datum") or
+                    (conv.proposed_slots[slot_idx]["datum"] if conv and slot_idx is not None else ""),
+                    "%d.%m.%Y"
+                ).date()
+            except Exception:
+                termin_dt = None
+
+            conv = await upsert_conversation(
+                tenant_id=tenant.id,
+                kunde_email=sender_email,
+                kunde_name=sender_name,
+                gcal_event_id=booking_result.get("event_id"),
+                termin_datum=termin_dt,
+                last_message_id=message_id,
+                last_subject=subject,
+                state=STATE_BOOKED,
+                existing=conv,
+            )
+        elif not booking_result and (action == "verschiebung_eskaliert" or (not klar)):
+            # Auch ohne Buchung Konversation tracken (fuer spaetere Replies)
+            conv = await upsert_conversation(
+                tenant_id=tenant.id,
+                kunde_email=sender_email,
+                kunde_name=sender_name,
+                last_message_id=message_id,
+                last_subject=subject,
+                state=STATE_AWAITING_CONFIRMATION,
+                existing=conv,
+            )
+
+        # 8. Telegram-Push an Tenant
+        await self._notify_tenant_telegram(tenant, sender_email, sender_name, subject, extracted, action=action)
+
+        # 9. Auto-Reply an Kunden
         await self._send_auto_reply(
             global_cfg=global_cfg,
             tenant=tenant,
@@ -311,10 +733,11 @@ class Plugin(BasePlugin):
         return {
             "status": "processed",
             "tenant": tenant.slug,
-            "sender": sender_email,
-            "klar": extracted.get("klar_genug_zum_buchen"),
+            "action": action,
+            "klar": klar,
             "booking": booking_result,
         }
+
 
     async def _notify_tenant_telegram(
         self,
@@ -323,10 +746,43 @@ class Plugin(BasePlugin):
         sender_name: str,
         subject: str,
         extracted: dict,
+        action: str = "neu",
     ) -> None:
         klar = extracted.get("klar_genug_zum_buchen", False)
-        status_emoji = "📧" if klar else "❓"
-        status_text = "klar" if klar else "<b>unklar - manuell pruefen</b>"
+        begruendung = (extracted.get("begruendung") or "").upper()
+        ist_verschiebung = "VERSCHIEBUNG" in begruendung or "STORNO" in begruendung
+
+        # Action-basierte Status-Anzeige (Multi-Turn)
+        if action == "storniert":
+            status_emoji = "X"
+            status_text = "<b>Termin storniert</b>"
+        elif action == "storno_ohne_termin":
+            status_emoji = "!"
+            status_text = "<b>STORNO ohne bestehenden Termin - manuell pruefen</b>"
+        elif action == "neu_gebucht":
+            status_emoji = "📅"
+            status_text = "<b>Neuer Termin gebucht</b>"
+        elif action == "verschoben":
+            status_emoji = "🔄"
+            status_text = "<b>Termin verschoben</b>"
+        elif action == "slot_gewaehlt":
+            status_emoji = "✅"
+            status_text = "<b>Kunde hat Slot gewaehlt + gebucht</b>"
+        elif action == "slots_vorgeschlagen":
+            status_emoji = "📋"
+            status_text = "<b>Slots vorgeschlagen, warte auf Bestaetigung</b>"
+        elif action == "verschiebung_eskaliert":
+            status_emoji = "⚠️"
+            status_text = "<b>VERSCHIEBUNG ohne Wunsch - manuell pruefen</b>"
+        elif ist_verschiebung:
+            status_emoji = "🔄"
+            status_text = "<b>VERSCHIEBUNG/STORNO - manuell pruefen</b>"
+        elif klar:
+            status_emoji = "📧"
+            status_text = "klar"
+        else:
+            status_emoji = "❓"
+            status_text = "<b>unklar - manuell pruefen</b>"
 
         text = (
             f"{status_emoji} <b>Neue Mail-Anfrage ({status_text})</b>\n"
@@ -416,15 +872,34 @@ class Plugin(BasePlugin):
             )
         else:
             # Anliegen unklar -> Eskalation, kein Termin-Versuch
-            html = self._build_html(
-                anrede=f"Hallo {sender_name},",
-                hauptteil=(
-                    f"<p>vielen Dank fuer Ihre Nachricht. Wir haben Ihre Anfrage "
-                    f"erhalten und melden uns zeitnah mit Termin-Vorschlaegen.</p>"
-                    f"<p>Falls es eilig ist, erreichen Sie uns auch telefonisch.</p>"
-                ),
-                tenant=tenant,
-            )
+            begruendung = (extracted.get("begruendung") or "").upper()
+            ist_verschiebung = "VERSCHIEBUNG" in begruendung or "STORNO" in begruendung
+            if ist_verschiebung:
+                html = self._build_html(
+                    anrede=f"Hallo {sender_name},",
+                    hauptteil=(
+                        "<p>vielen Dank fuer Ihre Nachricht. Wir haben Ihre Aenderungs-Wunsch "
+                        "erhalten und melden uns zeitnah mit einer Bestaetigung "
+                        "oder einem Alternativ-Vorschlag.</p>"
+                        "<p>Bei dringenden Aenderungen erreichen Sie uns am besten telefonisch.</p>"
+                    ),
+                    tenant=tenant,
+                )
+            else:
+                html = self._build_html(
+                    anrede=f"Hallo {sender_name},",
+                    hauptteil=(
+                        "<p>vielen Dank fuer Ihre Nachricht. Wir haben Ihre Anfrage "
+                        "erhalten und melden uns zeitnah mit Termin-Vorschlaegen.</p>"
+                        "<p>Falls es eilig ist, erreichen Sie uns auch telefonisch.</p>"
+                    ),
+                    tenant=tenant,
+                )
+
+        # Reply-To: Antworten landen auf der Tenant-Inbound-Adresse,
+        # nicht auf der noreply-Hauptdomain (die keinen MX-Record hat).
+        inbound_domain = global_cfg.get("inbound_domain", "reply.gewerbeagent.de")
+        tenant_reply_to = f"{tenant.slug}@{inbound_domain}"
 
         await send_reply_via_brevo(
             api_key=global_cfg["brevo_api_key"],
@@ -435,6 +910,135 @@ class Plugin(BasePlugin):
             subject=reply_subject,
             html_body=html,
             in_reply_to=in_reply_to,
+            reply_to_email=tenant_reply_to,
+        )
+
+    async def _check_slot(self, tenant, datum: str, uhrzeit: str) -> bool:
+        """Prueft ob Slot frei ist via kalender-Plugin check_availability."""
+        from core.plugin_system import get_plugin_for_tenant
+        kalender = await get_plugin_for_tenant(tenant.slug, "kalender")
+        if not kalender:
+            return False
+        try:
+            res = await kalender.on_webhook(
+                "check_availability",
+                {"datum": datum, "uhrzeit": uhrzeit},
+            )
+            return bool(res.get("verfuegbar"))
+        except Exception as e:
+            logger.exception(f"check_slot fehlgeschlagen: {e}")
+            return False
+
+    async def _slot_alternativen(self, tenant, datum: str, uhrzeit: str) -> list:
+        """Holt freie Slots ueber kalender.find_free_slots."""
+        from core.plugin_system import get_plugin_for_tenant
+        kalender = await get_plugin_for_tenant(tenant.slug, "kalender")
+        if not kalender:
+            return []
+        try:
+            res = await kalender.on_webhook(
+                "find_free_slots",
+                {"datum": datum, "uhrzeit": uhrzeit},
+            )
+            if res.get("erfolg"):
+                return res.get("slots", [])
+        except Exception as e:
+            logger.exception(f"slot_alternativen fehlgeschlagen: {e}")
+        return []
+
+    async def _cancel_via_kalender(self, tenant, event_id: str) -> None:
+        """Loescht alten Termin ueber kalender.cancel_appointment."""
+        from core.plugin_system import get_plugin_for_tenant
+        kalender = await get_plugin_for_tenant(tenant.slug, "kalender")
+        if not kalender:
+            return
+        try:
+            await kalender.on_webhook("cancel_appointment", {"event_id": event_id})
+            logger.info(f"Termin {event_id} geloescht")
+        except Exception as e:
+            logger.exception(f"cancel fehlgeschlagen: {e}")
+
+    async def _send_slot_proposals(
+        self,
+        global_cfg: dict,
+        tenant,
+        sender_email: str,
+        sender_name: str,
+        original_subject: str,
+        in_reply_to: str | None,
+        extracted: dict,
+        slots: list,
+    ) -> None:
+        """Schickt Mail mit den vorgeschlagenen Slots."""
+        if not slots:
+            slot_html = "<p>Leider sind in den naechsten Tagen keine freien Termine verfuegbar. Wir melden uns telefonisch.</p>"
+        else:
+            slot_lines = "".join([
+                f"<li><b>{s['wochentag']} {s['datum']}</b> um <b>{s['uhrzeit']} Uhr</b></li>"
+                for s in slots
+            ])
+            slot_html = f"<ul>{slot_lines}</ul>"
+
+        wunsch = extracted.get("wunschtermin_datum") or "Ihr Wunschtermin"
+        hauptteil = (
+            f"<p>vielen Dank fuer Ihre Anfrage. Leider ist {wunsch} "
+            f"{extracted.get('wunschtermin_uhrzeit', '')} Uhr nicht mehr verfuegbar.</p>"
+            f"<p>Wir koennen Ihnen folgende Termine anbieten:</p>"
+            f"{slot_html}"
+            f"<p>Bitte antworten Sie einfach auf diese Mail mit dem fuer Sie passenden Termin "
+            f"(z.B. \"Donnerstag 30.04. um 8 Uhr\" oder \"erster Termin\"), und wir tragen ihn fuer Sie ein.</p>"
+        )
+
+        html = self._build_html(anrede=f"Hallo {sender_name},", hauptteil=hauptteil, tenant=tenant)
+
+        reply_subject = original_subject if original_subject.lower().startswith("re:") else f"Re: {original_subject}"
+        inbound_domain = global_cfg.get("inbound_domain", "reply.gewerbeagent.de")
+        tenant_reply_to = f"{tenant.slug}@{inbound_domain}"
+
+        await send_reply_via_brevo(
+            api_key=global_cfg["brevo_api_key"],
+            sender_name=global_cfg["sender_name"],
+            sender_email=global_cfg["sender_email"],
+            to_email=sender_email,
+            to_name=sender_name,
+            subject=reply_subject,
+            html_body=html,
+            in_reply_to=in_reply_to,
+            reply_to_email=tenant_reply_to,
+        )
+
+    async def _send_storno_reply(
+        self,
+        global_cfg: dict,
+        tenant,
+        sender_email: str,
+        sender_name: str,
+        original_subject: str,
+        in_reply_to: str | None,
+    ) -> None:
+        """Schickt Bestaetigungs-Mail nach erfolgreicher Stornierung."""
+        hauptteil = (
+            "<p>vielen Dank fuer Ihre Nachricht. Wir haben Ihren Termin "
+            "wie gewuenscht aus unserem Kalender entfernt.</p>"
+            "<p>Falls Sie zu einem spaeteren Zeitpunkt einen neuen Termin moechten, "
+            "antworten Sie einfach auf diese Mail oder melden sich telefonisch.</p>"
+        )
+        html = self._build_html(anrede=f"Hallo {sender_name},", hauptteil=hauptteil, tenant=tenant)
+
+        reply_subject = original_subject if original_subject.lower().startswith("re:") else f"Re: {original_subject}"
+        inbound_domain = global_cfg.get("inbound_domain", "reply.gewerbeagent.de")
+        tenant_reply_to = f"{tenant.slug}@{inbound_domain}"
+
+        await send_reply_via_brevo(
+            api_key=global_cfg["brevo_api_key"],
+            sender_name=global_cfg["sender_name"],
+            sender_email=global_cfg["sender_email"],
+            to_email=sender_email,
+            to_name=sender_name,
+            subject=reply_subject,
+            html_body=html,
+            in_reply_to=in_reply_to,
+            reply_to_email=tenant_reply_to,
         )
 
     def _build_html(self, anrede: str, hauptteil: str, tenant: Tenant) -> str:

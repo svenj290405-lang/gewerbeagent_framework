@@ -64,11 +64,15 @@ async def call_gemini(
     prompt: str,
     *,
     temperature: float = 0.2,
-    max_output_tokens: int = 1024,
+    max_output_tokens: int = 4096,
 ) -> str:
     """
     Synchrones Vertex-SDK in Threadpool, damit es in Async-Code passt.
     Default-Temperatur niedrig fuer strukturierte Extraction.
+
+    HINWEIS: Gemini 2.5 Flash macht "Thinking" vor Output. Bei zu niedrigem
+    max_output_tokens werden alle Tokens fuers Thinking verbraucht und die
+    eigentliche Antwort bleibt leer. Daher Default 4096.
     """
     def _run() -> str:
         model = _get_model()
@@ -77,6 +81,16 @@ async def call_gemini(
             max_output_tokens=max_output_tokens,
         )
         response = model.generate_content(prompt, generation_config=config)
-        return response.text or ""
+        # response.text wirft wenn Content leer (z.B. MAX_TOKENS bei Thinking).
+        try:
+            return response.text or ""
+        except Exception as e:
+            logger.warning(f"Gemini-Antwort hat keinen Text: {e}")
+            # Fallback: erste Candidate-Parts manuell joinen
+            try:
+                parts = response.candidates[0].content.parts
+                return "".join(p.text for p in parts if hasattr(p, "text"))
+            except Exception:
+                return ""
 
     return await asyncio.to_thread(_run)

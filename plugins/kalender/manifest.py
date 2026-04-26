@@ -21,5 +21,7 @@ MANIFEST = PluginManifest(
     webhook_endpoints=[
         {"path": "/check_availability", "method": "POST"},
         {"path": "/book_appointment", "method": "POST"},
+        {"path": "/find_free_slots", "method": "POST"},
+        {"path": "/cancel_appointment", "method": "POST"},
     ],
 )
