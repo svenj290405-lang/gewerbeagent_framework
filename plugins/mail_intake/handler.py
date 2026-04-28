@@ -400,6 +400,70 @@ Erweitere das JSON um:
         }
 
 
+
+async def humanize_termin_bestaetigung(
+    sender_name: str,
+    datum: str,
+    uhrzeit: str,
+    anliegen: str,
+    company_name: str,
+) -> str | None:
+    """
+    Erzeugt einen warmen, menschlichen HTML-Hauptteil fuer eine Termin-Bestaetigung.
+    Datum und Uhrzeit MUESSEN wortwoertlich uebernommen werden.
+    Returns None bei jedem Fehler -> Caller faellt auf altes Template zurueck.
+    """
+    try:
+        from core.ai import call_gemini
+
+        anliegen_zeile = f"Anliegen: {anliegen}" if anliegen else ""
+        prompt = (
+            "Du schreibst einen kurzen warmen HTML-Mail-Hauptteil fuer eine "
+            f"Termin-Bestaetigung von {company_name}.\n\n"
+            f"KUNDE: {sender_name}\n"
+            f"PFLICHT-DATUM: {datum}\n"
+            f"PFLICHT-UHRZEIT: {uhrzeit}\n"
+            f"{anliegen_zeile}\n\n"
+            "REGELN:\n"
+            "- Antworte nur mit HTML-<p>-Absaetzen, KEIN <html>/<body>.\n"
+            "- KEIN Anrede-Absatz (kommt extern), starte direkt mit dem Hauptteil.\n"
+            "- KEIN Schlussgruss (kommt extern).\n"
+            "- Datum und Uhrzeit MUESSEN exakt wie oben angegeben im Text vorkommen, "
+            "fettgedruckt mit <b>...</b>.\n"
+            "- Erwaehne dass der Kunde einfach auf die Mail antworten kann falls der "
+            "Termin nicht passt.\n"
+            "- KEINE englischen Floskeln. Locker, freundlich, deutsch.\n"
+            "- KEINE Umlaute (ae, oe, ue, ss).\n"
+            "- Maximal 60 Worte gesamt.\n\n"
+            "Schreibe jetzt nur die <p>-Absaetze:"
+        )
+
+        response = await call_gemini(prompt, temperature=0.7, max_output_tokens=1024)
+        text = (response or "").strip()
+
+        if text.startswith("```"):
+            text = re.sub(r"^```(?:html)?\s*", "", text)
+            text = re.sub(r"\s*```\s*$", "", text)
+            text = text.strip()
+
+        if not text or "<p" not in text.lower() or len(text) < 30:
+            logger.warning(f"humanize_termin_bestaetigung: Output verworfen: {text!r}")
+            return None
+
+        if datum not in text or uhrzeit not in text:
+            logger.warning(
+                f"humanize_termin_bestaetigung: Pflicht-Daten fehlen "
+                f"(datum={datum!r}, uhrzeit={uhrzeit!r}), Fallback."
+            )
+            return None
+
+        return text
+
+    except Exception as e:
+        logger.exception(f"humanize_termin_bestaetigung fehlgeschlagen: {e}")
+        return None
+
+
 # ---------- Plugin-Klasse ----------
 
 class Plugin(BasePlugin):
@@ -846,16 +910,24 @@ class Plugin(BasePlugin):
 
         if gebucht:
             # Termin wurde gebucht
+            fallback_hauptteil = (
+                f"<p>vielen Dank fuer Ihre Anfrage. Ich habe den Termin "
+                f"am <b>{extracted['wunschtermin_datum']}</b> um "
+                f"<b>{extracted['wunschtermin_uhrzeit']} Uhr</b> fuer Sie eingetragen.</p>"
+                f"<p>Anliegen: {extracted.get('anliegen', '')}</p>"
+                f"<p>Falls der Termin nicht passt, antworten Sie einfach auf diese Mail "
+                f"mit einem Alternativ-Termin oder rufen Sie uns an.</p>"
+            )
+            humanized = await humanize_termin_bestaetigung(
+                sender_name=sender_name,
+                datum=extracted['wunschtermin_datum'],
+                uhrzeit=extracted['wunschtermin_uhrzeit'],
+                anliegen=extracted.get('anliegen', ''),
+                company_name=tenant.company_name,
+            )
             html = self._build_html(
                 anrede=f"Hallo {sender_name},",
-                hauptteil=(
-                    f"<p>vielen Dank fuer Ihre Anfrage. Ich habe den Termin "
-                    f"am <b>{extracted['wunschtermin_datum']}</b> um "
-                    f"<b>{extracted['wunschtermin_uhrzeit']} Uhr</b> fuer Sie eingetragen.</p>"
-                    f"<p>Anliegen: {extracted.get('anliegen', '')}</p>"
-                    f"<p>Falls der Termin nicht passt, antworten Sie einfach auf diese Mail "
-                    f"mit einem Alternativ-Termin oder rufen Sie uns an.</p>"
-                ),
+                hauptteil=humanized if humanized else fallback_hauptteil,
                 tenant=tenant,
             )
         elif klar and not gebucht:

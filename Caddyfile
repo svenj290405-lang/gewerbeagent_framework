@@ -1,4 +1,4 @@
-gewerbeagent.de, www.gewerbeagent.de {
+gewerbeagent.de {
     encode gzip
 
     reverse_proxy framework:8001 {
@@ -10,6 +10,21 @@ gewerbeagent.de, www.gewerbeagent.de {
 
     log {
         output file /var/log/caddy/access.log {
+            roll_size 10mb
+            roll_keep 5
+        }
+        format console
+    }
+}
+
+www.gewerbeagent.de {
+    encode gzip
+
+    root * /srv/website
+    file_server
+
+    log {
+        output file /var/log/caddy/website-access.log {
             roll_size 10mb
             roll_keep 5
         }
