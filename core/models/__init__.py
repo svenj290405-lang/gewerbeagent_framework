@@ -8,11 +8,29 @@ from core.models.email_conversation import (
 from core.models.oauth_state import OAuthState
 from core.models.oauth_token import OAuthToken
 from core.models.tenant import Tenant, TenantStatus
+from core.models.tenant_knowledge import (
+    TenantKnowledge,
+    KATEGORIE_MATERIALIEN,
+    KATEGORIE_PREISE,
+    KATEGORIE_ANFAHRT,
+    KATEGORIE_NOTFALL,
+    KATEGORIE_OEFFNUNGSZEITEN,
+    KATEGORIE_FAQ,
+    ALLE_KATEGORIEN,
+)
 from core.models.tool_config import ToolConfig
 
 __all__ = [
     "Tenant",
     "TenantStatus",
+    "TenantKnowledge",
+    "KATEGORIE_MATERIALIEN",
+    "KATEGORIE_PREISE",
+    "KATEGORIE_ANFAHRT",
+    "KATEGORIE_NOTFALL",
+    "KATEGORIE_OEFFNUNGSZEITEN",
+    "KATEGORIE_FAQ",
+    "ALLE_KATEGORIEN",
     "ToolConfig",
     "OAuthToken",
     "OAuthState",

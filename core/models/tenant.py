@@ -12,7 +12,7 @@ import uuid
 from enum import Enum
 from typing import TYPE_CHECKING
 
-from sqlalchemy import String
+from sqlalchemy import BigInteger, String
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -55,6 +55,11 @@ class Tenant(Base):
 
     # Freitext für interne Notizen
     notes: Mapped[str | None] = mapped_column(String(2000), nullable=True)
+
+    # Telegram-Bot-Chat-ID (wird beim Onboarding via QR-Code gesetzt)
+    telegram_chat_id: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True, index=True
+    )
 
     # --- Relationships ---
 
