@@ -11,7 +11,7 @@ Hard-Delete Cleanup: Konversationen bei denen termin_datum laenger als
 import datetime as dt
 import uuid
 
-from sqlalchemy import Date, DateTime, ForeignKey, Index, String, func
+from sqlalchemy import Date, DateTime, ForeignKey, Index, String, Text, func
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -59,6 +59,10 @@ class EmailConversation(Base):
     # Threading: letzte Mail-Message-ID (fuer In-Reply-To-Matching)
     last_message_id: Mapped[str | None] = mapped_column(String(500), nullable=True)
     last_subject: Mapped[str | None] = mapped_column(String(500), nullable=True)
+
+    # Konversations-Memory fuer Multi-Turn (Q weiss was er zuletzt fragte)
+    last_q_reply: Mapped[str | None] = mapped_column(Text, nullable=True)
+    last_user_message: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     # State-Machine
     state: Mapped[str] = mapped_column(

@@ -20,21 +20,37 @@ from core.database.base import Base
 
 
 # Erlaubte Kategorien (lose, kein DB-Constraint - nur Doku)
+KATEGORIE_LEISTUNGEN = "leistungen"
 KATEGORIE_MATERIALIEN = "materialien"
 KATEGORIE_PREISE = "preise"
 KATEGORIE_ANFAHRT = "anfahrt"
-KATEGORIE_NOTFALL = "notfall"
 KATEGORIE_OEFFNUNGSZEITEN = "oeffnungszeiten"
+KATEGORIE_NOTFALL = "notfall"
+KATEGORIE_BESONDERHEITEN = "besonderheiten"
 KATEGORIE_FAQ = "faq"
 
 ALLE_KATEGORIEN = (
+    KATEGORIE_LEISTUNGEN,
     KATEGORIE_MATERIALIEN,
     KATEGORIE_PREISE,
     KATEGORIE_ANFAHRT,
-    KATEGORIE_NOTFALL,
     KATEGORIE_OEFFNUNGSZEITEN,
+    KATEGORIE_NOTFALL,
+    KATEGORIE_BESONDERHEITEN,
     KATEGORIE_FAQ,
 )
+
+# Display-Labels fuer den User (Reihenfolge = ALLE_KATEGORIEN)
+KATEGORIE_LABELS = {
+    KATEGORIE_LEISTUNGEN: "Leistungen / Gewerke",
+    KATEGORIE_MATERIALIEN: "Materialien",
+    KATEGORIE_PREISE: "Preise & Stundensatz",
+    KATEGORIE_ANFAHRT: "Anfahrt & Einzugsgebiet",
+    KATEGORIE_OEFFNUNGSZEITEN: "Oeffnungszeiten",
+    KATEGORIE_NOTFALL: "Notfall-Logik",
+    KATEGORIE_BESONDERHEITEN: "Besonderheiten / Garantie / Zertifikate",
+    KATEGORIE_FAQ: "FAQ / Sonstiges",
+}
 
 
 class TenantKnowledge(Base):

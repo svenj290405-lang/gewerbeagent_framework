@@ -127,6 +127,8 @@ async def upsert_conversation(
     last_subject: str | None = None,
     state: str | None = None,
     proposed_slots=None,
+    last_q_reply: str | None = None,
+    last_user_message: str | None = None,
     existing=None,
 ):
     """
@@ -167,6 +169,10 @@ async def upsert_conversation(
             conv.last_subject = last_subject[:500]
         if state is not None:
             conv.state = state
+        if last_q_reply is not None:
+            conv.last_q_reply = last_q_reply
+        if last_user_message is not None:
+            conv.last_user_message = last_user_message
         if proposed_slots is not None:
             conv.proposed_slots = proposed_slots
 
@@ -407,23 +413,69 @@ async def humanize_termin_bestaetigung(
     uhrzeit: str,
     anliegen: str,
     company_name: str,
+    tenant_id=None,
 ) -> str | None:
     """
     Erzeugt einen warmen, menschlichen HTML-Hauptteil fuer eine Termin-Bestaetigung.
     Datum und Uhrzeit MUESSEN wortwoertlich uebernommen werden.
+    Wenn tenant_id mitgegeben wird, wird die Wissensbasis dieses Tenants als
+    Kontext in den Gemini-Prompt eingebaut (z.B. damit auf das Anliegen
+    spezifisch eingegangen werden kann).
     Returns None bei jedem Fehler -> Caller faellt auf altes Template zurueck.
     """
     try:
         from core.ai import call_gemini
 
+        # Wissensbasis dieses Tenants als Kontext laden (best-effort, fail-soft)
+        tenant_knowledge_block = ""
+        if tenant_id is not None:
+            try:
+                from core.database import AsyncSessionLocal
+                from core.models import (
+                    ALLE_KATEGORIEN,
+                    KATEGORIE_LABELS,
+                    TenantKnowledge,
+                )
+                from sqlalchemy import select
+
+                async with AsyncSessionLocal() as s:
+                    entries = (await s.execute(
+                        select(TenantKnowledge)
+                        .where(TenantKnowledge.tenant_id == tenant_id)
+                        .order_by(TenantKnowledge.kategorie, TenantKnowledge.created_at)
+                    )).scalars().all()
+
+                if entries:
+                    by_kat = {}
+                    for e in entries:
+                        by_kat.setdefault(e.kategorie, []).append(e.text)
+                    parts = []
+                    for kat in ALLE_KATEGORIEN:
+                        if kat not in by_kat:
+                            continue
+                        label = KATEGORIE_LABELS.get(kat, kat)
+                        parts.append(f"## {label}")
+                        for t in by_kat[kat]:
+                            parts.append(f"- {t}")
+                        parts.append("")
+                    tenant_knowledge_block = "\n".join(parts).strip()
+            except Exception as ke:
+                logger.warning(f"Wissensbasis-Lookup fehlgeschlagen: {ke}")
+
         anliegen_zeile = f"Anliegen: {anliegen}" if anliegen else ""
+        knowledge_zeile = (
+            f"\n\nBETRIEBS-INFORMATIONEN (nutze nur falls thematisch passend):\n"
+            f"{tenant_knowledge_block}"
+        ) if tenant_knowledge_block else ""
+
         prompt = (
             "Du schreibst einen kurzen warmen HTML-Mail-Hauptteil fuer eine "
             f"Termin-Bestaetigung von {company_name}.\n\n"
             f"KUNDE: {sender_name}\n"
             f"PFLICHT-DATUM: {datum}\n"
             f"PFLICHT-UHRZEIT: {uhrzeit}\n"
-            f"{anliegen_zeile}\n\n"
+            f"{anliegen_zeile}"
+            f"{knowledge_zeile}\n\n"
             "REGELN:\n"
             "- Antworte nur mit HTML-<p>-Absaetzen, KEIN <html>/<body>.\n"
             "- KEIN Anrede-Absatz (kommt extern), starte direkt mit dem Hauptteil.\n"
@@ -438,7 +490,7 @@ async def humanize_termin_bestaetigung(
             "Schreibe jetzt nur die <p>-Absaetze:"
         )
 
-        response = await call_gemini(prompt, temperature=0.7, max_output_tokens=1024)
+        response = await call_gemini(prompt, temperature=0.7, max_output_tokens=8192)
         text = (response or "").strip()
 
         if text.startswith("```"):
@@ -463,6 +515,142 @@ async def humanize_termin_bestaetigung(
         logger.exception(f"humanize_termin_bestaetigung fehlgeschlagen: {e}")
         return None
 
+
+async def humanize_eingangsbestaetigung(
+    sender_name,
+    text_body,
+    extracted,
+    company_name,
+    tenant_id=None,
+    is_verschiebung=False,
+    last_q_reply=None,
+    last_user_message=None,
+):
+    """
+    Erzeugt einen warmen, hilfreichen HTML-Mail-Hauptteil fuer eine
+    Eingangsbestaetigung wenn der Wunschtermin (noch) nicht klar ist.
+    """
+    try:
+        from core.ai import call_gemini
+
+        tenant_knowledge_block = ""
+        if tenant_id is not None:
+            try:
+                from core.database import AsyncSessionLocal
+                from core.models import (
+                    ALLE_KATEGORIEN,
+                    KATEGORIE_LABELS,
+                    TenantKnowledge,
+                )
+                from sqlalchemy import select
+                async with AsyncSessionLocal() as s:
+                    entries = (await s.execute(
+                        select(TenantKnowledge)
+                        .where(TenantKnowledge.tenant_id == tenant_id)
+                        .order_by(TenantKnowledge.kategorie, TenantKnowledge.created_at)
+                    )).scalars().all()
+                if entries:
+                    by_kat = {}
+                    for e in entries:
+                        by_kat.setdefault(e.kategorie, []).append(e.text)
+                    parts = []
+                    for kat in ALLE_KATEGORIEN:
+                        if kat not in by_kat:
+                            continue
+                        label = KATEGORIE_LABELS.get(kat, kat)
+                        parts.append(f"## {label}")
+                        for t in by_kat[kat]:
+                            parts.append(f"- {t}")
+                        parts.append("")
+                    tenant_knowledge_block = "\n".join(parts).strip()
+            except Exception as ke:
+                logger.warning(f"Wissensbasis-Lookup fehlgeschlagen: {ke}")
+
+        anliegen = (extracted or {}).get("anliegen", "") or ""
+        wunsch_datum = (extracted or {}).get("wunschtermin_datum", "") or ""
+        wunsch_uhrzeit = (extracted or {}).get("wunschtermin_uhrzeit", "") or ""
+        scenario = "VERSCHIEBUNG_STORNO" if is_verschiebung else "ANFRAGE_UNKLAR"
+
+        knowledge_zeile = (
+            f"\n\nBETRIEBS-INFORMATIONEN (nutze nur falls thematisch passend):\n"
+            f"{tenant_knowledge_block}"
+        ) if tenant_knowledge_block else ""
+
+        body_excerpt = (text_body or "").strip()
+        if len(body_excerpt) > 1500:
+            body_excerpt = body_excerpt[:1500] + "..."
+
+        # Konversations-Historie aufbereiten
+        history_block = ""
+        if last_q_reply or last_user_message:
+            h_parts = []
+            if last_q_reply:
+                lqr = last_q_reply if len(last_q_reply) <= 800 else last_q_reply[:800] + "..."
+                h_parts.append(f"DEINE LETZTE ANTWORT (was Q zuletzt schrieb):\n{lqr}")
+            if last_user_message:
+                lum = last_user_message if len(last_user_message) <= 500 else last_user_message[:500] + "..."
+                h_parts.append(f"VORHERIGE NACHRICHT DES KUNDEN:\n{lum}")
+            history_block = "\n\n" + "\n\n".join(h_parts)
+
+        prompt_parts = []
+        P = prompt_parts.append
+        P(f"Du schreibst einen kurzen, warmen HTML-Mail-Hauptteil fuer {company_name}.")
+        P("Du befindest Dich in einer fortlaufenden Mail-Konversation - die Mail des Kunden ist eine ANTWORT auf Deine vorherige Nachricht.")
+        P("Beziehe Dich darauf was Du zuletzt gefragt hast und gehe auf die neue Information ein.")
+        if history_block:
+            P(history_block)
+        P("")
+        P("KONTEXT:")
+        P(f"- Kunde: {sender_name}")
+        P(f"- Szenario: {scenario}")
+        P(f"- Erkanntes Anliegen: {anliegen if anliegen else '(unbekannt)'}")
+        P(f"- Erkannter Wunschtermin: {wunsch_datum} {wunsch_uhrzeit}".strip())
+        P("")
+        P("ORIGINAL-MAIL-TEXT DES KUNDEN:")
+        P(body_excerpt if body_excerpt else "(leer)")
+        P(knowledge_zeile)
+        P("")
+        P("REGELN:")
+        P("- Antworte nur mit HTML-<p>-Absaetzen, KEIN <html>/<body>.")
+        P("- KEIN Anrede-Absatz (kommt extern), starte direkt mit dem Hauptteil.")
+        P("- KEIN Schlussgruss (kommt extern).")
+        P("- Maximal 70 Worte gesamt.")
+        P("- Keine Umlaute (ae, oe, ue, ss).")
+        P("- Klar, freundlich, deutsch, kein Englisch, kein Buerokraten-Stil.")
+        P("")
+        P("INHALT:")
+        if scenario == "ANFRAGE_UNKLAR":
+            P("- Bestaetige kurz dass du verstanden hast worum es geht.")
+            P("- Wenn aus den Betriebs-Informationen Spezifisches dazu bekannt ist, erwaehne es kurz.")
+            P("- Stelle 1-2 gezielte Rueckfragen falls Infos fehlen.")
+            P("- Kuendige an dass konkrete Termin-Vorschlaege folgen.")
+            P("- KEINE konkreten Termine erfinden.")
+        else:
+            P("- Bestaetige dass die Aenderung/Stornierung angekommen ist.")
+            P("- Sage dass eine Bestaetigung oder Alternativ-Vorschlag folgt.")
+            P("- Bei Notfaellen: weise darauf hin dass Anrufen schneller ist.")
+        P("")
+        P("Schreibe jetzt nur die <p>-Absaetze:")
+
+        prompt = "\n".join(prompt_parts)
+
+        response = await call_gemini(prompt, temperature=0.7, max_output_tokens=8192)
+        text = (response or "").strip()
+
+        if text.startswith("```"):
+            text = re.sub(r"^```(?:html)?\s*", "", text)
+            text = re.sub(r"\s*```\s*$", "", text)
+            text = text.strip()
+
+        if not text or "<p" not in text.lower() or len(text) < 30:
+            logger.warning(f"humanize_eingangsbestaetigung: Output verworfen: {text!r}")
+            return None
+
+        return text
+
+    except Exception as e:
+        logger.exception(f"humanize_eingangsbestaetigung fehlgeschlagen: {e}")
+        return None
 
 # ---------- Plugin-Klasse ----------
 
@@ -608,9 +796,11 @@ class Plugin(BasePlugin):
                     sender_email=sender_email,
                     sender_name=sender_name,
                     original_subject=subject,
+                    text_body=text_body,
                     extracted=extracted,
                     booking_result=None,
                     in_reply_to=message_id,
+                    conv=conv,
                 )
                 return {"status": "storno_ohne_termin", "tenant": tenant.slug}
 
@@ -783,16 +973,32 @@ class Plugin(BasePlugin):
         await self._notify_tenant_telegram(tenant, sender_email, sender_name, subject, extracted, action=action)
 
         # 9. Auto-Reply an Kunden
-        await self._send_auto_reply(
+        sent_html = await self._send_auto_reply(
             global_cfg=global_cfg,
             tenant=tenant,
             sender_email=sender_email,
             sender_name=sender_name,
             original_subject=subject,
+            text_body=text_body,
             extracted=extracted,
             booking_result=booking_result,
             in_reply_to=message_id,
+            conv=conv,
         )
+
+        # 10. Konversations-Memory aktualisieren (last_q_reply + last_user_message)
+        # damit der naechste Multi-Turn-Step Kontext hat
+        if sent_html:
+            try:
+                conv = await upsert_conversation(
+                    tenant_id=tenant.id,
+                    kunde_email=sender_email,
+                    last_q_reply=sent_html,
+                    last_user_message=text_body,
+                    existing=conv,
+                )
+            except Exception as e:
+                logger.warning(f"Konversations-Memory-Update fehlgeschlagen: {e}")
 
         return {
             "status": "processed",
@@ -895,11 +1101,13 @@ class Plugin(BasePlugin):
         sender_email: str,
         sender_name: str,
         original_subject: str,
+        text_body: str,
         extracted: dict,
         booking_result: dict | None,
         in_reply_to: str | None,
-    ) -> None:
-        """Schickt Auto-Reply an den Kunden."""
+        conv=None,
+    ) -> str | None:
+        """Schickt Auto-Reply an den Kunden. Gibt das gesendete HTML zurueck (oder None bei Fehler)."""
         klar = extracted.get("klar_genug_zum_buchen", False)
         gebucht = booking_result and booking_result.get("erfolg")
 
@@ -924,6 +1132,7 @@ class Plugin(BasePlugin):
                 uhrzeit=extracted['wunschtermin_uhrzeit'],
                 anliegen=extracted.get('anliegen', ''),
                 company_name=tenant.company_name,
+                tenant_id=tenant.id,
             )
             html = self._build_html(
                 anrede=f"Hallo {sender_name},",
@@ -947,24 +1156,46 @@ class Plugin(BasePlugin):
             begruendung = (extracted.get("begruendung") or "").upper()
             ist_verschiebung = "VERSCHIEBUNG" in begruendung or "STORNO" in begruendung
             if ist_verschiebung:
+                fallback_versch = (
+                    "<p>vielen Dank fuer Ihre Nachricht. Wir haben Ihre Aenderungs-Wunsch "
+                    "erhalten und melden uns zeitnah mit einer Bestaetigung "
+                    "oder einem Alternativ-Vorschlag.</p>"
+                    "<p>Bei dringenden Aenderungen erreichen Sie uns am besten telefonisch.</p>"
+                )
+                humanized_versch = await humanize_eingangsbestaetigung(
+                    sender_name=sender_name,
+                    text_body=text_body,
+                    extracted=extracted,
+                    company_name=tenant.company_name,
+                    tenant_id=tenant.id,
+                    is_verschiebung=True,
+                    last_q_reply=conv.last_q_reply if conv else None,
+                    last_user_message=conv.last_user_message if conv else None,
+                )
                 html = self._build_html(
                     anrede=f"Hallo {sender_name},",
-                    hauptteil=(
-                        "<p>vielen Dank fuer Ihre Nachricht. Wir haben Ihre Aenderungs-Wunsch "
-                        "erhalten und melden uns zeitnah mit einer Bestaetigung "
-                        "oder einem Alternativ-Vorschlag.</p>"
-                        "<p>Bei dringenden Aenderungen erreichen Sie uns am besten telefonisch.</p>"
-                    ),
+                    hauptteil=humanized_versch if humanized_versch else fallback_versch,
                     tenant=tenant,
                 )
             else:
+                fallback_unklar = (
+                    "<p>vielen Dank fuer Ihre Nachricht. Wir haben Ihre Anfrage "
+                    "erhalten und melden uns zeitnah mit Termin-Vorschlaegen.</p>"
+                    "<p>Falls es eilig ist, erreichen Sie uns auch telefonisch.</p>"
+                )
+                humanized_unklar = await humanize_eingangsbestaetigung(
+                    sender_name=sender_name,
+                    text_body=text_body,
+                    extracted=extracted,
+                    company_name=tenant.company_name,
+                    tenant_id=tenant.id,
+                    is_verschiebung=False,
+                    last_q_reply=conv.last_q_reply if conv else None,
+                    last_user_message=conv.last_user_message if conv else None,
+                )
                 html = self._build_html(
                     anrede=f"Hallo {sender_name},",
-                    hauptteil=(
-                        "<p>vielen Dank fuer Ihre Nachricht. Wir haben Ihre Anfrage "
-                        "erhalten und melden uns zeitnah mit Termin-Vorschlaegen.</p>"
-                        "<p>Falls es eilig ist, erreichen Sie uns auch telefonisch.</p>"
-                    ),
+                    hauptteil=humanized_unklar if humanized_unklar else fallback_unklar,
                     tenant=tenant,
                 )
 
@@ -984,6 +1215,7 @@ class Plugin(BasePlugin):
             in_reply_to=in_reply_to,
             reply_to_email=tenant_reply_to,
         )
+        return html  # zur Speicherung in der Konversation als last_q_reply
 
     async def _check_slot(self, tenant, datum: str, uhrzeit: str) -> bool:
         """Prueft ob Slot frei ist via kalender-Plugin check_availability."""

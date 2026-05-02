@@ -61,6 +61,17 @@ class Tenant(Base):
         BigInteger, nullable=True, index=True
     )
 
+    # Branche fuer Agent-Mapping (tischler, sanitaer, elektrik, ...)
+    branche: Mapped[str | None] = mapped_column(
+        String(50), nullable=True, index=True
+    )
+
+    # Voice-Phone-Number fuer Tenant-Routing bei eingehenden Calls
+    # (E.164: +492187973998912)
+    voice_phone_number: Mapped[str | None] = mapped_column(
+        String(30), nullable=True, unique=True, index=True
+    )
+
     # --- Relationships ---
 
     # Alle ToolConfigs dieses Tenants (automatisch geladen)

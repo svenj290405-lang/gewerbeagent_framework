@@ -47,3 +47,7 @@ client_secret*.json
 # Lokale Backups
 *.bak
 docker-compose.freeswitch.yml
+
+# Backup-Dateien (Edit-History, lokal)
+*.bak
+*.before_*.bak
