@@ -304,6 +304,209 @@ class LexwareProvider(AccountingProvider):
         )
         return results
 
+
+    async def create_customer_contact(
+        self,
+        name: str,
+        email: str | None = None,
+        phone: str | None = None,
+        street: str | None = None,
+        zip_code: str | None = None,
+        city: str | None = None,
+        country_code: str = "DE",
+        is_company: bool = False,
+    ) -> ContactMatch:
+        """
+        POST /v1/contacts - legt neuen Kunden-Kontakt an.
+
+        Wichtig: Lexware erlaubt nur 1 Eintrag pro Liste (emailAddresses.business etc.)
+        beim Anlegen - sonst ValidationError.
+        """
+        if not name or len(name.strip()) < 2:
+            raise ValueError("Kontakt-Name fehlt")
+
+        body = {
+            "version": 0,
+            "roles": {"customer": {}},
+        }
+
+        # person vs company
+        if is_company:
+            body["company"] = {"name": name.strip()}
+        else:
+            # Versuch Vorname + Nachname zu trennen
+            parts = name.strip().split(maxsplit=1)
+            person = {}
+            # Salutation aus name extrahieren falls "Frau X" oder "Herr X"
+            salutation = None
+            if parts and parts[0].lower() in ("frau", "herr"):
+                salutation = parts[0].capitalize()
+                parts = parts[1].split(maxsplit=1) if len(parts) > 1 else []
+            if salutation:
+                person["salutation"] = salutation
+            if len(parts) == 2:
+                person["firstName"] = parts[0]
+                person["lastName"] = parts[1]
+            elif len(parts) == 1:
+                person["lastName"] = parts[0]
+            else:
+                person["lastName"] = name.strip()
+            body["person"] = person
+
+        # Optional: Adresse
+        if street or zip_code or city:
+            address = {"countryCode": country_code}
+            if street:
+                address["street"] = street
+            if zip_code:
+                address["zip"] = zip_code
+            if city:
+                address["city"] = city
+            address["isPrimary"] = True
+            body["addresses"] = {"billing": [address]}
+
+        # Optional: Email
+        if email:
+            body["emailAddresses"] = {"business": [email.strip()]}
+
+        # Optional: Telefon
+        if phone:
+            body["phoneNumbers"] = {"business": [phone.strip()]}
+
+        await self._rate_limit()
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            r = await client.post(
+                f"{LEXWARE_API_BASE}/v1/contacts",
+                headers={**self._headers, "Content-Type": "application/json"},
+                json=body,
+            )
+            self._raise_for_status(r, "create_customer_contact")
+            data = r.json()
+
+        cid = UUID(data["id"])
+        logger.info("Lexware create_contact OK: id=%s name=%r email=%r", cid, name, email)
+
+        # Format-konsistent zu search_contacts
+        roles = data.get("roles") or {}
+        role = "customer" if "customer" in roles else "unknown"
+        return ContactMatch(
+            contact_id=cid,
+            name=name,
+            role=role,
+            email=email,
+            city=city,
+            raw_data=data,
+        )
+
+    async def update_contact_email(
+        self,
+        contact_id: UUID,
+        email: str,
+    ) -> bool:
+        """
+        PUT /v1/contacts/{id} - aktualisiert Mail-Adresse eines Kontakts.
+
+        Lexware-Quirks:
+        - Wir muessen die aktuelle 'version' mitschicken (Optimistic Locking)
+        - Wir muessen das KOMPLETTE Objekt PUT-en, nicht nur die Aenderung
+        - Bei mehr als 1 Eintrag pro emailAddresses-Liste: ValidationError
+        """
+        if not email or "@" not in email:
+            raise ValueError("Ungueltige Mail-Adresse")
+
+        # 1) Aktuellen Kontakt holen
+        await self._rate_limit()
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            r = await client.get(
+                f"{LEXWARE_API_BASE}/v1/contacts/{contact_id}",
+                headers=self._headers,
+            )
+            self._raise_for_status(r, "update_contact_email/get")
+            current = r.json()
+
+        # 2) Mail einbauen
+        emails = current.get("emailAddresses") or {}
+        business = emails.get("business") or []
+
+        # Wenn schon eine business-Mail da: ueberschreiben
+        # Wenn mehrere: Lexware erlaubt Update sowieso nicht - skippen
+        if len(business) > 1:
+            logger.warning(
+                "Lexware update_contact_email: %s hat schon %d Business-Mails - skip",
+                contact_id, len(business),
+            )
+            return False
+
+        # Wenn schon dieselbe Mail: nichts tun
+        if business and business[0].lower() == email.lower():
+            logger.info("Lexware update_contact_email: %s hat schon %r", contact_id, email)
+            return True
+
+        emails["business"] = [email]
+        current["emailAddresses"] = emails
+
+        # 3) PUT mit Version
+        await self._rate_limit()
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            r = await client.put(
+                f"{LEXWARE_API_BASE}/v1/contacts/{contact_id}",
+                headers={**self._headers, "Content-Type": "application/json"},
+                json=current,
+            )
+            self._raise_for_status(r, "update_contact_email/put")
+
+        logger.info("Lexware update_contact_email OK: %s -> %r", contact_id, email)
+        return True
+
+    async def get_contact(self, contact_id: UUID) -> ContactMatch | None:
+        """GET /v1/contacts/{id}"""
+        await self._rate_limit()
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            r = await client.get(
+                f"{LEXWARE_API_BASE}/v1/contacts/{contact_id}",
+                headers=self._headers,
+            )
+            if r.status_code == 404:
+                return None
+            self._raise_for_status(r, "get_contact")
+            data = r.json()
+
+        roles = data.get("roles") or {}
+        role = "customer" if "customer" in roles else (
+            "vendor" if "vendor" in roles else "unknown"
+        )
+        company = data.get("company") or {}
+        person = data.get("person") or {}
+        display_name = (
+            company.get("name")
+            or " ".join(p for p in [
+                person.get("salutation"),
+                person.get("firstName"),
+                person.get("lastName"),
+            ] if p)
+            or "(unbekannt)"
+        )
+        email = None
+        emails = data.get("emailAddresses") or {}
+        for kind in ("business", "office", "private", "other"):
+            lst = emails.get(kind) or []
+            if lst:
+                email = lst[0]
+                break
+        city = None
+        addresses = data.get("addresses") or {}
+        billing = addresses.get("billing") or []
+        if billing:
+            city = (billing[0] or {}).get("city")
+        return ContactMatch(
+            contact_id=contact_id,
+            name=display_name,
+            role=role,
+            email=email,
+            city=city,
+            raw_data=data,
+        )
+
     # ------------------------------------------------------------------
     # Invoices
     # ------------------------------------------------------------------

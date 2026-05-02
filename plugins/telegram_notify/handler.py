@@ -41,6 +41,7 @@ from core.models import (
     RECHNUNG_STATUS_DRAFTED,
     RECHNUNG_STATUS_ERROR,
     RECHNUNG_STATUS_EXTRACTING,
+    RECHNUNG_STATUS_MAIL_SENT,
     RECHNUNG_STATUS_PREVIEWING,
     Tenant,
     TenantKnowledge,
@@ -553,7 +554,16 @@ async def process_telegram_update(payload):
         elif state.state_key == STATE_RECHNUNG_CONFIRMING:
             reply = "Bitte einen der Buttons oben antippen oder /abbrechen schicken."
         elif state.state_key == STATE_RECHNUNG_AWAITING_MAIL:
-            reply = "Bitte den \"Fertig\"-Button oben antippen oder /abbrechen schicken."
+            stage = (state.state_data or {}).get("stage")
+            if stage == "awaiting_mail_address":
+                reply_or_none = await _handle_rechnung_mail_address_input(
+                    chat_id, text, state.state_data
+                )
+                if reply_or_none is None:
+                    return {"ok": True}
+                reply = reply_or_none
+            else:
+                reply = "Bitte einen der Buttons oben antippen oder /abbrechen schicken."
         else:
             await _clear_state(chat_id)
             return {"ok": True}
@@ -1540,6 +1550,30 @@ async def _handle_rechnung_callback(chat_id, callback_data, callback_query_id, b
         )
         return
 
+    if action == "start_mail":
+        # User klickt 'Per Mail senden' nach Lexware-Draft
+        await _handle_rechnung_start_mail(chat_id, rechnung_id, bot_token)
+        return
+
+    if action == "confirm_mail":
+        # User klickt 'Senden' nach Mail-Adress-Bestaetigung
+        await _handle_rechnung_send_mail_now(chat_id, rechnung_id, bot_token)
+        return
+
+    if action == "redo_mail":
+        # User will andere Mail-Adresse eingeben
+        await _save_state(
+            chat_id,
+            STATE_RECHNUNG_AWAITING_MAIL,
+            {"rechnung_id": str(rechnung_id), "stage": "awaiting_mail_address"},
+        )
+        await _send_to_chat(
+            chat_id,
+            "OK, an welche Mail-Adresse soll ich die Rechnung schicken?\n\n"
+            "<i>Tippe die Adresse, oder schreibe &quot;weiss nicht&quot; um die Kunden-Daten zum Anrufen zu sehen.</i>",
+        )
+        return
+
     await _send_to_chat(chat_id, f"Unbekannte Aktion: {action}")
 
 
@@ -1612,24 +1646,72 @@ async def _create_rechnung_in_lexware(chat_id, rechnung_id, bot_token):
         tax_rate_percent=19,
     )
 
-    # One-time-Address (auch wenn nicht alles gefuellt - Lexware akzeptiert Teil-Adressen)
-    address = {
-        "name": kunde_name or "Kunde",
-        "countryCode": "DE",
-    }
-    if kunde_strasse:
-        address["street"] = kunde_strasse
-    if kunde_plz:
-        address["zip"] = kunde_plz
-    if kunde_ort:
-        address["city"] = kunde_ort
+    # Schritt 1: Kontakt suchen oder anlegen
+    await _send_to_chat(chat_id, "<i>Lege Kunde in Lexware an...</i>")
 
+    contact_id = None
+    is_company = bool(kunde_name and any(
+        kw in (kunde_name or "").lower()
+        for kw in ("gmbh", "ag", "kg", "ohg", "ug", "gbr", "e.k.", "ev", "verein", "bauunternehmen", "firma")
+    ))
+
+    try:
+        existing = await provider.search_contacts(kunde_name or "", customer_only=True)
+        match = None
+        if kunde_name:
+            for cand in existing:
+                if cand.name.strip().lower() == kunde_name.strip().lower():
+                    if not kunde_ort or (cand.city and cand.city.lower() == kunde_ort.lower()):
+                        match = cand
+                        break
+
+        if match:
+            contact_id = match.contact_id
+            logger.info(f"Lexware-Kontakt match: {match.name} -> {contact_id}")
+        else:
+            new_contact = await provider.create_customer_contact(
+                name=kunde_name or "Kunde",
+                street=kunde_strasse,
+                zip_code=kunde_plz,
+                city=kunde_ort,
+                is_company=is_company,
+            )
+            contact_id = new_contact.contact_id
+            logger.info(f"Lexware-Kontakt angelegt: {new_contact.name} -> {contact_id}")
+    except Exception as e:
+        logger.warning(f"Contact-Handling fehlgeschlagen, fallback auf one-time-address: {e}")
+        contact_id = None
+
+    if contact_id is not None:
+        async with AsyncSessionLocal() as s:
+            rg = (await s.execute(
+                select(Rechnung).where(Rechnung.id == rechnung_id)
+            )).scalar_one_or_none()
+            if rg:
+                rg.lexware_contact_id = contact_id
+                await s.commit()
+
+    # Schritt 2: Rechnungs-Draft anlegen
     await _send_to_chat(chat_id, "<i>Lege Rechnungs-Entwurf in Lexware an...</i>")
+
+    one_time_address = None
+    if contact_id is None:
+        one_time_address = {
+            "name": kunde_name or "Kunde",
+            "countryCode": "DE",
+        }
+        if kunde_strasse:
+            one_time_address["street"] = kunde_strasse
+        if kunde_plz:
+            one_time_address["zip"] = kunde_plz
+        if kunde_ort:
+            one_time_address["city"] = kunde_ort
 
     try:
         draft = await provider.create_invoice_draft(
             line_items=[line_item],
-            one_time_address=address,
+            contact_id=contact_id,
+            one_time_address=one_time_address,
             title="Rechnung",
             introduction="Vielen Dank fuer Ihren Auftrag.",
             remark="Zahlbar innerhalb 14 Tagen ohne Abzug.",
@@ -1675,16 +1757,17 @@ async def _create_rechnung_in_lexware(chat_id, rechnung_id, bot_token):
             rg.drafted_at = dt.datetime.now(dt.timezone.utc)
             await s.commit()
 
-    # Erfolgs-Nachricht mit Folge-Buttons
+    # Erfolgs-Nachricht mit Folge-Buttons (jetzt mit Mail-Versand-Option)
     msg = "<b>Entwurf in Lexware angelegt.</b>\n\n"
     msg += f'<a href="{draft.deeplink_view}">In Lexware oeffnen und pruefen</a>\n\n'
     msg += (
-        "<i>Bitte Anschrift vervollstaendigen, ggf. korrigieren und in Lexware "
-        "finalisieren. Mailversand mit PDF folgt in einer der naechsten Updates.</i>"
+        "<i>Empfohlen: erst in Lexware oeffnen, Anschrift pruefen "
+        "und finalisieren. Dann hier &quot;Per Mail senden&quot; klicken.</i>"
     )
 
     buttons = [
-        [{"text": "Fertig", "callback_data": f"rg:finish:{rechnung_id}"}],
+        [{"text": "✋ Per Mail senden", "callback_data": f"rg:start_mail:{rechnung_id}"}],
+        [{"text": "Erstmal nur Entwurf, fertig", "callback_data": f"rg:finish:{rechnung_id}"}],
     ]
     await _save_state(chat_id, STATE_RECHNUNG_AWAITING_MAIL, {"rechnung_id": str(rechnung_id)})
     await _send_with_inline_buttons(chat_id, msg, buttons, bot_token=bot_token)
@@ -1723,6 +1806,466 @@ async def _handle_rechnungen_anzeigen_command(chat_id):
         else:
             lines.append(f'\u2022 {ts} {kunde} {betrag} Status: {rg.status}')
     return "\n".join(lines)
+
+
+
+
+# =====================================================================
+# Rechnung Mail-Versand-Wizard (Phase A2)
+# =====================================================================
+
+import re as _re
+
+EMAIL_REGEX = _re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
+
+# Trigger fuer "weiss nicht / hab keine"
+NO_MAIL_TRIGGERS = (
+    "weiss nicht", "weiss ich nicht", "hab keine", "kenne ich nicht",
+    "keine ahnung", "nein", "nope", "?", "??",
+    "ich habe sie nicht", "noch nicht", "muss erst fragen",
+)
+
+
+def _looks_like_no_mail(text: str) -> bool:
+    """User sagt 'weiss nicht' oder aehnlich."""
+    t = (text or "").strip().lower()
+    if not t:
+        return False
+    if t in NO_MAIL_TRIGGERS:
+        return True
+    for trig in NO_MAIL_TRIGGERS:
+        if trig in t and len(t) < 60:
+            return True
+    return False
+
+
+def _format_kunde_info_for_phone(rg) -> str:
+    """Zeigt dem Tenant alle Kunden-Daten zum manuell Anrufen."""
+    msg = "<b>Kunden-Daten zum Anrufen:</b>\n\n"
+    if rg.kunde_name:
+        msg += f"\u2022 <b>Name:</b> {rg.kunde_name}\n"
+    addr_parts = []
+    if rg.kunde_strasse:
+        addr_parts.append(rg.kunde_strasse)
+    if rg.kunde_plz or rg.kunde_ort:
+        addr_parts.append(f"{rg.kunde_plz or ''} {rg.kunde_ort or ''}".strip())
+    if addr_parts:
+        msg += f"\u2022 <b>Adresse:</b> {', '.join(addr_parts)}\n"
+    if rg.leistung_titel:
+        leistung = rg.leistung_titel
+        if rg.leistung_beschreibung:
+            leistung += f" ({rg.leistung_beschreibung})"
+        msg += f"\u2022 <b>Leistung:</b> {leistung}\n"
+    if rg.betrag_brutto_eur is not None:
+        msg += f"\u2022 <b>Betrag:</b> {float(rg.betrag_brutto_eur):.2f} \u20ac brutto\n"
+    if rg.lexware_voucher_number:
+        msg += f"\u2022 <b>Rechnungsnr.:</b> {rg.lexware_voucher_number}\n"
+    return msg
+
+
+async def _handle_rechnung_start_mail(chat_id, rechnung_id, bot_token):
+    """User klickt 'Per Mail senden'. Wir pruefen Lexware-Status + holen Mail-Adresse-Vorschlag."""
+    tenant = await _get_tenant_by_chat(chat_id)
+    if not tenant:
+        await _send_to_chat(chat_id, "Tenant nicht gefunden.")
+        return
+
+    provider = await _get_lexware_provider_for_tenant(tenant)
+    if not provider:
+        await _send_to_chat(chat_id, "Lexware nicht verbunden.")
+        return
+
+    # Rechnung aus DB laden
+    async with AsyncSessionLocal() as s:
+        rg = (await s.execute(
+            select(Rechnung).where(Rechnung.id == rechnung_id)
+        )).scalar_one_or_none()
+        if not rg:
+            await _send_to_chat(chat_id, "Rechnung nicht gefunden.")
+            return
+        if not rg.lexware_invoice_id:
+            await _send_to_chat(
+                chat_id,
+                "Diese Rechnung hat noch keinen Lexware-Eintrag. Erst /rechnung anlegen.",
+            )
+            return
+        rg_data = {
+            "id": rg.id,
+            "lexware_invoice_id": rg.lexware_invoice_id,
+            "lexware_contact_id": rg.lexware_contact_id,
+            "kunde_name": rg.kunde_name,
+            "kunde_email": rg.kunde_email,
+        }
+
+    # Lexware-Status pruefen: noch Draft?
+    await _send_to_chat(chat_id, "<i>Pruefe Status in Lexware...</i>")
+    try:
+        invoice = await provider.get_invoice(rg_data["lexware_invoice_id"])
+    except Exception as e:
+        logger.exception(f"get_invoice fehlgeschlagen: {e}")
+        await _send_to_chat(
+            chat_id,
+            "Konnte Status in Lexware nicht abrufen. Bitte spaeter erneut versuchen.",
+        )
+        return
+
+    voucher_status = invoice.get("voucherStatus", "unknown")
+    voucher_number = invoice.get("voucherNumber")
+
+    # Voucher-Number falls neu da, in DB speichern
+    if voucher_number:
+        async with AsyncSessionLocal() as s:
+            rg = (await s.execute(
+                select(Rechnung).where(Rechnung.id == rechnung_id)
+            )).scalar_one_or_none()
+            if rg and not rg.lexware_voucher_number:
+                rg.lexware_voucher_number = voucher_number
+                await s.commit()
+
+    # Wenn noch draft -> blocken
+    if voucher_status == "draft":
+        deeplink = LexwareProvider.invoice_deeplink_view(rg_data["lexware_invoice_id"])
+        msg = "<b>Rechnung ist noch im Entwurf-Status.</b>\n\n"
+        msg += "PDF kann erst geladen werden, wenn du die Rechnung in Lexware finalisiert hast.\n\n"
+        msg += f'<a href="{deeplink}">In Lexware oeffnen</a>\n\n'
+        msg += "Klicke dort auf <b>Finalisieren</b> (oder &quot;Festschreiben&quot;), "
+        msg += "danach hier nochmal auf &quot;Per Mail senden&quot; klicken."
+        buttons = [
+            [{"text": "\u270b Per Mail senden (nochmal probieren)", "callback_data": f"rg:start_mail:{rechnung_id}"}],
+            [{"text": "Erstmal nur Entwurf, fertig", "callback_data": f"rg:finish:{rechnung_id}"}],
+        ]
+        await _send_with_inline_buttons(chat_id, msg, buttons, bot_token=bot_token)
+        return
+
+    # Status OK -> Mail-Adresse-Vorschlag bauen
+    suggested_email = None
+    suggested_source = None
+
+    # 1. Wenn schon mal in DB gespeichert
+    if rg_data["kunde_email"]:
+        suggested_email = rg_data["kunde_email"]
+        suggested_source = "fruehere_eingabe"
+
+    # 2. Wenn nicht: aus Lexware-Kontakt holen
+    if not suggested_email and rg_data["lexware_contact_id"]:
+        try:
+            contact = await provider.get_contact(rg_data["lexware_contact_id"])
+            if contact and contact.email:
+                suggested_email = contact.email
+                suggested_source = "lexware_kontakt"
+        except Exception as e:
+            logger.warning(f"Konnte Kontakt nicht laden: {e}")
+
+    # State setzen
+    await _save_state(
+        chat_id,
+        STATE_RECHNUNG_AWAITING_MAIL,
+        {"rechnung_id": str(rechnung_id), "stage": "awaiting_mail_address"},
+    )
+
+    msg = f"<b>Rechnung {voucher_number or ''} per Mail an Kunde senden</b>\n\n"
+    if suggested_email:
+        if suggested_source == "lexware_kontakt":
+            msg += f"In Lexware ist diese Mail hinterlegt:\n<code>{suggested_email}</code>\n\n"
+        else:
+            msg += f"Letzte verwendete Mail:\n<code>{suggested_email}</code>\n\n"
+        msg += "Soll ich an diese Adresse senden?\n\n"
+        msg += "<i>Oder tippe einfach eine andere Mail-Adresse hier rein.</i>"
+        buttons = [
+            [{"text": f"\u2705 Senden an {suggested_email}", "callback_data": f"rg:confirm_mail:{rechnung_id}"}],
+            [{"text": "\u274c Abbrechen", "callback_data": f"rg:finish:{rechnung_id}"}],
+        ]
+        await _save_state(
+            chat_id,
+            STATE_RECHNUNG_AWAITING_MAIL,
+            {
+                "rechnung_id": str(rechnung_id),
+                "stage": "confirming_mail",
+                "suggested_email": suggested_email,
+            },
+        )
+        await _send_with_inline_buttons(chat_id, msg, buttons, bot_token=bot_token)
+    else:
+        msg += "An welche Mail-Adresse soll ich die Rechnung schicken?\n\n"
+        msg += "<i>Tippe einfach die Mail-Adresse ein. "
+        msg += "Falls du sie nicht zur Hand hast, schreibe &quot;weiss nicht&quot; - "
+        msg += "ich gebe dir dann die Kunden-Daten zum Anrufen.</i>"
+        await _send_to_chat(chat_id, msg)
+
+
+async def _handle_rechnung_mail_address_input(chat_id, text, state_data):
+    """User tippt Mail-Adresse (oder 'weiss nicht')."""
+    rechnung_id_str = (state_data or {}).get("rechnung_id")
+    if not rechnung_id_str:
+        await _clear_state(chat_id)
+        return "Kontext verloren. Bitte mit /rechnung neu starten."
+
+    import uuid as _uuid
+    try:
+        rechnung_id = _uuid.UUID(rechnung_id_str)
+    except Exception:
+        await _clear_state(chat_id)
+        return "Ungueltiger Kontext. Bitte mit /rechnung neu starten."
+
+    text = (text or "").strip()
+
+    # Variante 1: User sagt "weiss nicht"
+    if _looks_like_no_mail(text):
+        async with AsyncSessionLocal() as s:
+            rg = (await s.execute(
+                select(Rechnung).where(Rechnung.id == rechnung_id)
+            )).scalar_one_or_none()
+        if not rg:
+            await _clear_state(chat_id)
+            return "Rechnung nicht gefunden."
+        msg = _format_kunde_info_for_phone(rg)
+        msg += "\n<i>Wenn du die Mail-Adresse hast, einfach hier eintippen. "
+        msg += "Oder /abbrechen wenn du heute nicht mehr willst.</i>"
+        return msg
+
+    # Variante 2: User tippt eine Mail
+    if not EMAIL_REGEX.match(text):
+        return (
+            "Das sieht nicht wie eine Mail-Adresse aus. "
+            "Bitte im Format <code>name@firma.de</code> eintippen, "
+            "oder schreibe &quot;weiss nicht&quot; um die Kunden-Daten zu sehen."
+        )
+
+    # Mail in DB merken
+    async with AsyncSessionLocal() as s:
+        rg = (await s.execute(
+            select(Rechnung).where(Rechnung.id == rechnung_id)
+        )).scalar_one_or_none()
+        if not rg:
+            await _clear_state(chat_id)
+            return "Rechnung nicht gefunden."
+        rg.kunde_email = text
+        await s.commit()
+
+    # State auf "confirming"
+    await _save_state(
+        chat_id,
+        STATE_RECHNUNG_AWAITING_MAIL,
+        {
+            "rechnung_id": str(rechnung_id),
+            "stage": "confirming_mail",
+            "suggested_email": text,
+        },
+    )
+
+    bot_token = await _load_global_bot_token()
+    msg = f"<b>Senden an</b>\n<code>{text}</code>\n\n"
+    msg += "Soll ich die Rechnung jetzt an diese Adresse schicken?\n\n"
+    msg += "<i>Du selbst bekommst eine Kopie an deine hinterlegte E-Mail-Adresse.</i>"
+    buttons = [
+        [{"text": "\u2705 Ja, senden", "callback_data": f"rg:confirm_mail:{rechnung_id}"}],
+        [{"text": "\u270f\ufe0f Andere Adresse", "callback_data": f"rg:redo_mail:{rechnung_id}"}],
+        [{"text": "\u274c Abbrechen", "callback_data": f"rg:finish:{rechnung_id}"}],
+    ]
+    await _send_with_inline_buttons(chat_id, msg, buttons, bot_token=bot_token)
+    return None  # mit Buttons schon gesendet
+
+
+async def _handle_rechnung_send_mail_now(chat_id, rechnung_id, bot_token):
+    """User hat 'Senden'-Button geklickt. Wir laden PDF + schicken Mail."""
+    tenant = await _get_tenant_by_chat(chat_id)
+    if not tenant:
+        await _send_to_chat(chat_id, "Tenant nicht gefunden.")
+        return
+
+    provider = await _get_lexware_provider_for_tenant(tenant)
+    if not provider:
+        await _send_to_chat(chat_id, "Lexware nicht verbunden.")
+        return
+
+    # Rechnung + alle relevanten Daten holen
+    async with AsyncSessionLocal() as s:
+        rg = (await s.execute(
+            select(Rechnung).where(Rechnung.id == rechnung_id)
+        )).scalar_one_or_none()
+        if not rg:
+            await _send_to_chat(chat_id, "Rechnung nicht gefunden.")
+            return
+        if not rg.kunde_email:
+            await _send_to_chat(chat_id, "Keine Mail-Adresse hinterlegt.")
+            return
+        rg_data = {
+            "id": rg.id,
+            "lexware_invoice_id": rg.lexware_invoice_id,
+            "lexware_contact_id": rg.lexware_contact_id,
+            "voucher_number": rg.lexware_voucher_number,
+            "kunde_name": rg.kunde_name or "",
+            "kunde_email": rg.kunde_email,
+            "betrag": float(rg.betrag_brutto_eur or 0),
+        }
+
+    # Tenant-Daten fuer Sender + BCC + Reply-To
+    async with AsyncSessionLocal() as s:
+        t = (await s.execute(
+            select(Tenant).where(Tenant.id == tenant.id)
+        )).scalar_one_or_none()
+        tenant_data = {
+            "company_name": t.company_name,
+            "contact_name": t.contact_name,
+            "contact_email": t.contact_email,
+        }
+
+    # Brevo-Config
+    async with AsyncSessionLocal() as s:
+        tc = (await s.execute(
+            select(ToolConfig)
+            .join(Tenant, ToolConfig.tenant_id == Tenant.id)
+            .where(Tenant.slug == GLOBAL_TENANT_SLUG, ToolConfig.tool_name == "mail_intake")
+        )).scalar_one_or_none()
+        if not tc:
+            await _send_to_chat(chat_id, "Mail-Konfiguration fehlt - Betreiber kontaktieren.")
+            return
+        cfg = tc.config or {}
+        brevo_api_key = cfg.get("brevo_api_key")
+        sender_email = cfg.get("sender_email")
+        sender_name = cfg.get("sender_name")
+
+    if not all([brevo_api_key, sender_email, sender_name]):
+        await _send_to_chat(chat_id, "Mail-Konfiguration unvollstaendig.")
+        return
+
+    # PDF von Lexware holen
+    await _send_to_chat(chat_id, "<i>Lade PDF von Lexware...</i>")
+    try:
+        pdf_bytes = await provider.download_invoice_pdf(rg_data["lexware_invoice_id"])
+    except AccountingError as e:
+        if e.status_code == 409:
+            deeplink = LexwareProvider.invoice_deeplink_view(rg_data["lexware_invoice_id"])
+            await _send_to_chat(
+                chat_id,
+                "Rechnung ist in Lexware noch nicht finalisiert.\n\n"
+                f'<a href="{deeplink}">In Lexware oeffnen + Finalisieren klicken</a>\n\n'
+                "Danach hier wieder /rechnungen_anzeigen und Senden klicken.",
+            )
+        else:
+            await _send_to_chat(chat_id, f"Lexware-Fehler beim PDF-Download (HTTP {e.status_code}).")
+        return
+    except Exception as e:
+        logger.exception(f"download_invoice_pdf fehlgeschlagen: {e}")
+        await _send_to_chat(chat_id, "PDF-Download fehlgeschlagen. Bitte spaeter erneut.")
+        return
+
+    if not pdf_bytes or len(pdf_bytes) < 100:
+        await _send_to_chat(chat_id, "Lexware hat ein leeres PDF zurueckgegeben.")
+        return
+
+    # Mail-Body bauen
+    rg_nummer_str = f" {rg_data['voucher_number']}" if rg_data["voucher_number"] else ""
+    subject = f"Rechnung{rg_nummer_str} von {tenant_data['company_name']}"
+    html_body = (
+        f"<p>Sehr geehrte Damen und Herren,</p>"
+        f"<p>vielen Dank fuer Ihren Auftrag.</p>"
+        f"<p>Anbei finden Sie unsere Rechnung{rg_nummer_str} im Anhang als PDF.</p>"
+        f"<p>Bei Fragen koennen Sie diese Mail einfach beantworten.</p>"
+        f"<p>Mit freundlichen Gruessen<br>"
+        f"{tenant_data['contact_name']}<br>"
+        f"{tenant_data['company_name']}</p>"
+    )
+
+    # Send via Brevo
+    from core.integrations.brevo import BrevoMailer, MailRecipient, MailAttachment, BrevoError
+
+    mailer = BrevoMailer(api_key=brevo_api_key)
+    pdf_filename = f"Rechnung{('_' + rg_data['voucher_number']) if rg_data['voucher_number'] else ''}.pdf"
+
+    try:
+        # Mail an Kunden
+        result = await mailer.send(
+            sender_email=sender_email,
+            sender_name=tenant_data["company_name"],
+            to=MailRecipient(email=rg_data["kunde_email"], name=rg_data["kunde_name"]),
+            subject=subject,
+            html_body=html_body,
+            reply_to_email=tenant_data["contact_email"],
+            reply_to_name=tenant_data["contact_name"],
+            attachments=[MailAttachment(
+                filename=pdf_filename,
+                content_bytes=pdf_bytes,
+                content_type="application/pdf",
+            )],
+        )
+        logger.info(f"Rechnungs-Mail an Kunde gesendet: {result.get('messageId')}")
+
+        # Kopie an Tenant
+        try:
+            copy_subject = f"[Kopie] Rechnung an {rg_data['kunde_email']} versendet"
+            copy_body = (
+                f"<p>Hallo {tenant_data['contact_name']},</p>"
+                f"<p>zur Info: Du hast soeben folgende Rechnung an deinen Kunden geschickt:</p>"
+                f"<ul>"
+                f"<li>Empfaenger: {rg_data['kunde_email']}</li>"
+                f"<li>Rechnung: {rg_data['voucher_number'] or '(noch keine Nummer)'}</li>"
+                f"<li>Betrag: {rg_data['betrag']:.2f} \u20ac brutto</li>"
+                f"</ul>"
+                f"<p>Das PDF ist auch an diese Mail angehaengt.</p>"
+                f"<p>Gewerbeagent</p>"
+            )
+            await mailer.send(
+                sender_email=sender_email,
+                sender_name="Gewerbeagent",
+                to=MailRecipient(email=tenant_data["contact_email"], name=tenant_data["contact_name"]),
+                subject=copy_subject,
+                html_body=copy_body,
+                attachments=[MailAttachment(
+                    filename=pdf_filename,
+                    content_bytes=pdf_bytes,
+                    content_type="application/pdf",
+                )],
+            )
+            logger.info(f"Rechnungs-Kopie an Tenant gesendet: {tenant_data['contact_email']}")
+        except Exception as e:
+            logger.warning(f"Tenant-Kopie fehlgeschlagen (nicht kritisch): {e}")
+
+    except BrevoError as e:
+        async with AsyncSessionLocal() as s:
+            rg = (await s.execute(
+                select(Rechnung).where(Rechnung.id == rechnung_id)
+            )).scalar_one_or_none()
+            if rg:
+                rg.status = RECHNUNG_STATUS_ERROR
+                rg.error_message = f"Brevo: {str(e)[:400]}"
+                await s.commit()
+        await _clear_state(chat_id)
+        await _send_to_chat(chat_id, f"Mailversand fehlgeschlagen (HTTP {e.status_code}). Bitte spaeter erneut.")
+        return
+    except Exception as e:
+        logger.exception(f"Mailversand unerwartet fehlgeschlagen: {e}")
+        await _clear_state(chat_id)
+        await _send_to_chat(chat_id, "Mailversand fehlgeschlagen. Bitte spaeter erneut.")
+        return
+
+    # Status auf mail_sent
+    async with AsyncSessionLocal() as s:
+        rg = (await s.execute(
+            select(Rechnung).where(Rechnung.id == rechnung_id)
+        )).scalar_one_or_none()
+        if rg:
+            rg.status = RECHNUNG_STATUS_MAIL_SENT
+            rg.mail_sent_to = rg_data["kunde_email"]
+            rg.mail_sent_at = dt.datetime.now(dt.timezone.utc)
+            await s.commit()
+
+    # Lexware-Kontakt mit Mail aktualisieren (Lern-Effekt)
+    if rg_data["lexware_contact_id"]:
+        try:
+            await provider.update_contact_email(
+                rg_data["lexware_contact_id"],
+                rg_data["kunde_email"],
+            )
+        except Exception as e:
+            logger.warning(f"Lexware update_contact_email fehlgeschlagen (nicht kritisch): {e}")
+
+    await _clear_state(chat_id)
+    msg = f"<b>Rechnung versendet.</b>\n\n"
+    msg += f"\u2709\ufe0f An: {rg_data['kunde_email']}\n"
+    msg += f"\u2709\ufe0f Kopie: {tenant_data['contact_email']}\n\n"
+    msg += "Mit /rechnung kannst du die naechste anlegen."
+    await _send_to_chat(chat_id, msg)
 
 
 
