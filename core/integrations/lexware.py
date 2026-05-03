@@ -507,6 +507,138 @@ class LexwareProvider(AccountingProvider):
             raw_data=data,
         )
 
+
+    async def upsert_customer_contact(
+        self,
+        name: str,
+        phone: str | None = None,
+        email: str | None = None,
+        anliegen: str | None = None,
+        is_company: bool = False,
+    ) -> tuple[ContactMatch, bool]:
+        """
+        Findet einen Kontakt nach Name oder legt einen neuen an.
+        Bei vorhandenem Kontakt: ergaenzt Phone/Mail falls fehlend.
+        Bei mehreren gleichnamigen Treffern: nimmt den ersten und logged Warnung.
+
+        Returns: (ContactMatch, created_new) - True wenn neu angelegt.
+        """
+        if not name or len(name.strip()) < 2:
+            raise ValueError("Kontakt-Name fehlt")
+
+        # 1) Existierende suchen
+        try:
+            existing = await self.search_contacts(name.strip(), customer_only=True)
+        except Exception as e:
+            logger.warning(f"upsert_customer_contact search fehlgeschlagen: {e}")
+            existing = []
+
+        # 2) Genauer Name-Match
+        match = None
+        for cand in existing:
+            if cand.name.strip().lower() == name.strip().lower():
+                match = cand
+                break
+
+        if match:
+            if len(existing) > 1:
+                logger.warning(
+                    "upsert_customer_contact: %d Treffer fuer %r - nehme ersten Match %s",
+                    len(existing), name, match.contact_id,
+                )
+            updated = False
+
+            # Voller Datensatz holen (fuer Phone/Mail-Check)
+            full = await self.get_contact(match.contact_id)
+            if full is None:
+                logger.warning(f"upsert: Kontakt {match.contact_id} nicht ladbar")
+                return match, False
+
+            # Email ergaenzen
+            if email and not full.email:
+                try:
+                    await self.update_contact_email(match.contact_id, email)
+                    updated = True
+                    logger.info(f"upsert: Mail ergaenzt fuer {match.contact_id}")
+                except Exception as e:
+                    logger.warning(f"upsert: Mail-Update fehlgeschlagen: {e}")
+
+            # Telefon ergaenzen (analog Mail-Update)
+            if phone:
+                try:
+                    await self.update_contact_phone(match.contact_id, phone)
+                    if updated:
+                        logger.info(f"upsert: Phone+Mail ergaenzt fuer {match.contact_id}")
+                    else:
+                        logger.info(f"upsert: Phone ergaenzt fuer {match.contact_id}")
+                    updated = True
+                except Exception as e:
+                    logger.warning(f"upsert: Phone-Update fehlgeschlagen: {e}")
+
+            # Refresh wenn was geaendert
+            if updated:
+                full = await self.get_contact(match.contact_id) or full
+            return full, False
+
+        # 3) Neu anlegen
+        new_contact = await self.create_customer_contact(
+            name=name,
+            email=email,
+            phone=phone,
+            is_company=is_company,
+        )
+        return new_contact, True
+
+
+    async def update_contact_phone(
+        self,
+        contact_id: UUID,
+        phone: str,
+    ) -> bool:
+        """
+        PUT /v1/contacts/{id} - aktualisiert Telefonnummer.
+        Wie update_contact_email mit Optimistic Locking.
+        """
+        if not phone or len(phone.strip()) < 4:
+            raise ValueError("Ungueltige Telefonnummer")
+
+        await self._rate_limit()
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            r = await client.get(
+                f"{LEXWARE_API_BASE}/v1/contacts/{contact_id}",
+                headers=self._headers,
+            )
+            self._raise_for_status(r, "update_contact_phone/get")
+            current = r.json()
+
+        phones = current.get("phoneNumbers") or {}
+        business = phones.get("business") or []
+
+        if len(business) > 1:
+            logger.warning(
+                "update_contact_phone: %s hat schon %d Business-Phones - skip",
+                contact_id, len(business),
+            )
+            return False
+
+        if business and business[0].strip() == phone.strip():
+            return True
+
+        phones["business"] = [phone.strip()]
+        current["phoneNumbers"] = phones
+
+        await self._rate_limit()
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            r = await client.put(
+                f"{LEXWARE_API_BASE}/v1/contacts/{contact_id}",
+                headers={**self._headers, "Content-Type": "application/json"},
+                json=current,
+            )
+            self._raise_for_status(r, "update_contact_phone/put")
+
+        logger.info("update_contact_phone OK: %s -> %r", contact_id, phone)
+        return True
+
     # ------------------------------------------------------------------
     # Invoices
     # ------------------------------------------------------------------

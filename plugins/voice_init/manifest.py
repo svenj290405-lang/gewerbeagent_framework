@@ -18,5 +18,6 @@ MANIFEST = PluginManifest(
     default_config={},
     webhook_endpoints=[
         {"path": "/initiation", "method": "POST"},
+        {"path": "/save_contact", "method": "POST"},
     ],
 )
