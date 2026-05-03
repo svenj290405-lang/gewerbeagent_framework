@@ -66,6 +66,7 @@ from core.models.rechnung import (
     RECHNUNG_INPUT_TEXT,
     RECHNUNG_INPUT_VOICE,
 )
+from core.models.rechnung_position import RechnungPosition
 from core.models.tool_config import ToolConfig
 
 __all__ = [
@@ -92,6 +93,7 @@ __all__ = [
     "RECHNUNG_STATUS_CANCELLED",
     "RECHNUNG_INPUT_TEXT",
     "RECHNUNG_INPUT_VOICE",
+    "RechnungPosition",
     "ToolConfig",
     "OAuthToken",
     "OAuthState",

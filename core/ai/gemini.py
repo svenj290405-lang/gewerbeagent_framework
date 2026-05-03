@@ -208,20 +208,38 @@ RECHNUNG_PROMPT = """Du bekommst entweder einen Text oder eine Sprachnachricht e
 
 Extrahiere strukturierte Felder als JSON. Wenn ein Feld nicht erwaehnt wird, setze es auf null. Erfinde KEINE Werte.
 
-Felder:
-- kunde_name: Name des Kunden (z.B. "Frau Mueller", "Bauunternehmen Schmidt"). Pflicht. Falls unklar -> null + missing_fields-Eintrag.
-- kunde_ort: Stadt/Ort des Kunden falls genannt
-- kunde_strasse: Strasse mit Hausnummer falls genannt
+KUNDE:
+- kunde_name: Name des Kunden (z.B. "Frau Mueller", "Bauunternehmen Schmidt"). Pflicht.
+- kunde_ort: Stadt/Ort falls genannt
+- kunde_strasse: Strasse + Hausnummer falls genannt
 - kunde_plz: Postleitzahl falls genannt
 - kunde_email: E-Mail falls genannt
-- leistung_titel: Kurze Bezeichnung (z.B. "Moebelmontage", "Kuechenmontage"). Pflicht.
-- leistung_beschreibung: Detaillierte Beschreibung falls vorhanden
-- betrag_brutto_eur: Betrag in Euro als Zahl (float). WICHTIG: "350 Euro" -> 350.00 als Zahl. "Netto" gesagt? Trotzdem Brutto errechnen (Netto * 1.19 fuer 19% MwSt). Pflicht.
+
+POSITIONEN (Liste - mindestens 1 Eintrag):
+- positionen: Liste von Objekten. Jedes Objekt:
+  * name: Kurzbezeichnung (z.B. "Moebelmontage", "Anfahrt", "Material"). Pflicht.
+  * beschreibung: Optional, laengere Detailbeschreibung
+  * menge: Anzahl als Zahl (default 1.0). "3 Stunden" -> 3.0, "5 Liter" -> 5.0
+  * einheit: Default "Stueck". Andere: "Stunde", "Meter", "Liter", "kg", "qm", "Tag"
+  * preis_brutto_eur: Einzelpreis brutto pro Einheit. "Netto"? Brutto errechnen (Netto * 1.19).
+  * mwst_prozent: Default 19. Photovoltaik 0, Buecher 7.
+
+WICHTIG zur Positionen-Erkennung:
+- "Moebelmontage 350 Euro" -> 1 Position (name=Moebelmontage, menge=1, preis=350)
+- "Moebelmontage 250 plus 50 Anfahrt plus 70 Material" -> 3 Positionen mit Einzelpreisen
+- "3 Stunden Arbeit a 80 Euro" -> 1 Position (menge=3, einheit=Stunde, preis=80)
+- "Tueren einbauen 150 pro Stueck, 4 Stueck" -> 1 Position (menge=4, preis=150)
+- Wenn nur 1 Gesamtbetrag ohne Aufschluesselung -> 1 Position mit menge=1
+
+GESAMT:
+- gesamtbetrag_brutto_eur: Summe aller Positionen. Bei 1 Position = Position-Preis. Bei mehreren = Summe der menge*preis. Pflicht.
+
+META:
 - transcript: Bei Audio das wortgetreue Transkript. Bei Text der Original-Text.
-- extraction_confidence: "high" wenn alle Pflichtfelder klar, "medium" bei Unsicherheiten, "low" wenn vieles unklar.
+- extraction_confidence: "high" wenn alles klar, "medium" bei Unsicherheiten, "low" wenn vieles unklar.
 - missing_fields: Liste der fehlenden Pflichtfelder als Strings.
 
-Pflichtfelder: kunde_name, leistung_titel, betrag_brutto_eur.
+Pflichtfelder: kunde_name, positionen (mit mindestens 1 Eintrag), gesamtbetrag_brutto_eur.
 Antworte AUSSCHLIESSLICH mit dem JSON, kein Markdown, keine Erlaeuterung.
 """
 
@@ -233,9 +251,22 @@ RECHNUNG_RESPONSE_SCHEMA = {
         "kunde_strasse": {"type": "STRING", "nullable": True},
         "kunde_plz": {"type": "STRING", "nullable": True},
         "kunde_email": {"type": "STRING", "nullable": True},
-        "leistung_titel": {"type": "STRING", "nullable": True},
-        "leistung_beschreibung": {"type": "STRING", "nullable": True},
-        "betrag_brutto_eur": {"type": "NUMBER", "nullable": True},
+        "positionen": {
+            "type": "ARRAY",
+            "items": {
+                "type": "OBJECT",
+                "properties": {
+                    "name": {"type": "STRING"},
+                    "beschreibung": {"type": "STRING", "nullable": True},
+                    "menge": {"type": "NUMBER"},
+                    "einheit": {"type": "STRING"},
+                    "preis_brutto_eur": {"type": "NUMBER"},
+                    "mwst_prozent": {"type": "INTEGER"},
+                },
+                "required": ["name", "menge", "einheit", "preis_brutto_eur", "mwst_prozent"],
+            },
+        },
+        "gesamtbetrag_brutto_eur": {"type": "NUMBER", "nullable": True},
         "transcript": {"type": "STRING", "nullable": True},
         "extraction_confidence": {
             "type": "STRING",
@@ -248,8 +279,8 @@ RECHNUNG_RESPONSE_SCHEMA = {
     },
     "required": [
         "kunde_name",
-        "leistung_titel",
-        "betrag_brutto_eur",
+        "positionen",
+        "gesamtbetrag_brutto_eur",
         "extraction_confidence",
         "missing_fields",
     ],
@@ -264,20 +295,57 @@ def _normalize_rechnung_extraction(data: dict) -> dict:
         "kunde_strasse": None,
         "kunde_plz": None,
         "kunde_email": None,
-        "leistung_titel": None,
-        "leistung_beschreibung": None,
-        "betrag_brutto_eur": None,
+        "positionen": [],
+        "gesamtbetrag_brutto_eur": None,
         "transcript": None,
         "extraction_confidence": "low",
         "missing_fields": [],
     }
     out = {**defaults, **(data or {})}
-    b = out.get("betrag_brutto_eur")
-    if isinstance(b, str):
+
+    # Positionen normalisieren
+    positionen = out.get("positionen") or []
+    if not isinstance(positionen, list):
+        positionen = []
+    cleaned = []
+    for p in positionen:
+        if not isinstance(p, dict):
+            continue
         try:
-            out["betrag_brutto_eur"] = float(b.replace(",", ".").strip())
+            name = (p.get("name") or "").strip()
+            if not name:
+                continue
+            menge = float(p.get("menge") or 1)
+            einheit = p.get("einheit") or "Stueck"
+            preis = p.get("preis_brutto_eur")
+            if isinstance(preis, str):
+                preis = float(preis.replace(",", ".").strip())
+            else:
+                preis = float(preis or 0)
+            mwst = int(p.get("mwst_prozent") or 19)
+            cleaned.append({
+                "name": name,
+                "beschreibung": p.get("beschreibung"),
+                "menge": menge,
+                "einheit": einheit,
+                "preis_brutto_eur": round(preis, 2),
+                "mwst_prozent": mwst,
+            })
         except Exception:
-            out["betrag_brutto_eur"] = None
+            continue
+    out["positionen"] = cleaned
+
+    # Gesamtbetrag: explizit oder errechnen
+    gb = out.get("gesamtbetrag_brutto_eur")
+    if isinstance(gb, str):
+        try:
+            gb = float(gb.replace(",", ".").strip())
+        except Exception:
+            gb = None
+    if gb is None and cleaned:
+        gb = sum(p["menge"] * p["preis_brutto_eur"] for p in cleaned)
+    out["gesamtbetrag_brutto_eur"] = round(gb, 2) if gb is not None else None
+
     if not isinstance(out["missing_fields"], list):
         out["missing_fields"] = []
     return out
@@ -337,11 +405,11 @@ async def _gemini_extract_rechnung(parts: list, mode: str) -> dict:
 
     normalized = _normalize_rechnung_extraction(data)
     logger.info(
-        "extract_rechnung OK (%s): kunde=%r leistung=%r betrag=%s conf=%s missing=%s",
+        "extract_rechnung OK (%s): kunde=%r positionen=%d gesamt=%s conf=%s missing=%s",
         mode,
         normalized.get("kunde_name"),
-        normalized.get("leistung_titel"),
-        normalized.get("betrag_brutto_eur"),
+        len(normalized.get("positionen") or []),
+        normalized.get("gesamtbetrag_brutto_eur"),
         normalized.get("extraction_confidence"),
         normalized.get("missing_fields"),
     )

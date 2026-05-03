@@ -34,6 +34,7 @@ from core.models import (
     BELEG_STATUS_UPLOADED,
     BELEG_STATUS_UPLOADING,
     Rechnung,
+    RechnungPosition,
     RECHNUNG_INPUT_TEXT,
     RECHNUNG_INPUT_VOICE,
     RECHNUNG_STATUS_CANCELLED,
@@ -1305,7 +1306,7 @@ RECHNUNG_VOICE_MAX_SECONDS = 120     # 2 Minuten max
 
 
 def _format_rechnung_preview(extracted: dict, confidence_warning: str = "") -> str:
-    """Baut die Vorschau-Nachricht aus extrahierten Daten."""
+    """Baut die Vorschau-Nachricht aus extrahierten Daten (mit Positionen-Liste)."""
     kn = extracted.get("kunde_name") or "<i>(fehlt)</i>"
     ko = extracted.get("kunde_ort") or ""
     ks = extracted.get("kunde_strasse") or ""
@@ -1318,19 +1319,33 @@ def _format_rechnung_preview(extracted: dict, confidence_warning: str = "") -> s
         addr_extra.append(f"{kp} {ko}".strip())
     addr_str = ", ".join(addr_extra) if addr_extra else (ko or "<i>(unbekannt)</i>")
 
-    leistung = extracted.get("leistung_titel") or "<i>(fehlt)</i>"
-    leistung_desc = extracted.get("leistung_beschreibung")
-    betrag = extracted.get("betrag_brutto_eur")
-    betrag_str = f"{betrag:.2f} \u20ac brutto" if betrag is not None else "<i>(fehlt)</i>"
+    positionen = extracted.get("positionen") or []
+    gesamt = extracted.get("gesamtbetrag_brutto_eur")
 
     msg = "<b>Rechnung-Vorschau</b>\n\n"
-    msg += "Verstanden:\n"
-    msg += f"\u2022 <b>Kunde:</b>      {kn}\n"
-    msg += f"\u2022 <b>Anschrift:</b>  {addr_str}\n"
-    msg += f"\u2022 <b>Leistung:</b>   {leistung}\n"
-    if leistung_desc:
-        msg += f"  <i>{leistung_desc}</i>\n"
-    msg += f"\u2022 <b>Betrag:</b>     {betrag_str}\n"
+    msg += f"\u2022 <b>Kunde:</b>     {kn}\n"
+    msg += f"\u2022 <b>Anschrift:</b> {addr_str}\n"
+    msg += "\n<b>Positionen:</b>\n"
+
+    if not positionen:
+        msg += "<i>(keine erkannt)</i>\n"
+    else:
+        for i, p in enumerate(positionen, 1):
+            menge = p.get("menge") or 1
+            einheit = p.get("einheit") or "Stueck"
+            preis = p.get("preis_brutto_eur") or 0
+            name = p.get("name") or "?"
+            beschreibung = p.get("beschreibung")
+            position_total = float(menge) * float(preis)
+            if abs(float(menge) - 1.0) < 0.01 and einheit == "Stueck":
+                msg += f"  <b>{i}.</b> {name}: <b>{position_total:.2f} \u20ac</b>\n"
+            else:
+                msg += f"  <b>{i}.</b> {name}: {menge} {einheit} \u00d7 {float(preis):.2f} \u20ac = <b>{position_total:.2f} \u20ac</b>\n"
+            if beschreibung:
+                msg += f"     <i>{beschreibung}</i>\n"
+
+    if gesamt is not None:
+        msg += f"\n<b>Gesamt brutto: {float(gesamt):.2f} \u20ac</b>\n"
 
     missing = extracted.get("missing_fields") or []
     if missing:
@@ -1339,8 +1354,8 @@ def _format_rechnung_preview(extracted: dict, confidence_warning: str = "") -> s
         msg += f"\n\u26a0\ufe0f {confidence_warning}\n"
 
     msg += (
-        "\n<i>Hinweis: Die Anschrift musst du in Lexware ggf. vervollstaendigen, "
-        "bevor du die Rechnung finalisierst.</i>"
+        "\n<i>Hinweis: Anschrift in Lexware ggf. vervollstaendigen, "
+        "bevor du finalisierst.</i>"
     )
     return msg
 
@@ -1430,6 +1445,11 @@ async def _handle_rechnung_input_received(
         return "KI-Extraktion fehlgeschlagen. Bitte spaeter erneut versuchen oder /rechnung neu starten."
 
     # In DB anlegen
+    # Erste Position als 'leistung_titel/betrag' fuer Rueckwaertskompatibilitaet
+    positionen_list = extracted.get("positionen") or []
+    first_pos = positionen_list[0] if positionen_list else {}
+    gesamt = extracted.get("gesamtbetrag_brutto_eur")
+
     rechnung_id = None
     async with AsyncSessionLocal() as s:
         rg = Rechnung(
@@ -1444,15 +1464,34 @@ async def _handle_rechnung_input_received(
             kunde_strasse=extracted.get("kunde_strasse"),
             kunde_plz=extracted.get("kunde_plz"),
             kunde_email=extracted.get("kunde_email"),
-            leistung_titel=extracted.get("leistung_titel"),
-            leistung_beschreibung=extracted.get("leistung_beschreibung"),
-            betrag_brutto_eur=extracted.get("betrag_brutto_eur"),
+            leistung_titel=first_pos.get("name"),
+            leistung_beschreibung=first_pos.get("beschreibung"),
+            betrag_brutto_eur=gesamt,
             status=RECHNUNG_STATUS_PREVIEWING,
         )
         s.add(rg)
         await s.commit()
         await s.refresh(rg)
         rechnung_id = rg.id
+
+        # Positionen in rechnung_positionen speichern
+        for i, p in enumerate(positionen_list, start=1):
+            pos = RechnungPosition(
+                rechnung_id=rechnung_id,
+                position_nr=i,
+                name=p.get("name") or "Position",
+                beschreibung=p.get("beschreibung"),
+                menge=p.get("menge") or 1,
+                einheit=p.get("einheit") or "Stueck",
+                preis_brutto_eur=p.get("preis_brutto_eur") or 0,
+                mwst_prozent=p.get("mwst_prozent") or 19,
+            )
+            s.add(pos)
+        await s.commit()
+        logger.info(
+            f"Rechnung {rechnung_id} angelegt mit {len(positionen_list)} Positionen, "
+            f"Gesamt {gesamt}"
+        )
 
     # Vorschau-Nachricht
     confidence = extracted.get("extraction_confidence", "low")
@@ -1463,10 +1502,11 @@ async def _handle_rechnung_input_received(
         confidence_warning = "Mittlere Erkennungs-Konfidenz - bitte sorgfaeltig pruefen."
 
     # Pflichtfelder pruefen - bei wesentlich Fehlendem, kein Best.-Button
+    positionen_check = extracted.get("positionen") or []
     has_minimum = bool(
         extracted.get("kunde_name")
-        and extracted.get("leistung_titel")
-        and (extracted.get("betrag_brutto_eur") is not None)
+        and len(positionen_check) >= 1
+        and (extracted.get("gesamtbetrag_brutto_eur") is not None)
     )
 
     preview_text = _format_rechnung_preview(extracted, confidence_warning)
@@ -1636,14 +1676,38 @@ async def _create_rechnung_in_lexware(chat_id, rechnung_id, bot_token):
         )
         return
 
-    # LineItem bauen
-    line_item = InvoiceLineItem(
-        name=leistung_titel or "Leistung",
-        quantity=1,
-        unit_name="Stueck",
-        unit_price_gross=betrag,
-        description=leistung_beschreibung,
-        tax_rate_percent=19,
+    # LineItems bauen: alle Positionen aus rechnung_positionen-Tabelle laden
+    line_items = []
+    async with AsyncSessionLocal() as s:
+        positionen_db = (await s.execute(
+            select(RechnungPosition)
+            .where(RechnungPosition.rechnung_id == rechnung_id)
+            .order_by(RechnungPosition.position_nr.asc())
+        )).scalars().all()
+
+    for p in positionen_db:
+        line_items.append(InvoiceLineItem(
+            name=p.name,
+            quantity=float(p.menge),
+            unit_name=p.einheit,
+            unit_price_gross=float(p.preis_brutto_eur),
+            description=p.beschreibung,
+            tax_rate_percent=int(p.mwst_prozent),
+        ))
+
+    # Fallback falls keine Positionen in DB: alte Single-Line-Logik
+    if not line_items:
+        line_items.append(InvoiceLineItem(
+            name=leistung_titel or "Leistung",
+            quantity=1,
+            unit_name="Stueck",
+            unit_price_gross=betrag,
+            description=leistung_beschreibung,
+            tax_rate_percent=19,
+        ))
+
+    logger.info(
+        f"Lexware-Invoice fuer rechnung={rechnung_id}: {len(line_items)} Positionen"
     )
 
     # Schritt 1: Kontakt suchen oder anlegen
@@ -1709,7 +1773,7 @@ async def _create_rechnung_in_lexware(chat_id, rechnung_id, bot_token):
 
     try:
         draft = await provider.create_invoice_draft(
-            line_items=[line_item],
+            line_items=line_items,
             contact_id=contact_id,
             one_time_address=one_time_address,
             title="Rechnung",
