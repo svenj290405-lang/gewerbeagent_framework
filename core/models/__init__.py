@@ -20,6 +20,8 @@ from core.models.telegram_state import (
     STATE_RECHNUNG_WAITING_INPUT,
     STATE_RECHNUNG_CONFIRMING,
     STATE_RECHNUNG_AWAITING_MAIL,
+    STATE_AUFNAHME_WAITING_AUDIO,
+    STATE_AUFNAHME_PREVIEWING,
 )
 from core.models.visualisierung import (
     Visualisierung,
@@ -129,4 +131,12 @@ __all__ = [
     "STATE_BOOKED",
     "STATE_PROPOSING_SLOTS",
     "STATE_CLOSED",
+    "AngebotPosition",
+    "Kundengespraech",
+    "STATE_AUFNAHME_WAITING_AUDIO",
+    "STATE_AUFNAHME_PREVIEWING",
 ]
+from core.models.tenant_leistung import TenantLeistung
+from core.models.angebot import Angebot
+from core.models.angebot_position import AngebotPosition
+from core.models.kundengespraech import Kundengespraech

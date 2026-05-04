@@ -63,6 +63,21 @@ class InvoiceDraft:
     raw_response: dict
 
 
+@dataclass
+class QuotationDraft:
+    """Ergebnis einer Angebots-Erstellung als Draft.
+
+    Analog zu InvoiceDraft, aber fuer Lexware Quotations (/v1/quotations).
+    Quotation-Drafts haben zusaetzlich eine expirationDate (Gueltig-bis).
+    """
+    quotation_id: UUID
+    voucher_number: str | None     # z.B. "AN-00042" - bei Draft oft None
+    deeplink_view: str             # URL zum Anschauen in Lexware
+    deeplink_edit: str             # URL zum Bearbeiten in Lexware
+    expiration_date: str | None = None  # ISO-Date wann das Angebot ablaeuft
+    raw_response: dict | None = None
+
+
 class AccountingError(Exception):
     """Basis-Fehlerklasse fuer Buchhaltungs-Operationen."""
 

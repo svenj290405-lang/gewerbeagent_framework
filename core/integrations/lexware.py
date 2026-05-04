@@ -28,6 +28,7 @@ from core.integrations.accounting_base import (
     ContactMatch,
     InvoiceDraft,
     InvoiceLineItem,
+    QuotationDraft,
     UploadResult,
     VoucherInfo,
 )
@@ -742,6 +743,124 @@ class LexwareProvider(AccountingProvider):
             deeplink_edit=self.invoice_deeplink_edit(invoice_id),
             raw_response=data,
         )
+
+    async def create_quotation_draft(
+        self,
+        line_items: list[InvoiceLineItem],
+        contact_id: UUID | None = None,
+        one_time_address: dict | None = None,
+        voucher_date: str | None = None,
+        expiration_date: str | None = None,
+        title: str | None = None,
+        introduction: str | None = None,
+        remark: str | None = None,
+        tax_type: str = "gross",
+    ) -> QuotationDraft:
+        """
+        POST /v1/quotations  (ohne ?finalize -> bleibt 'draft')
+
+        Analog zu create_invoice_draft, aber fuer Angebote.
+        Zusaetzliche Pflicht: expirationDate (default: voucher_date + 30 Tage).
+
+        Entweder contact_id ODER one_time_address muss gesetzt sein.
+
+        introduction = Anschreiben (von Gemini generiert)
+        remark = Schluss-Text (von Gemini generiert)
+        Pro Position kann li.description die line-Beschreibung enthalten.
+        """
+        if not line_items:
+            raise ValueError("Mindestens eine Angebots-Position erforderlich")
+        if not contact_id and not one_time_address:
+            raise ValueError("Entweder contact_id oder one_time_address muss gesetzt sein")
+
+        if not voucher_date:
+            voucher_date = dt_now_iso()
+        if not expiration_date:
+            # Default: 30 Tage Gueltigkeit, gleiches Format wie voucher_date
+            import datetime as _dt
+            base = _dt.datetime.now(_dt.timezone.utc).astimezone()
+            expiration_date = (base + _dt.timedelta(days=30)).isoformat(timespec="milliseconds")
+
+        # Address-Block bauen
+        if contact_id:
+            address_block = {"contactId": str(contact_id)}
+        else:
+            address_block = dict(one_time_address)
+            address_block.setdefault("countryCode", "DE")
+
+        # LineItems in Lexware-Format wandeln (analog Invoice)
+        items_payload = []
+        for li in line_items:
+            unit_price = {
+                "currency": "EUR",
+                "taxRatePercentage": li.tax_rate_percent,
+            }
+            if tax_type == "gross":
+                unit_price["grossAmount"] = round(float(li.unit_price_gross), 2)
+            else:
+                unit_price["netAmount"] = round(float(li.unit_price_gross), 2)
+
+            item = {
+                "type": "custom",
+                "name": li.name,
+                "quantity": float(li.quantity),
+                "unitName": li.unit_name,
+                "unitPrice": unit_price,
+            }
+            if li.description:
+                item["description"] = li.description
+            items_payload.append(item)
+
+        body = {
+            "voucherDate": voucher_date,
+            "expirationDate": expiration_date,
+            "address": address_block,
+            "lineItems": items_payload,
+            "totalPrice": {"currency": "EUR"},
+            "taxConditions": {"taxType": tax_type},
+            "shippingConditions": {
+                "shippingType": "service",
+                "shippingDate": voucher_date,
+            },
+        }
+        if title:
+            body["title"] = title
+        if introduction:
+            body["introduction"] = introduction
+        if remark:
+            body["remark"] = remark
+
+        await self._rate_limit()
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            r = await client.post(
+                f"{LEXWARE_API_BASE}/v1/quotations",
+                headers={**self._headers, "Content-Type": "application/json"},
+                json=body,
+            )
+            self._raise_for_status(r, "create_quotation_draft")
+            data = r.json()
+
+        quotation_id = UUID(data["id"])
+        logger.info(
+            "Lexware create_quotation_draft OK: id=%s items=%d expires=%s tax=%s",
+            quotation_id, len(line_items), expiration_date[:10], tax_type,
+        )
+        return QuotationDraft(
+            quotation_id=quotation_id,
+            voucher_number=None,  # bei draft noch nicht vergeben
+            deeplink_view=self.quotation_deeplink_view(quotation_id),
+            deeplink_edit=self.quotation_deeplink_edit(quotation_id),
+            expiration_date=expiration_date,
+            raw_response=data,
+        )
+
+    @staticmethod
+    def quotation_deeplink_view(quotation_id: UUID) -> str:
+        return f"{LEXWARE_APP_BASE}/permalink/quotations/view/{quotation_id}"
+
+    @staticmethod
+    def quotation_deeplink_edit(quotation_id: UUID) -> str:
+        return f"{LEXWARE_APP_BASE}/permalink/quotations/edit/{quotation_id}"
 
     async def get_invoice(self, invoice_id: UUID) -> dict:
         """GET /v1/invoices/{id} - rohes JSON zurueckgeben."""
