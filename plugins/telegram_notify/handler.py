@@ -27,6 +27,8 @@ from core.models import (
     STATE_RECHNUNG_WAITING_INPUT,
     STATE_RECHNUNG_CONFIRMING,
     STATE_RECHNUNG_AWAITING_MAIL,
+    STATE_AUFNAHME_WAITING_AUDIO,
+    STATE_AUFNAHME_PREVIEWING,
     Beleg,
     BELEG_SOURCE_TELEGRAM,
     BELEG_STATUS_ERROR,
@@ -35,6 +37,7 @@ from core.models import (
     BELEG_STATUS_UPLOADING,
     Rechnung,
     RechnungPosition,
+    Kundengespraech,
     RECHNUNG_INPUT_TEXT,
     RECHNUNG_INPUT_VOICE,
     RECHNUNG_STATUS_CANCELLED,
@@ -55,7 +58,11 @@ from core.models import (
     Visualisierung,
 )
 from core.security import decrypt, encrypt
-from core.ai import extract_rechnung_from_audio, extract_rechnung_from_text
+from core.ai import (
+    extract_rechnung_from_audio,
+    extract_rechnung_from_text,
+    analyse_kundengespraech_from_audio,
+)
 from core.integrations.lexware import LexwareProvider
 from core.integrations.accounting_base import (
     AccountingError,
@@ -414,6 +421,8 @@ async def process_telegram_update(payload):
         logger.info(f"Callback-Query: chat={cq_chat_id} data={cq_data!r}")
         if cq_data.startswith("rg:"):
             await _handle_rechnung_callback(cq_chat_id, cq_data, cq_id, bot_token)
+        elif cq_data and cq_data.startswith("aufnahme:"):
+            await _handle_aufnahme_callback(cq_chat_id, cq_data, cq_id, bot_token)
         else:
             # Unbekannte Callback-Daten - nur bestätigen
             await _answer_callback_query(cq_id, "Unbekannte Aktion", bot_token)
@@ -488,6 +497,21 @@ async def process_telegram_update(payload):
             if reply:
                 await _send_to_chat(chat_id, reply)
             return {"ok": True}
+        # ----- Aufnahme-Wizard: Voice-Note empfangen -----
+        if state and state.state_key == STATE_AUFNAHME_WAITING_AUDIO:
+            bot_token = await _load_global_bot_token()
+            if not bot_token:
+                await _send_to_chat(
+                    chat_id,
+                    "Bot-Konfiguration fehlt - bitte beim Betreiber melden.",
+                )
+                return {"ok": True}
+            reply = await _handle_aufnahme_audio_received(
+                chat_id, voice_dict=voice, bot_token=bot_token
+            )
+            if reply:
+                await _send_to_chat(chat_id, reply)
+            return {"ok": True}
         # Voice-Note ohne aktiven Wizard - ignorieren
         logger.info("Voice ohne passenden State ignoriert")
         return {"ok": True}
@@ -522,6 +546,8 @@ async def process_telegram_update(payload):
         reply = await _handle_belege_anzeigen_command(chat_id)
     elif text == "/rechnung":
         reply = await _handle_rechnung_command(chat_id)
+    elif text == "/aufnahme":
+        reply = await _handle_aufnahme_command(chat_id)
     elif text == "/rechnungen_anzeigen":
         await _clear_state(chat_id)
         reply = await _handle_rechnungen_anzeigen_command(chat_id)
@@ -553,6 +579,10 @@ async def process_telegram_update(payload):
                 return {"ok": True}
             reply = reply_or_none
         elif state.state_key == STATE_RECHNUNG_CONFIRMING:
+            reply = "Bitte einen der Buttons oben antippen oder /abbrechen schicken."
+        elif state.state_key == STATE_AUFNAHME_WAITING_AUDIO:
+            reply = "Bitte sende eine Sprachnachricht (kein Text). Oder /abbrechen."
+        elif state.state_key == STATE_AUFNAHME_PREVIEWING:
             reply = "Bitte einen der Buttons oben antippen oder /abbrechen schicken."
         elif state.state_key == STATE_RECHNUNG_AWAITING_MAIL:
             stage = (state.state_data or {}).get("stage")
@@ -1302,6 +1332,10 @@ async def _telegram_download_voice(bot_token, voice_dict):
 # Limits + Defaults
 RECHNUNG_MAX_INPUT_LEN = 1000        # Text-Eingabe Maximum
 RECHNUNG_MAX_VOICE_BYTES = 5_000_000 # 5 MB Audio-Maximum
+
+# Aufnahme-Konstanten - lange Kundengespraeche
+AUFNAHME_MAX_AUDIO_BYTES = 50_000_000  # 50 MB (~30 Min Voice-Note)
+
 RECHNUNG_VOICE_MAX_SECONDS = 120     # 2 Minuten max
 
 
@@ -1540,6 +1574,244 @@ async def _handle_rechnung_input_received(
     return None  # Schon mit Buttons gesendet
 
 
+
+
+# ==============================================================
+# /aufnahme - Kundengespraech-Aufnahme-Wizard
+# ==============================================================
+
+async def _handle_aufnahme_command(chat_id):
+    """Startet den /aufnahme-Wizard fuer Kundengespraeche."""
+    tenant = await _get_tenant_by_chat(chat_id)
+    if not tenant:
+        return (
+            "Dieser Chat ist noch keinem Betrieb zugeordnet.\n"
+            "Bitte zuerst den Aktivierungs-QR-Code scannen."
+        )
+
+    await _save_state(chat_id, STATE_AUFNAHME_WAITING_AUDIO, {})
+    msg = "<b>📞 Kundengespraech aufnehmen</b>\n\n"
+    msg += "Sende mir jetzt eine Sprachnachricht mit dem Kundengespraech.\n\n"
+    msg += "<b>Wichtig:</b> Vorher Zustimmung des Kunden einholen!\n\n"
+    msg += "Ich werde:\n"
+    msg += "• Das Gespraech transkribieren\n"
+    msg += "• Kunden-Daten + Anliegen extrahieren\n"
+    msg += "• Ein Briefing fuer dich speichern (fuer den Termin)\n"
+    msg += "• Optional: ein Lexware-Angebots-Draft erstellen\n\n"
+    msg += "Maximal 30 Min Aufnahme.\n"
+    msg += "/abbrechen um abzubrechen."
+    return msg
+
+
+def _format_aufnahme_preview(extracted: dict) -> str:
+    """Formatiert die Vorschau eines analysierten Kundengespraechs."""
+    msg = "<b>📋 Kundengespraech analysiert</b>\n\n"
+
+    # Kunde
+    kunde = extracted.get("kunde_name") or "<i>(unbekannt)</i>"
+    msg += f"<b>Kunde:</b> {kunde}\n"
+
+    parts = []
+    if extracted.get("kunde_strasse"):
+        parts.append(extracted["kunde_strasse"])
+    if extracted.get("kunde_plz") or extracted.get("kunde_ort"):
+        parts.append(
+            f"{extracted.get('kunde_plz') or ''} {extracted.get('kunde_ort') or ''}".strip()
+        )
+    if parts:
+        msg += f"<i>{', '.join(parts)}</i>\n"
+    if extracted.get("kunde_telefon"):
+        msg += f"📞 {extracted['kunde_telefon']}\n"
+    if extracted.get("kunde_email"):
+        msg += f"✉️ {extracted['kunde_email']}\n"
+
+    # Briefing kurz
+    briefing = extracted.get("briefing_kurz")
+    if briefing:
+        msg += f"\n<b>📝 Briefing:</b>\n<i>{briefing}</i>\n"
+
+    # Termin
+    termin = extracted.get("termin_datum")
+    if termin:
+        msg += f"\n<b>📅 Termin:</b> {termin}"
+        if extracted.get("termin_ort"):
+            msg += f" @ {extracted['termin_ort']}"
+        msg += "\n"
+
+    # Positionen (falls Preise im Gespraech genannt)
+    positionen = extracted.get("positionen") or []
+    if positionen:
+        msg += "\n<b>💰 Positionen (aus Gespraech):</b>\n"
+        gesamt = 0.0
+        ohne_preis = 0
+        for i, p in enumerate(positionen, 1):
+            menge = p.get("menge") or 1.0
+            einheit = p.get("einheit") or "Stueck"
+            preis = p.get("preis_brutto_eur")
+            name = p.get("name") or "(?)"
+            if preis is not None:
+                summe = float(menge) * float(preis)
+                gesamt += summe
+                msg += f"  {i}. {name}: {menge} {einheit} × {preis:.2f}€ = <b>{summe:.2f}€</b>\n"
+            else:
+                ohne_preis += 1
+                msg += f"  {i}. {name}: {menge} {einheit} (Preis offen)\n"
+        if gesamt > 0:
+            msg += f"  <b>Summe (genannte Preise): {gesamt:.2f}€</b>\n"
+        if ohne_preis > 0:
+            msg += f"  <i>{ohne_preis} Position(en) ohne Preis</i>\n"
+    else:
+        msg += "\n<i>Keine Positionen im Gespraech erkannt.</i>\n"
+
+    # TODOs
+    todos = extracted.get("todos") or []
+    if todos:
+        msg += "\n<b>✅ TODOs fuer dich:</b>\n"
+        for todo in todos[:8]:  # max 8 zeigen
+            msg += f"  • {todo}\n"
+
+    # Confidence + Missing
+    conf = extracted.get("extraction_confidence") or "low"
+    if conf == "low":
+        msg += "\n⚠️ <i>Niedrige Confidence - bitte Daten genau pruefen!</i>"
+    elif conf == "medium":
+        msg += "\n<i>Mittlere Confidence - bitte Vorschau pruefen.</i>"
+
+    missing = extracted.get("missing_fields") or []
+    if missing:
+        msg += f"\n<i>Fehlende Felder: {', '.join(missing)}</i>"
+
+    return msg
+
+
+async def _handle_aufnahme_audio_received(chat_id, voice_dict, bot_token=None):
+    """Tenant hat Audio-Aufnahme geschickt. Gemini analysiert + DB-Speicherung + Vorschau."""
+    import uuid as _uuid
+    from datetime import datetime as _datetime, timezone as _timezone
+
+    tenant = await _get_tenant_by_chat(chat_id)
+    if not tenant:
+        await _clear_state(chat_id)
+        return None
+
+    # Sofort Feedback
+    await _send_to_chat(chat_id, "<i>🎧 Hoere mir das Gespraech an... Das kann 30-60 Sek dauern.</i>")
+
+    # Audio downloaden
+    if bot_token is None:
+        bot_token = await _load_global_bot_token()
+    audio_bytes, audio_mime = await _telegram_download_voice(bot_token, voice_dict)
+    if not audio_bytes:
+        await _clear_state(chat_id)
+        return "Konnte die Sprachnachricht nicht laden. Bitte erneut versuchen."
+    if len(audio_bytes) > AUFNAHME_MAX_AUDIO_BYTES:
+        await _clear_state(chat_id)
+        return (
+            f"Die Aufnahme ist zu lang ({len(audio_bytes) // 1024 // 1024} MB).\n"
+            f"Maximum: {AUFNAHME_MAX_AUDIO_BYTES // 1024 // 1024} MB (~30 Min).\n"
+            "Bitte ggf. in mehrere Aufnahmen aufteilen."
+        )
+
+    # Audio-Dauer aus voice_dict (Telegram liefert "duration" in Sekunden)
+    audio_dauer = voice_dict.get("duration")
+
+    # Gemini-Analyse
+    try:
+        extracted = await analyse_kundengespraech_from_audio(audio_bytes, mime_type=audio_mime)
+    except Exception as e:
+        logger.error(f"analyse_kundengespraech fehler: {e}", exc_info=True)
+        await _clear_state(chat_id)
+        return f"❌ Fehler bei Analyse: {e}\n\nBitte erneut versuchen."
+
+    # Pflicht: kunde_name muss da sein
+    if not extracted.get("kunde_name"):
+        await _clear_state(chat_id)
+        return (
+            "❌ Konnte keinen Kundennamen aus der Aufnahme extrahieren.\n\n"
+            "Bitte erneut aufnehmen und sicherstellen dass der Kundenname genannt wird."
+        )
+
+    # In DB speichern
+    async with AsyncSessionLocal() as session:
+        gespraech = Kundengespraech(
+            tenant_id=tenant.id,
+            kunde_name=extracted["kunde_name"][:300],
+            audio_dauer_sekunden=audio_dauer,
+            raw_transcript=extracted.get("transcript"),
+            briefing_kurz=extracted.get("briefing_kurz"),
+            notizen_lang=extracted.get("notizen_lang"),
+            todos=extracted.get("todos") or [],
+            termin_ort=extracted.get("termin_ort"),
+            confidence=extracted.get("extraction_confidence"),
+            status="erfasst",
+        )
+        # Termin-Datum parsen falls vorhanden
+        termin_str = extracted.get("termin_datum")
+        if termin_str:
+            try:
+                # Versuche verschiedene Formate
+                for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+                    try:
+                        dt = _datetime.strptime(termin_str[:19], fmt)
+                        gespraech.termin_datum = dt.replace(tzinfo=_timezone.utc)
+                        break
+                    except ValueError:
+                        continue
+            except Exception as e:
+                logger.warning(f"Konnte termin_datum nicht parsen: {termin_str!r} | {e}")
+
+        session.add(gespraech)
+        await session.commit()
+        gespraech_id = gespraech.id
+
+    logger.info(
+        "Kundengespraech gespeichert: id=%s tenant=%s kunde=%r positionen=%d todos=%d",
+        gespraech_id, tenant.id, extracted.get("kunde_name"),
+        len(extracted.get("positionen") or []),
+        len(extracted.get("todos") or []),
+    )
+
+    # State auf PREVIEWING setzen, ID + extracted im state_data fuer Callback
+    await _save_state(
+        chat_id,
+        STATE_AUFNAHME_PREVIEWING,
+        {
+            "gespraech_id": str(gespraech_id),
+            "extracted": extracted,
+        },
+    )
+
+    # Vorschau senden mit Buttons
+    preview = _format_aufnahme_preview(extracted)
+
+    has_positionen_mit_preis = any(
+        p.get("preis_brutto_eur") is not None
+        for p in (extracted.get("positionen") or [])
+    )
+
+    if has_positionen_mit_preis:
+        keyboard = [
+            [
+                {"text": "✅ Mit Lexware-Angebot", "callback_data": f"aufnahme:angebot:{gespraech_id}"},
+            ],
+            [
+                {"text": "📋 Nur speichern", "callback_data": f"aufnahme:speichern:{gespraech_id}"},
+                {"text": "❌ Verwerfen", "callback_data": f"aufnahme:verwerfen:{gespraech_id}"},
+            ],
+        ]
+    else:
+        # Kein Preis genannt -> nur speichern oder verwerfen
+        keyboard = [
+            [
+                {"text": "📋 Speichern (kein Angebot)", "callback_data": f"aufnahme:speichern:{gespraech_id}"},
+                {"text": "❌ Verwerfen", "callback_data": f"aufnahme:verwerfen:{gespraech_id}"},
+            ],
+        ]
+
+    await _send_with_inline_buttons(chat_id, preview, keyboard)
+    return None  # Nachricht ist schon gesendet
+
+
 async def _handle_rechnung_callback(chat_id, callback_data, callback_query_id, bot_token):
     """
     User hat einen Button geklickt.
@@ -1615,6 +1887,218 @@ async def _handle_rechnung_callback(chat_id, callback_data, callback_query_id, b
         return
 
     await _send_to_chat(chat_id, f"Unbekannte Aktion: {action}")
+
+
+
+async def _handle_aufnahme_callback(chat_id, callback_data, callback_query_id, bot_token):
+    """Verarbeitet Callbacks von Aufnahme-Buttons.
+
+    Format: aufnahme:<action>:<gespraech_id>
+    Actions:
+      - angebot   = Lexware-Angebots-Draft erstellen + verknuepfen
+      - speichern = Nur in DB lassen, kein Angebot
+      - verwerfen = DB-Eintrag loeschen
+    """
+    import uuid as _uuid
+    from sqlalchemy import select
+
+    parts = callback_data.split(":")
+    if len(parts) != 3:
+        await _answer_callback_query(callback_query_id, "Ungueltige Aktion", bot_token)
+        return
+
+    _, action, gespraech_id_str = parts
+    try:
+        gespraech_id = _uuid.UUID(gespraech_id_str)
+    except ValueError:
+        await _answer_callback_query(callback_query_id, "Ungueltige Aktion", bot_token)
+        return
+
+    tenant = await _get_tenant_by_chat(chat_id)
+    if not tenant:
+        await _answer_callback_query(callback_query_id, "Tenant nicht gefunden", bot_token)
+        return
+
+    async with AsyncSessionLocal() as session:
+        # Gespraech laden
+        result = await session.execute(
+            select(Kundengespraech).where(
+                Kundengespraech.id == gespraech_id,
+                Kundengespraech.tenant_id == tenant.id,
+            )
+        )
+        gespraech = result.scalar_one_or_none()
+        if not gespraech:
+            await _answer_callback_query(callback_query_id, "Gespraech nicht gefunden", bot_token)
+            await _clear_state(chat_id)
+            return
+
+        # === Action: VERWERFEN ===
+        if action == "verwerfen":
+            await session.delete(gespraech)
+            await session.commit()
+            await _answer_callback_query(callback_query_id, "Verworfen", bot_token)
+            await _clear_state(chat_id)
+            await _send_to_chat(chat_id, "🗑 Gespraech verworfen.")
+            return
+
+        # === Action: SPEICHERN (nur DB, kein Angebot) ===
+        if action == "speichern":
+            gespraech.status = "erfasst"
+            await session.commit()
+            await _answer_callback_query(callback_query_id, "Gespeichert", bot_token)
+            await _clear_state(chat_id)
+            briefing = gespraech.briefing_kurz or "<i>(kein Briefing)</i>"
+            await _send_to_chat(
+                chat_id,
+                f"✅ Gespraech mit <b>{gespraech.kunde_name}</b> gespeichert.\n\n"
+                f"<b>Briefing:</b> <i>{briefing}</i>\n\n"
+                f"Spaeter abrufbar mit /briefing oder /kunde {gespraech.kunde_name.split()[0] if gespraech.kunde_name else ''}"
+            )
+            return
+
+        # === Action: ANGEBOT (Lexware-Draft erstellen + verknuepfen) ===
+        if action == "angebot":
+            # Lexware-Provider laden
+            provider = await _get_lexware_provider_for_tenant(tenant)
+            if not provider:
+                await _answer_callback_query(callback_query_id, "Lexware nicht verbunden", bot_token)
+                await _send_to_chat(
+                    chat_id,
+                    "❌ Lexware ist nicht verbunden.\n"
+                    "Bitte /lexware_setup ausfuehren. Gespraech bleibt gespeichert."
+                )
+                gespraech.status = "erfasst"
+                await session.commit()
+                await _clear_state(chat_id)
+                return
+
+            # extracted aus state_data laden
+            state = await _load_state(chat_id)
+            if not state or not state.state_data:
+                await _answer_callback_query(callback_query_id, "Session abgelaufen", bot_token)
+                await _clear_state(chat_id)
+                return
+            extracted = state.state_data.get("extracted") or {}
+            positionen = extracted.get("positionen") or []
+            positionen_mit_preis = [p for p in positionen if p.get("preis_brutto_eur") is not None]
+            if not positionen_mit_preis:
+                await _answer_callback_query(callback_query_id, "Keine Positionen mit Preis", bot_token)
+                await _send_to_chat(
+                    chat_id,
+                    "❌ Keine Positionen mit Preisen gefunden. Angebot kann nicht erstellt werden.\n"
+                    "Gespraech bleibt gespeichert."
+                )
+                gespraech.status = "erfasst"
+                await session.commit()
+                await _clear_state(chat_id)
+                return
+
+            # Sofortiges Feedback
+            await _answer_callback_query(callback_query_id, "Erstelle Angebot...", bot_token)
+            await _send_to_chat(chat_id, "<i>📝 Lege Angebot in Lexware an...</i>")
+
+            # Angebot in DB anlegen
+            from core.models import Angebot, AngebotPosition
+            from decimal import Decimal as _Dec
+
+            angebot = Angebot(
+                tenant_id=tenant.id,
+                quelle="telegram_voice",
+                raw_input=extracted.get("transcript", "")[:5000] if extracted.get("transcript") else None,
+                kunde_name=gespraech.kunde_name,
+                kunde_strasse=extracted.get("kunde_strasse"),
+                kunde_plz=extracted.get("kunde_plz"),
+                kunde_ort=extracted.get("kunde_ort"),
+                introduction_text=None,  # spaeter Gemini-generiert
+                remark_text=None,
+                status="erstellt",
+                confidence=extracted.get("extraction_confidence"),
+            )
+            session.add(angebot)
+            await session.flush()  # ID generieren
+
+            gesamt = _Dec("0")
+            for i, p in enumerate(positionen_mit_preis, 1):
+                menge = _Dec(str(p.get("menge") or 1))
+                preis = _Dec(str(p.get("preis_brutto_eur") or 0))
+                pos = AngebotPosition(
+                    angebot_id=angebot.id,
+                    position_nr=i,
+                    name=(p.get("name") or "")[:500],
+                    beschreibung=p.get("beschreibung"),
+                    menge=menge,
+                    einheit=(p.get("einheit") or "Stueck")[:50],
+                    preis_brutto_eur=preis,
+                    mwst_prozent=int(p.get("mwst_prozent") or 19),
+                )
+                session.add(pos)
+                gesamt += menge * preis
+            angebot.gesamtbetrag_brutto_eur = gesamt
+
+            # Lexware-Draft erstellen
+            from core.integrations.accounting_base import InvoiceLineItem
+
+            line_items = [
+                InvoiceLineItem(
+                    name=(p.get("name") or "")[:200],
+                    quantity=float(p.get("menge") or 1),
+                    unit_name=(p.get("einheit") or "Stueck"),
+                    unit_price_gross=float(p.get("preis_brutto_eur") or 0),
+                    description=p.get("beschreibung"),
+                    tax_rate_percent=int(p.get("mwst_prozent") or 19),
+                )
+                for p in positionen_mit_preis
+            ]
+
+            one_time_address = {
+                "name": gespraech.kunde_name,
+                "countryCode": "DE",
+            }
+            if extracted.get("kunde_strasse"):
+                one_time_address["street"] = extracted["kunde_strasse"]
+            if extracted.get("kunde_plz"):
+                one_time_address["zip"] = extracted["kunde_plz"]
+            if extracted.get("kunde_ort"):
+                one_time_address["city"] = extracted["kunde_ort"]
+
+            try:
+                quotation = await provider.create_quotation_draft(
+                    line_items=line_items,
+                    one_time_address=one_time_address,
+                    title=f"Angebot {gespraech.kunde_name}",
+                    introduction=f"Sehr geehrte/r {gespraech.kunde_name},\n\nvielen Dank fuer Ihre Anfrage. Wir freuen uns, Ihnen folgendes Angebot zu unterbreiten.",
+                    remark="Die Preise verstehen sich inkl. gesetzlicher MwSt.\n\nWir freuen uns auf Ihren Auftrag!",
+                    tax_type="gross",
+                )
+            except Exception as e:
+                logger.error(f"Lexware create_quotation fehler: {e}", exc_info=True)
+                await session.rollback()
+                gespraech.status = "erfasst"
+                await session.commit()
+                await _clear_state(chat_id)
+                await _send_to_chat(chat_id, f"❌ Lexware-Fehler: {e}\n\nGespraech bleibt gespeichert.")
+                return
+
+            # Angebot mit Lexware-IDs aktualisieren
+            angebot.lexware_quotation_id = quotation.quotation_id
+            angebot.status = "in_lexware"
+            gespraech.angebot_id = angebot.id
+            gespraech.status = "mit_angebot"
+            await session.commit()
+
+            await _clear_state(chat_id)
+            await _send_to_chat(
+                chat_id,
+                f"✅ <b>Angebot erstellt!</b>\n\n"
+                f"Kunde: {gespraech.kunde_name}\n"
+                f"Gesamt: {float(gesamt):.2f}€\n\n"
+                f"<a href=\"{quotation.deeplink_view}\">→ In Lexware oeffnen</a>\n\n"
+                f"<i>Bitte in Lexware pruefen, ggf. anpassen, dann versenden.</i>"
+            )
+            return
+
+    await _answer_callback_query(callback_query_id, "Unbekannte Aktion", bot_token)
 
 
 async def _mark_rechnung_cancelled(rechnung_id):

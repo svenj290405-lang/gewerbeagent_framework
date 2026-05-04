@@ -4,6 +4,7 @@ from core.ai.gemini import (
     extract_rechnung_from_audio,
     extract_rechnung_from_text,
     generate_image_from_image,
+    analyse_kundengespraech_from_audio,
 )
 
 __all__ = [
@@ -11,4 +12,5 @@ __all__ = [
     "generate_image_from_image",
     "extract_rechnung_from_text",
     "extract_rechnung_from_audio",
+    "analyse_kundengespraech_from_audio",
 ]

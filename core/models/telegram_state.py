@@ -37,6 +37,9 @@ STATE_RECHNUNG_WAITING_INPUT = "rechnung_waiting_input"
 STATE_RECHNUNG_CONFIRMING = "rechnung_confirming"
 STATE_RECHNUNG_AWAITING_MAIL = "rechnung_awaiting_mail"
 
+STATE_AUFNAHME_WAITING_AUDIO = "aufnahme_waiting_audio"
+STATE_AUFNAHME_PREVIEWING = "aufnahme_previewing"
+
 
 
 
