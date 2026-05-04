@@ -40,6 +40,11 @@ STATE_RECHNUNG_AWAITING_MAIL = "rechnung_awaiting_mail"
 STATE_AUFNAHME_WAITING_AUDIO = "aufnahme_waiting_audio"
 STATE_AUFNAHME_PREVIEWING = "aufnahme_previewing"
 
+STATE_LEISTUNG_WAITING_NAME = "leistung_waiting_name"
+STATE_LEISTUNG_WAITING_PREIS = "leistung_waiting_preis"
+STATE_LEISTUNG_WAITING_BESCHREIBUNG = "leistung_waiting_beschreibung"
+STATE_LEISTUNG_PREVIEWING = "leistung_previewing"
+
 
 
 

@@ -22,6 +22,10 @@ from core.models.telegram_state import (
     STATE_RECHNUNG_AWAITING_MAIL,
     STATE_AUFNAHME_WAITING_AUDIO,
     STATE_AUFNAHME_PREVIEWING,
+    STATE_LEISTUNG_WAITING_NAME,
+    STATE_LEISTUNG_WAITING_PREIS,
+    STATE_LEISTUNG_WAITING_BESCHREIBUNG,
+    STATE_LEISTUNG_PREVIEWING,
 )
 from core.models.visualisierung import (
     Visualisierung,

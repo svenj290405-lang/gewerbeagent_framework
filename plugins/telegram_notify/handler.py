@@ -29,6 +29,10 @@ from core.models import (
     STATE_RECHNUNG_AWAITING_MAIL,
     STATE_AUFNAHME_WAITING_AUDIO,
     STATE_AUFNAHME_PREVIEWING,
+    STATE_LEISTUNG_WAITING_NAME,
+    STATE_LEISTUNG_WAITING_PREIS,
+    STATE_LEISTUNG_WAITING_BESCHREIBUNG,
+    STATE_LEISTUNG_PREVIEWING,
     Beleg,
     BELEG_SOURCE_TELEGRAM,
     BELEG_STATUS_ERROR,
@@ -56,6 +60,7 @@ from core.models import (
     VIZ_STATUS_GENERATING,
     VIZ_STATUS_PENDING,
     Visualisierung,
+    TenantLeistung,
 )
 from core.security import decrypt, encrypt
 from core.ai import (
@@ -423,6 +428,8 @@ async def process_telegram_update(payload):
             await _handle_rechnung_callback(cq_chat_id, cq_data, cq_id, bot_token)
         elif cq_data and cq_data.startswith("aufnahme:"):
             await _handle_aufnahme_callback(cq_chat_id, cq_data, cq_id, bot_token)
+        elif cq_data and cq_data.startswith("leistung:"):
+            await _handle_leistung_callback(cq_chat_id, cq_data, cq_id, bot_token)
         else:
             # Unbekannte Callback-Daten - nur bestätigen
             await _answer_callback_query(cq_id, "Unbekannte Aktion", bot_token)
@@ -548,6 +555,21 @@ async def process_telegram_update(payload):
         reply = await _handle_rechnung_command(chat_id)
     elif text == "/aufnahme":
         reply = await _handle_aufnahme_command(chat_id)
+    elif text == "/leistungen":
+        await _clear_state(chat_id)
+        reply = await _handle_leistungen_command(chat_id)
+    elif text == "/leistung" or text == "/leistung neu" or text == "/leistung_neu":
+        # Ohne Argumente -> Wizard starten
+        reply = await _handle_leistung_neu_command(chat_id)
+    elif text.startswith("/leistung_loeschen"):
+        await _clear_state(chat_id)
+        args = text[len("/leistung_loeschen"):].strip()
+        reply = await _handle_leistung_loeschen_command(chat_id, args)
+    elif text.startswith("/leistung"):
+        # Mit Argumenten -> Detail anzeigen
+        await _clear_state(chat_id)
+        args = text[len("/leistung"):].strip()
+        reply = await _handle_leistung_show_command(chat_id, args)
     elif text == "/briefing":
         await _clear_state(chat_id)
         reply = await _handle_briefing_command(chat_id)
@@ -594,6 +616,17 @@ async def process_telegram_update(payload):
         elif state.state_key == STATE_AUFNAHME_WAITING_AUDIO:
             reply = "Bitte sende eine Sprachnachricht (kein Text). Oder /abbrechen."
         elif state.state_key == STATE_AUFNAHME_PREVIEWING:
+            reply = "Bitte einen der Buttons oben antippen oder /abbrechen schicken."
+        elif state.state_key == STATE_LEISTUNG_WAITING_NAME:
+            reply = await _handle_leistung_name_input(chat_id, text)
+        elif state.state_key == STATE_LEISTUNG_WAITING_PREIS:
+            reply = await _handle_leistung_preis_input(chat_id, text)
+        elif state.state_key == STATE_LEISTUNG_WAITING_BESCHREIBUNG:
+            reply_or_none = await _handle_leistung_beschreibung_input(chat_id, text)
+            if reply_or_none is None:
+                return {"ok": True}
+            reply = reply_or_none
+        elif state.state_key == STATE_LEISTUNG_PREVIEWING:
             reply = "Bitte einen der Buttons oben antippen oder /abbrechen schicken."
         elif state.state_key == STATE_RECHNUNG_AWAITING_MAIL:
             stage = (state.state_data or {}).get("stage")
@@ -1368,8 +1401,8 @@ def _format_rechnung_preview(extracted: dict, confidence_warning: str = "") -> s
     gesamt = extracted.get("gesamtbetrag_brutto_eur")
 
     msg = "<b>Rechnung-Vorschau</b>\n\n"
-    msg += f"\u2022 <b>Kunde:</b>     {kn}\n"
-    msg += f"\u2022 <b>Anschrift:</b> {addr_str}\n"
+    msg += f"• <b>Kunde:</b>     {kn}\n"
+    msg += f"• <b>Anschrift:</b> {addr_str}\n"
     msg += "\n<b>Positionen:</b>\n"
 
     if not positionen:
@@ -1383,20 +1416,20 @@ def _format_rechnung_preview(extracted: dict, confidence_warning: str = "") -> s
             beschreibung = p.get("beschreibung")
             position_total = float(menge) * float(preis)
             if abs(float(menge) - 1.0) < 0.01 and einheit == "Stueck":
-                msg += f"  <b>{i}.</b> {name}: <b>{position_total:.2f} \u20ac</b>\n"
+                msg += f"  <b>{i}.</b> {name}: <b>{position_total:.2f} €</b>\n"
             else:
-                msg += f"  <b>{i}.</b> {name}: {menge} {einheit} \u00d7 {float(preis):.2f} \u20ac = <b>{position_total:.2f} \u20ac</b>\n"
+                msg += f"  <b>{i}.</b> {name}: {menge} {einheit} \u00d7 {float(preis):.2f} € = <b>{position_total:.2f} €</b>\n"
             if beschreibung:
                 msg += f"     <i>{beschreibung}</i>\n"
 
     if gesamt is not None:
-        msg += f"\n<b>Gesamt brutto: {float(gesamt):.2f} \u20ac</b>\n"
+        msg += f"\n<b>Gesamt brutto: {float(gesamt):.2f} €</b>\n"
 
     missing = extracted.get("missing_fields") or []
     if missing:
-        msg += f"\n\u26a0\ufe0f Unklar: {', '.join(missing)}\n"
+        msg += f"\n⚠️ Unklar: {', '.join(missing)}\n"
     if confidence_warning:
-        msg += f"\n\u26a0\ufe0f {confidence_warning}\n"
+        msg += f"\n⚠️ {confidence_warning}\n"
 
     msg += (
         "\n<i>Hinweis: Anschrift in Lexware ggf. vervollstaendigen, "
@@ -1566,17 +1599,17 @@ async def _handle_rechnung_input_received(
     # Inline-Buttons
     if has_minimum:
         buttons = [
-            [{"text": "\u2705 In Lexware anlegen", "callback_data": f"rg:confirm:{rechnung_id}"}],
+            [{"text": "✅ In Lexware anlegen", "callback_data": f"rg:confirm:{rechnung_id}"}],
             [
-                {"text": "\u270f\ufe0f Neu eingeben", "callback_data": f"rg:retry:{rechnung_id}"},
-                {"text": "\u274c Abbrechen", "callback_data": f"rg:cancel:{rechnung_id}"},
+                {"text": "\u270f️ Neu eingeben", "callback_data": f"rg:retry:{rechnung_id}"},
+                {"text": "❌ Abbrechen", "callback_data": f"rg:cancel:{rechnung_id}"},
             ],
         ]
     else:
         # Keine Confirm-Option weil Pflichtfelder fehlen
         buttons = [
-            [{"text": "\u270f\ufe0f Neu eingeben", "callback_data": f"rg:retry:{rechnung_id}"}],
-            [{"text": "\u274c Abbrechen", "callback_data": f"rg:cancel:{rechnung_id}"}],
+            [{"text": "\u270f️ Neu eingeben", "callback_data": f"rg:retry:{rechnung_id}"}],
+            [{"text": "❌ Abbrechen", "callback_data": f"rg:cancel:{rechnung_id}"}],
         ]
 
     if bot_token is None:
@@ -1773,6 +1806,411 @@ async def _handle_anrufe_command(chat_id):
 
     msg += "\nDetails mit <code>/kunde [Name]</code>"
     return msg
+
+
+# =====================================================================
+# Wissensbasis: tenant_leistungen pflegen
+# /leistungen, /leistung neu, /leistung [Name], /leistung_loeschen [Name]
+# =====================================================================
+
+# Erlaubte Einheiten (Voice-freundlich)
+ERLAUBTE_EINHEITEN = (
+    "Stueck", "Stunde", "Tag", "Pauschal",
+    "Meter", "lfm", "qm", "kg", "Liter", "Set",
+)
+
+
+def _einheit_normalisieren(text: str) -> str | None:
+    """Erkennt Einheit aus Tenant-Eingabe.
+
+    'pro stunde' -> 'Stunde', 'pauschal' -> 'Pauschal', '/lfm' -> 'lfm'
+    Gibt None zurueck wenn unklar.
+    """
+    if not text:
+        return None
+    t = text.lower().strip().lstrip("/")
+    mapping = {
+        "stunde": "Stunde", "stunden": "Stunde", "std": "Stunde", "h": "Stunde",
+        "stueck": "Stueck", "stk": "Stueck", "stck": "Stueck", "stück": "Stueck",
+        "tag": "Tag", "tage": "Tag",
+        "pauschal": "Pauschal", "pausch": "Pauschal", "psch": "Pauschal",
+        "meter": "Meter", "m": "Meter",
+        "lfm": "lfm", "laufmeter": "lfm", "laufender meter": "lfm",
+        "qm": "qm", "quadratmeter": "qm", "m2": "qm", "m²": "qm",
+        "kg": "kg", "kilo": "kg",
+        "liter": "Liter", "l": "Liter",
+        "set": "Set",
+    }
+    for key, val in mapping.items():
+        if t == key or t.endswith(" " + key) or t.startswith(key + " "):
+            return val
+    return None
+
+
+def _parse_preis_eingabe(text: str) -> dict | None:
+    """Parst Tenant-Eingabe wie '75 Euro pro Stunde' oder '50 pauschal'.
+
+    Returns: {'preis_eur': float, 'einheit': str} oder None bei Fehler.
+    """
+    import re
+    if not text:
+        return None
+    t = text.lower().strip()
+
+    # Preis: erste Zahl finden (mit Komma oder Punkt)
+    preis_match = re.search(r"(\d+[,.]?\d*)", t)
+    if not preis_match:
+        return None
+    preis_str = preis_match.group(1).replace(",", ".")
+    try:
+        preis = float(preis_str)
+    except ValueError:
+        return None
+    if preis <= 0:
+        return None
+
+    # Einheit: nach dem Preis suchen
+    rest = t[preis_match.end():].strip()
+    # Schluesselworte ignorieren
+    for ignore in ("euro", "eur", "€", "pro", "/", "je", "brutto", "netto"):
+        rest = rest.replace(ignore, " ")
+    rest = " ".join(rest.split())  # Whitespace normalisieren
+    einheit = _einheit_normalisieren(rest) if rest else None
+    if not einheit:
+        return None
+
+    return {"preis_eur": preis, "einheit": einheit}
+
+
+def _format_leistung_short(l) -> str:
+    """Eine Zeile fuer Liste: 'Moebelmontage - 75,00€/Stunde'."""
+    preis = f"{float(l.preis_eur):.2f}€".replace(".", ",")
+    return f"<b>{l.name}</b> — {preis}/{l.einheit}"
+
+
+def _format_leistung_full(l) -> str:
+    """Vollanzeige einer Leistung."""
+    preis = f"{float(l.preis_eur):.2f}€".replace(".", ",")
+    msg = f"<b>📐 {l.name}</b>\n"
+    msg += f"<i>{preis} pro {l.einheit} (brutto, {l.mwst_prozent}% MwSt)</i>\n"
+    if l.standard_beschreibung:
+        msg += f"\n{l.standard_beschreibung}\n"
+    if not l.aktiv:
+        msg += "\n⚠️ <i>Inaktiv (geloescht)</i>"
+    return msg
+
+
+# ----- Befehl: /leistungen -----
+
+async def _handle_leistungen_command(chat_id):
+    """Liste der aktiven Leistungen."""
+    from sqlalchemy import select
+
+    tenant = await _get_tenant_by_chat(chat_id)
+    if not tenant:
+        return "Dieser Chat ist noch keinem Betrieb zugeordnet."
+
+    async with AsyncSessionLocal() as s:
+        leistungen = (await s.execute(
+            select(TenantLeistung)
+            .where(
+                TenantLeistung.tenant_id == tenant.id,
+                TenantLeistung.aktiv == True,  # noqa: E712
+            )
+            .order_by(TenantLeistung.sortierung.asc(), TenantLeistung.name.asc())
+        )).scalars().all()
+
+    if not leistungen:
+        msg = "<b>📚 Wissensbasis</b>\n\n"
+        msg += "Du hast noch keine Leistungen hinterlegt.\n\n"
+        msg += "<i>Das ist OK</i> — du kannst /aufnahme weiter nutzen, "
+        msg += "Q schaut sich die Preise dann aus dem Gespraech ab.\n\n"
+        msg += "<b>Wenn du oft die gleichen Leistungen anbietest</b>, hilft es Q "
+        msg += "wenn du sie hier hinterlegst.\n\n"
+        msg += "<b>Beispiele aus verschiedenen Gewerken:</b>\n"
+        msg += "• Tischler: <i>Moebelmontage 75€/Stunde</i>\n"
+        msg += "• Sanitaer: <i>Heizungswartung 120€ pauschal</i>\n"
+        msg += "• Elektriker: <i>Steckdose montieren 35€/Stueck</i>\n\n"
+        msg += "<b>Tipp:</b> Pflege deine 3-5 wichtigsten Leistungen ein. "
+        msg += "Mehr ist nicht noetig.\n\n"
+        msg += "Anlegen mit: /leistung neu"
+        return msg
+
+    msg = f"<b>📚 Deine Leistungen ({len(leistungen)})</b>\n\n"
+    for i, l in enumerate(leistungen, 1):
+        msg += f"{i}. {_format_leistung_short(l)}\n"
+    msg += "\n"
+    msg += "Neue anlegen: /leistung neu\n"
+    msg += "Details: /leistung [Name]\n"
+    msg += "Loeschen: /leistung_loeschen [Name]"
+    return msg
+
+
+# ----- Befehl: /leistung neu -----
+
+async def _handle_leistung_neu_command(chat_id):
+    """Startet den Anlege-Wizard."""
+    tenant = await _get_tenant_by_chat(chat_id)
+    if not tenant:
+        return "Dieser Chat ist noch keinem Betrieb zugeordnet."
+
+    await _save_state(chat_id, STATE_LEISTUNG_WAITING_NAME, {})
+    msg = "<b>➕ Neue Leistung anlegen</b>\n\n"
+    msg += "Wie heisst die Leistung?\n\n"
+    msg += "<b>Beispiele:</b>\n"
+    msg += "• <i>Moebelmontage</i>\n"
+    msg += "• <i>Heizungswartung</i>\n"
+    msg += "• <i>Anfahrt Trier</i>\n\n"
+    msg += "/abbrechen um abzubrechen."
+    return msg
+
+
+async def _handle_leistung_name_input(chat_id, text: str):
+    """Schritt 1: Name erhalten."""
+    name = (text or "").strip()
+    if not name or len(name) < 2:
+        return "Name ist zu kurz. Bitte Name eingeben (mind. 2 Zeichen) oder /abbrechen."
+    if len(name) > 200:
+        return "Name ist zu lang (max 200 Zeichen). Bitte kuerzer."
+
+    await _save_state(chat_id, STATE_LEISTUNG_WAITING_PREIS, {"name": name})
+    msg = f"<b>{name}</b> — was kostet das?\n\n"
+    msg += "<b>Format:</b> <i>Preis Einheit</i>\n\n"
+    msg += "<b>Beispiele:</b>\n"
+    msg += "• <i>75 Euro pro Stunde</i>\n"
+    msg += "• <i>150 pro lfm</i>\n"
+    msg += "• <i>50 pauschal</i>\n"
+    msg += "• <i>35 pro Stueck</i>\n\n"
+    msg += "Erlaubte Einheiten: Stunde, Stueck, Tag, Pauschal, Meter, lfm, qm, kg, Liter, Set"
+    return msg
+
+
+async def _handle_leistung_preis_input(chat_id, text: str):
+    """Schritt 2: Preis + Einheit erhalten."""
+    state = await _load_state(chat_id)
+    if not state or not state.state_data:
+        await _clear_state(chat_id)
+        return "Wizard-Session abgelaufen. Bitte /leistung neu erneut starten."
+
+    name = (state.state_data or {}).get("name") or ""
+    parsed = _parse_preis_eingabe(text)
+    if not parsed:
+        return (
+            "Konnte den Preis nicht erkennen.\n\n"
+            "Bitte Format: <i>75 Euro pro Stunde</i> oder <i>50 pauschal</i>\n\n"
+            "Erlaubte Einheiten: Stunde, Stueck, Tag, Pauschal, Meter, lfm, qm, kg, Liter, Set\n\n"
+            "Oder /abbrechen."
+        )
+
+    state.state_data["preis_eur"] = parsed["preis_eur"]
+    state.state_data["einheit"] = parsed["einheit"]
+    await _save_state(chat_id, STATE_LEISTUNG_WAITING_BESCHREIBUNG, state.state_data)
+
+    preis_str = f"{parsed['preis_eur']:.2f}€".replace(".", ",")
+    msg = f"<b>{name}</b> — {preis_str}/{parsed['einheit']}\n\n"
+    msg += "Eine Standardbeschreibung fuer Angebote? "
+    msg += "Wird in Lexware-Angeboten als Detailtext genutzt.\n\n"
+    msg += "<b>Beispiele:</b>\n"
+    msg += "• <i>Fachgerechte Moebelmontage inkl. Aufbau und Justierung</i>\n"
+    msg += "• <i>Wartung der Heizungsanlage gem. Hersteller-Vorgabe</i>\n\n"
+    msg += "Oder /skip um leer zu lassen."
+    return msg
+
+
+async def _handle_leistung_beschreibung_input(chat_id, text: str):
+    """Schritt 3: Beschreibung (oder /skip)."""
+    state = await _load_state(chat_id)
+    if not state or not state.state_data:
+        await _clear_state(chat_id)
+        return "Wizard-Session abgelaufen. Bitte /leistung neu erneut starten."
+
+    beschreibung = None
+    t = (text or "").strip()
+    if t.lower() not in ("/skip", "skip", "-", "nein", ""):
+        if len(t) > 1000:
+            return "Beschreibung zu lang (max 1000 Zeichen). Bitte kuerzer oder /skip."
+        beschreibung = t
+
+    data = state.state_data
+    data["standard_beschreibung"] = beschreibung
+    await _save_state(chat_id, STATE_LEISTUNG_PREVIEWING, data)
+
+    # Vorschau mit Buttons
+    name = data["name"]
+    preis = data["preis_eur"]
+    einheit = data["einheit"]
+    preis_str = f"{preis:.2f}€".replace(".", ",")
+
+    msg = "<b>🔍 Vorschau</b>\n\n"
+    msg += f"<b>{name}</b>\n"
+    msg += f"<i>{preis_str} pro {einheit} (19% MwSt)</i>\n"
+    if beschreibung:
+        msg += f"\n{beschreibung}\n"
+
+    keyboard = [[
+        {"text": "✅ Anlegen", "callback_data": "leistung:save"},
+        {"text": "❌ Verwerfen", "callback_data": "leistung:cancel"},
+    ]]
+    await _send_with_inline_buttons(chat_id, msg, keyboard)
+    return None
+
+
+async def _handle_leistung_callback(chat_id, callback_data, callback_query_id, bot_token):
+    """Save/Cancel beim Anlegen."""
+    parts = callback_data.split(":")
+    if len(parts) < 2:
+        await _answer_callback_query(callback_query_id, "Ungueltig", bot_token)
+        return
+    action = parts[1]
+
+    if action == "cancel":
+        await _clear_state(chat_id)
+        await _answer_callback_query(callback_query_id, "Verworfen", bot_token)
+        await _send_to_chat(chat_id, "🗑 Anlage abgebrochen.")
+        return
+
+    if action != "save":
+        await _answer_callback_query(callback_query_id, "Unbekannt", bot_token)
+        return
+
+    state = await _load_state(chat_id)
+    if not state or not state.state_data:
+        await _answer_callback_query(callback_query_id, "Session abgelaufen", bot_token)
+        await _clear_state(chat_id)
+        return
+
+    tenant = await _get_tenant_by_chat(chat_id)
+    if not tenant:
+        await _answer_callback_query(callback_query_id, "Tenant fehlt", bot_token)
+        await _clear_state(chat_id)
+        return
+
+    data = state.state_data
+    from decimal import Decimal as _Dec
+
+    async with AsyncSessionLocal() as s:
+        leistung = TenantLeistung(
+            tenant_id=tenant.id,
+            name=data["name"][:200],
+            preis_eur=_Dec(str(data["preis_eur"])),
+            einheit=data["einheit"][:50],
+            mwst_prozent=19,
+            standard_beschreibung=data.get("standard_beschreibung"),
+            aktiv=True,
+        )
+        s.add(leistung)
+        await s.commit()
+        leistung_id = leistung.id
+
+    logger.info(
+        "TenantLeistung angelegt: id=%s tenant=%s name=%r preis=%s/%s",
+        leistung_id, tenant.id, data["name"], data["preis_eur"], data["einheit"],
+    )
+
+    await _clear_state(chat_id)
+    await _answer_callback_query(callback_query_id, "Angelegt!", bot_token)
+    await _send_to_chat(
+        chat_id,
+        f"✅ <b>{data['name']}</b> wurde angelegt.\n\n"
+        "Q wird jetzt diese Leistung kennen wenn du sie im Gespraech erwaehnst.\n\n"
+        "Weitere anlegen: /leistung neu\nUebersicht: /leistungen"
+    )
+
+
+# ----- Befehl: /leistung [Name] (Detail) -----
+
+async def _handle_leistung_show_command(chat_id, args: str):
+    """Detail einer Leistung anzeigen via Name-Match."""
+    from sqlalchemy import select, func
+
+    if not args or len(args.strip()) < 2:
+        return (
+            "Bitte einen Leistungs-Namen angeben.\n\n"
+            "Beispiel: <code>/leistung Moebelmontage</code>\n\n"
+            "Liste: /leistungen"
+        )
+
+    tenant = await _get_tenant_by_chat(chat_id)
+    if not tenant:
+        return "Dieser Chat ist noch keinem Betrieb zugeordnet."
+
+    suchbegriff = args.strip().lower()
+
+    async with AsyncSessionLocal() as s:
+        leistungen = (await s.execute(
+            select(TenantLeistung)
+            .where(
+                TenantLeistung.tenant_id == tenant.id,
+                func.lower(TenantLeistung.name).contains(suchbegriff),
+            )
+            .order_by(TenantLeistung.aktiv.desc(), TenantLeistung.name.asc())
+            .limit(5)
+        )).scalars().all()
+
+    if not leistungen:
+        return f"Keine Leistung gefunden zu <i>{suchbegriff}</i>.\n\nListe: /leistungen"
+
+    if len(leistungen) == 1:
+        return _format_leistung_full(leistungen[0])
+
+    msg = f"<b>{len(leistungen)} Treffer</b> fuer <i>{suchbegriff}</i>:\n\n"
+    for i, l in enumerate(leistungen, 1):
+        msg += f"{i}. {_format_leistung_short(l)}"
+        if not l.aktiv:
+            msg += " <i>(inaktiv)</i>"
+        msg += "\n"
+    msg += "\nGenauer eingrenzen: <code>/leistung [genauer Name]</code>"
+    return msg
+
+
+# ----- Befehl: /leistung_loeschen [Name] -----
+
+async def _handle_leistung_loeschen_command(chat_id, args: str):
+    """Soft-delete: aktiv = FALSE."""
+    from sqlalchemy import select, func
+
+    if not args or len(args.strip()) < 2:
+        return (
+            "Bitte den Leistungs-Namen angeben.\n\n"
+            "Beispiel: <code>/leistung_loeschen Moebelmontage</code>"
+        )
+
+    tenant = await _get_tenant_by_chat(chat_id)
+    if not tenant:
+        return "Dieser Chat ist noch keinem Betrieb zugeordnet."
+
+    suchbegriff = args.strip().lower()
+
+    async with AsyncSessionLocal() as s:
+        # Nur AKTIVE Leistungen finden
+        leistungen = (await s.execute(
+            select(TenantLeistung)
+            .where(
+                TenantLeistung.tenant_id == tenant.id,
+                TenantLeistung.aktiv == True,  # noqa: E712
+                func.lower(TenantLeistung.name).contains(suchbegriff),
+            )
+            .limit(5)
+        )).scalars().all()
+
+        if not leistungen:
+            return f"Keine aktive Leistung gefunden zu <i>{suchbegriff}</i>."
+
+        if len(leistungen) > 1:
+            namen = ", ".join(l.name for l in leistungen)
+            return (
+                f"Mehrere Treffer gefunden ({len(leistungen)}): {namen}\n\n"
+                "Bitte genauer eingrenzen, z.B. <code>/leistung_loeschen [genauer Name]</code>"
+            )
+
+        # Genau 1 -> deaktivieren
+        l = leistungen[0]
+        l.aktiv = False
+        await s.commit()
+        name = l.name
+
+    logger.info("TenantLeistung deaktiviert: tenant=%s name=%r", tenant.id, name)
+    return f"✅ <b>{name}</b> wurde deaktiviert.\n\nListe: /leistungen"
 
 
 async def _handle_aufnahme_command(chat_id):
@@ -2537,17 +2975,17 @@ async def _handle_rechnungen_anzeigen_command(chat_id):
     for rg in rechnungen:
         ts = rg.created_at.strftime("%d.%m %H:%M") if rg.created_at else "-"
         kunde = rg.kunde_name or "?"
-        betrag = f"{float(rg.betrag_brutto_eur):.0f}\u20ac" if rg.betrag_brutto_eur is not None else "?"
+        betrag = f"{float(rg.betrag_brutto_eur):.0f}€" if rg.betrag_brutto_eur is not None else "?"
         if rg.status == RECHNUNG_STATUS_DRAFTED and rg.lexware_invoice_id:
             link = LexwareProvider.invoice_deeplink_view(rg.lexware_invoice_id)
-            lines.append(f'\u2022 {ts} {kunde} {betrag} <a href="{link}">in Lexware</a>')
+            lines.append(f'• {ts} {kunde} {betrag} <a href="{link}">in Lexware</a>')
         elif rg.status == RECHNUNG_STATUS_ERROR:
             err = (rg.error_message or "?")[:50]
-            lines.append(f'\u2022 {ts} {kunde} {betrag} <i>Fehler: {err}</i>')
+            lines.append(f'• {ts} {kunde} {betrag} <i>Fehler: {err}</i>')
         elif rg.status == RECHNUNG_STATUS_CANCELLED:
-            lines.append(f'\u2022 {ts} {kunde} {betrag} (abgebrochen)')
+            lines.append(f'• {ts} {kunde} {betrag} (abgebrochen)')
         else:
-            lines.append(f'\u2022 {ts} {kunde} {betrag} Status: {rg.status}')
+            lines.append(f'• {ts} {kunde} {betrag} Status: {rg.status}')
     return "\n".join(lines)
 
 
@@ -2586,23 +3024,23 @@ def _format_kunde_info_for_phone(rg) -> str:
     """Zeigt dem Tenant alle Kunden-Daten zum manuell Anrufen."""
     msg = "<b>Kunden-Daten zum Anrufen:</b>\n\n"
     if rg.kunde_name:
-        msg += f"\u2022 <b>Name:</b> {rg.kunde_name}\n"
+        msg += f"• <b>Name:</b> {rg.kunde_name}\n"
     addr_parts = []
     if rg.kunde_strasse:
         addr_parts.append(rg.kunde_strasse)
     if rg.kunde_plz or rg.kunde_ort:
         addr_parts.append(f"{rg.kunde_plz or ''} {rg.kunde_ort or ''}".strip())
     if addr_parts:
-        msg += f"\u2022 <b>Adresse:</b> {', '.join(addr_parts)}\n"
+        msg += f"• <b>Adresse:</b> {', '.join(addr_parts)}\n"
     if rg.leistung_titel:
         leistung = rg.leistung_titel
         if rg.leistung_beschreibung:
             leistung += f" ({rg.leistung_beschreibung})"
-        msg += f"\u2022 <b>Leistung:</b> {leistung}\n"
+        msg += f"• <b>Leistung:</b> {leistung}\n"
     if rg.betrag_brutto_eur is not None:
-        msg += f"\u2022 <b>Betrag:</b> {float(rg.betrag_brutto_eur):.2f} \u20ac brutto\n"
+        msg += f"• <b>Betrag:</b> {float(rg.betrag_brutto_eur):.2f} € brutto\n"
     if rg.lexware_voucher_number:
-        msg += f"\u2022 <b>Rechnungsnr.:</b> {rg.lexware_voucher_number}\n"
+        msg += f"• <b>Rechnungsnr.:</b> {rg.lexware_voucher_number}\n"
     return msg
 
 
@@ -2715,8 +3153,8 @@ async def _handle_rechnung_start_mail(chat_id, rechnung_id, bot_token):
         msg += "Soll ich an diese Adresse senden?\n\n"
         msg += "<i>Oder tippe einfach eine andere Mail-Adresse hier rein.</i>"
         buttons = [
-            [{"text": f"\u2705 Senden an {suggested_email}", "callback_data": f"rg:confirm_mail:{rechnung_id}"}],
-            [{"text": "\u274c Abbrechen", "callback_data": f"rg:finish:{rechnung_id}"}],
+            [{"text": f"✅ Senden an {suggested_email}", "callback_data": f"rg:confirm_mail:{rechnung_id}"}],
+            [{"text": "❌ Abbrechen", "callback_data": f"rg:finish:{rechnung_id}"}],
         ]
         await _save_state(
             chat_id,
@@ -2801,9 +3239,9 @@ async def _handle_rechnung_mail_address_input(chat_id, text, state_data):
     msg += "Soll ich die Rechnung jetzt an diese Adresse schicken?\n\n"
     msg += "<i>Du selbst bekommst eine Kopie an deine hinterlegte E-Mail-Adresse.</i>"
     buttons = [
-        [{"text": "\u2705 Ja, senden", "callback_data": f"rg:confirm_mail:{rechnung_id}"}],
-        [{"text": "\u270f\ufe0f Andere Adresse", "callback_data": f"rg:redo_mail:{rechnung_id}"}],
-        [{"text": "\u274c Abbrechen", "callback_data": f"rg:finish:{rechnung_id}"}],
+        [{"text": "✅ Ja, senden", "callback_data": f"rg:confirm_mail:{rechnung_id}"}],
+        [{"text": "\u270f️ Andere Adresse", "callback_data": f"rg:redo_mail:{rechnung_id}"}],
+        [{"text": "❌ Abbrechen", "callback_data": f"rg:finish:{rechnung_id}"}],
     ]
     await _send_with_inline_buttons(chat_id, msg, buttons, bot_token=bot_token)
     return None  # mit Buttons schon gesendet
@@ -2943,7 +3381,7 @@ async def _handle_rechnung_send_mail_now(chat_id, rechnung_id, bot_token):
                 f"<ul>"
                 f"<li>Empfaenger: {rg_data['kunde_email']}</li>"
                 f"<li>Rechnung: {rg_data['voucher_number'] or '(noch keine Nummer)'}</li>"
-                f"<li>Betrag: {rg_data['betrag']:.2f} \u20ac brutto</li>"
+                f"<li>Betrag: {rg_data['betrag']:.2f} € brutto</li>"
                 f"</ul>"
                 f"<p>Das PDF ist auch an diese Mail angehaengt.</p>"
                 f"<p>Gewerbeagent</p>"
@@ -3005,8 +3443,8 @@ async def _handle_rechnung_send_mail_now(chat_id, rechnung_id, bot_token):
 
     await _clear_state(chat_id)
     msg = f"<b>Rechnung versendet.</b>\n\n"
-    msg += f"\u2709\ufe0f An: {rg_data['kunde_email']}\n"
-    msg += f"\u2709\ufe0f Kopie: {tenant_data['contact_email']}\n\n"
+    msg += f"\u2709️ An: {rg_data['kunde_email']}\n"
+    msg += f"\u2709️ Kopie: {tenant_data['contact_email']}\n\n"
     msg += "Mit /rechnung kannst du die naechste anlegen."
     await _send_to_chat(chat_id, msg)
 
