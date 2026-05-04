@@ -548,6 +548,17 @@ async def process_telegram_update(payload):
         reply = await _handle_rechnung_command(chat_id)
     elif text == "/aufnahme":
         reply = await _handle_aufnahme_command(chat_id)
+    elif text == "/briefing":
+        await _clear_state(chat_id)
+        reply = await _handle_briefing_command(chat_id)
+    elif text == "/anrufe":
+        await _clear_state(chat_id)
+        reply = await _handle_anrufe_command(chat_id)
+    elif text.startswith("/kunde"):
+        await _clear_state(chat_id)
+        # Argumente nach '/kunde' extrahieren
+        args = text[len("/kunde"):].strip()
+        reply = await _handle_kunde_command(chat_id, args)
     elif text == "/rechnungen_anzeigen":
         await _clear_state(chat_id)
         reply = await _handle_rechnungen_anzeigen_command(chat_id)
@@ -1579,6 +1590,190 @@ async def _handle_rechnung_input_received(
 # ==============================================================
 # /aufnahme - Kundengespraech-Aufnahme-Wizard
 # ==============================================================
+
+# =====================================================================
+# Briefing-Befehle: /briefing, /kunde X, /anrufe
+# =====================================================================
+
+def _format_kundengespraech_short(g) -> str:
+    """Eine Zeile: Datum Kunde Status."""
+    ts = g.gespraech_datum.strftime("%d.%m %H:%M") if g.gespraech_datum else "-"
+    status_emoji = {
+        "erfasst": "📋",
+        "mit_angebot": "💰",
+        "archiviert": "📦",
+    }.get(g.status, "•")
+    return f"{status_emoji} {ts} <b>{g.kunde_name}</b>"
+
+
+def _format_kundengespraech_full(g) -> str:
+    """Vollstaendige Anzeige eines Kundengespraechs (fuer /briefing + /kunde)."""
+    msg = f"<b>📋 {g.kunde_name}</b>\n"
+    if g.gespraech_datum:
+        msg += f"<i>Gespraech am {g.gespraech_datum.strftime('%d.%m.%Y %H:%M')}</i>\n"
+
+    if g.termin_datum:
+        msg += f"\n<b>📅 Termin:</b> {g.termin_datum.strftime('%d.%m.%Y %H:%M')}"
+        if g.termin_ort:
+            msg += f" @ {g.termin_ort}"
+        msg += "\n"
+
+    if g.briefing_kurz:
+        msg += f"\n<b>📝 Briefing:</b>\n<i>{g.briefing_kurz}</i>\n"
+
+    if g.todos:
+        msg += "\n<b>✅ TODOs:</b>\n"
+        for todo in g.todos[:8]:
+            msg += f"  • {todo}\n"
+
+    if g.notizen_lang:
+        # Volle Notizen nur wenn nicht zu lang
+        notizen = g.notizen_lang
+        if len(notizen) > 600:
+            notizen = notizen[:580] + "..."
+        msg += f"\n<b>📓 Notizen:</b>\n<i>{notizen}</i>\n"
+
+    if g.status == "mit_angebot":
+        msg += "\n💰 <i>Angebot wurde erstellt</i>"
+
+    return msg
+
+
+async def _handle_briefing_command(chat_id):
+    """Zeigt naechsten anstehenden Termin mit Briefing.
+
+    Faellt zurueck auf juengstes Gespraech wenn kein zukuenftiger Termin.
+    """
+    from datetime import datetime, timezone
+    from sqlalchemy import select, and_, or_
+
+    tenant = await _get_tenant_by_chat(chat_id)
+    if not tenant:
+        return "Dieser Chat ist noch keinem Betrieb zugeordnet."
+
+    now = datetime.now(timezone.utc)
+
+    async with AsyncSessionLocal() as s:
+        # Erst: zukuenftiger Termin
+        future = (await s.execute(
+            select(Kundengespraech)
+            .where(
+                Kundengespraech.tenant_id == tenant.id,
+                Kundengespraech.termin_datum.is_not(None),
+                Kundengespraech.termin_datum >= now,
+            )
+            .order_by(Kundengespraech.termin_datum.asc())
+            .limit(1)
+        )).scalar_one_or_none()
+
+        if future:
+            msg = "<b>🔔 Naechster Termin</b>\n\n"
+            msg += _format_kundengespraech_full(future)
+            return msg
+
+        # Kein zukuenftiger Termin -> juengstes Gespraech zeigen
+        latest = (await s.execute(
+            select(Kundengespraech)
+            .where(Kundengespraech.tenant_id == tenant.id)
+            .order_by(Kundengespraech.gespraech_datum.desc())
+            .limit(1)
+        )).scalar_one_or_none()
+
+        if not latest:
+            return (
+                "Noch kein Kundengespraech erfasst.\n\n"
+                "Mit /aufnahme das erste anlegen."
+            )
+
+        msg = "<b>📋 Letztes Gespraech</b>\n"
+        msg += "<i>(Kein anstehender Termin)</i>\n\n"
+        msg += _format_kundengespraech_full(latest)
+        return msg
+
+
+async def _handle_kunde_command(chat_id, args):
+    """/kunde [Name] - alle Gespraeche zu einem Kunden.
+
+    args = String nach '/kunde ' (z.B. 'Mueller' oder 'Frau Mueller')
+    """
+    from sqlalchemy import select, func
+
+    if not args or len(args.strip()) < 2:
+        return (
+            "Bitte einen Kunden-Namen angeben.\n\n"
+            "Beispiel: <code>/kunde Mueller</code>"
+        )
+
+    tenant = await _get_tenant_by_chat(chat_id)
+    if not tenant:
+        return "Dieser Chat ist noch keinem Betrieb zugeordnet."
+
+    suchbegriff = args.strip().lower()
+
+    async with AsyncSessionLocal() as s:
+        gespraeche = (await s.execute(
+            select(Kundengespraech)
+            .where(
+                Kundengespraech.tenant_id == tenant.id,
+                func.lower(Kundengespraech.kunde_name).contains(suchbegriff),
+            )
+            .order_by(Kundengespraech.gespraech_datum.desc())
+            .limit(10)
+        )).scalars().all()
+
+    if not gespraeche:
+        return f"Keine Gespraeche zu <i>{suchbegriff}</i> gefunden."
+
+    if len(gespraeche) == 1:
+        # Nur eins -> volle Anzeige
+        return _format_kundengespraech_full(gespraeche[0])
+
+    # Mehrere -> Liste mit Briefings
+    msg = f"<b>📋 Gespraeche zu '{suchbegriff}'</b> ({len(gespraeche)})\n\n"
+    for i, g in enumerate(gespraeche[:5], 1):
+        msg += f"<b>{i}. {_format_kundengespraech_short(g)}</b>\n"
+        if g.briefing_kurz:
+            briefing = g.briefing_kurz
+            if len(briefing) > 200:
+                briefing = briefing[:180] + "..."
+            msg += f"<i>{briefing}</i>\n\n"
+    if len(gespraeche) > 5:
+        msg += f"<i>... und {len(gespraeche) - 5} weitere</i>\n"
+    return msg
+
+
+async def _handle_anrufe_command(chat_id):
+    """Zeigt die letzten 10 Kundengespraeche."""
+    from sqlalchemy import select
+
+    tenant = await _get_tenant_by_chat(chat_id)
+    if not tenant:
+        return "Dieser Chat ist noch keinem Betrieb zugeordnet."
+
+    async with AsyncSessionLocal() as s:
+        gespraeche = (await s.execute(
+            select(Kundengespraech)
+            .where(Kundengespraech.tenant_id == tenant.id)
+            .order_by(Kundengespraech.gespraech_datum.desc())
+            .limit(10)
+        )).scalars().all()
+
+    if not gespraeche:
+        return (
+            "Noch kein Kundengespraech erfasst.\n\n"
+            "Mit /aufnahme das erste anlegen."
+        )
+
+    msg = f"<b>📞 Letzte {len(gespraeche)} Gespraeche</b>\n\n"
+    for i, g in enumerate(gespraeche, 1):
+        msg += f"{_format_kundengespraech_short(g)}"
+        if g.termin_datum:
+            msg += f" → 📅 {g.termin_datum.strftime('%d.%m %H:%M')}"
+        msg += "\n"
+
+    msg += "\nDetails mit <code>/kunde [Name]</code>"
+    return msg
+
 
 async def _handle_aufnahme_command(chat_id):
     """Startet den /aufnahme-Wizard fuer Kundengespraeche."""
