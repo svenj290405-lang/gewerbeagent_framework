@@ -1,4 +1,4 @@
-﻿"""
+"""
 FastAPI-Hauptanwendung fuer Gewerbeagent Framework.
 
 Zentrale Webhook-Router unter /webhook/{tenant}/{plugin}/{endpoint}
@@ -21,6 +21,7 @@ from core.plugin_system import (
     discover_plugins,
     get_plugin_for_tenant,
 )
+from core.api.anfrage_routes import router as anfrage_router
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(
@@ -50,6 +51,9 @@ app = FastAPI(
 # ============================================================
 # ROUTES
 # ============================================================
+
+app.include_router(anfrage_router)
+
 
 @app.get("/")
 async def root() -> dict[str, Any]:

@@ -144,3 +144,9 @@ from core.models.tenant_leistung import TenantLeistung
 from core.models.angebot import Angebot
 from core.models.angebot_position import AngebotPosition
 from core.models.kundengespraech import Kundengespraech
+from core.models.anfrage import (
+    AnfrageToken,
+    AnfrageResponse,
+    ANFRAGE_TYP_TISCHLER,
+    ANFRAGE_TYP_ALLGEMEIN,
+)
