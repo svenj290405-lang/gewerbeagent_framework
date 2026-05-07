@@ -244,26 +244,39 @@ async def _handle_start_command(text, chat_id, from_data):
         return reply
 
 async def _handle_help_command():
-    msg = "<b>Verfuegbare Befehle</b>\n\n"
-    msg += "<b>Wissensbasis</b>\n"
+    msg = "<b>📋 Verfuegbare Befehle</b>\n\n"
+
+    msg += "<b>📷 BELEGE</b>\n"
+    msg += "/beleg - Foto/PDF an Lexware schicken\n"
+    msg += "/belege_anzeigen - letzte 10 hochgeladene\n\n"
+
+    msg += "<b>💰 RECHNUNGEN</b>\n"
+    msg += "/rechnung - neue anlegen (Text oder Sprache)\n"
+    msg += "/rechnungen_anzeigen - letzte 10\n\n"
+
+    msg += "<b>📞 KUNDENGESPRAECHE</b>\n"
+    msg += "/aufnahme - Gespraech aufnehmen + Lexware-Angebot\n"
+    msg += "/briefing - naechster Termin mit Briefing\n"
+    msg += "/anrufe - letzte 10 Gespraeche\n"
+    msg += "/kunde [Name] - alle Gespraeche zu einem Kunden\n\n"
+
+    msg += "<b>📚 WISSENSBASIS</b>\n"
     msg += "/wissen - neuen Eintrag anlegen\n"
-    msg += "/wissen_anzeigen - alle Eintraege ansehen\n"
+    msg += "/wissen_anzeigen - alle ansehen\n"
     msg += "/wissen_loeschen - Eintrag entfernen\n\n"
-    msg += "<b>Visualisierung</b>\n"
-    msg += "/visualisierung - Foto schicken, KI rendert was rein soll\n\n"
-    msg += "<b>Lexware (Buchhaltung):</b>\n"
+
+    msg += "<b>🎨 VISUALISIERUNG</b>\n"
+    msg += "/visualisierung - Foto + KI-Rendering\n\n"
+
+    msg += "<b>⚙️ SETUP</b>\n"
     msg += "/lexware_setup - Lexware verbinden\n"
     msg += "/lexware_status - Verbindung pruefen\n"
-    msg += "/beleg - Beleg-Foto/PDF an Lexware schicken\n"
-    msg += "/belege_anzeigen - letzte hochgeladene Belege\n"
-    msg += "/rechnung - neue Rechnung anlegen (Text oder Sprache)\n"
-    msg += "/rechnungen_anzeigen - letzte Rechnungen\n\n"
-    msg += "<b>Allgemein</b>\n"
-    msg += "/start - Bot mit Ihrem Betrieb verbinden\n"
-    msg += "/status - Ist Ihr Agent aktiv?\n"
+    msg += "/start - Bot mit Betrieb verbinden\n"
+    msg += "/status - Agent-Status pruefen\n"
     msg += "/abbrechen - laufende Aktion abbrechen\n"
     msg += "/help - Diese Liste\n\n"
-    msg += "Bei Fragen: hallo@gewerbeagent.de"
+
+    msg += "<i>Bei Fragen: hallo@gewerbeagent.de</i>"
     return msg
 
 async def _handle_status_command(chat_id):
@@ -553,6 +566,12 @@ async def process_telegram_update(payload):
         reply = await _handle_belege_anzeigen_command(chat_id)
     elif text == "/rechnung":
         reply = await _handle_rechnung_command(chat_id)
+    elif text == "/microsoft_setup":
+        reply = await _handle_microsoft_setup_command(chat_id)
+    elif text == "/microsoft_status":
+        reply = await _handle_microsoft_status_command(chat_id)
+    elif text == "/microsoft_test":
+        reply = await _handle_microsoft_test_command(chat_id)
     elif text == "/aufnahme":
         reply = await _handle_aufnahme_command(chat_id)
     elif text == "/leistungen":
@@ -2211,6 +2230,125 @@ async def _handle_leistung_loeschen_command(chat_id, args: str):
 
     logger.info("TenantLeistung deaktiviert: tenant=%s name=%r", tenant.id, name)
     return f"✅ <b>{name}</b> wurde deaktiviert.\n\nListe: /leistungen"
+
+
+# =====================================================================
+# Microsoft 365 Mail-Integration
+# /microsoft_setup, /microsoft_status, /microsoft_test
+# =====================================================================
+
+async def _handle_microsoft_setup_command(chat_id):
+    """Generiert OAuth-URL und schickt sie als klickbaren Link."""
+    from config.settings import settings
+
+    tenant = await _get_tenant_by_chat(chat_id)
+    if not tenant:
+        return "Dieser Chat ist noch keinem Betrieb zugeordnet."
+
+    public_url = settings.public_url.rstrip("/")
+    setup_url = f"{public_url}/oauth/start?tenant={tenant.slug}&provider=microsoft"
+
+    msg = "<b>Microsoft 365 Mail-Anbindung</b>\n\n"
+    msg += "Klick den Link um deinen Microsoft-Account zu verbinden:\n\n"
+    msg += f'<a href="{setup_url}">Microsoft-Account verbinden</a>\n\n'
+    msg += "<i>Du wirst zu Microsoft weitergeleitet. "
+    msg += "Logg dich mit der gewuenschten Mail-Adresse ein und "
+    msg += "bestaetige dass Gewerbeagent <b>Mails in deinem Namen senden</b> darf.</i>\n\n"
+    msg += "<b>Was Gewerbeagent darf:</b>\n"
+    msg += "  Mails in deinem Namen senden\n"
+    msg += "  Profil-Info lesen\n\n"
+    msg += "<b>Was Gewerbeagent NICHT darf:</b>\n"
+    msg += "  Deine Mails lesen\n"
+    msg += "  Mails verschieben oder loeschen\n\n"
+    msg += "Status pruefen mit /microsoft_status\n"
+    msg += "Test-Mail mit /microsoft_test"
+    return msg
+
+
+async def _handle_microsoft_status_command(chat_id):
+    """Zeigt Microsoft-Verbindungsstatus."""
+    from core.integrations.microsoft import get_microsoft_status
+
+    tenant = await _get_tenant_by_chat(chat_id)
+    if not tenant:
+        return "Dieser Chat ist noch keinem Betrieb zugeordnet."
+
+    status = await get_microsoft_status(tenant.id)
+    if not status["connected"]:
+        return (
+            "<b>Microsoft 365: nicht verbunden</b>\n\n"
+            "Anbindung starten mit /microsoft_setup"
+        )
+
+    msg = "<b>Microsoft 365: verbunden</b>\n\n"
+    msg += f"Account: <b>{status['account_email']}</b>\n"
+    if status.get("expires_at"):
+        try:
+            expires_str = status["expires_at"].strftime("%d.%m.%Y %H:%M")
+            msg += f"Token gueltig bis: {expires_str}\n"
+        except Exception:
+            pass
+    msg += f"Berechtigungen: {status.get('scopes', '?')}\n\n"
+    msg += "Test-Mail senden mit /microsoft_test\n"
+    msg += "Neu verbinden (anderer Account) mit /microsoft_setup"
+    return msg
+
+
+async def _handle_microsoft_test_command(chat_id):
+    """Schickt eine Test-Mail an die Tenant-eigene Adresse."""
+    from core.integrations.microsoft import (
+        send_mail_as_user,
+        get_microsoft_status,
+        MicrosoftNotConnectedError,
+    )
+
+    tenant = await _get_tenant_by_chat(chat_id)
+    if not tenant:
+        return "Dieser Chat ist noch keinem Betrieb zugeordnet."
+
+    status = await get_microsoft_status(tenant.id)
+    if not status["connected"]:
+        return (
+            "Microsoft 365 nicht verbunden.\n\n"
+            "Erst /microsoft_setup verwenden."
+        )
+
+    to_email = status["account_email"]
+    if not to_email:
+        return "Kann Empfaenger nicht ermitteln. Bitte /microsoft_setup neu starten."
+
+    body_html = (
+        "<p>Hallo,</p>"
+        "<p>diese Test-Mail wurde von <b>Gewerbeagent</b> in deinem Namen gesendet.</p>"
+        "<p>Wenn du diese Mail in deinem Posteingang siehst, "
+        "funktioniert die Microsoft-365-Anbindung korrekt.</p>"
+        "<p>Viele Gruesse<br>Q (dein digitaler Assistent)</p>"
+    )
+
+    try:
+        ok = await send_mail_as_user(
+            tenant_id=tenant.id,
+            to_email=to_email,
+            subject="Test-Mail von Gewerbeagent",
+            body_html=body_html,
+        )
+    except MicrosoftNotConnectedError:
+        return "Microsoft-Account ist nicht (mehr) verbunden. /microsoft_setup neu."
+    except Exception as e:
+        logger.exception("microsoft_test fehler: %s", e)
+        return f"Fehler beim Senden: {e}"
+
+    if not ok:
+        return (
+            "<b>Test-Mail konnte nicht gesendet werden.</b>\n\n"
+            "Pruefe /microsoft_status. "
+            "Oder /microsoft_setup neu durchlaufen."
+        )
+
+    return (
+        f"Test-Mail an <b>{to_email}</b> gesendet.\n\n"
+        "Schau in deine Inbox (kann bis zu 1 Min dauern)."
+    )
 
 
 async def _handle_aufnahme_command(chat_id):
