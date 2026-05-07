@@ -721,3 +721,119 @@ async def analyse_kundengespraech_from_audio(
         mode=f"audio/{mime_type}",
     )
 
+
+
+# =====================================================================
+# Mail-Subject-Klassifikation
+# Schnelle Pre-Filterung: relevant fuer Bot oder nicht?
+# =====================================================================
+
+CLASSIFY_PROMPT = """Du klassifizierst eingehende Mails fuer einen Handwerker.
+
+Mail-Daten:
+- Betreff: {subject}
+- Absender: {sender}
+- Tenant: {tenant_company}, Branche: {tenant_branche}
+
+Antworte als JSON mit:
+- classification: EINER von: RELEVANT_KUNDE, RELEVANT_GESCHAEFT, NICHT_RELEVANT, PRIVAT, UNSICHER
+- confidence: low / medium / high
+- reason: 1 Satz Begruendung
+
+Kategorien:
+- RELEVANT_KUNDE: Kunden-Anfrage (Termin, Anfrage, Angebot, Reklamation)
+- RELEVANT_GESCHAEFT: Geschaefts-Mail (Lieferant, Material-Bestellung, Rechnung von Dienstleister)
+- NICHT_RELEVANT: Newsletter, Spam, Werbung, Auto-Notifications
+- PRIVAT: Privat-Mail (Familie, Steuerberater, Bank, Versicherung)
+- UNSICHER: nicht eindeutig zuzuordnen
+
+Wenn Absender bekannt-privat (Banken, Versicherungen, Steuerberater): PRIVAT
+Wenn typische Werbung-Subjects oder noreply-Adressen: NICHT_RELEVANT
+Wenn Subject eindeutig Anfrage: RELEVANT_KUNDE"""
+
+
+CLASSIFY_RESPONSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "classification": {
+            "type": "string",
+            "enum": ["RELEVANT_KUNDE", "RELEVANT_GESCHAEFT", "NICHT_RELEVANT", "PRIVAT", "UNSICHER"],
+        },
+        "confidence": {"type": "string", "enum": ["low", "medium", "high"]},
+        "reason": {"type": "string"},
+    },
+    "required": ["classification", "confidence", "reason"],
+}
+
+
+async def classify_mail_subject(
+    subject: str,
+    sender: str,
+    tenant_company: str = "Handwerksbetrieb",
+    tenant_branche: str = "Handwerk",
+) -> dict:
+    """Klassifiziert eine Mail anhand Subject + Sender. Sehr schnell, sehr billig.
+
+    Returns: {classification, confidence, reason}
+    Bei Fehler: classification=UNSICHER, confidence=low
+    """
+    import json as _json
+    import re as _re
+
+    prompt = CLASSIFY_PROMPT.format(
+        subject=(subject or "(kein Betreff)")[:200],
+        sender=(sender or "unbekannt")[:200],
+        tenant_company=tenant_company[:100],
+        tenant_branche=tenant_branche[:50],
+    )
+    prompt += "\n\nAntworte AUSSCHLIESSLICH mit gueltigem JSON (kein Markdown, keine Erklaerung), z.B.:\n"
+    prompt += '{"classification": "RELEVANT_KUNDE", "confidence": "high", "reason": "Klare Anfrage"}'
+
+    try:
+        text = await call_gemini(
+            prompt=prompt,
+            temperature=0.0,
+            max_output_tokens=2048,
+        )
+
+        # JSON aus Antwort extrahieren (Gemini packt manchmal Markdown drumherum)
+        text_stripped = text.strip()
+        if text_stripped.startswith("```"):
+            # Markdown-Codeblock entfernen
+            text_stripped = _re.sub(r"^```(?:json)?\s*", "", text_stripped)
+            text_stripped = _re.sub(r"\s*```$", "", text_stripped)
+
+        # Versuch direkt zu parsen, sonst JSON-Objekt rauspicken
+        try:
+            result = _json.loads(text_stripped)
+        except _json.JSONDecodeError:
+            match = _re.search(r"\{[^{}]*\}", text_stripped, _re.DOTALL)
+            if not match:
+                raise ValueError(f"Kein JSON in Antwort: {text[:200]!r}")
+            result = _json.loads(match.group(0))
+        # Validierung
+        valid_classes = {"RELEVANT_KUNDE", "RELEVANT_GESCHAEFT", "NICHT_RELEVANT", "PRIVAT", "UNSICHER"}
+        cls = result.get("classification") or "UNSICHER"
+        if cls not in valid_classes:
+            cls = "UNSICHER"
+        conf = result.get("confidence") or "low"
+        if conf not in ("low", "medium", "high"):
+            conf = "low"
+        reason = (result.get("reason") or "")[:500]
+
+        logger.info(
+            "classify_mail_subject: subject=%r sender=%r -> %s (%s) %s",
+            subject[:60] if subject else "",
+            sender[:40] if sender else "",
+            cls, conf, reason[:80],
+        )
+        return {"classification": cls, "confidence": conf, "reason": reason}
+
+    except Exception as e:
+        logger.warning(f"classify_mail_subject fehler: {e}")
+        return {
+            "classification": "UNSICHER",
+            "confidence": "low",
+            "reason": f"Klassifikation fehlgeschlagen: {e}",
+        }
+

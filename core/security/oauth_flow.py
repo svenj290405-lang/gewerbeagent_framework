@@ -38,6 +38,7 @@ MICROSOFT_TOKEN_URL = "https://login.microsoftonline.com/common/oauth2/v2.0/toke
 MICROSOFT_USERINFO_URL = "https://graph.microsoft.com/v1.0/me"
 MICROSOFT_SCOPES = [
     "Mail.Send",
+    "Mail.ReadWrite",
     "User.Read",
     "offline_access",
 ]

@@ -724,6 +724,29 @@ class Plugin(BasePlugin):
 
         logger.info(f"Mail-Routing: {recipient_addr} -> tenant '{tenant.slug}'")
 
+        # 2b. Subject-Klassifikation (schnell, billig, vor teurer Extraction)
+        try:
+            from core.ai.gemini import classify_mail_subject
+            classification_result = await classify_mail_subject(
+                subject=subject,
+                sender=sender_email,
+                tenant_company=tenant.company_name or "Handwerksbetrieb",
+                tenant_branche=getattr(tenant, "branche", None) or "Handwerk",
+            )
+            classification = classification_result.get("classification") or "UNSICHER"
+            classification_confidence = classification_result.get("confidence") or "low"
+            classification_reason = classification_result.get("reason") or ""
+            logger.info(
+                f"Klassifikation: tenant={tenant.slug} from={sender_email} "
+                f"subject={subject[:60]!r} -> {classification} ({classification_confidence}): "
+                f"{classification_reason[:120]}"
+            )
+        except Exception as cls_err:
+            logger.warning(f"Klassifikation fehlgeschlagen: {cls_err}")
+            classification = "UNSICHER"
+            classification_confidence = "low"
+            classification_reason = f"Fehler: {cls_err}"
+
         # 3. Globale Konfig laden
         global_cfg = await load_global_config()
         if not global_cfg:
@@ -737,6 +760,23 @@ class Plugin(BasePlugin):
                 f"Konversation gefunden: id={conv.id} state={conv.state} "
                 f"termin={conv.termin_datum}"
             )
+            # Klassifikation bei bestehender Konversation aktualisieren
+            try:
+                import datetime as _dt_cls
+                from core.database import AsyncSessionLocal as _ASL_cls
+                from core.models import EmailConversation as _EC_cls
+                from sqlalchemy import select as _select_cls
+                async with _ASL_cls() as _s_cls:
+                    _r_cls = await _s_cls.execute(_select_cls(_EC_cls).where(_EC_cls.id == conv.id))
+                    _conv_db = _r_cls.scalar_one_or_none()
+                    if _conv_db:
+                        _conv_db.classification = classification
+                        _conv_db.classification_confidence = classification_confidence
+                        _conv_db.classification_reason = (classification_reason or "")[:1000]
+                        _conv_db.classified_at = _dt_cls.datetime.now(_dt_cls.timezone.utc)
+                        await _s_cls.commit()
+            except Exception as _e_cls:
+                logger.warning(f"Klassifikations-Persist fehler: {_e_cls}")
 
         # 5. Gemini-Extraction (mit proposed_slots-Kontext falls vorhanden)
         extracted = await extract_termin_aus_mail(
@@ -776,6 +816,7 @@ class Plugin(BasePlugin):
                     state="closed",
                     existing=conv,
                 )
+
                 # Telegram-Push + Auto-Reply
                 await self._notify_tenant_telegram(
                     tenant, sender_email, sender_name, subject, extracted, action="storniert"

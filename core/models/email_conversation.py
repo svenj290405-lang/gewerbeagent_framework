@@ -26,6 +26,20 @@ STATE_PROPOSING_SLOTS = "proposing_slots"
 STATE_CLOSED = "closed"
 
 
+
+# === Klassifikations-Kategorien ===
+CLASSIFICATION_RELEVANT_KUNDE = "RELEVANT_KUNDE"
+CLASSIFICATION_RELEVANT_GESCHAEFT = "RELEVANT_GESCHAEFT"
+CLASSIFICATION_NICHT_RELEVANT = "NICHT_RELEVANT"
+CLASSIFICATION_PRIVAT = "PRIVAT"
+CLASSIFICATION_UNSICHER = "UNSICHER"
+
+CLASSIFICATIONS_RELEVANT = (CLASSIFICATION_RELEVANT_KUNDE, CLASSIFICATION_RELEVANT_GESCHAEFT)
+
+CONFIDENCE_LOW = "low"
+CONFIDENCE_MEDIUM = "medium"
+CONFIDENCE_HIGH = "high"
+
 class EmailConversation(Base):
     """Mail-Konversations-Memory pro (Tenant, Kunden-Mail)."""
 
@@ -87,6 +101,10 @@ class EmailConversation(Base):
         nullable=False,
     )
 
+    classification: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    classification_confidence: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    classification_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    classified_at: Mapped["dt.datetime | None"] = mapped_column(DateTime(timezone=True), nullable=True)
     # Relationship zum Tenant
     tenant: Mapped["Tenant"] = relationship()  # noqa: F821
 

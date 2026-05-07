@@ -570,6 +570,8 @@ async def process_telegram_update(payload):
         reply = await _handle_microsoft_setup_command(chat_id)
     elif text == "/microsoft_status":
         reply = await _handle_microsoft_status_command(chat_id)
+    elif text == "/microsoft_check":
+        reply = await _handle_microsoft_check_command(chat_id)
     elif text == "/microsoft_test":
         reply = await _handle_microsoft_test_command(chat_id)
     elif text == "/aufnahme":
@@ -2291,6 +2293,50 @@ async def _handle_microsoft_status_command(chat_id):
     msg += f"Berechtigungen: {status.get('scopes', '?')}\n\n"
     msg += "Test-Mail senden mit /microsoft_test\n"
     msg += "Neu verbinden (anderer Account) mit /microsoft_setup"
+    return msg
+
+
+async def _handle_microsoft_check_command(chat_id):
+    """Polled die Outlook-Inbox des Tenants und klassifiziert ungelesene Mails."""
+    from core.integrations.microsoft_inbox import poll_microsoft_inbox
+
+    tenant = await _get_tenant_by_chat(chat_id)
+    if not tenant:
+        return "Dieser Chat ist noch keinem Betrieb zugeordnet."
+
+    result = await poll_microsoft_inbox(tenant.id)
+
+    if result.get("error"):
+        return f"Fehler beim Abruf: {result['error']}"
+
+    n = result.get("checked", 0)
+    if n == 0:
+        return "Keine ungelesenen Mails in deiner Outlook-Inbox."
+
+    classified = result.get("classified", {})
+    msgs = result.get("messages", [])
+
+    msg = f"<b>Outlook-Inbox: {n} ungelesene Mail(s)</b>\n\n"
+    msg += "<b>Verteilung:</b>\n"
+    for cls, count in classified.items():
+        msg += f"  {cls}: {count}\n"
+
+    msg += "\n<b>Details (max 10):</b>\n"
+    for m in msgs[:10]:
+        cls_emoji = {
+            "RELEVANT_KUNDE": "K",
+            "RELEVANT_GESCHAEFT": "G",
+            "NICHT_RELEVANT": "N",
+            "PRIVAT": "P",
+            "UNSICHER": "?",
+        }.get(m["classification"], "?")
+        msg += (
+            f"\n<b>[{cls_emoji}] {m['classification']}</b> ({m['confidence']})\n"
+            f"Von: {m['sender']}\n"
+            f"Betreff: {m['subject']}\n"
+            f"Grund: {m['reason'][:100]}\n"
+        )
+
     return msg
 
 
