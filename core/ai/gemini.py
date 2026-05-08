@@ -837,3 +837,94 @@ async def classify_mail_subject(
             "reason": f"Klassifikation fehlgeschlagen: {e}",
         }
 
+
+# =====================================================================
+# Mail-Reply-Generator fuer RELEVANT_KUNDE Mails
+# Generiert persoenliche Antwort auf Kunden-Anfrage mit Wissensbasis-
+# Kontext und Verweis auf Anfrage-Formular.
+# =====================================================================
+
+REPLY_PROMPT = """Du bist Q, ein freundlicher Assistent fuer den Handwerker {tenant_company} (Branche: {tenant_branche}).
+
+Du beantwortest eingehende Kunden-Mails im Namen von {tenant_owner_first_name}.
+
+Kontext-Wissen ueber den Betrieb:
+{wissensbasis}
+
+Eingehende Kunden-Mail:
+- Betreff: {subject}
+- Von: {sender_name} ({sender_email})
+
+Mail-Inhalt:
+---
+{body}
+---
+
+Aufgabe:
+Schreib eine kurze, freundliche, persoenliche Antwort. Beachte:
+1. Geh konkret auf das Anliegen ein (nicht generisch)
+2. Wenn die Wissensbasis Antworten enthaelt (Preise, Lieferzeiten), nutze sie
+3. Bitte am Ende um Ausfuellen des Anfrage-Formulars mit dem Link {form_url}
+4. Schreib auf Deutsch, hoeflich aber nicht foermlich (Du-Form falls Kunde Du verwendet, sonst Sie)
+5. Unterzeichne mit "{tenant_owner_first_name} (via Q)"
+6. KEIN Marketing-Geschwafel, KEINE Floskeln wie "Vielen Dank fuer ihre Anfrage"
+7. Sei direkt und ehrlich
+
+Antworte NUR mit dem Mail-Text (keine Begruessung wie "Hier die Antwort:", kein Markdown)."""
+
+
+async def generate_anfrage_reply(
+    subject: str,
+    sender_name: str,
+    sender_email: str,
+    body: str,
+    form_url: str,
+    tenant_company: str = "Handwerksbetrieb",
+    tenant_branche: str = "Handwerk",
+    tenant_owner_first_name: str = "Daniel",
+    wissensbasis: str = "(keine spezifischen Infos hinterlegt)",
+) -> str:
+    """Generiert eine persoenliche Antwort auf eine Kunden-Mail.
+
+    Returns: Plain-Text Antwort (kein HTML), bereit fuer send_mail_as_user.
+    """
+    prompt = REPLY_PROMPT.format(
+        tenant_company=tenant_company[:100],
+        tenant_branche=tenant_branche[:50],
+        tenant_owner_first_name=tenant_owner_first_name[:50],
+        wissensbasis=wissensbasis[:3000],
+        subject=(subject or "(kein Betreff)")[:200],
+        sender_name=(sender_name or "Kunde")[:100],
+        sender_email=(sender_email or "")[:100],
+        body=(body or "(kein Inhalt)")[:4000],
+        form_url=form_url,
+    )
+
+    try:
+        text = await call_gemini(
+            prompt=prompt,
+            temperature=0.4,
+            max_output_tokens=8192,
+        )
+        text = (text or "").strip()
+        if not text:
+            raise ValueError("Gemini hat leeren Text zurueckgegeben")
+
+        logger.info(
+            f"generate_anfrage_reply: subject={subject[:60]!r} sender={sender_email!r} "
+            f"-> reply_len={len(text)}"
+        )
+        return text
+    except Exception as e:
+        logger.exception(f"generate_anfrage_reply fehler: {e}")
+        # Fallback-Antwort
+        return (
+            f"Hallo {sender_name or 'zusammen'},\n\n"
+            f"vielen Dank fuer deine Nachricht. Damit ich dir gut weiterhelfen kann, "
+            f"fuell bitte kurz das folgende Formular aus:\n\n"
+            f"{form_url}\n\n"
+            f"Dann melde ich mich schnell mit einem konkreten Angebot.\n\n"
+            f"Viele Gruesse\n"
+            f"{tenant_owner_first_name} (via Q)"
+        )
+

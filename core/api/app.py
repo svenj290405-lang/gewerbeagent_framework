@@ -9,6 +9,7 @@ Zentrale Webhook-Router unter /webhook/{tenant}/{plugin}/{endpoint}
 from __future__ import annotations
 
 import logging
+import asyncio
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -22,6 +23,7 @@ from core.plugin_system import (
     get_plugin_for_tenant,
 )
 from core.api.anfrage_routes import router as anfrage_router
+from core.integrations.microsoft_cron import cron_loop as microsoft_cron_loop
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(
@@ -32,11 +34,21 @@ logging.basicConfig(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Lifecycle-Hook: Plugins beim Start laden."""
+    """Lifecycle-Hook: Plugins beim Start laden + Cron-Tasks starten."""
     logger.info("Framework startet...")
     discover_plugins()
     logger.info(f"{len(PLUGIN_MANIFESTS)} Plugins geladen")
+
+    cron_task = asyncio.create_task(microsoft_cron_loop())
+    logger.info("Microsoft-Cron als Background-Task gestartet")
+
     yield
+
+    cron_task.cancel()
+    try:
+        await cron_task
+    except asyncio.CancelledError:
+        pass
     logger.info("Framework faehrt runter.")
 
 

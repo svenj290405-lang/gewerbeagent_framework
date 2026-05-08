@@ -2336,6 +2336,13 @@ async def _handle_microsoft_check_command(chat_id):
             f"Betreff: {m['subject']}\n"
             f"Grund: {m['reason'][:100]}\n"
         )
+        # Bei RELEVANT_KUNDE: Verarbeitungs-Status anzeigen
+        pr = m.get("process_result")
+        if pr is not None:
+            if pr.get("success"):
+                msg += f"  Q hat geantwortet + Mail verschoben\n"
+            elif pr.get("error"):
+                msg += f"  Fehler: {pr['error'][:80]}\n"
 
     return msg
 

@@ -38,9 +38,16 @@ async def fetch_unread_messages(
     access_token = await get_microsoft_token(tenant_id)
 
     # Nur Felder holen die wir brauchen - bodyPreview ist max 255 Zeichen
+    # Filter: ungelesen UND noch keine Q-Kategorie
+    # Microsoft Graph $filter mit categories: "categories/any(c:c eq 'X')"
+    # Wir wollen das Gegenteil: KEINE der Q-Kategorien
+    q_filter_parts = [f"categories/any(c:c eq \'{cat}\')" for cat in ALL_Q_CATEGORIES]
+    not_q_marked = "not (" + " or ".join(q_filter_parts) + ")"
+    full_filter = f"isRead eq false and {not_q_marked}"
+
     params = {
-        "$filter": "isRead eq false",
-        "$select": "id,subject,from,bodyPreview,receivedDateTime,isRead",
+        "$filter": full_filter,
+        "$select": "id,subject,from,bodyPreview,categories,receivedDateTime,isRead",
         "$orderby": "receivedDateTime desc",
         "$top": top,
     }
@@ -136,6 +143,39 @@ async def poll_microsoft_inbox(tenant_id: UUID) -> dict:
             reason = f"Fehler: {e}"
 
         classified_counts[classification] = classified_counts.get(classification, 0) + 1
+
+        # Auto-Verarbeitung NUR bei RELEVANT_KUNDE
+        process_result = None
+        if classification == "RELEVANT_KUNDE":
+            try:
+                process_result = await process_relevant_kunde_mail(
+                    tenant_id=tenant_id,
+                    message_id=msg.get("id"),
+                    classification_result={
+                        "classification": classification,
+                        "confidence": confidence,
+                        "reason": reason,
+                    },
+                )
+            except Exception as e:
+                logger.exception(f"process_relevant_kunde_mail fehler: {e}")
+                process_result = {"success": False, "error": str(e)}
+        else:
+            # Andere Klassifikationen: Outlook-Kategorie setzen, Mail bleibt in Inbox
+            target_category = Q_CATEGORY_BY_CLASSIFICATION.get(classification)
+            if target_category and msg.get("id"):
+                try:
+                    # Bestehende Kategorien beibehalten + Q-Kategorie hinzufuegen
+                    existing_cats = msg.get("categories") or []
+                    new_cats = list(existing_cats) + [target_category]
+                    await set_message_categories(
+                        tenant_id=tenant_id,
+                        message_id=msg.get("id"),
+                        categories=new_cats,
+                    )
+                except Exception as e:
+                    logger.warning(f"Kategorie setzen fehler (non-fatal): {e}")
+
         results.append({
             "subject": subject[:80],
             "sender": sender_email,
@@ -146,6 +186,7 @@ async def poll_microsoft_inbox(tenant_id: UUID) -> dict:
             "message_id": msg.get("id"),
             "received": msg.get("receivedDateTime"),
             "preview": body_preview[:120],
+            "process_result": process_result,
         })
 
         logger.info(
@@ -159,3 +200,396 @@ async def poll_microsoft_inbox(tenant_id: UUID) -> dict:
         "tenant_slug": tenant.slug,
         "polled_at": datetime.now(timezone.utc).isoformat(),
     }
+
+
+# =====================================================================
+# Vollen Mail-Body holen (fuer Reply-Generierung)
+# =====================================================================
+
+async def fetch_full_message(tenant_id: UUID, message_id: str) -> dict | None:
+    """Holt vollen Mail-Inhalt inkl. Body via Graph API.
+
+    Returns: dict mit subject, from, body (text/html), receivedDateTime
+    """
+    try:
+        access_token = await get_microsoft_token(tenant_id)
+    except Exception as e:
+        logger.error(f"fetch_full_message Token-Fehler: {e}")
+        return None
+
+    params = {
+        "$select": "id,subject,from,toRecipients,body,bodyPreview,receivedDateTime,isRead,internetMessageId",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            resp = await client.get(
+                f"{GRAPH_API_BASE}/me/messages/{message_id}",
+                headers={"Authorization": f"Bearer {access_token}"},
+                params=params,
+            )
+            if resp.status_code != 200:
+                logger.error(
+                    f"fetch_full_message fehlgeschlagen: {resp.status_code} {resp.text[:200]}"
+                )
+                return None
+            return resp.json()
+    except Exception as e:
+        logger.exception(f"fetch_full_message Exception: {e}")
+        return None
+
+
+# =====================================================================
+# Ordner-Management: "Gewerbeagent"-Ordner anlegen + Mails verschieben
+# =====================================================================
+
+GEWERBEAGENT_FOLDER_NAME = "Gewerbeagent"
+
+# In-Memory-Cache: tenant_id -> folder_id
+_folder_id_cache: dict[str, str] = {}
+
+
+async def ensure_gewerbeagent_folder(tenant_id: UUID) -> str | None:
+    """Stellt sicher dass der 'Gewerbeagent'-Ordner existiert. Returnt Ordner-ID.
+
+    Cached die ID in-memory pro Tenant.
+    """
+    cache_key = str(tenant_id)
+    if cache_key in _folder_id_cache:
+        return _folder_id_cache[cache_key]
+
+    try:
+        access_token = await get_microsoft_token(tenant_id)
+    except Exception as e:
+        logger.error(f"ensure_gewerbeagent_folder Token-Fehler: {e}")
+        return None
+
+    # 1) Existierende Top-Level-Ordner durchsuchen
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.get(
+                f"{GRAPH_API_BASE}/me/mailFolders",
+                headers={"Authorization": f"Bearer {access_token}"},
+                params={"$top": 100, "$select": "id,displayName"},
+            )
+            if resp.status_code != 200:
+                logger.error(f"mailFolders-list fehlgeschlagen: {resp.status_code}")
+                return None
+            folders = resp.json().get("value", [])
+            for f in folders:
+                if f.get("displayName") == GEWERBEAGENT_FOLDER_NAME:
+                    folder_id = f["id"]
+                    _folder_id_cache[cache_key] = folder_id
+                    logger.info(
+                        f"Ordner '{GEWERBEAGENT_FOLDER_NAME}' existiert: tenant={tenant_id} "
+                        f"folder_id={folder_id[:30]}..."
+                    )
+                    return folder_id
+    except Exception as e:
+        logger.exception(f"mailFolders-list Exception: {e}")
+        return None
+
+    # 2) Nicht gefunden - anlegen
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(
+                f"{GRAPH_API_BASE}/me/mailFolders",
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "Content-Type": "application/json",
+                },
+                json={"displayName": GEWERBEAGENT_FOLDER_NAME},
+            )
+            if resp.status_code not in (200, 201):
+                logger.error(
+                    f"mailFolders-create fehlgeschlagen: {resp.status_code} {resp.text[:200]}"
+                )
+                return None
+            folder_id = resp.json().get("id")
+            _folder_id_cache[cache_key] = folder_id
+            logger.info(
+                f"Ordner '{GEWERBEAGENT_FOLDER_NAME}' angelegt: tenant={tenant_id} "
+                f"folder_id={folder_id[:30]}..."
+            )
+            return folder_id
+    except Exception as e:
+        logger.exception(f"mailFolders-create Exception: {e}")
+        return None
+
+
+async def move_to_gewerbeagent(tenant_id: UUID, message_id: str) -> bool:
+    """Verschiebt eine Mail in den Gewerbeagent-Ordner. Erstellt Ordner falls noetig."""
+    folder_id = await ensure_gewerbeagent_folder(tenant_id)
+    if not folder_id:
+        logger.warning(f"move_to_gewerbeagent: kein folder_id, Mail bleibt in Inbox")
+        return False
+
+    try:
+        access_token = await get_microsoft_token(tenant_id)
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(
+                f"{GRAPH_API_BASE}/me/messages/{message_id}/move",
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "Content-Type": "application/json",
+                },
+                json={"destinationId": folder_id},
+            )
+            if resp.status_code in (200, 201):
+                logger.info(
+                    f"Mail verschoben nach Gewerbeagent: tenant={tenant_id} "
+                    f"msg_id={message_id[:30]}..."
+                )
+                return True
+            logger.error(
+                f"messages-move fehlgeschlagen: {resp.status_code} {resp.text[:200]}"
+            )
+            return False
+    except Exception as e:
+        logger.exception(f"move_to_gewerbeagent Exception: {e}")
+        return False
+
+
+# =====================================================================
+# Pipeline: RELEVANT_KUNDE Mail komplett verarbeiten
+# (Body holen + Token erstellen + Antwort senden + verschieben)
+# =====================================================================
+
+async def process_relevant_kunde_mail(
+    tenant_id: UUID,
+    message_id: str,
+    classification_result: dict,
+) -> dict:
+    """Verarbeitet eine als RELEVANT_KUNDE klassifizierte Mail komplett.
+
+    Schritte:
+    1. Vollen Body holen
+    2. Anfrage-Token + URL erstellen
+    3. KI-Antwort generieren mit Wissensbasis-Kontext + Formular-Link
+    4. Antwort via Microsoft Graph aus Tenant-Adresse senden
+    5. Original-Mail in 'Gewerbeagent'-Ordner verschieben
+
+    Returns: {success, sent, moved, token, error?}
+    """
+    from core.ai.gemini import generate_anfrage_reply
+    from core.integrations.anfrage_forms import (
+        create_anfrage_token,
+        build_anfrage_url,
+    )
+    from core.integrations.microsoft import send_mail_as_user
+    from core.models import ANFRAGE_TYP_TISCHLER, ANFRAGE_TYP_ALLGEMEIN, Tenant
+    from core.database import AsyncSessionLocal
+    from sqlalchemy import select as _sel
+
+    result = {"success": False, "sent": False, "moved": False, "token": None}
+
+    # 1) Vollen Body holen
+    full = await fetch_full_message(tenant_id, message_id)
+    if not full:
+        result["error"] = "fetch_full_message fehlgeschlagen"
+        return result
+
+    subject = full.get("subject", "(kein Betreff)") or "(kein Betreff)"
+    from_obj = (full.get("from") or {}).get("emailAddress") or {}
+    sender_email = from_obj.get("address", "") or "unbekannt"
+    sender_name = from_obj.get("name", "") or sender_email
+    body_obj = full.get("body") or {}
+    body_text = body_obj.get("content", "") or full.get("bodyPreview", "") or ""
+    # Wenn HTML, simpel strippen
+    if body_obj.get("contentType", "").lower() == "html":
+        import re as _re
+        body_text = _re.sub(r"<[^>]+>", " ", body_text)
+        body_text = _re.sub(r"\s+", " ", body_text).strip()
+    internet_message_id = full.get("internetMessageId", "")
+
+    # 2) Tenant + Wissensbasis laden
+    async with AsyncSessionLocal() as session:
+        t_res = await session.execute(_sel(Tenant).where(Tenant.id == tenant_id))
+        tenant = t_res.scalar_one_or_none()
+    if not tenant:
+        result["error"] = "Tenant nicht gefunden"
+        return result
+
+    tenant_company = tenant.company_name or "Handwerksbetrieb"
+    tenant_branche = getattr(tenant, "branche", None) or "Handwerk"
+    tenant_owner = (tenant.company_name or "der Betrieb").split()[0]
+
+    # Wissensbasis als Text laden (best-effort)
+    wissensbasis_text = "(noch keine spezifischen Infos hinterlegt)"
+    try:
+        from core.models import TenantKnowledge
+        async with AsyncSessionLocal() as session:
+            k_res = await session.execute(
+                _sel(TenantKnowledge).where(TenantKnowledge.tenant_id == tenant_id)
+            )
+            entries = k_res.scalars().all()
+            if entries:
+                lines = []
+                for e in entries[:20]:
+                    cat = getattr(e, "kategorie", "") or ""
+                    txt = getattr(e, "inhalt", "") or ""
+                    if txt:
+                        lines.append(f"- [{cat}] {txt[:300]}")
+                if lines:
+                    wissensbasis_text = "\n".join(lines)
+    except ImportError:
+        pass
+    except Exception as e:
+        logger.warning(f"Wissensbasis laden fehler: {e}")
+
+    # 3) Token + URL erstellen
+    anfrage_typ = ANFRAGE_TYP_TISCHLER if "tischler" in tenant_branche.lower() else ANFRAGE_TYP_ALLGEMEIN
+    try:
+        token_obj = await create_anfrage_token(
+            tenant_id=tenant_id,
+            kunde_email=sender_email,
+            kunde_name=sender_name,
+            anfrage_typ=anfrage_typ,
+            original_subject=subject,
+            original_message_id=internet_message_id,
+            valid_days=14,
+        )
+        form_url = build_anfrage_url(token_obj.token)
+        result["token"] = token_obj.token
+    except Exception as e:
+        logger.exception(f"Token-Erstellung fehler: {e}")
+        result["error"] = f"Token-Erstellung: {e}"
+        return result
+
+    # 4) KI-Antwort generieren
+    try:
+        reply_text = await generate_anfrage_reply(
+            subject=subject,
+            sender_name=sender_name,
+            sender_email=sender_email,
+            body=body_text,
+            form_url=form_url,
+            tenant_company=tenant_company,
+            tenant_branche=tenant_branche,
+            tenant_owner_first_name=tenant_owner,
+            wissensbasis=wissensbasis_text,
+        )
+    except Exception as e:
+        logger.exception(f"KI-Reply fehler: {e}")
+        result["error"] = f"KI-Reply: {e}"
+        return result
+
+    # 5) Mail senden via Microsoft Graph
+    try:
+        # Plain-Text -> HTML mit klickbaren Links
+        # 1) URLs zu <a href>-Tags machen
+        import re as _re_link
+        # Finde URLs die vermutlich Anfrage-Links sind und mache sie klickbar
+        def _linkify(text: str) -> str:
+            # Erst form_url speziell behandeln (sicher klickbar)
+            t = text
+            if form_url in t:
+                button_html = (
+                    f'<a href="{form_url}" style="display:inline-block;'
+                    f'background:#2563eb;color:white;padding:10px 20px;'
+                    f'border-radius:6px;text-decoration:none;font-weight:500;">'
+                    f'Anfrage-Formular ausfuellen</a>'
+                )
+                # Ersetze nur den ersten Treffer
+                t = t.replace(form_url, button_html, 1)
+            # Andere URLs auch klickbar (falls Gemini eine zweite einbaut)
+            t = _re_link.sub(
+                r'(?<!href=")(?<!>)(https?://[^\s<>"]+)',
+                r'<a href="\1">\1</a>',
+                t,
+            )
+            return t
+
+        body_with_links = _linkify(reply_text)
+        # 2) Zeilenumbrueche zu HTML
+        body_html = "<p>" + body_with_links.replace("\n\n", "</p><p>").replace("\n", "<br>") + "</p>"
+        sent_ok = await send_mail_as_user(
+            tenant_id=tenant_id,
+            to_email=sender_email,
+            subject=f"Re: {subject}" if not subject.lower().startswith("re:") else subject,
+            body_html=body_html,
+            save_to_sent=True,
+        )
+        result["sent"] = bool(sent_ok)
+        if not sent_ok:
+            result["error"] = "Mail-Versand fehlgeschlagen"
+            logger.warning(f"send_mail_as_user returnte False: tenant={tenant_id} to={sender_email}")
+    except Exception as e:
+        logger.exception(f"Mail-Versand fehler: {e}")
+        result["error"] = f"Mail-Versand: {e}"
+        return result
+
+    # 6) Original-Mail in Gewerbeagent-Ordner verschieben (nur wenn Send erfolgreich)
+    if result["sent"]:
+        try:
+            moved = await move_to_gewerbeagent(tenant_id, message_id)
+            result["moved"] = moved
+        except Exception as e:
+            logger.warning(f"Mail-Move fehler (non-fatal): {e}")
+
+    result["success"] = result["sent"]
+    logger.info(
+        f"process_relevant_kunde_mail: tenant={tenant_id} from={sender_email} "
+        f"sent={result['sent']} moved={result['moved']} token={result.get('token','')[:10]}..."
+    )
+    return result
+
+
+# =====================================================================
+# Outlook-Kategorien fuer Q-Klassifikation
+# Daniel sieht in Outlook auf einen Blick was Q schon angeschaut hat.
+# =====================================================================
+
+# Mapping Klassifikation -> Outlook-Kategorie-Name
+Q_CATEGORY_BY_CLASSIFICATION = {
+    "NICHT_RELEVANT": "Q-Werbung",
+    "PRIVAT": "Q-Privat",
+    "RELEVANT_GESCHAEFT": "Q-Geschaeft",
+    "UNSICHER": "Q-Unsicher",
+    # RELEVANT_KUNDE bekommt KEINE Kategorie - wird ja in Ordner verschoben
+}
+
+# Alle Q-Kategorien (fuer Filter "nicht Q-markiert")
+ALL_Q_CATEGORIES = list(Q_CATEGORY_BY_CLASSIFICATION.values())
+
+
+async def set_message_categories(
+    tenant_id: UUID, message_id: str, categories: list[str]
+) -> bool:
+    """Setzt Outlook-Kategorien auf einer Mail via Graph API.
+
+    Categories werden in Outlook als farbige Labels angezeigt.
+    Microsoft erstellt die Kategorie automatisch falls nicht vorhanden.
+    Returns True bei Erfolg.
+    """
+    try:
+        access_token = await get_microsoft_token(tenant_id)
+    except Exception as e:
+        logger.error(f"set_message_categories Token-Fehler: {e}")
+        return False
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.patch(
+                f"{GRAPH_API_BASE}/me/messages/{message_id}",
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "Content-Type": "application/json",
+                },
+                json={"categories": categories},
+            )
+            if resp.status_code in (200, 204):
+                logger.info(
+                    f"Kategorie gesetzt: tenant={tenant_id} "
+                    f"msg={message_id[:30]}... cats={categories}"
+                )
+                return True
+            logger.error(
+                f"set_message_categories fehlgeschlagen: "
+                f"{resp.status_code} {resp.text[:200]}"
+            )
+            return False
+    except Exception as e:
+        logger.exception(f"set_message_categories Exception: {e}")
+        return False
+
