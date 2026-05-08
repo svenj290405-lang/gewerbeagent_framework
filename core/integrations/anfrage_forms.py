@@ -130,9 +130,60 @@ ANFRAGE_SCHEMAS = {
 }
 
 
-def get_schema(anfrage_typ: str) -> dict:
-    """Liefert das Formular-Schema fuer den Anfrage-Typ. Default = allgemein."""
+def get_default_schema(anfrage_typ: str) -> dict:
+    """Liefert das HARDCODED Default-Schema. Fallback wenn kein Tenant-Schema in DB."""
     return ANFRAGE_SCHEMAS.get(anfrage_typ) or ANFRAGE_SCHEMAS[ANFRAGE_TYP_ALLGEMEIN]
+
+
+async def get_schema_for_tenant(
+    tenant_id: "UUID | None",
+    anfrage_typ: str,
+) -> dict:
+    """Liefert das Formular-Schema fuer einen Tenant + Anfrage-Typ.
+
+    Reihenfolge:
+    1. Wenn tenant_id gegeben: DB-Lookup auf tenant_anfrage_schemas
+       (active = True UND tenant_id + anfrage_typ matchen)
+    2. Sonst: hardcoded Default-Schema aus ANFRAGE_SCHEMAS
+
+    Returns: {title, subtitle, fields}
+    """
+    if tenant_id is not None:
+        try:
+            from core.models import TenantAnfrageSchema
+            async with AsyncSessionLocal() as session:
+                result = await session.execute(
+                    select(TenantAnfrageSchema).where(
+                        TenantAnfrageSchema.tenant_id == tenant_id,
+                        TenantAnfrageSchema.anfrage_typ == anfrage_typ,
+                        TenantAnfrageSchema.is_active.is_(True),
+                    )
+                )
+                row = result.scalar_one_or_none()
+                if row is not None:
+                    default = get_default_schema(anfrage_typ)
+                    logger.info(
+                        f"get_schema_for_tenant: DB-Schema gefunden fuer "
+                        f"tenant={tenant_id} typ={anfrage_typ}"
+                    )
+                    return {
+                        "title": row.title or default.get("title", "Anfrage-Formular"),
+                        "subtitle": row.subtitle or default.get("subtitle", ""),
+                        "fields": row.fields or default.get("fields", []),
+                    }
+        except Exception as e:
+            logger.warning(f"DB-Schema-Lookup fehler (fallback auf Default): {e}")
+
+    # Fallback
+    return get_default_schema(anfrage_typ)
+
+
+# Backwards-compat: alte sync-Funktion bleibt fuer Default-Aufrufe
+def get_schema(anfrage_typ: str) -> dict:
+    """Liefert das HARDCODED Default-Schema (sync, ohne DB).
+    Fuer neue Calls bitte get_schema_for_tenant() nutzen.
+    """
+    return get_default_schema(anfrage_typ)
 
 
 async def create_anfrage_token(

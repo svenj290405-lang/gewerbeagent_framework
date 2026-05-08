@@ -18,6 +18,10 @@ from sqlalchemy import select
 
 from core.ai.gemini import classify_mail_subject
 from core.database import AsyncSessionLocal
+from core.integrations.mail_template import (
+    build_kunde_reply_html,
+    extract_first_name,
+)
 from core.integrations.microsoft import (
     GRAPH_API_BASE,
     MicrosoftNotConnectedError,
@@ -474,35 +478,26 @@ async def process_relevant_kunde_mail(
         result["error"] = f"KI-Reply: {e}"
         return result
 
-    # 5) Mail senden via Microsoft Graph
-    try:
-        # Plain-Text -> HTML mit klickbaren Links
-        # 1) URLs zu <a href>-Tags machen
-        import re as _re_link
-        # Finde URLs die vermutlich Anfrage-Links sind und mache sie klickbar
-        def _linkify(text: str) -> str:
-            # Erst form_url speziell behandeln (sicher klickbar)
-            t = text
-            if form_url in t:
-                button_html = (
-                    f'<a href="{form_url}" style="display:inline-block;'
-                    f'background:#2563eb;color:white;padding:10px 20px;'
-                    f'border-radius:6px;text-decoration:none;font-weight:500;">'
-                    f'Anfrage-Formular ausfuellen</a>'
-                )
-                # Ersetze nur den ersten Treffer
-                t = t.replace(form_url, button_html, 1)
-            # Andere URLs auch klickbar (falls Gemini eine zweite einbaut)
-            t = _re_link.sub(
-                r'(?<!href=")(?<!>)(https?://[^\s<>"]+)',
-                r'<a href="\1">\1</a>',
-                t,
-            )
-            return t
+    # 5) Mail-HTML mit professionellem Template bauen
+    # Vorname extrahieren - NUR aus echtem Display-Name, nicht aus E-Mail
+    if sender_name and "@" not in sender_name and sender_name != sender_email:
+        kunde_anrede = extract_first_name(sender_name)
+    else:
+        kunde_anrede = ""
 
-        body_with_links = _linkify(reply_text)
-        # 2) Zeilenumbrueche zu HTML
-        body_html = "<p>" + body_with_links.replace("\n\n", "</p><p>").replace("\n", "<br>") + "</p>"
+    body_html = build_kunde_reply_html(
+        kunde_anrede_name=kunde_anrede,
+        kunde_email=sender_email,
+        reply_text=reply_text,
+        form_url=form_url,
+        company_name=tenant_company,
+        contact_name=getattr(tenant, "contact_name", "") or tenant_owner,
+        contact_email=getattr(tenant, "contact_email", "") or "",
+        contact_phone=getattr(tenant, "contact_phone", "") or "",
+    )
+
+    # Mail senden via Microsoft Graph
+    try:
         sent_ok = await send_mail_as_user(
             tenant_id=tenant_id,
             to_email=sender_email,

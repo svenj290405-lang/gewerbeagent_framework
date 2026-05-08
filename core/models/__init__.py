@@ -150,3 +150,4 @@ from core.models.anfrage import (
     ANFRAGE_TYP_TISCHLER,
     ANFRAGE_TYP_ALLGEMEIN,
 )
+from core.models.tenant_anfrage_schema import TenantAnfrageSchema

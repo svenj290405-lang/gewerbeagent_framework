@@ -17,6 +17,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 
 from core.integrations.anfrage_forms import (
     get_schema,
+    get_schema_for_tenant,
     get_token_with_tenant,
     submit_anfrage,
 )
@@ -165,7 +166,7 @@ async def render_anfrage_form(token: str):
             status_code=200,
         )
 
-    schema = get_schema(token_obj.anfrage_typ)
+    schema = await get_schema_for_tenant(token_obj.tenant_id, token_obj.anfrage_typ)
     fields_html = "".join(_render_field(f) for f in schema["fields"])
 
     company = _html.escape(tenant.company_name or "Dein Handwerker")
