@@ -928,3 +928,207 @@ async def generate_anfrage_reply(
             f"{tenant_owner_first_name} (via Q)"
         )
 
+
+# =====================================================================
+# Angebot-Workflow: Extraktion + Update via Sprache + Annahme-Erkennung
+# Wiederverwendet RECHNUNG_RESPONSE_SCHEMA (Angebot hat strukturell die
+# gleichen Felder: kunde_*, positionen[], gesamtbetrag).
+# =====================================================================
+
+ANGEBOT_PROMPT = """Du bekommst entweder einen Text oder eine Sprachnachricht eines Handwerkers, der ein Angebot fuer einen Kunden erstellen will.
+
+Extrahiere strukturierte Felder als JSON. Wenn ein Feld nicht erwaehnt wird, setze es auf null. Erfinde KEINE Werte.
+
+KUNDE:
+- kunde_name: Name des Kunden (z.B. "Frau Mueller", "Bauunternehmen Schmidt"). Pflicht.
+- kunde_ort: Stadt/Ort falls genannt
+- kunde_strasse: Strasse + Hausnummer falls genannt
+- kunde_plz: Postleitzahl falls genannt
+- kunde_email: E-Mail falls genannt
+
+POSITIONEN (Liste - mindestens 1 Eintrag):
+- positionen: Liste von Objekten. Jedes Objekt:
+  * name: Kurzbezeichnung (z.B. "Moebelmontage", "Anfahrt", "Material"). Pflicht.
+  * beschreibung: Optional, laengere Detailbeschreibung
+  * menge: Anzahl als Zahl (default 1.0). "3 Stunden" -> 3.0, "5 Liter" -> 5.0
+  * einheit: Default "Stueck". Andere: "Stunde", "Meter", "Liter", "kg", "qm", "Tag"
+  * preis_brutto_eur: Einzelpreis brutto pro Einheit. Bei "Netto"-Angabe Brutto errechnen (Netto * 1.19).
+  * mwst_prozent: Default 19. Photovoltaik 0, Buecher 7.
+
+GESAMT:
+- gesamtbetrag_brutto_eur: Summe aller (menge * preis_brutto_eur). Pflicht.
+
+META:
+- transcript: Bei Audio das wortgetreue Transkript. Bei Text der Original-Text.
+- extraction_confidence: "high" wenn alles klar, "medium" bei Unsicherheiten, "low" wenn vieles unklar.
+- missing_fields: Liste der fehlenden Pflichtfelder als Strings.
+
+Pflichtfelder: kunde_name, positionen (mit mindestens 1 Eintrag), gesamtbetrag_brutto_eur.
+Antworte AUSSCHLIESSLICH mit dem JSON, kein Markdown, keine Erlaeuterung.
+"""
+
+
+async def extract_angebot_from_text(text: str) -> dict:
+    """Extrahiert Angebots-Felder aus Text-Eingabe (analog Rechnung).
+    Schema ist identisch (RECHNUNG_RESPONSE_SCHEMA).
+    """
+    if not text or not text.strip():
+        return _normalize_rechnung_extraction({"missing_fields": ["alle"]})
+
+    full_prompt = (
+        ANGEBOT_PROMPT
+        + "\n\n--- Text-Eingabe des Handwerkers: ---\n"
+        + text.strip()
+    )
+    return await _gemini_extract_rechnung([full_prompt], mode="angebot/text")
+
+
+async def extract_angebot_from_audio(
+    audio_bytes: bytes,
+    mime_type: str = "audio/ogg",
+) -> dict:
+    """Extrahiert Angebots-Felder aus Sprachnachricht."""
+    if not audio_bytes:
+        return _normalize_rechnung_extraction({"missing_fields": ["alle"]})
+
+    from google.genai.types import Part
+
+    audio_part = Part.from_bytes(data=audio_bytes, mime_type=mime_type)
+    return await _gemini_extract_rechnung(
+        [audio_part, ANGEBOT_PROMPT],
+        mode=f"angebot/audio/{mime_type}",
+    )
+
+
+def _build_update_prompt(current: dict) -> str:
+    """Prompt der bestehende Daten zeigt + Aenderung als JSON-Patch verlangt."""
+    import json as _json
+    current_json = _json.dumps(current, ensure_ascii=False, indent=2, default=str)
+    return f"""Du bist ein Assistent, der bestehende Angebots-Daten aktualisiert.
+
+Hier ist der aktuelle Stand des Angebots (JSON):
+{current_json}
+
+Der Handwerker erwaehnt jetzt Aenderungen (Audio/Text folgt unten). Aufgabe:
+1. Verstehe die Aenderungen (z.B. "aendere Position 2 auf 350 Euro", "fuege Anfahrt 50 Euro hinzu", "loesche die Material-Position").
+2. Gib das KOMPLETTE Angebot als JSON in der gleichen Struktur zurueck, aber mit den gewuenschten Aenderungen.
+3. Behalte alle Felder die nicht erwaehnt wurden bei. Erfinde keine Werte.
+4. Errechne gesamtbetrag_brutto_eur neu nach den Aenderungen.
+
+Pflichtfelder: kunde_name, positionen (mind. 1 Eintrag), gesamtbetrag_brutto_eur.
+Antworte AUSSCHLIESSLICH mit dem aktualisierten JSON, kein Markdown, keine Erlaeuterung.
+"""
+
+
+async def update_angebot_from_text(current_extraction: dict, change_text: str) -> dict:
+    """Baut den aktuellen Snapshot um Aenderungen aus Freitext um.
+    current_extraction muss die Felder kunde_name, positionen, gesamtbetrag_brutto_eur haben.
+    """
+    if not change_text or not change_text.strip():
+        return current_extraction
+
+    prompt = _build_update_prompt(current_extraction)
+    full = prompt + "\n--- Aenderungswuensche des Handwerkers: ---\n" + change_text.strip()
+    return await _gemini_extract_rechnung([full], mode="angebot/update_text")
+
+
+async def update_angebot_from_audio(
+    current_extraction: dict,
+    audio_bytes: bytes,
+    mime_type: str = "audio/ogg",
+) -> dict:
+    """Baut den aktuellen Snapshot um Aenderungen aus Sprachnachricht um."""
+    if not audio_bytes:
+        return current_extraction
+
+    from google.genai.types import Part
+
+    prompt = _build_update_prompt(current_extraction)
+    audio_part = Part.from_bytes(data=audio_bytes, mime_type=mime_type)
+    return await _gemini_extract_rechnung(
+        [audio_part, prompt],
+        mode=f"angebot/update_audio/{mime_type}",
+    )
+
+
+# Antwort-Klassifikation: ist die eingehende Mail eine Annahme/Ablehnung
+# oder eine Rueckfrage zum Angebot?
+ANGEBOT_RESPONSE_RESPONSE_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "classification": {
+            "type": "STRING",
+            "enum": ["ANNAHME", "ABLEHNUNG", "RUECKFRAGE", "UNSICHER"],
+        },
+        "confidence": {"type": "STRING", "enum": ["high", "medium", "low"]},
+        "reason": {"type": "STRING"},
+    },
+    "required": ["classification", "confidence", "reason"],
+}
+
+ANGEBOT_RESPONSE_PROMPT = """Du klassifizierst die Antwort eines Kunden auf ein per Mail versandtes Angebot eines Handwerkers.
+
+Moegliche Klassen:
+- ANNAHME: Kunde nimmt das Angebot an, will dass beauftragt/loslegt wird ("ja, machen wir", "Auftrag erteilt", "passt so", "bitte umsetzen").
+- ABLEHNUNG: Kunde lehnt ab oder hat sich anders entschieden ("zu teuer", "nicht mehr noetig", "wir nehmen einen anderen").
+- RUECKFRAGE: Kunde hat Fragen oder will Aenderungen ("Koennen Sie noch X aendern?", "Was kostet Variante Y?", "Ist Termin frueher moeglich?").
+- UNSICHER: Klassifikation nicht klar.
+
+confidence: "high" wenn eindeutig, "medium" bei leichten Hinweisen, "low" bei schwachen Signalen.
+reason: ein Halbsatz auf Deutsch, warum klassifiziert.
+
+Antworte AUSSCHLIESSLICH mit dem JSON.
+"""
+
+
+async def classify_angebot_response(
+    *, mail_subject: str, mail_body: str
+) -> dict:
+    """Sub-Klassifikation einer Mail-Antwort, wenn sie zu einem versandten
+    Angebot gehoert. Returns: {classification, confidence, reason}.
+    """
+    import json as _json
+    from google.genai.types import GenerateContentConfig
+
+    prompt = (
+        ANGEBOT_RESPONSE_PROMPT
+        + f"\n--- Subject ---\n{mail_subject}\n--- Body ---\n{mail_body[:2500]}"
+    )
+
+    client = _get_genai_client(location=GENAI_TEXT_LOCATION)
+    config = GenerateContentConfig(
+        temperature=0.1,
+        max_output_tokens=512,
+        response_mime_type="application/json",
+        response_schema=ANGEBOT_RESPONSE_RESPONSE_SCHEMA,
+    )
+
+    def _sync_call():
+        return client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=[prompt],
+            config=config,
+        )
+
+    loop = asyncio.get_event_loop()
+    try:
+        response = await loop.run_in_executor(None, _sync_call)
+        if not response.candidates:
+            return {"classification": "UNSICHER", "confidence": "low", "reason": "kein Candidate"}
+        candidate = response.candidates[0]
+        if not candidate.content or not candidate.content.parts:
+            return {"classification": "UNSICHER", "confidence": "low", "reason": "leere Antwort"}
+        raw_text = "".join(p.text for p in candidate.content.parts if getattr(p, "text", None))
+        data = _json.loads(raw_text) if raw_text else {}
+        cls = data.get("classification") or "UNSICHER"
+        if cls not in ("ANNAHME", "ABLEHNUNG", "RUECKFRAGE", "UNSICHER"):
+            cls = "UNSICHER"
+        return {
+            "classification": cls,
+            "confidence": data.get("confidence") or "low",
+            "reason": data.get("reason") or "",
+        }
+    except Exception as e:
+        logger.warning(f"classify_angebot_response Fehler: {e}")
+        return {"classification": "UNSICHER", "confidence": "low", "reason": f"Fehler: {e}"}
+

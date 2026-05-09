@@ -904,6 +904,50 @@ class LexwareProvider(AccountingProvider):
     def invoice_deeplink_edit(invoice_id: UUID) -> str:
         return f"{LEXWARE_APP_BASE}/permalink/invoices/edit/{invoice_id}"
 
+    async def get_quotation(self, quotation_id: UUID) -> dict:
+        """GET /v1/quotations/{id} - rohes JSON zurueckgeben."""
+        await self._rate_limit()
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            r = await client.get(
+                f"{LEXWARE_API_BASE}/v1/quotations/{quotation_id}",
+                headers=self._headers,
+            )
+            self._raise_for_status(r, "get_quotation")
+            return r.json()
+
+    async def download_quotation_pdf(self, quotation_id: UUID) -> bytes:
+        """
+        GET /v1/quotations/{id}/file
+        Liefert PDF-Bytes des Angebots. Funktioniert nur wenn Angebot NICHT
+        mehr im Draft-Status (Lexware verlangt Finalisierung).
+        """
+        await self._rate_limit()
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            r = await client.get(
+                f"{LEXWARE_API_BASE}/v1/quotations/{quotation_id}/file",
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Accept": "application/pdf",
+                },
+            )
+            if r.status_code == 409:
+                raise AccountingError(
+                    "Angebot ist noch im Draft-Status, PDF-Download nicht moeglich. "
+                    "Bitte erst in Lexware finalisieren.",
+                    status_code=409,
+                    provider=self.provider_name,
+                )
+            self._raise_for_status(r, "download_quotation_pdf")
+            return r.content
+
+    @staticmethod
+    def quotation_deeplink_view(quotation_id: UUID) -> str:
+        return f"{LEXWARE_APP_BASE}/permalink/quotations/view/{quotation_id}"
+
+    @staticmethod
+    def quotation_deeplink_edit(quotation_id: UUID) -> str:
+        return f"{LEXWARE_APP_BASE}/permalink/quotations/edit/{quotation_id}"
+
     # Lexware-spezifische Helper (nicht in Basis-Klasse)
     # ------------------------------------------------------------------
 

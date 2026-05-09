@@ -55,8 +55,46 @@ class Angebot(Base):
     remark_text: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     # Workflow
+    # Status-Werte:
+    #   erstellt | in_lexware | mail_sent | accepted | rejected | rechnung_erstellt
     status: Mapped[str] = mapped_column(String(50), default="erstellt", nullable=False)
     confidence: Mapped[str | None] = mapped_column(String(20), nullable=True)
+
+    # Mail-Versand & Tracking (fuer Auto-Rechnung-Erkennung)
+    kunde_email: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    mail_sent_to: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    mail_sent_at: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # Microsoft-Graph-IDs der versandten Mail - zum Match bei Antworten
+    mail_message_id: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    mail_internet_message_id: Mapped[str | None] = mapped_column(
+        String(500), nullable=True, index=True,
+    )
+    mail_conversation_id: Mapped[str | None] = mapped_column(
+        String(500), nullable=True, index=True,
+    )
+
+    # Annahme/Ablehnung durch den Kunden (per Mail-Reply)
+    accepted_at: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    rejected_at: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # Falls aus dem Angebot eine Rechnung gebaut wurde
+    rechnung_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True
+    )
+
+    # Erstellung (fuer Listings/Sortierung)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(),
+        nullable=False,
+    )
 
     # Relationships
     positionen: Mapped[list[AngebotPosition]] = relationship(  # noqa: F821
