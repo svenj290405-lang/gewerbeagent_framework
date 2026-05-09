@@ -23,6 +23,7 @@ from core.plugin_system import (
     get_plugin_for_tenant,
 )
 from core.api.anfrage_routes import router as anfrage_router
+from core.admin.routes import router as admin_router, mount_static as mount_admin_static
 from core.integrations.microsoft_cron import cron_loop as microsoft_cron_loop
 
 logger = logging.getLogger(__name__)
@@ -65,6 +66,8 @@ app = FastAPI(
 # ============================================================
 
 app.include_router(anfrage_router)
+app.include_router(admin_router)
+mount_admin_static(app)
 
 
 @app.get("/")

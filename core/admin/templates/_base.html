@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}Gewerbeagent Admin{% endblock %}</title>
+    <meta name="robots" content="noindex,nofollow">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/admin/static/admin.css">
+    {% block head %}{% endblock %}
+</head>
+<body class="{% block body_class %}{% endblock %}">
+
+{% if user %}
+<header class="admin-nav">
+    <div class="admin-nav-inner">
+        <div class="admin-brand">
+            <span class="brand-dot"></span>
+            <strong>Gewerbeagent</strong>
+            <span class="brand-sub">Admin</span>
+        </div>
+        <nav class="admin-nav-links">
+            <a href="/admin/" {% if active == 'overview' %}class="active"{% endif %}>Overview</a>
+            <a href="/admin/tenants" {% if active == 'tenants' %}class="active"{% endif %}>Tenants</a>
+            <a href="/admin/costs" {% if active == 'costs' %}class="active"{% endif %}>Kosten</a>
+            <a href="/admin/pricing" {% if active == 'pricing' %}class="active"{% endif %}>Pricing</a>
+            <a href="/admin/audit" {% if active == 'audit' %}class="active"{% endif %}>Audit</a>
+        </nav>
+        <div class="admin-meta">
+            <span class="live-dot" id="liveDot" title="Container-Health"></span>
+            <span class="meta-time" id="metaTime">--:--</span>
+            <span class="meta-user">{{ user.email }}</span>
+            <form action="/admin/logout" method="post" style="display:inline">
+                <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+                <button type="submit" class="logout-btn">Logout</button>
+            </form>
+        </div>
+    </div>
+</header>
+{% endif %}
+
+<main class="admin-main">
+    {% if flash %}
+        <div class="flash flash-{{ flash.kind|default('info') }}">
+            {{ flash.message }}
+        </div>
+    {% endif %}
+    {% block content %}{% endblock %}
+</main>
+
+{% if user %}
+<script>
+// Uhrzeit aktualisieren
+function updateTime() {
+    const t = new Date();
+    document.getElementById('metaTime').textContent =
+        t.toTimeString().slice(0,5) + ' · ' + t.toLocaleDateString('de-DE', { day:'2-digit', month:'short' });
+}
+updateTime();
+setInterval(updateTime, 30000);
+
+// Container-Health-Indikator (versucht /admin/api/health alle 30s)
+async function pingHealth() {
+    try {
+        const r = await fetch('/admin/api/health', {credentials: 'same-origin'});
+        const dot = document.getElementById('liveDot');
+        if (r.ok) {
+            const j = await r.json();
+            dot.classList.toggle('healthy', j.status === 'ok');
+            dot.classList.toggle('degraded', j.status !== 'ok');
+            dot.title = 'Status: ' + (j.status || 'unknown');
+        }
+    } catch (e) {}
+}
+pingHealth();
+setInterval(pingHealth, 30000);
+</script>
+{% endif %}
+{% block scripts %}{% endblock %}
+</body>
+</html>

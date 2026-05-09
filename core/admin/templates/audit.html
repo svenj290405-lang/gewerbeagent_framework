@@ -1,0 +1,51 @@
+{% extends "_base.html" %}
+{% set active = 'audit' %}
+{% block title %}Audit-Log — Gewerbeagent Admin{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <div>
+        <h1>Audit-Log</h1>
+        <p>Alle administrativen Aktionen. Letzte 200 Eintraege.</p>
+    </div>
+    <form method="post" action="/admin/sessions/revoke-all" onsubmit="return confirm('Alle aktiven Sessions abmelden?');">
+        <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+        <button type="submit" class="btn btn-danger">Alle Sessions ausloggen</button>
+    </form>
+</div>
+
+<div class="table-wrap">
+    <table class="data-table">
+        <thead>
+            <tr>
+                <th>Zeit</th>
+                <th>User</th>
+                <th>Aktion</th>
+                <th>Ziel</th>
+                <th>IP</th>
+                <th>Status</th>
+            </tr>
+        </thead>
+        <tbody>
+        {% for ev in events %}
+            <tr>
+                <td class="mono">{{ ev.created_short }}</td>
+                <td class="muted">{{ ev.user_email or '–' }}</td>
+                <td>{{ ev.action }}</td>
+                <td class="muted">{{ ev.target or '' }}</td>
+                <td class="muted mono">{{ ev.ip_address or '–' }}</td>
+                <td>
+                    {% if ev.success %}
+                    <span class="pill pill-green">ok</span>
+                    {% else %}
+                    <span class="pill pill-red">fail</span>
+                    {% endif %}
+                </td>
+            </tr>
+        {% else %}
+            <tr><td colspan="6" class="muted" style="text-align:center; padding:24px;">Keine Audit-Events.</td></tr>
+        {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% endblock %}

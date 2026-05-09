@@ -1,0 +1,39 @@
+{% extends "_base.html" %}
+{% block body_class %}auth{% endblock %}
+{% block title %}Erst-Setup — Gewerbeagent Admin{% endblock %}
+
+{% block content %}
+<div class="auth-card">
+    <div class="auth-brand">
+        <span class="brand-dot"></span>
+        <strong>Gewerbeagent</strong>
+        <span class="brand-sub">Admin · Setup</span>
+    </div>
+
+    <h1>Ersten Admin-Account anlegen</h1>
+    <p class="lead">
+        Diese Seite ist nur einmal aufrufbar. Sobald ein Admin existiert,
+        wird sie automatisch deaktiviert.
+    </p>
+
+    <form method="post" action="/admin/setup">
+        <div class="form-group">
+            <label for="email">E-Mail</label>
+            <input type="email" id="email" name="email" class="form-control" required
+                   autocomplete="email" autofocus>
+        </div>
+        <div class="form-group">
+            <label for="password">Passwort</label>
+            <input type="password" id="password" name="password" class="form-control" required
+                   minlength="10" autocomplete="new-password">
+            <div class="hint">Mindestens 10 Zeichen. Wird via bcrypt (cost 12) gehasht.</div>
+        </div>
+        <div class="form-group">
+            <label for="password_confirm">Passwort wiederholen</label>
+            <input type="password" id="password_confirm" name="password_confirm" class="form-control" required
+                   minlength="10" autocomplete="new-password">
+        </div>
+        <button type="submit" class="btn btn-primary">Admin-Account anlegen</button>
+    </form>
+</div>
+{% endblock %}

@@ -1,0 +1,165 @@
+{% extends "_base.html" %}
+{% set active = 'overview' %}
+{% block title %}Overview — Gewerbeagent Admin{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <div>
+        <h1>Overview</h1>
+        <p>Live-Status. Aktualisierung alle 30 Sek.</p>
+    </div>
+</div>
+
+<div class="stats-grid">
+    <div class="stat-card">
+        <div class="stat-label"><svg class="stat-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path><circle cx="9" cy="7" r="4"></circle><path d="M23 21v-2a4 4 0 0 0-3-3.87"></path><path d="M16 3.13a4 4 0 0 1 0 7.75"></path></svg>Aktive Tenants</div>
+        <div class="stat-value">{{ stats.active_tenants }}</div>
+        <div class="stat-sub">{{ stats.tenants_total }} insgesamt</div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-label"><svg class="stat-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"></path><polyline points="22,6 12,13 2,6"></polyline></svg>Mails heute</div>
+        <div class="stat-value">{{ stats.mails_today }}</div>
+        <div class="stat-sub">{{ stats.mails_week }} letzte 7 Tage</div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-label"><svg class="stat-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline></svg>Anfragen heute</div>
+        <div class="stat-value">{{ stats.anfragen_today }}</div>
+        <div class="stat-sub">{{ stats.anfragen_week }} diese Woche</div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-label"><svg class="stat-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="1" x2="12" y2="23"></line><path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"></path></svg>API-Kosten heute</div>
+        <div class="stat-value">{{ "%.4f"|format(stats.cost_today) }} €</div>
+        <div class="stat-sub">{{ "%.2f"|format(stats.cost_month) }} € im Monat</div>
+    </div>
+</div>
+
+<div class="section-title">
+    Letzte 30 Tage
+    <small>Mails, Anfragen, Kosten</small>
+</div>
+
+<div class="chart-wrap">
+    <h3>Mails &amp; Anfragen pro Tag</h3>
+    <canvas id="trafficChart" height="80"></canvas>
+</div>
+
+<div style="display:grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 24px;">
+    <div class="chart-wrap">
+        <h3>API-Kosten nach Provider (30 Tage)</h3>
+        <canvas id="costsByProvider" height="220"></canvas>
+    </div>
+    <div class="chart-wrap">
+        <h3>Top Tenants nach Kosten (30 Tage)</h3>
+        <canvas id="costsByTenant" height="220"></canvas>
+    </div>
+</div>
+
+<div class="section-title">
+    Live-Feed
+    <small id="feedAge">aktualisiert vor wenigen Sekunden</small>
+</div>
+<div class="live-feed" id="liveFeed">
+    {% for ev in live_feed %}
+    <div class="feed-item">
+        <div class="feed-time">{{ ev.time }}</div>
+        <div><span class="pill {{ ev.pill_class }}">{{ ev.kind }}</span></div>
+        <div class="feed-msg">{{ ev.message }}</div>
+    </div>
+    {% else %}
+    <div class="feed-item">
+        <div class="feed-time">--:--</div>
+        <div><span class="pill">stille</span></div>
+        <div class="feed-msg">Noch keine Events. Warten auf erste Aktivitaet.</div>
+    </div>
+    {% endfor %}
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<script>
+const ACCENT = '#3b82f6';
+const ACCENT_SOFT = '#93c5fd';
+const PALETTE = ['#3b82f6','#8b5cf6','#10b981','#f59e0b','#ef4444','#06b6d4','#ec4899','#6366f1','#14b8a6'];
+
+function lineChart(id, labels, datasets) {
+    const el = document.getElementById(id);
+    if (!el) return;
+    new Chart(el, {
+        type: 'line',
+        data: { labels, datasets: datasets.map((d, i) => ({
+            label: d.label, data: d.data,
+            borderColor: PALETTE[i],
+            backgroundColor: PALETTE[i] + '22',
+            tension: 0.35, fill: true, borderWidth: 2,
+            pointRadius: 0, pointHoverRadius: 4,
+        })) },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: { legend: { position: 'bottom', labels: { boxWidth: 10, font: { size: 11 } } } },
+            scales: {
+                x: { grid: { display: false }, ticks: { font: { size: 10 } } },
+                y: { beginAtZero: true, ticks: { font: { size: 10 } } },
+            },
+        },
+    });
+}
+
+function pieChart(id, labels, data) {
+    const el = document.getElementById(id);
+    if (!el) return;
+    new Chart(el, {
+        type: 'doughnut',
+        data: { labels, datasets: [{ data, backgroundColor: PALETTE, borderWidth: 0 }] },
+        options: {
+            responsive: true, maintainAspectRatio: false,
+            plugins: { legend: { position: 'right', labels: { boxWidth: 10, font: { size: 11 } } } },
+            cutout: '62%',
+        },
+    });
+}
+
+function barChart(id, labels, data) {
+    const el = document.getElementById(id);
+    if (!el) return;
+    new Chart(el, {
+        type: 'bar',
+        data: { labels, datasets: [{ data, backgroundColor: ACCENT, borderRadius: 6 }] },
+        options: {
+            responsive: true, maintainAspectRatio: false, indexAxis: 'y',
+            plugins: { legend: { display: false } },
+            scales: { x: { ticks: { font: { size: 10 } } }, y: { ticks: { font: { size: 10 } } } },
+        },
+    });
+}
+
+// Daten aus dem Server-Render holen
+const TRAFFIC = {{ charts.traffic | tojson }};
+const PROVIDER = {{ charts.provider | tojson }};
+const TENANTS = {{ charts.top_tenants | tojson }};
+
+lineChart('trafficChart', TRAFFIC.labels, TRAFFIC.datasets);
+pieChart('costsByProvider', PROVIDER.labels, PROVIDER.data);
+barChart('costsByTenant', TENANTS.labels, TENANTS.data);
+
+// Live-Feed-Refresh alle 30s
+async function refreshFeed() {
+    try {
+        const r = await fetch('/admin/api/feed', {credentials: 'same-origin'});
+        if (!r.ok) return;
+        const data = await r.json();
+        const wrap = document.getElementById('liveFeed');
+        wrap.innerHTML = data.events.map(e => `
+            <div class="feed-item">
+                <div class="feed-time">${e.time}</div>
+                <div><span class="pill ${e.pill_class}">${e.kind}</span></div>
+                <div class="feed-msg">${e.message}</div>
+            </div>
+        `).join('') || `<div class="feed-item"><div class="feed-time">--:--</div><div><span class="pill">stille</span></div><div class="feed-msg">Noch keine Events.</div></div>`;
+        document.getElementById('feedAge').textContent = 'aktualisiert ' + new Date().toLocaleTimeString('de-DE');
+    } catch(e) {}
+}
+setInterval(refreshFeed, 30000);
+</script>
+{% endblock %}

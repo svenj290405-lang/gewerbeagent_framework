@@ -1,0 +1,111 @@
+{% extends "_base.html" %}
+{% set active = 'tenants' %}
+{% block title %}{{ tenant.company_name }} — Tenant{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <div>
+        <a href="/admin/tenants" style="font-size:13px;color:var(--ink-muted);">&larr; alle Tenants</a>
+        <h1 style="margin-top:8px;">{{ tenant.company_name }}</h1>
+        <p>{{ tenant.branche or 'Handwerk' }} · slug <code>{{ tenant.slug }}</code> · status <span class="pill pill-{{ 'green' if tenant.status == 'active' else 'yellow' }}">{{ tenant.status }}</span></p>
+    </div>
+</div>
+
+<div class="stats-grid">
+    <div class="stat-card">
+        <div class="stat-label">Kontakt</div>
+        <div class="stat-value" style="font-size:16px;">{{ tenant.contact_name }}</div>
+        <div class="stat-sub">{{ tenant.contact_email }}<br>{{ tenant.contact_phone or '–' }}</div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-label">Mails Monat</div>
+        <div class="stat-value">{{ stats.mails_month }}</div>
+        <div class="stat-sub">{{ stats.mails_total }} insgesamt</div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-label">Anfragen Monat</div>
+        <div class="stat-value">{{ stats.anfragen_month }}</div>
+        <div class="stat-sub">{{ stats.anfragen_total }} insgesamt</div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-label">API-Kosten Monat</div>
+        <div class="stat-value">{{ "%.4f €"|format(stats.cost_month) }}</div>
+        <div class="stat-sub">{{ "%.4f €"|format(stats.cost_total) }} insgesamt</div>
+    </div>
+</div>
+
+<div style="display:grid; grid-template-columns: 2fr 1fr; gap: 16px; margin-bottom: 24px;">
+    <div class="chart-wrap">
+        <h3>API-Kosten letzte 30 Tage</h3>
+        <canvas id="costTimeline" height="200"></canvas>
+    </div>
+    <div class="chart-wrap">
+        <h3>Provider-Verteilung</h3>
+        <canvas id="providerPie" height="200"></canvas>
+    </div>
+</div>
+
+<div class="section-title">
+    Letzte API-Calls
+    <small>(50 neueste)</small>
+</div>
+<div class="table-wrap">
+    <table class="data-table">
+        <thead>
+            <tr>
+                <th>Zeit</th>
+                <th>Provider</th>
+                <th>Operation</th>
+                <th>Unit</th>
+                <th class="num">Units</th>
+                <th class="num">Kosten</th>
+            </tr>
+        </thead>
+        <tbody>
+        {% for u in usage %}
+            <tr>
+                <td class="mono">{{ u.created_short }}</td>
+                <td><span class="pill pill-blue">{{ u.provider }}</span></td>
+                <td class="muted">{{ u.operation or '–' }}</td>
+                <td class="muted">{{ u.unit }}</td>
+                <td class="num">{{ "%.2f"|format(u.units_consumed|float) }}</td>
+                <td class="num">{{ "%.6f €"|format(u.cost_eur|float) }}</td>
+            </tr>
+        {% else %}
+            <tr><td colspan="6" class="muted" style="text-align:center; padding:24px;">Noch keine API-Calls erfasst.</td></tr>
+        {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<script>
+const PALETTE = ['#3b82f6','#8b5cf6','#10b981','#f59e0b','#ef4444','#06b6d4','#ec4899'];
+
+const TIMELINE = {{ charts.timeline | tojson }};
+const PROV = {{ charts.providers | tojson }};
+
+new Chart(document.getElementById('costTimeline'), {
+    type: 'line',
+    data: { labels: TIMELINE.labels, datasets: [{
+        label: 'EUR',
+        data: TIMELINE.data,
+        borderColor: '#3b82f6', backgroundColor: '#3b82f622',
+        tension: 0.35, fill: true, borderWidth: 2, pointRadius: 0,
+    }]},
+    options: { responsive: true, maintainAspectRatio: false,
+        plugins: { legend: { display: false } },
+        scales: { x: { grid: { display: false }, ticks: { font: { size: 10 } } }, y: { beginAtZero: true } } },
+});
+
+new Chart(document.getElementById('providerPie'), {
+    type: 'doughnut',
+    data: { labels: PROV.labels, datasets: [{ data: PROV.data, backgroundColor: PALETTE, borderWidth: 0 }] },
+    options: { responsive: true, maintainAspectRatio: false,
+        plugins: { legend: { position: 'bottom', labels: { boxWidth: 10, font: { size: 11 } } } },
+        cutout: '62%' },
+});
+</script>
+{% endblock %}

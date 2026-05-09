@@ -1,0 +1,60 @@
+{% extends "_base.html" %}
+{% set active = 'tenants' %}
+{% block title %}Tenants — Gewerbeagent Admin{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <div>
+        <h1>Tenants</h1>
+        <p>{{ tenants|length }} Tenants insgesamt. Sortiert nach Kosten dieser Monat.</p>
+    </div>
+</div>
+
+<div class="search-bar">
+    <input type="text" id="searchTenants" class="search-input" placeholder="Suchen nach Name, Kontakt oder Slug..." autofocus>
+</div>
+
+<div class="tenant-grid" id="tenantGrid">
+{% for t in tenants %}
+<div class="tenant-card"
+     data-name="{{ t.company_name|lower }}"
+     data-contact="{{ t.contact_name|lower }}"
+     data-slug="{{ t.slug|lower }}">
+    <div class="tenant-card-head">
+        <div>
+            <h3>{{ t.company_name }}</h3>
+            <div class="branche">{{ t.branche or 'Handwerk' }} · {{ t.slug }}</div>
+        </div>
+        <span class="pill {% if t.status == 'active' %}pill-green{% elif t.status == 'suspended' %}pill-red{% else %}{% endif %}">{{ t.status }}</span>
+    </div>
+    <div class="muted" style="font-size:13px;">{{ t.contact_name }}<br>{{ t.contact_email }}</div>
+    <div class="stats">
+        <div>Mails Monat<strong>{{ t.mails_month }}</strong></div>
+        <div>Anfragen Monat<strong>{{ t.anfragen_month }}</strong></div>
+        <div>API-Kosten<strong>{{ "%.4f €"|format(t.cost_month) }}</strong></div>
+        <div>Onboarding<strong>{{ t.created_at_short }}</strong></div>
+    </div>
+    <div class="actions">
+        <a href="/admin/tenants/{{ t.id }}" class="btn btn-sm">Details</a>
+    </div>
+</div>
+{% else %}
+<div class="card">
+    <p class="muted">Noch keine Tenants. Lege einen via <code>scripts/onboard.py</code> an.</p>
+</div>
+{% endfor %}
+</div>
+
+<script>
+const search = document.getElementById('searchTenants');
+const grid = document.getElementById('tenantGrid');
+search.addEventListener('input', (e) => {
+    const q = e.target.value.toLowerCase().trim();
+    grid.querySelectorAll('.tenant-card').forEach(card => {
+        if (!q) { card.style.display = ''; return; }
+        const hay = card.dataset.name + ' ' + card.dataset.contact + ' ' + card.dataset.slug;
+        card.style.display = hay.includes(q) ? '' : 'none';
+    });
+});
+</script>
+{% endblock %}
