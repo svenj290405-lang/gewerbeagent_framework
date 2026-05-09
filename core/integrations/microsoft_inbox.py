@@ -56,15 +56,19 @@ async def fetch_unread_messages(
         "$top": top,
     }
 
+    # Bewusst NUR Inbox pollen, nicht /me/messages (das wuerde auch den
+    # Gewerbeagent-Ordner einschliessen und bereits beantwortete Mails
+    # erneut zurueckliefern - Loop-Risiko).
     async with httpx.AsyncClient(timeout=20.0) as client:
         resp = await client.get(
-            f"{GRAPH_API_BASE}/me/messages",
+            f"{GRAPH_API_BASE}/me/mailFolders/inbox/messages",
             headers={"Authorization": f"Bearer {access_token}"},
             params=params,
         )
         if resp.status_code != 200:
             raise ValueError(
-                f"Graph /me/messages fehlgeschlagen: {resp.status_code} {resp.text[:300]}"
+                f"Graph /me/mailFolders/inbox/messages fehlgeschlagen: "
+                f"{resp.status_code} {resp.text[:300]}"
             )
         data = resp.json()
         return data.get("value", [])
@@ -514,8 +518,21 @@ async def process_relevant_kunde_mail(
         result["error"] = f"Mail-Versand: {e}"
         return result
 
-    # 6) Original-Mail in Gewerbeagent-Ordner verschieben (nur wenn Send erfolgreich)
+    # 6) Original-Mail aufraeumen (nur wenn Send erfolgreich)
+    #    a) isRead=true setzen - Defense-in-Depth: selbst wenn der
+    #       Inbox-Filter mal greift bevor die Mail verschoben ist,
+    #       wird sie durch "isRead eq false" nicht mehr gefangen.
+    #    b) Dann in Gewerbeagent-Ordner verschieben.
     if result["sent"]:
+        try:
+            read_ok = await mark_as_read(tenant_id, message_id)
+            if not read_ok:
+                logger.warning(
+                    f"mark_as_read returnte False: tenant={tenant_id} "
+                    f"msg={message_id[:30]}..."
+                )
+        except Exception as e:
+            logger.warning(f"mark_as_read fehler (non-fatal): {e}")
         try:
             moved = await move_to_gewerbeagent(tenant_id, message_id)
             result["moved"] = moved
