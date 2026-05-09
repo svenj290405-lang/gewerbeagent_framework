@@ -70,6 +70,16 @@ app.include_router(admin_router)
 mount_admin_static(app)
 
 
+# Admin-Redirect-Exception in echten 303-Redirect umwandeln
+from core.admin.auth import _AdminRedirect
+
+@app.exception_handler(_AdminRedirect)
+async def _admin_redirect_handler(request: Request, exc: _AdminRedirect):
+    from fastapi.responses import RedirectResponse
+    target = exc.headers.get("Location", "/admin/login") if exc.headers else "/admin/login"
+    return RedirectResponse(target, status_code=303)
+
+
 @app.get("/")
 async def root() -> dict[str, Any]:
     """Health-Check + Infos."""

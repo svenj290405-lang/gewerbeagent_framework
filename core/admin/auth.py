@@ -241,6 +241,11 @@ async def revoke_all_user_sessions(
 # DEPENDENCIES (FastAPI)
 # =====================================================================
 
+class _AdminRedirect(HTTPException):
+    """Custom Exception, die als 303-Redirect zur Login-Seite gerendert wird."""
+    pass
+
+
 async def require_admin(
     request: Request,
     response: Response,
@@ -248,15 +253,15 @@ async def require_admin(
     """
     FastAPI-Dependency: laedt Session aus Cookie, validiert, returnet User.
 
-    Schreibt 'last activity' zurueck via session.commit() implizit
-    durch den get_session()-Wrapper.
+    Bei fehlender / abgelaufener Session: 303 Redirect zu /admin/login.
     """
     token = request.cookies.get(SESSION_COOKIE_NAME)
     async with get_session() as s:
         result = await get_active_session(token, session=s)
         if not result:
-            raise HTTPException(
-                status_code=401, detail="Login erforderlich",
+            # 303 see-other zu Login (RedirectResponse via Exception-Handler)
+            raise _AdminRedirect(
+                status_code=303, detail="Login erforderlich",
                 headers={"Location": "/admin/login"},
             )
         sess, user = result
