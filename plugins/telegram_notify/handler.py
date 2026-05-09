@@ -33,6 +33,15 @@ from core.models import (
     STATE_LEISTUNG_WAITING_PREIS,
     STATE_LEISTUNG_WAITING_BESCHREIBUNG,
     STATE_LEISTUNG_PREVIEWING,
+    STATE_FORMULAR_TYP_WAEHLEN,
+    STATE_FORMULAR_HAUPTMENU,
+    STATE_FORMULAR_NEU_NAME,
+    STATE_FORMULAR_NEU_LABEL,
+    STATE_FORMULAR_NEU_TYP,
+    STATE_FORMULAR_NEU_OPTIONEN,
+    STATE_FORMULAR_NEU_REQUIRED,
+    STATE_FORMULAR_LOESCHEN,
+    STATE_FORMULAR_RESET_CONFIRM,
     Beleg,
     BELEG_SOURCE_TELEGRAM,
     BELEG_STATUS_ERROR,
@@ -54,6 +63,9 @@ from core.models import (
     Tenant,
     TenantKnowledge,
     TelegramState,
+    TenantAnfrageSchema,
+    ANFRAGE_TYP_TISCHLER,
+    ANFRAGE_TYP_ALLGEMEIN,
     ToolConfig,
     VIZ_STATUS_DONE,
     VIZ_STATUS_FAILED,
@@ -265,6 +277,11 @@ async def _handle_help_command():
     msg += "/wissen_anzeigen - alle ansehen\n"
     msg += "/wissen_loeschen - Eintrag entfernen\n\n"
 
+    msg += "<b>📋 ANFRAGE-FORMULAR</b>\n"
+    msg += "/formular - Felder bearbeiten (Wizard)\n"
+    msg += "/formular_anzeigen - aktuelle Felder ansehen\n"
+    msg += "/formular_zuruecksetzen - auf Standard zuruecksetzen\n\n"
+
     msg += "<b>🎨 VISUALISIERUNG</b>\n"
     msg += "/visualisierung - Foto + KI-Rendering\n\n"
 
@@ -443,6 +460,8 @@ async def process_telegram_update(payload):
             await _handle_aufnahme_callback(cq_chat_id, cq_data, cq_id, bot_token)
         elif cq_data and cq_data.startswith("leistung:"):
             await _handle_leistung_callback(cq_chat_id, cq_data, cq_id, bot_token)
+        elif cq_data and cq_data.startswith("formular:"):
+            await _handle_formular_callback(cq_chat_id, cq_data, cq_id, bot_token)
         else:
             # Unbekannte Callback-Daten - nur bestätigen
             await _answer_callback_query(cq_id, "Unbekannte Aktion", bot_token)
@@ -576,6 +595,13 @@ async def process_telegram_update(payload):
         reply = await _handle_microsoft_test_command(chat_id)
     elif text == "/aufnahme":
         reply = await _handle_aufnahme_command(chat_id)
+    elif text == "/formular":
+        reply = await _handle_formular_command(chat_id)
+    elif text == "/formular_anzeigen":
+        await _clear_state(chat_id)
+        reply = await _handle_formular_anzeigen_command(chat_id)
+    elif text == "/formular_zuruecksetzen":
+        reply = await _handle_formular_zuruecksetzen_command(chat_id)
     elif text == "/leistungen":
         await _clear_state(chat_id)
         reply = await _handle_leistungen_command(chat_id)
@@ -660,6 +686,27 @@ async def process_telegram_update(payload):
                 reply = reply_or_none
             else:
                 reply = "Bitte einen der Buttons oben antippen oder /abbrechen schicken."
+        elif state.state_key == STATE_FORMULAR_TYP_WAEHLEN:
+            reply = await _handle_formular_typ_input(chat_id, text)
+        elif state.state_key == STATE_FORMULAR_HAUPTMENU:
+            reply_or_none = await _handle_formular_hauptmenu_input(chat_id, text, state.state_data)
+            if reply_or_none is None:
+                return {"ok": True}
+            reply = reply_or_none
+        elif state.state_key == STATE_FORMULAR_NEU_NAME:
+            reply = await _handle_formular_neu_name_input(chat_id, text, state.state_data)
+        elif state.state_key == STATE_FORMULAR_NEU_LABEL:
+            reply = await _handle_formular_neu_label_input(chat_id, text, state.state_data)
+        elif state.state_key == STATE_FORMULAR_NEU_TYP:
+            reply = await _handle_formular_neu_typ_input(chat_id, text, state.state_data)
+        elif state.state_key == STATE_FORMULAR_NEU_OPTIONEN:
+            reply = await _handle_formular_neu_optionen_input(chat_id, text, state.state_data)
+        elif state.state_key == STATE_FORMULAR_NEU_REQUIRED:
+            reply = await _handle_formular_neu_required_input(chat_id, text, state.state_data)
+        elif state.state_key == STATE_FORMULAR_LOESCHEN:
+            reply = await _handle_formular_loeschen_input(chat_id, text, state.state_data)
+        elif state.state_key == STATE_FORMULAR_RESET_CONFIRM:
+            reply = "Bitte einen der Buttons oben antippen oder /abbrechen schicken."
         else:
             await _clear_state(chat_id)
             return {"ok": True}
@@ -3639,6 +3686,493 @@ async def _handle_rechnung_send_mail_now(chat_id, rechnung_id, bot_token):
     msg += "Mit /rechnung kannst du die naechste anlegen."
     await _send_to_chat(chat_id, msg)
 
+
+
+# =====================================================================
+# Formular-Editor-Wizard ( /formular  /formular_anzeigen  /formular_zuruecksetzen )
+#
+# Erlaubt dem Tenant das Anfrage-Formular pro Anfrage-Typ zu pflegen.
+# Pattern wie /leistung neu (siehe _handle_leistung_neu_command oben).
+#
+# Datenmodell: TenantAnfrageSchema (UNIQUE auf tenant_id + anfrage_typ).
+# Snapshot-Strategie: kompletter Field-Array wird in fields-JSONB gespeichert.
+# Wizard-Start klont die Hardcoded-Defaults wenn noch kein Schema existiert.
+# =====================================================================
+
+# Mapping fuer Typ-Auswahl im Wizard (Nummer -> Anfrage-Typ-Konstante)
+_FORMULAR_TYP_LABEL = {
+    ANFRAGE_TYP_TISCHLER: "Tischlerei (Schrank/Tisch/Massmoebel)",
+    ANFRAGE_TYP_ALLGEMEIN: "Allgemeine Anfrage (alle Gewerke)",
+}
+
+# Field-Type-Auswahl im Wizard - Reihenfolge fixiert
+_FORMULAR_FELDTYP_REIHE = [
+    ("text", "Text (1 Zeile)"),
+    ("textarea", "Mehrzeiliger Text"),
+    ("tel", "Telefonnummer"),
+    ("date", "Datum"),
+    ("radio", "Auswahl (eine Option)"),
+    ("checkbox_multi", "Mehrfachauswahl (Checkboxen)"),
+    ("select", "Dropdown"),
+    ("masse", "Masse Hoehe/Breite/Tiefe"),
+]
+
+# Welche Typen brauchen Optionen?
+_FORMULAR_TYPEN_MIT_OPTIONEN = {"radio", "checkbox_multi", "select"}
+
+
+def _formular_format_field_short(idx: int, f: dict) -> str:
+    """Eine Zeile pro Feld fuer Listen/Vorschau."""
+    typ = f.get("type", "?")
+    label = f.get("label") or f.get("name", "?")
+    pflicht = " *" if f.get("required") else ""
+    opts_hint = ""
+    if typ in _FORMULAR_TYPEN_MIT_OPTIONEN:
+        n = len(f.get("options") or [])
+        opts_hint = f" ({n} Optionen)"
+    return f"{idx}. <b>{label}</b>{pflicht}\n   <i>{typ}{opts_hint}</i>"
+
+
+def _formular_render_hauptmenu(fields: list[dict], anfrage_typ: str, dirty: bool = False) -> str:
+    """Hauptmenue-Text mit Feld-Anzahl + Aktionen.
+
+    dirty=True markiert ungespeicherte Aenderungen mit deutlichem Hinweis.
+    """
+    typ_label = _FORMULAR_TYP_LABEL.get(anfrage_typ, anfrage_typ)
+    msg = f"<b>📋 Formular-Editor: {typ_label}</b>\n\n"
+    msg += f"Aktuell <b>{len(fields)} Felder</b> im Formular.\n"
+    if dirty:
+        msg += "⚠️  <b>Aenderungen sind noch nicht gespeichert!</b>\n"
+        msg += "    Erst mit <b>4</b> landet es im Web-Formular.\n"
+    msg += "\nWas tun?\n"
+    msg += "<b>1</b>) ➕ Feld hinzufuegen\n"
+    msg += "<b>2</b>) ➖ Feld entfernen\n"
+    msg += "<b>3</b>) 👁  Vorschau\n"
+    msg += "<b>4</b>) ✅ Speichern (und im Web aktivieren)\n"
+    msg += "<b>5</b>) 🗑  Verwerfen\n\n"
+    msg += "Bitte Nummer schicken oder /abbrechen."
+    return msg
+
+
+async def _formular_load_initial_fields(tenant_id, anfrage_typ: str) -> list[dict]:
+    """Initial-Snapshot: vorhandenes DB-Schema oder Default-Klon."""
+    from core.integrations.anfrage_forms import get_default_schema
+    from sqlalchemy import select as _sel
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            _sel(TenantAnfrageSchema).where(
+                TenantAnfrageSchema.tenant_id == tenant_id,
+                TenantAnfrageSchema.anfrage_typ == anfrage_typ,
+            )
+        )
+        row = result.scalar_one_or_none()
+        if row is not None and row.fields:
+            # Deep copy via list+dict comprehension
+            return [dict(f) for f in row.fields]
+    default = get_default_schema(anfrage_typ)
+    return [dict(f) for f in (default.get("fields") or [])]
+
+
+async def _handle_formular_command(chat_id):
+    """Einstieg: /formular - fragt nach Anfrage-Typ."""
+    tenant = await _get_tenant_by_chat(chat_id)
+    if not tenant:
+        return "Dieser Chat ist noch keinem Betrieb zugeordnet."
+
+    await _save_state(chat_id, STATE_FORMULAR_TYP_WAEHLEN, {})
+    msg = "<b>📋 Anfrage-Formular bearbeiten</b>\n\n"
+    msg += "Welches Formular willst du anpassen?\n\n"
+    msg += f"<b>1</b>) {_FORMULAR_TYP_LABEL[ANFRAGE_TYP_TISCHLER]}\n"
+    msg += f"<b>2</b>) {_FORMULAR_TYP_LABEL[ANFRAGE_TYP_ALLGEMEIN]}\n\n"
+    msg += "Bitte Nummer schicken oder /abbrechen."
+    return msg
+
+
+async def _handle_formular_typ_input(chat_id, text: str):
+    """Schritt 0: Anfrage-Typ-Auswahl."""
+    tenant = await _get_tenant_by_chat(chat_id)
+    if not tenant:
+        await _clear_state(chat_id)
+        return "Dieser Chat ist keinem Betrieb zugeordnet."
+
+    t = (text or "").strip()
+    if t == "1":
+        anfrage_typ = ANFRAGE_TYP_TISCHLER
+    elif t == "2":
+        anfrage_typ = ANFRAGE_TYP_ALLGEMEIN
+    else:
+        return "Bitte <b>1</b> oder <b>2</b> schicken oder /abbrechen."
+
+    fields = await _formular_load_initial_fields(tenant.id, anfrage_typ)
+    state_data = {"anfrage_typ": anfrage_typ, "fields": fields}
+    await _save_state(chat_id, STATE_FORMULAR_HAUPTMENU, state_data)
+    return _formular_render_hauptmenu(fields, anfrage_typ)
+
+
+async def _handle_formular_hauptmenu_input(chat_id, text: str, state_data: dict):
+    """Hauptmenue: 1=neu, 2=entfernen, 3=vorschau, 4=speichern, 5=verwerfen."""
+    if not state_data:
+        await _clear_state(chat_id)
+        return "Wizard-Session abgelaufen. Bitte /formular erneut starten."
+
+    t = (text or "").strip()
+    fields = state_data.get("fields") or []
+    anfrage_typ = state_data.get("anfrage_typ") or ANFRAGE_TYP_ALLGEMEIN
+
+    if t == "1":
+        # Neues Feld - Schritt 1: Name
+        await _save_state(chat_id, STATE_FORMULAR_NEU_NAME, state_data)
+        msg = "<b>➕ Neues Feld</b>\n\n"
+        msg += "Wie soll das Feld <i>technisch</i> heissen? "
+        msg += "(Kleinbuchstaben, Zahlen, Unterstriche; max 30 Zeichen)\n\n"
+        msg += "<b>Beispiele:</b>\n"
+        msg += "• <i>lieferadresse</i>\n"
+        msg += "• <i>wandfarbe</i>\n"
+        msg += "• <i>raumgroesse</i>\n\n"
+        msg += "Oder /abbrechen."
+        return msg
+
+    if t == "2":
+        if not fields:
+            return _formular_render_hauptmenu(fields, anfrage_typ) + "\n\nKein Feld zum Loeschen vorhanden."
+        await _save_state(chat_id, STATE_FORMULAR_LOESCHEN, state_data)
+        msg = "<b>➖ Feld entfernen</b>\n\nWelches Feld soll raus? Nummer schicken:\n\n"
+        for i, f in enumerate(fields, 1):
+            msg += _formular_format_field_short(i, f) + "\n"
+        msg += "\nOder /abbrechen."
+        return msg
+
+    if t == "3":
+        # Vorschau
+        if not fields:
+            preview = "<i>(noch keine Felder)</i>"
+        else:
+            preview = "\n".join(_formular_format_field_short(i, f) for i, f in enumerate(fields, 1))
+        msg = "<b>👁 Vorschau</b>\n\n" + preview + "\n\n"
+        if state_data.get("dirty"):
+            msg += "⚠️  <b>Noch nicht gespeichert!</b> Erst mit <b>4</b> landet das im Web-Formular.\n"
+        msg += "Mit <b>1</b>=hinzufuegen, <b>2</b>=entfernen, <b>4</b>=speichern, <b>5</b>=verwerfen weiter."
+        return msg
+
+    if t == "4":
+        # Speichern via Inline-Buttons (Bestaetigung + sicherer Save-Pfad)
+        from core.integrations.anfrage_forms import validate_schema_fields
+        ok, err = validate_schema_fields(fields)
+        if not ok:
+            return f"Schema ist nicht gueltig: {err}\n\nBitte Felder korrigieren und nochmal speichern."
+
+        msg = f"<b>✅ Speichern?</b>\n\n{len(fields)} Felder werden uebernommen."
+        keyboard = [[
+            {"text": "✅ Speichern", "callback_data": "formular:save"},
+            {"text": "❌ Verwerfen", "callback_data": "formular:cancel"},
+        ]]
+        await _send_with_inline_buttons(chat_id, msg, keyboard)
+        return None
+
+    if t == "5":
+        await _clear_state(chat_id)
+        return "🗑 Aenderungen verworfen. Bisheriges Formular bleibt aktiv."
+
+    return "Bitte <b>1</b>-<b>5</b> schicken oder /abbrechen."
+
+
+async def _handle_formular_neu_name_input(chat_id, text: str, state_data: dict):
+    """Schritt 1: technischer Feldname."""
+    import re
+    if not state_data:
+        await _clear_state(chat_id)
+        return "Wizard-Session abgelaufen. Bitte /formular erneut starten."
+
+    name = (text or "").strip().lower()
+    if not name or len(name) < 2:
+        return "Name zu kurz. Bitte mind. 2 Zeichen oder /abbrechen."
+    if len(name) > 30:
+        return "Name zu lang (max 30 Zeichen). Bitte kuerzer."
+    if not re.match(r"^[a-z][a-z0-9_]*$", name):
+        return "Nur Kleinbuchstaben, Zahlen, Unterstriche; muss mit Buchstabe anfangen."
+    if name in {"name", "email", "token"}:
+        return f"'{name}' ist reserviert. Bitte einen anderen Namen waehlen."
+
+    existing_names = {(f.get("name") or "").lower() for f in (state_data.get("fields") or [])}
+    if name in existing_names:
+        return f"'{name}' ist schon vergeben. Bitte einen anderen Namen waehlen."
+
+    pending = {"name": name}
+    state_data["pending_field"] = pending
+    await _save_state(chat_id, STATE_FORMULAR_NEU_LABEL, state_data)
+    msg = f"<b>{name}</b> — was soll als <i>Anzeige-Label</i> im Formular stehen?\n\n"
+    msg += "<b>Beispiele:</b>\n"
+    msg += "• <i>An welche Adresse soll geliefert werden?</i>\n"
+    msg += "• <i>Welche Wandfarbe haetten Sie gerne?</i>\n\n"
+    msg += "Oder /abbrechen."
+    return msg
+
+
+async def _handle_formular_neu_label_input(chat_id, text: str, state_data: dict):
+    """Schritt 2: Anzeige-Label."""
+    if not state_data or "pending_field" not in state_data:
+        await _clear_state(chat_id)
+        return "Wizard-Session abgelaufen. Bitte /formular erneut starten."
+
+    label = (text or "").strip()
+    if not label or len(label) < 2:
+        return "Label zu kurz. Bitte mind. 2 Zeichen oder /abbrechen."
+    if len(label) > 200:
+        return "Label zu lang (max 200 Zeichen). Bitte kuerzer."
+
+    state_data["pending_field"]["label"] = label
+    await _save_state(chat_id, STATE_FORMULAR_NEU_TYP, state_data)
+
+    msg = f"<b>{label}</b>\n\nWelcher Feld-Typ?\n\n"
+    for i, (_, lab) in enumerate(_FORMULAR_FELDTYP_REIHE, 1):
+        msg += f"<b>{i}</b>) {lab}\n"
+    msg += "\nBitte Nummer schicken oder /abbrechen."
+    return msg
+
+
+async def _handle_formular_neu_typ_input(chat_id, text: str, state_data: dict):
+    """Schritt 3: Feld-Typ-Auswahl 1-8."""
+    if not state_data or "pending_field" not in state_data:
+        await _clear_state(chat_id)
+        return "Wizard-Session abgelaufen. Bitte /formular erneut starten."
+
+    t = (text or "").strip()
+    if not t.isdigit() or not (1 <= int(t) <= len(_FORMULAR_FELDTYP_REIHE)):
+        return f"Bitte eine Zahl von 1 bis {len(_FORMULAR_FELDTYP_REIHE)} schicken oder /abbrechen."
+
+    typ_key, _ = _FORMULAR_FELDTYP_REIHE[int(t) - 1]
+    state_data["pending_field"]["type"] = typ_key
+
+    if typ_key in _FORMULAR_TYPEN_MIT_OPTIONEN:
+        await _save_state(chat_id, STATE_FORMULAR_NEU_OPTIONEN, state_data)
+        msg = f"<b>Optionen fuer '{state_data['pending_field']['label']}'</b>\n\n"
+        msg += "Bitte alle Auswahlmoeglichkeiten als <b>Komma-getrennte Liste</b> schicken.\n\n"
+        msg += "<b>Beispiel:</b> <i>Eiche, Buche, Nussbaum, Lackiert</i>\n\n"
+        msg += "Mindestens 2 Optionen, max 12. Oder /abbrechen."
+        return msg
+
+    # Kein Optionen-Schritt - direkt zu Required
+    await _save_state(chat_id, STATE_FORMULAR_NEU_REQUIRED, state_data)
+    return (
+        f"Soll das Feld ein <b>Pflichtfeld</b> sein?\n\n"
+        f"<b>ja</b> oder <b>nein</b> schicken (oder /abbrechen)."
+    )
+
+
+async def _handle_formular_neu_optionen_input(chat_id, text: str, state_data: dict):
+    """Schritt 3.5: Optionen fuer radio/checkbox/select."""
+    if not state_data or "pending_field" not in state_data:
+        await _clear_state(chat_id)
+        return "Wizard-Session abgelaufen. Bitte /formular erneut starten."
+
+    raw = (text or "").strip()
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    if len(parts) < 2:
+        return "Mindestens 2 Optionen. Bitte komma-getrennt nochmal schicken oder /abbrechen."
+    if len(parts) > 12:
+        return "Max 12 Optionen. Bitte kuerzen oder /abbrechen."
+    if any(len(p) > 80 for p in parts):
+        return "Eine Option ist laenger als 80 Zeichen. Bitte kuerzen."
+
+    state_data["pending_field"]["options"] = parts
+    await _save_state(chat_id, STATE_FORMULAR_NEU_REQUIRED, state_data)
+    return (
+        f"Optionen erfasst ({len(parts)}). Soll das Feld ein <b>Pflichtfeld</b> sein?\n\n"
+        f"<b>ja</b> oder <b>nein</b> schicken (oder /abbrechen)."
+    )
+
+
+async def _handle_formular_neu_required_input(chat_id, text: str, state_data: dict):
+    """Schritt 4 (final): Pflichtfeld ja/nein, dann Feld dem Snapshot anhaengen."""
+    if not state_data or "pending_field" not in state_data:
+        await _clear_state(chat_id)
+        return "Wizard-Session abgelaufen. Bitte /formular erneut starten."
+
+    t = (text or "").strip().lower()
+    if t in ("ja", "j", "y", "yes"):
+        required = True
+    elif t in ("nein", "n", "no"):
+        required = False
+    else:
+        return "Bitte <b>ja</b> oder <b>nein</b> schicken oder /abbrechen."
+
+    pending = state_data["pending_field"]
+    pending["required"] = required
+
+    fields = state_data.get("fields") or []
+    fields.append(pending)
+    state_data["fields"] = fields
+    state_data["dirty"] = True
+    state_data.pop("pending_field", None)
+
+    anfrage_typ = state_data.get("anfrage_typ") or ANFRAGE_TYP_ALLGEMEIN
+    await _save_state(chat_id, STATE_FORMULAR_HAUPTMENU, state_data)
+
+    msg = (
+        f"✅ <b>{pending['label']}</b> in Bearbeitungspuffer aufgenommen.\n"
+        f"<i>(noch nicht im Web aktiv – tippe <b>4</b> zum Speichern)</i>\n\n"
+    )
+    msg += _formular_render_hauptmenu(fields, anfrage_typ, dirty=True)
+    return msg
+
+
+async def _handle_formular_loeschen_input(chat_id, text: str, state_data: dict):
+    """Loescht das Feld an Position N (1-basiert) aus dem Snapshot."""
+    if not state_data:
+        await _clear_state(chat_id)
+        return "Wizard-Session abgelaufen. Bitte /formular erneut starten."
+
+    fields = state_data.get("fields") or []
+    anfrage_typ = state_data.get("anfrage_typ") or ANFRAGE_TYP_ALLGEMEIN
+    t = (text or "").strip()
+    if not t.isdigit():
+        return "Bitte eine Zahl schicken oder /abbrechen."
+    idx = int(t)
+    if idx < 1 or idx > len(fields):
+        return f"Index ausserhalb. Bitte 1 bis {len(fields)} schicken."
+
+    removed = fields.pop(idx - 1)
+    state_data["fields"] = fields
+    state_data["dirty"] = True
+    await _save_state(chat_id, STATE_FORMULAR_HAUPTMENU, state_data)
+    msg = (
+        f"➖ <b>{removed.get('label', removed.get('name', 'Feld'))}</b> aus Bearbeitungspuffer entfernt.\n"
+        f"<i>(noch nicht im Web aktiv – tippe <b>4</b> zum Speichern)</i>\n\n"
+    )
+    msg += _formular_render_hauptmenu(fields, anfrage_typ, dirty=True)
+    return msg
+
+
+async def _handle_formular_anzeigen_command(chat_id):
+    """/formular_anzeigen - Read-only-View des aktiven Schemas (DB oder Default)."""
+    tenant = await _get_tenant_by_chat(chat_id)
+    if not tenant:
+        return "Dieser Chat ist noch keinem Betrieb zugeordnet."
+
+    from core.integrations.anfrage_forms import get_schema_for_tenant
+    msg = "<b>📋 Aktive Formulare</b>\n\n"
+    for typ in (ANFRAGE_TYP_TISCHLER, ANFRAGE_TYP_ALLGEMEIN):
+        schema = await get_schema_for_tenant(tenant.id, typ)
+        flds = schema.get("fields") or []
+        msg += f"<b>{_FORMULAR_TYP_LABEL[typ]}</b> ({len(flds)} Felder)\n"
+        for i, f in enumerate(flds, 1):
+            msg += _formular_format_field_short(i, f) + "\n"
+        msg += "\n"
+    msg += "Mit /formular kannst du Felder anpassen."
+    return msg
+
+
+async def _handle_formular_zuruecksetzen_command(chat_id):
+    """/formular_zuruecksetzen - Bestaetigung via Inline-Buttons."""
+    tenant = await _get_tenant_by_chat(chat_id)
+    if not tenant:
+        return "Dieser Chat ist noch keinem Betrieb zugeordnet."
+
+    await _save_state(chat_id, STATE_FORMULAR_RESET_CONFIRM, {})
+    msg = "<b>🗑 Formular zuruecksetzen?</b>\n\n"
+    msg += "Setzt <i>beide</i> Anfrage-Typen (Tischlerei + Allgemein) auf die "
+    msg += "Standard-Felder zurueck. Eigene Anpassungen gehen verloren.\n\n"
+    msg += "Welche moechtest du zuruecksetzen?"
+    keyboard = [
+        [{"text": "Tischlerei", "callback_data": f"formular:reset:{ANFRAGE_TYP_TISCHLER}"}],
+        [{"text": "Allgemein", "callback_data": f"formular:reset:{ANFRAGE_TYP_ALLGEMEIN}"}],
+        [{"text": "Beide", "callback_data": "formular:reset:both"}],
+        [{"text": "❌ Abbrechen", "callback_data": "formular:reset_cancel"}],
+    ]
+    await _send_with_inline_buttons(chat_id, msg, keyboard)
+    return None
+
+
+async def _handle_formular_callback(chat_id, callback_data, callback_query_id, bot_token):
+    """Inline-Button-Dispatcher fuer save/cancel und reset:*."""
+    parts = callback_data.split(":")
+    if len(parts) < 2:
+        await _answer_callback_query(callback_query_id, "Ungueltig", bot_token)
+        return
+    action = parts[1]
+
+    if action == "cancel":
+        await _clear_state(chat_id)
+        await _answer_callback_query(callback_query_id, "Verworfen", bot_token)
+        await _send_to_chat(chat_id, "🗑 Aenderungen verworfen.")
+        return
+
+    if action == "reset_cancel":
+        await _clear_state(chat_id)
+        await _answer_callback_query(callback_query_id, "Abgebrochen", bot_token)
+        await _send_to_chat(chat_id, "🗑 Reset abgebrochen.")
+        return
+
+    if action == "save":
+        state = await _load_state(chat_id)
+        if not state or not state.state_data:
+            await _answer_callback_query(callback_query_id, "Session abgelaufen", bot_token)
+            await _clear_state(chat_id)
+            return
+        tenant = await _get_tenant_by_chat(chat_id)
+        if not tenant:
+            await _answer_callback_query(callback_query_id, "Tenant fehlt", bot_token)
+            return
+        from core.integrations.anfrage_forms import upsert_tenant_schema
+        anfrage_typ = state.state_data.get("anfrage_typ") or ANFRAGE_TYP_ALLGEMEIN
+        fields = state.state_data.get("fields") or []
+        ok, err = await upsert_tenant_schema(
+            tenant_id=tenant.id,
+            anfrage_typ=anfrage_typ,
+            fields=fields,
+        )
+        await _clear_state(chat_id)
+        if ok:
+            await _answer_callback_query(callback_query_id, "Gespeichert!", bot_token)
+            label = _FORMULAR_TYP_LABEL.get(anfrage_typ, anfrage_typ)
+            await _send_to_chat(
+                chat_id,
+                f"✅ <b>Gespeichert.</b>\n\nFormular '{label}' hat jetzt {len(fields)} Felder.",
+            )
+        else:
+            await _answer_callback_query(callback_query_id, "Fehler", bot_token)
+            await _send_to_chat(chat_id, f"❌ Konnte nicht speichern: {err}")
+        return
+
+    if action == "reset":
+        if len(parts) < 3:
+            await _answer_callback_query(callback_query_id, "Ungueltig", bot_token)
+            return
+        target = parts[2]
+        tenant = await _get_tenant_by_chat(chat_id)
+        if not tenant:
+            await _answer_callback_query(callback_query_id, "Tenant fehlt", bot_token)
+            return
+        from core.integrations.anfrage_forms import delete_tenant_schema
+        if target == "both":
+            n1 = await delete_tenant_schema(tenant.id, ANFRAGE_TYP_TISCHLER)
+            n2 = await delete_tenant_schema(tenant.id, ANFRAGE_TYP_ALLGEMEIN)
+            removed = int(n1) + int(n2)
+        elif target in (ANFRAGE_TYP_TISCHLER, ANFRAGE_TYP_ALLGEMEIN):
+            removed = 1 if await delete_tenant_schema(tenant.id, target) else 0
+        else:
+            await _answer_callback_query(callback_query_id, "Ungueltig", bot_token)
+            return
+        await _clear_state(chat_id)
+        await _answer_callback_query(callback_query_id, "Zurueckgesetzt", bot_token)
+        if removed:
+            await _send_to_chat(
+                chat_id,
+                f"✅ Zurueckgesetzt. Default-Felder werden wieder verwendet ({removed}× geloescht).",
+            )
+        else:
+            await _send_to_chat(
+                chat_id,
+                "ℹ️ Es gab kein eigenes Schema - Defaults waren ohnehin aktiv.",
+            )
+        return
+
+    await _answer_callback_query(callback_query_id, "Unbekannt", bot_token)
+
+
+# =====================================================================
+# Plugin-Klasse (Webhook-Einstieg)
+# =====================================================================
 
 
 class Plugin(BasePlugin):

@@ -45,6 +45,17 @@ STATE_LEISTUNG_WAITING_PREIS = "leistung_waiting_preis"
 STATE_LEISTUNG_WAITING_BESCHREIBUNG = "leistung_waiting_beschreibung"
 STATE_LEISTUNG_PREVIEWING = "leistung_previewing"
 
+# Formular-Editor-Wizard
+STATE_FORMULAR_TYP_WAEHLEN = "formular_typ_waehlen"
+STATE_FORMULAR_HAUPTMENU = "formular_hauptmenu"
+STATE_FORMULAR_NEU_NAME = "formular_neu_name"
+STATE_FORMULAR_NEU_LABEL = "formular_neu_label"
+STATE_FORMULAR_NEU_TYP = "formular_neu_typ"
+STATE_FORMULAR_NEU_OPTIONEN = "formular_neu_optionen"
+STATE_FORMULAR_NEU_REQUIRED = "formular_neu_required"
+STATE_FORMULAR_LOESCHEN = "formular_loeschen"
+STATE_FORMULAR_RESET_CONFIRM = "formular_reset_confirm"
+
 
 
 

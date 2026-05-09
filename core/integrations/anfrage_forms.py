@@ -186,6 +186,127 @@ def get_schema(anfrage_typ: str) -> dict:
     return get_default_schema(anfrage_typ)
 
 
+# =====================================================================
+# Schema-Schreibweg fuer Tenant-Editor (Telegram-Wizard)
+# =====================================================================
+
+# Welche Field-Types das Form-Template kennt (vgl. anfrage_form_template.render_field)
+ALLOWED_FIELD_TYPES = {
+    "text", "tel", "date", "textarea",
+    "radio", "checkbox_multi", "select", "masse",
+}
+
+# Reserviert weil im Mail-Pipeline / Submit-Logik anders behandelt
+RESERVED_FIELD_NAMES = {"name", "email", "token"}
+
+
+def validate_schema_fields(fields: list[dict]) -> tuple[bool, str]:
+    """Strukturpruefung. Returns (ok, error_msg). Fuer Telegram-Wizard + DB-Schreibweg."""
+    if not isinstance(fields, list) or not fields:
+        return False, "Mindestens 1 Feld noetig."
+    seen = set()
+    for f in fields:
+        if not isinstance(f, dict):
+            return False, "Feld-Eintrag ist kein Dict."
+        n = (f.get("name") or "").strip()
+        t = (f.get("type") or "").strip()
+        lab = (f.get("label") or "").strip()
+        if not n or not lab or not t:
+            return False, "Jedes Feld braucht name, label, type."
+        if n in seen:
+            return False, f"Feldname '{n}' kommt doppelt vor."
+        seen.add(n)
+        if n in RESERVED_FIELD_NAMES:
+            return False, f"Feldname '{n}' ist reserviert."
+        if t not in ALLOWED_FIELD_TYPES:
+            return False, f"Unbekannter Field-Type '{t}'."
+        if t in {"radio", "checkbox_multi", "select"}:
+            opts = f.get("options") or []
+            if not isinstance(opts, list) or len(opts) < 2:
+                return False, f"Feld '{n}': mindestens 2 Optionen noetig."
+    return True, ""
+
+
+async def upsert_tenant_schema(
+    tenant_id: UUID,
+    anfrage_typ: str,
+    fields: list[dict],
+    title: Optional[str] = None,
+    subtitle: Optional[str] = None,
+) -> tuple[bool, str]:
+    """Speichert oder aktualisiert das Tenant-Schema.
+
+    UNIQUE(tenant_id, anfrage_typ) wird vom DB-Index erzwungen.
+    Returns (ok, message).
+    """
+    ok, err = validate_schema_fields(fields)
+    if not ok:
+        return False, err
+
+    from core.models import TenantAnfrageSchema
+
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            select(TenantAnfrageSchema).where(
+                TenantAnfrageSchema.tenant_id == tenant_id,
+                TenantAnfrageSchema.anfrage_typ == anfrage_typ,
+            )
+        )
+        row = result.scalar_one_or_none()
+        if row is None:
+            row = TenantAnfrageSchema(
+                tenant_id=tenant_id,
+                anfrage_typ=anfrage_typ,
+                title=title,
+                subtitle=subtitle,
+                fields=fields,
+                is_active=True,
+            )
+            session.add(row)
+        else:
+            row.fields = fields
+            if title is not None:
+                row.title = title
+            if subtitle is not None:
+                row.subtitle = subtitle
+            row.is_active = True
+        await session.commit()
+
+    logger.info(
+        f"upsert_tenant_schema: tenant={tenant_id} typ={anfrage_typ} "
+        f"fields={len(fields)}"
+    )
+    return True, "ok"
+
+
+async def delete_tenant_schema(tenant_id: UUID, anfrage_typ: str) -> bool:
+    """Loescht das Tenant-Schema (fuer /formular_zuruecksetzen).
+
+    get_schema_for_tenant() faellt danach automatisch auf Defaults zurueck.
+    Returns True wenn ein Eintrag entfernt wurde.
+    """
+    from core.models import TenantAnfrageSchema
+
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            select(TenantAnfrageSchema).where(
+                TenantAnfrageSchema.tenant_id == tenant_id,
+                TenantAnfrageSchema.anfrage_typ == anfrage_typ,
+            )
+        )
+        row = result.scalar_one_or_none()
+        if row is None:
+            return False
+        await session.delete(row)
+        await session.commit()
+
+    logger.info(
+        f"delete_tenant_schema: tenant={tenant_id} typ={anfrage_typ} "
+        f"-> Default wird wieder genutzt"
+    )
+    return True
+
+
 async def create_anfrage_token(
     tenant_id: UUID,
     kunde_email: str,
