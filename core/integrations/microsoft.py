@@ -190,6 +190,17 @@ async def send_mail_as_user(
                     f"Microsoft-Mail gesendet: tenant={tenant_id} to={to_email} "
                     f"subject={subject[:50]!r} attachments={len(att_payload)}"
                 )
+                # Failsafe Usage-Tracking
+                try:
+                    from core.billing import track_mail_send
+                    await track_mail_send(
+                        "microsoft",
+                        tenant_id=tenant_id,
+                        operation="mail-send",
+                        recipient_count=1 + (len(cc) if cc else 0),
+                    )
+                except Exception as e:
+                    logger.debug(f"Microsoft-Tracking failed (egal): {e}")
                 return True
             logger.error(
                 f"Microsoft sendMail fehlgeschlagen: "

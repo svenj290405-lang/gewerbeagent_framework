@@ -24,6 +24,8 @@ from functools import lru_cache
 import vertexai
 from vertexai.generative_models import GenerativeModel, GenerationConfig
 
+from config.settings import settings
+
 logger = logging.getLogger(__name__)
 
 
@@ -65,6 +67,8 @@ async def call_gemini(
     *,
     temperature: float = 0.2,
     max_output_tokens: int = 4096,
+    tenant_id: str | None = None,
+    operation_kind: str | None = None,
 ) -> str:
     """
     Synchrones Vertex-SDK in Threadpool, damit es in Async-Code passt.
@@ -73,27 +77,43 @@ async def call_gemini(
     HINWEIS: Gemini 2.5 Flash macht "Thinking" vor Output. Bei zu niedrigem
     max_output_tokens werden alle Tokens fuers Thinking verbraucht und die
     eigentliche Antwort bleibt leer. Daher Default 4096.
+
+    tenant_id und operation_kind sind optional - falls gesetzt, wird der
+    Token-Verbrauch in api_usage_log gespeichert (failsafe).
     """
-    def _run() -> str:
+    def _run():
         model = _get_model()
         config = GenerationConfig(
             temperature=temperature,
             max_output_tokens=max_output_tokens,
         )
-        response = model.generate_content(prompt, generation_config=config)
-        # response.text wirft wenn Content leer (z.B. MAX_TOKENS bei Thinking).
-        try:
-            return response.text or ""
-        except Exception as e:
-            logger.warning(f"Gemini-Antwort hat keinen Text: {e}")
-            # Fallback: erste Candidate-Parts manuell joinen
-            try:
-                parts = response.candidates[0].content.parts
-                return "".join(p.text for p in parts if hasattr(p, "text"))
-            except Exception:
-                return ""
+        return model.generate_content(prompt, generation_config=config)
 
-    return await asyncio.to_thread(_run)
+    response = await asyncio.to_thread(_run)
+
+    # Usage-Tracking, failsafe (loggt nur Warnungen)
+    try:
+        from core.billing import track_gemini_response
+        await track_gemini_response(
+            response,
+            model=settings.gemini_model,
+            tenant_id=tenant_id,
+            operation_kind=operation_kind,
+        )
+    except Exception as e:
+        logger.debug(f"Gemini-Tracking failed (egal): {e}")
+
+    # response.text wirft wenn Content leer (z.B. MAX_TOKENS bei Thinking).
+    try:
+        return response.text or ""
+    except Exception as e:
+        logger.warning(f"Gemini-Antwort hat keinen Text: {e}")
+        # Fallback: erste Candidate-Parts manuell joinen
+        try:
+            parts = response.candidates[0].content.parts
+            return "".join(p.text for p in parts if hasattr(p, "text"))
+        except Exception:
+            return ""
 
 
 # =====================================================================

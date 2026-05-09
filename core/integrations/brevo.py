@@ -80,12 +80,14 @@ class BrevoMailer:
         reply_to_name: str | None = None,
         attachments: list[MailAttachment] | None = None,
         custom_headers: dict | None = None,
+        tenant_id: str | None = None,
     ) -> dict:
         """
         Verschickt eine Mail. Wirft BrevoError bei Fehler (im Gegensatz zur
         send_reply_via_brevo-Funktion in mail_intake, die silent failt).
 
         Returns: Brevo-Response-JSON (enthaelt messageId).
+        tenant_id (optional) wird fuer API-Usage-Tracking genutzt.
         """
         if not to.email:
             raise ValueError("Empfaenger-E-Mail fehlt")
@@ -133,6 +135,14 @@ class BrevoMailer:
                 to.email, subject, data.get("messageId"),
                 len(attachments) if attachments else 0,
             )
+            # Failsafe Usage-Tracking
+            try:
+                from core.billing import track_mail_send
+                await track_mail_send(
+                    "brevo", tenant_id=tenant_id, recipient_count=1,
+                )
+            except Exception as e:
+                logger.debug(f"Brevo-Tracking failed (egal): {e}")
             return data
 
         try:
