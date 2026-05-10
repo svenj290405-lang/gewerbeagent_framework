@@ -964,6 +964,7 @@ class Plugin(BasePlugin):
                         "telefon": extracted.get("telefon"),
                     },
                     assigned_employee_id=assigned_emp_id,
+                    idempotency_key=message_id,
                 )
                 action = "slot_gewaehlt"
 
@@ -982,6 +983,7 @@ class Plugin(BasePlugin):
                 booking_result = await self._versuche_buchung(
                     tenant, sender_name, extracted,
                     assigned_employee_id=assigned_emp_id,
+                    idempotency_key=message_id,
                 )
                 action = "verschoben"
             else:
@@ -1027,6 +1029,7 @@ class Plugin(BasePlugin):
                 booking_result = await self._versuche_buchung(
                     tenant, sender_name, extracted,
                     assigned_employee_id=assigned_emp_id,
+                    idempotency_key=message_id,
                 )
                 action = "neu_gebucht"
             else:
@@ -1067,6 +1070,7 @@ class Plugin(BasePlugin):
                 booking_result = await self._versuche_buchung(
                     tenant, sender_name, extracted,
                     assigned_employee_id=assigned_emp_id,
+                    idempotency_key=message_id,
                 )
                 action = "neu_gebucht"
             else:
@@ -1302,12 +1306,16 @@ class Plugin(BasePlugin):
         extracted: dict,
         *,
         assigned_employee_id=None,
+        idempotency_key: str | None = None,
     ) -> dict | None:
         """Ruft kalender-Plugin direkt auf via dessen on_webhook.
 
         Phase-5-Multi-Mitarbeiter: optional `assigned_employee_id`
         wird ans Kalender-Plugin durchgereicht (Phase-1 nutzt das
         fuer Multi-OAuth, Phase-3 fuer Routing-Origin).
+
+        idempotency_key (typischerweise Mail-Message-ID) verhindert
+        Doppelbuchungen bei Container-Restart oder Cron-Re-Polling.
         """
         try:
             from core.plugin_system import get_plugin_for_tenant
@@ -1319,13 +1327,15 @@ class Plugin(BasePlugin):
             payload = {
                 "name": kunden_name,
                 "anliegen": extracted.get("anliegen", "Mail-Anfrage"),
-                "adresse": "Per Mail nicht angegeben",
+                "adresse": extracted.get("kunde_adresse") or "Per Mail nicht angegeben",
                 "telefon": extracted.get("telefon"),
                 "datum": extracted["wunschtermin_datum"],
                 "uhrzeit": extracted["wunschtermin_uhrzeit"],
             }
             if assigned_employee_id is not None:
                 payload["employee_id"] = str(assigned_employee_id)
+            if idempotency_key:
+                payload["idempotency_key"] = idempotency_key
             return await kalender.on_webhook("book_appointment", payload)
         except Exception as e:
             logger.exception(f"Buchung fehlgeschlagen: {e}")

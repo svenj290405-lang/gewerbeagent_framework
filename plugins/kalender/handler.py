@@ -12,9 +12,11 @@ Refaktorierte Version des alten webhook_server.py:
 """
 from __future__ import annotations
 
+import asyncio
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
+from uuid import UUID
 
 from sqlalchemy import select
 
@@ -32,6 +34,73 @@ from plugins.kalender.manifest import MANIFEST
 from plugins.telegram_notify.handler import TelegramNotifier
 
 logger = logging.getLogger(__name__)
+
+
+# ----------------------------------------------------------------------
+# Booking Concurrency + Idempotency
+# ----------------------------------------------------------------------
+# In-process Lock-Map: pro (tenant_id, slot-start-minute) genau ein Booking
+# gleichzeitig. Verhindert Doppelbuchung wenn z.B. Mail-Pipeline und
+# Voice-Pipeline parallel auf den gleichen Slot zielen.
+_SLOT_LOCKS: dict[tuple[UUID, datetime], asyncio.Lock] = {}
+_SLOT_LOCKS_GUARD = asyncio.Lock()
+
+
+# Idempotency-Cache: bei wiederholtem _book_appointment-Aufruf mit
+# gleichem Key (z.B. Mail-Message-ID) gibt es das vorherige Resultat
+# zurueck statt eine zweite Buchung zu machen.
+# TTL: 24h (genug fuer Container-Restart-Recovery).
+_BOOKING_IDEMPOTENCY: dict[tuple[UUID, str], tuple[datetime, dict]] = {}
+_IDEMPOTENCY_TTL_SECONDS = 24 * 3600
+_IDEMPOTENCY_MAX_ENTRIES = 5000  # safety cap
+
+
+def _get_slot_lock(tenant_id: UUID, slot_start: datetime) -> asyncio.Lock:
+    """Liefert (oder erstellt) den Lock fuer einen konkreten Slot.
+
+    Wir runden auf Minuten-Granularitaet damit Slot-Variationen wie
+    14:00 und 14:00:30 den gleichen Lock bekommen.
+    """
+    minute_key = slot_start.replace(second=0, microsecond=0)
+    key = (tenant_id, minute_key)
+    lock = _SLOT_LOCKS.get(key)
+    if lock is None:
+        # Garde gegen Race beim Lock-Erstellen selbst (sehr klein, aber sauber)
+        lock = asyncio.Lock()
+        _SLOT_LOCKS[key] = lock
+    return lock
+
+
+def _cache_booking_idempotency(
+    tenant_id: UUID, key: str, response: dict,
+) -> None:
+    """Speichert das Booking-Resultat fuer 24h damit Wiederholungs-Aufrufe
+    mit dem gleichen Key kein zweites Event anlegen."""
+    try:
+        # Garbage Collect uralte Eintraege wenn Cap erreicht
+        if len(_BOOKING_IDEMPOTENCY) > _IDEMPOTENCY_MAX_ENTRIES:
+            cutoff = datetime.now(timezone.utc) - timedelta(seconds=_IDEMPOTENCY_TTL_SECONDS)
+            stale = [k for k, (ts, _) in _BOOKING_IDEMPOTENCY.items() if ts < cutoff]
+            for k in stale:
+                _BOOKING_IDEMPOTENCY.pop(k, None)
+        _BOOKING_IDEMPOTENCY[(tenant_id, key)] = (
+            datetime.now(timezone.utc), response,
+        )
+    except Exception as e:
+        logger.debug(f"idempotency cache failed (egal): {e}")
+
+
+def _check_booking_idempotency(tenant_id: UUID, key: str) -> dict | None:
+    """Liefert das gecachte Resultat fuer (tenant, key) wenn vorhanden +
+    nicht aelter als 24h. Sonst None."""
+    entry = _BOOKING_IDEMPOTENCY.get((tenant_id, key))
+    if entry is None:
+        return None
+    ts, response = entry
+    if (datetime.now(timezone.utc) - ts).total_seconds() > _IDEMPOTENCY_TTL_SECONDS:
+        _BOOKING_IDEMPOTENCY.pop((tenant_id, key), None)
+        return None
+    return response
 
 
 class Plugin(BasePlugin):
@@ -131,7 +200,17 @@ class Plugin(BasePlugin):
             }
 
     async def _book_appointment(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """Traegt einen Termin in Google Calendar ein."""
+        """Traegt einen Termin in Google Calendar ein.
+
+        TOCTOU-Schutz: in-process Lock pro (tenant_id, slot_start_minute)
+        serialisiert parallele Buchungs-Anfragen auf den gleichen Slot.
+        Verhindert Doppelbuchung wenn z.B. Mail- und Voice-Pipeline
+        gleichzeitig den selben Termin buchen wollen.
+
+        Idempotency: bei wiederholtem Aufruf mit gleichem idempotency_key
+        wird das vorherige Resultat zurueckgegeben (Container-Restart-
+        Schutz - kommt vom Caller via payload['idempotency_key']).
+        """
         try:
             name = payload.get("name", "")
             anliegen = payload.get("anliegen", "")
@@ -142,36 +221,69 @@ class Plugin(BasePlugin):
             dauer = payload.get(
                 "dauer_minuten", self.config["termin_dauer_minuten"]
             )
+            idempotency_key = payload.get("idempotency_key")
 
             start = self._parse_datum_uhrzeit(datum, uhrzeit)
             ende = start + timedelta(minutes=dauer)
 
             employee_id = payload.get("employee_id")
-            adapter = await get_calendar_adapter(
-                self.tenant_id, employee_id=employee_id,
-                fallback_calendar_id=self.config["calendar_id"],
-            )
 
-            betrieb_name = self.config["betrieb_name"]
-            telefon_text = f"\nTelefon: {telefon}" if telefon else ""
+            # Idempotency-Check: gibt es bereits ein Booking-Result fuer
+            # diesen Key? (z.B. Mail-Message-ID — verhindert Doppel-Buchung
+            # bei Mail-Re-Polling nach Container-Crash.)
+            if idempotency_key:
+                cached = _check_booking_idempotency(
+                    self.tenant_id, idempotency_key,
+                )
+                if cached is not None:
+                    logger.info(
+                        f"book_appointment idempotency-hit: "
+                        f"key={idempotency_key} -> reuse cached result"
+                    )
+                    return cached
 
-            summary = f"[{betrieb_name}] {anliegen} - {name}"
-            description = (
-                f"Betrieb: {betrieb_name}\n"
-                f"Kunde: {name}\n"
-                f"Anliegen: {anliegen}\n"
-                f"Adresse: {adresse}"
-                f"{telefon_text}\n\n"
-                f"Eingetragen via KI-Agent Q (Gewerbeagent Framework)"
-            )
-            result = await adapter.create_event(
-                summary=summary,
-                description=description,
-                location=adresse,
-                start=start,
-                end=ende,
-                timezone=self.config["zeitzone"],
-            )
+            # TOCTOU-Lock: pro Tenant + Slot-Start nur ein Booking
+            # gleichzeitig
+            lock = _get_slot_lock(self.tenant_id, start)
+            async with lock:
+                # Re-Check innerhalb des Locks: vielleicht hat ein anderer
+                # Request den Slot gerade gebucht
+                adapter = await get_calendar_adapter(
+                    self.tenant_id, employee_id=employee_id,
+                    fallback_calendar_id=self.config["calendar_id"],
+                )
+                if await adapter.is_slot_busy(start, ende):
+                    return {
+                        "erfolg": False,
+                        "nachricht": (
+                            f"Slot {start.strftime('%d.%m.%Y %H:%M')} ist "
+                            f"belegt. Anderer Termin wurde gerade gebucht."
+                        ),
+                        "konflikt": True,
+                    }
+
+                betrieb_name = self.config["betrieb_name"]
+                telefon_text = f"\nTelefon: {telefon}" if telefon else ""
+
+                summary = f"[{betrieb_name}] {anliegen} - {name}"
+                description = (
+                    f"Betrieb: {betrieb_name}\n"
+                    f"Kunde: {name}\n"
+                    f"Anliegen: {anliegen}\n"
+                    f"Adresse: {adresse}"
+                    f"{telefon_text}\n\n"
+                    f"Eingetragen via KI-Agent Q (Gewerbeagent Framework)"
+                )
+                if idempotency_key:
+                    description += f"\nGA-Ref: {idempotency_key}"
+                result = await adapter.create_event(
+                    summary=summary,
+                    description=description,
+                    location=adresse,
+                    start=start,
+                    end=ende,
+                    timezone=self.config["zeitzone"],
+                )
 
             # Telegram-Push (silent fail, blockiert nie den Termin)
             telefon_line = f"\n<b>Telefon:</b> {telefon}" if telefon else ""
@@ -188,7 +300,7 @@ class Plugin(BasePlugin):
                 ),
             )
 
-            return {
+            booking_response = {
                 "erfolg": True,
                 "nachricht": (
                     f"Termin erfolgreich eingetragen! "
@@ -198,6 +310,12 @@ class Plugin(BasePlugin):
                 "event_id": result.get("id"),
                 "link": result.get("html_link") or result.get("htmlLink"),
             }
+
+            if idempotency_key:
+                _cache_booking_idempotency(
+                    self.tenant_id, idempotency_key, booking_response,
+                )
+            return booking_response
 
         except Exception as e:
             return {
