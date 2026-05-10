@@ -37,8 +37,9 @@ cd05504 feat(admin-db): admin_users + api_pricing_config + api_usage_log + Seeds
 **Features:**
 - 3D-Wireframe-Sphere via Three.js r128 (CDN, lazy geladen)
 - IcosahedronGeometry mit 280 Brownian-Motion-Partikeln im Inneren
-- 7 dynamische Energy-Linien rotieren um die Sphere
-- Pulse-Animation (1.8s Loop) mit Linien-Opacity-Pulsing
+- 7 dynamische Energy-Linien (Mobile 5) rotieren um die Sphere
+- Pulse-Animation: Scale 1.0 → 1.05 → 1.0, Linien-Opacity 0.6 → 1.0 → 0.6, exakt 1.8s
+- Subtle blaue PointLight im Sphere-Zentrum pulsiert mit (Lebendigkeit)
 - Maus-Hover folgt sanft, Klick-Pulse-Burst
 - Build-Up-Animation: Sphere zeichnet sich beim Page-Load auf (1.6s)
 - `prefers-reduced-motion` respektiert
