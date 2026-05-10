@@ -40,8 +40,13 @@ class Plugin(BasePlugin):
     # ---- Dispatch ----
 
     async def on_webhook(
-        self, endpoint: str, payload: dict[str, Any]
+        self, endpoint: str, payload: dict[str, Any],
+        headers: dict[str, str] | None = None,
     ) -> dict[str, Any]:
+        # Kalender wird nur intern aufgerufen (mail_intake.on_webhook
+        # → kalender.on_webhook), nicht von externen Webhooks.
+        # Header-Verifikation entfaellt; Param fuer BasePlugin-Konformitaet.
+        _ = headers  # noqa: F841
         if endpoint == "check_availability":
             return await self._check_availability(payload)
         elif endpoint == "book_appointment":

@@ -64,7 +64,8 @@ class BasePlugin(ABC):
 
     @abstractmethod
     async def on_webhook(
-        self, endpoint: str, payload: dict[str, Any]
+        self, endpoint: str, payload: dict[str, Any],
+        headers: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         """
         Wird aufgerufen wenn ein Webhook an dieses Plugin kommt.
@@ -72,6 +73,10 @@ class BasePlugin(ABC):
         Args:
             endpoint: Welcher Endpunkt wurde aufgerufen (z.B. "check_availability")
             payload: JSON-Body des Requests
+            headers: HTTP-Request-Header (lowercase keys). Optional damit
+                bestehende Plugins die Signatur ignorieren koennen — neue
+                Plugins (Telegram, Brevo, ElevenLabs) nutzen sie zur
+                Signature-Verifikation eingehender Webhooks.
 
         Returns:
             Dict das als JSON-Response zurueckgeschickt wird

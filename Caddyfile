@@ -1,5 +1,32 @@
+(security_headers) {
+    header {
+        # 'defer' = Header werden NACH dem Backend gesetzt, ueberschreiben
+        # also auch das was uvicorn an Headers liefert. Ohne 'defer' kann
+        # reverse_proxy die Header verlieren.
+        defer
+        # HSTS: erzwingt HTTPS fuer 1 Jahr inkl. Subdomains. Verhindert
+        # Downgrade-Attacks. preload optional (manueller submit-Schritt).
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        # Verhindert MIME-Sniffing → Browser ignoriert content-type-Guess
+        X-Content-Type-Options "nosniff"
+        # Verhindert dass die Seite in iframe geladen wird (Clickjacking)
+        X-Frame-Options "DENY"
+        # Browser sendet Referrer nur an gleiche Origin → kein PII-Leak
+        # via Outbound-Links
+        Referrer-Policy "strict-origin-when-cross-origin"
+        # Cross-Origin-Opener-Policy: isoliert Browsing-Context
+        Cross-Origin-Opener-Policy "same-origin"
+        # Permissions-Policy: keine sensiblen APIs ohne expliziten Bedarf
+        Permissions-Policy "geolocation=(), camera=(), microphone=(), payment=()"
+        # Server-Header verstecken (verhindert Versions-Disclosure)
+        -Server
+    }
+}
+
 gewerbeagent.de {
     encode gzip
+
+    import security_headers
 
     reverse_proxy framework:8001 {
         header_up Host {host}
@@ -19,6 +46,8 @@ gewerbeagent.de {
 
 www.gewerbeagent.de {
     encode gzip
+
+    import security_headers
 
     root * /srv/website
     file_server

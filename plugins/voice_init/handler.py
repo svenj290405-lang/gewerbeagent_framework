@@ -92,7 +92,26 @@ class Plugin(BasePlugin):
 
     manifest = MANIFEST
 
-    async def on_webhook(self, endpoint, payload):
+    async def on_webhook(self, endpoint, payload, headers=None):
+        # Signature-Verifikation: ElevenLabs sendet HMAC-SHA256 ueber den
+        # Raw-Body im 'ElevenLabs-Signature'-Header, wenn beim Webhook-Setup
+        # ein Secret gesetzt wurde. Ohne Verifikation kann jeder gefakete
+        # Anrufe einschmuggeln (Lexware-Kontakte unter falschen Tenants
+        # anlegen, Telegram-Pushes ausloesen).
+        # Hinweis: wir haben hier nur das geparste Payload, nicht den Raw-
+        # Body — strenge HMAC-Verifizierung wuerde einen Raw-Body-Hook im
+        # zentralen Dispatcher brauchen. Pragmatischer Mittelweg: Secret
+        # als statischer Header-Vergleich gegen 'X-Webhook-Secret'.
+        from config.settings import settings
+        expected = (settings.elevenlabs_webhook_secret or "").strip()
+        if expected:
+            got = (headers or {}).get("x-webhook-secret", "") or (
+                headers or {}
+            ).get("elevenlabs-signature", "")
+            import hmac
+            if not hmac.compare_digest(got, expected):
+                raise PermissionError("invalid-elevenlabs-secret")
+
         if endpoint == "initiation":
             return await self._handle_initiation(payload)
         if endpoint == "save_contact":
@@ -249,15 +268,18 @@ class Plugin(BasePlugin):
             f"name={name!r} action={action}"
         )
 
-        # Tenant per Telegram informieren
+        # Tenant per Telegram informieren — alle User-Inputs HTML-escapen,
+        # weil parse_mode=HTML in Telegram. Sonst koennte ein Anrufer mit
+        # praepariertem Namen/Anliegen in fremde Bot-Antworten injizieren.
         if tenant_telegram:
-            anliegen_str = f"\n<b>Anliegen:</b> {anliegen}" if anliegen else ""
-            phone_str = f"\n<b>Telefon:</b> <code>{phone}</code>" if phone else ""
-            email_str = f"\n<b>Mail:</b> <code>{email}</code>" if email else ""
+            from html import escape as _h
+            anliegen_str = f"\n<b>Anliegen:</b> {_h(anliegen)}" if anliegen else ""
+            phone_str = f"\n<b>Telefon:</b> <code>{_h(phone)}</code>" if phone else ""
+            email_str = f"\n<b>Mail:</b> <code>{_h(email)}</code>" if email else ""
             deeplink = f"https://app.lexware.de/permalink/contacts/edit/{contact.contact_id}"
             msg = (
                 f"☎️ <b>Neuer Anruf - Kontakt {action}</b>\n\n"
-                f"<b>Name:</b> {name}"
+                f"<b>Name:</b> {_h(name)}"
                 f"{phone_str}"
                 f"{email_str}"
                 f"{anliegen_str}\n\n"

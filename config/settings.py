@@ -42,6 +42,22 @@ class Settings(BaseSettings):
     admin_telegram_bot_token: str = ""
     admin_telegram_chat_id: str = ""
 
+    # Webhook-Secret-Tokens fuer Signature-Verifikation eingehender Webhooks.
+    # Leer = Verifikation deaktiviert (Backward-Compat fuer Legacy-Setups
+    # ohne Secret). Sobald gesetzt, weist der Server alles ohne passenden
+    # Header ab.
+    #
+    # Telegram: setzbar via setWebhook secret_token-Parameter; Telegram
+    #   sendet ihn als 'X-Telegram-Bot-Api-Secret-Token' bei jedem Update.
+    # Brevo: kein offizielles Signing — wir benutzen einen URL-Secret-
+    #   Pfadteil oder einen Custom-Header 'X-Webhook-Secret' der beim
+    #   Brevo-Inbound-Parser-Setup als Custom-Header eingetragen wird.
+    # ElevenLabs: HMAC-SHA256 signed via 'ElevenLabs-Signature'-Header
+    #   wenn beim Webhook-Setup ein secret konfiguriert wurde.
+    telegram_webhook_secret: str = ""
+    brevo_webhook_secret: str = ""
+    elevenlabs_webhook_secret: str = ""
+
     public_url: str = "http://localhost:8000"
 
     @property

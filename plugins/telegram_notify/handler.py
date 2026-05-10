@@ -5063,7 +5063,22 @@ async def _handle_mitarbeiter_neu_skills_input(chat_id, text, state_data):
 class Plugin(BasePlugin):
     manifest = MANIFEST
 
-    async def on_webhook(self, endpoint, payload):
+    async def on_webhook(self, endpoint, payload, headers=None):
+        # Signature-Verifikation: Telegram setzt secret_token im Header
+        # 'X-Telegram-Bot-Api-Secret-Token' wenn beim setWebhook-Call ein
+        # Secret konfiguriert wurde. Ohne Verifikation kann jeder mit
+        # gefakten Updates Befehle ausloesen (/werkstatt-Adresse aendern,
+        # Mitarbeiter anlegen, Termine buchen).
+        from config.settings import settings
+        expected = (settings.telegram_webhook_secret or "").strip()
+        if expected:
+            got = (headers or {}).get("x-telegram-bot-api-secret-token", "")
+            # Constant-Time-Vergleich gegen Timing-Attacks
+            import hmac
+            if not hmac.compare_digest(got, expected):
+                raise PermissionError("invalid-telegram-secret")
+        # Wenn KEIN Secret gesetzt ist: Webhook ist offen (Backward-Compat).
+        # Das wird in STATUS.md/Doku als deployment-blocker markiert.
         logger.info(f"Telegram-Webhook empfangen: endpoint={endpoint}")
         if endpoint == "incoming":
             return await process_telegram_update(payload)

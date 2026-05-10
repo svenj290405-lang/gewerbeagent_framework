@@ -96,7 +96,14 @@ async def _admin_redirect_handler(request: Request, exc: _AdminRedirect):
 
 @app.get("/")
 async def root() -> dict[str, Any]:
-    """Health-Check + Infos."""
+    """Minimaler Health-Check.
+
+    Hardening: in Production keine Plugin-Liste, Version oder Env
+    ausgeben — gibt Angreifern unnoetige Recon-Infos. In Development
+    (z.B. lokal) bleibt es ausfuehrlich fuer Debug-Komfort.
+    """
+    if settings.is_production:
+        return {"status": "ok"}
     return {
         "status": "ok",
         "service": "Gewerbeagent Framework",
@@ -150,10 +157,21 @@ async def webhook_dispatch(
             ),
         )
 
+    # Header-Dict zum Plugin durchreichen (lowercase fuer konsistenten
+    # Lookup von Signatur-Headers wie X-Telegram-Bot-Api-Secret-Token).
+    headers_lc = {k.lower(): v for k, v in request.headers.items()}
+
     # Dispatch an Plugin
     try:
-        response_data = await plugin.on_webhook(endpoint, payload)
+        response_data = await plugin.on_webhook(endpoint, payload, headers=headers_lc)
         return JSONResponse(content=response_data)
+    except PermissionError as e:
+        # Plugin hat Signatur abgelehnt — generische 401, keine Detail-Leaks
+        logger.warning(
+            f"Webhook abgelehnt: tenant={tenant_slug} plugin={plugin_name} "
+            f"endpoint={endpoint} reason={e}"
+        )
+        raise HTTPException(status_code=401, detail="Unauthorized")
     except Exception as e:
         logger.exception(f"Plugin-Fehler in {plugin_name}/{endpoint}: {e}")
         raise HTTPException(
@@ -178,13 +196,22 @@ async def oauth_start(
 ) -> RedirectResponse:
     """
     Startet den OAuth-Flow: leitet Nutzer zu Google-Login weiter.
+
+    Hardening: Tenant-Slug-Format wird strikt validiert bevor er an die
+    OAuth-Funktion geht — keine sonderzeichen-basierten Bypasses.
     """
+    import re
+    if not re.fullmatch(r"[a-z0-9_-]{1,50}", tenant):
+        raise HTTPException(status_code=400, detail="Ungueltiger Tenant-Slug")
+    if provider not in ("google", "microsoft"):
+        raise HTTPException(status_code=400, detail="Unbekannter OAuth-Provider")
     try:
         auth_url = await generate_auth_url(tenant_slug=tenant, provider=provider)
         return RedirectResponse(url=auth_url, status_code=302)
     except Exception as e:
+        # Internal-Fehler nicht ans Frontend leaken (kein str(e))
         logger.exception(f"OAuth-Start fehlgeschlagen: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="OAuth-Start fehlgeschlagen")
 
 
 @app.get("/oauth/callback")
@@ -195,15 +222,21 @@ async def oauth_callback(
     """
     OAuth-Callback von Google.
     Tauscht code gegen Token, speichert verschluesselt in DB.
+
+    Hardening: HTML-escaped Render der erfolgreichen account_email +
+    generische Fehler-Seite ohne Exception-Details (verhindert Recon
+    via OAuth-Fehler-Messages, z.B. 'tenant XYZ not found').
     """
+    from html import escape as _h
     try:
         oauth_token = await handle_callback(code=code, state=state)
+        safe_email = _h(oauth_token.account_email or "?")
         return HTMLResponse(
             content=f"""
             <html>
             <body style="font-family: sans-serif; padding: 2em;">
                 <h1>✅ Verknuepfung erfolgreich!</h1>
-                <p>Google-Account <b>{oauth_token.account_email}</b> wurde mit
+                <p>Account <b>{safe_email}</b> wurde mit
                 dem Gewerbeagent-Framework verknuepft.</p>
                 <p>Du kannst dieses Fenster jetzt schliessen.</p>
             </body>
@@ -214,12 +247,13 @@ async def oauth_callback(
     except Exception as e:
         logger.exception(f"OAuth-Callback fehlgeschlagen: {e}")
         return HTMLResponse(
-            content=f"""
+            content="""
             <html>
             <body style="font-family: sans-serif; padding: 2em;">
                 <h1>❌ Verknuepfung fehlgeschlagen</h1>
-                <p>Fehler: {str(e)}</p>
-                <p>Bitte erneut versuchen oder an Sven wenden.</p>
+                <p>Bitte erneut versuchen. Sollte das Problem bestehen
+                bleiben, wende dich an den Support
+                (hallo@gewerbeagent.de). Details findest du im Server-Log.</p>
             </body>
             </html>
             """,

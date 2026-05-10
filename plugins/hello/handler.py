@@ -9,8 +9,10 @@ class Plugin(BasePlugin):
     manifest = MANIFEST
 
     async def on_webhook(
-        self, endpoint: str, payload: dict[str, Any]
+        self, endpoint: str, payload: dict[str, Any],
+        headers: dict[str, str] | None = None,
     ) -> dict[str, Any]:
+        _ = headers  # noqa: F841 — BasePlugin-Konformitaet
         if endpoint == "greet":
             name = payload.get("name", "unknown")
             greeting = self.config.get("greeting", "Hello")

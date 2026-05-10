@@ -20,7 +20,7 @@ from typing import Optional
 
 import bcrypt
 from fastapi import Cookie, HTTPException, Request, Response
-from sqlalchemy import select, update
+from sqlalchemy import select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from config.settings import settings
@@ -302,20 +302,38 @@ async def admin_users_exist() -> bool:
 async def create_initial_admin(
     email: str, password: str, *, request: Request,
 ) -> AdminUser:
-    """Legt den ersten Admin-User an. Schlaegt fehl wenn schon einer existiert."""
-    if await admin_users_exist():
-        raise HTTPException(409, "Setup bereits durchgefuehrt")
+    """Legt den ersten Admin-User an. Schlaegt fehl wenn schon einer existiert.
+
+    Hardening (Race-Condition-Fix): zwei parallel eintreffende /admin/setup-
+    Requests koennten beide den admin_users_exist()-Check passieren bevor
+    einer committed hat → zwei Admins entstehen. Loesung: SERIALIZABLE-
+    Transaktion + Re-Check innerhalb derselben Transaktion. Postgres
+    serialisiert dann die zweite Anfrage als 409 statt 200.
+    """
     if "@" not in email or len(email) > 255:
         raise HTTPException(400, "E-Mail ungueltig")
     if len(password) < 10:
         raise HTTPException(400, "Passwort muss mindestens 10 Zeichen lang sein")
 
-    user = AdminUser(
-        email=email.lower().strip(),
-        password_hash=hash_password(password),
-        is_active=True,
-    )
     async with get_session() as s:
+        # SERIALIZABLE-Isolation: garantiert dass kein paralleler Setup
+        # durchschluepft. Falls zwei Requests parallel SELECT machen
+        # bevor einer COMMIT, scheitert der zweite mit
+        # SerializationFailure → 500 vom Default-Handler. Beim erneuten
+        # Versuch greift dann der admin_users_exist()-Check und es kommt
+        # 409. Sicherer als der bisherige reine SELECT-then-INSERT-Pattern.
+        await s.execute(text("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"))
+        existing = (await s.execute(
+            select(AdminUser).limit(1)
+        )).scalar_one_or_none()
+        if existing is not None:
+            raise HTTPException(409, "Setup bereits durchgefuehrt")
+
+        user = AdminUser(
+            email=email.lower().strip(),
+            password_hash=hash_password(password),
+            is_active=True,
+        )
         s.add(user)
         await s.flush()
         await audit(
