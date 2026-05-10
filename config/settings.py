@@ -34,6 +34,11 @@ class Settings(BaseSettings):
 
     elevenlabs_api_key: str = ""
 
+    # OpenRouteService — Geocoding + Travel-Time-Matrix fuer Smart-Termine.
+    # Free-Tier: 2.000 Requests/Tag. Ohne Key: Smart-Routing bleibt aus,
+    # Slot-Vorschlag faellt sauber auf bisherige Logik zurueck.
+    openrouteservice_api_key: str = ""
+
     admin_telegram_bot_token: str = ""
     admin_telegram_chat_id: str = ""
 
