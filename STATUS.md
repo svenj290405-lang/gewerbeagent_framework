@@ -520,6 +520,127 @@ Phase 2 + 3 + 4 (Code) braucht den Restart.
 
 ---
 
+## TEIL G4 — PHASE 5: Skill-Router (10.05.2026 abend)
+
+### Status: ✅ Fertig + live (im Code), aktiv sobald 2+ Mitarbeiter da sind
+
+Eingehende Mails werden ab jetzt automatisch dem passenden Mitarbeiter
+zugewiesen — basierend auf Keyword-Match aus Anliegen/Subject/Body
+gegen die Skills der aktiven Mitarbeiter. Bei Tie-Break (mehrere mit
+gleichem Skill): kuerzeste Anfahrt zum Kunden gewinnt (wenn ORS aktiv +
+Heimat-Adressen gepflegt).
+
+### Neuer Service `core/routing/employee_router.py`
+
+`choose_employee(tenant_id, anliegen_text, kunde_adresse, existing_conversation)`
+liefert `RoutingDecision(employee_id, name, slug, reason, score, debug)`.
+
+**Routing-Hierarchie:**
+1. **Sticky:** wenn `existing_conversation.assigned_employee_id` schon
+   gesetzt → exakt der zurueck. Folge-Mails wechseln nicht den
+   Bearbeiter (`reason='sticky-conversation'`).
+2. **Trivial:** bei nur 1 aktiven Employee → der mit
+   `reason='only-active'`.
+3. **Skill-Match:** Substring-Match `anliegen_text` gegen
+   `KEYWORD_TO_SKILL` (45 Keywords ueber 6 Gewerke). Mitarbeiter mit
+   meisten Skill-Hits gewinnen → `reason='skill-match'`.
+4. **Distanz-Tiebreak:** wenn mehrere Skill-Winner + ORS configured +
+   `kunde_adresse` da → kuerzeste Anfahrt vom employee.heimat_*
+   gewinnt → `reason='distance'`. Pre-Filter auf max 3 Kandidaten
+   (ORS-Quota-Schutz).
+5. **Fallback:** kein Skill-Hit → Default-Employee
+   (`reason='fallback-default'`).
+
+Niemals raise — Caller muss nicht defensiv programmieren.
+
+KEYWORD_TO_SKILL umfasst:
+- Heizung (heizung, kessel, thermostat, brenner, warmwasser, ...)
+- Sanitaer (wasserhahn, abfluss, tropft, wc, rohr, ...)
+- Elektrik (steckdose, sicherung, strom, schalter, lampe, ...)
+- Dach (dach, ziegel, regenrinne, dachfenster, ...)
+- Tischler (tischler, schreiner, moebel, holz, kueche, ...)
+- Maler (maler, streichen, tapete, fassade, ...)
+
+### Anbindung in plugins/mail_intake/handler.py
+
+Direkt nach `extract_termin_aus_mail` wird `choose_employee` aufgerufen
+und `assigned_emp_id` durch alle 7 Aufrufstellen propagiert:
+- 4× `_versuche_buchung(..., assigned_employee_id=...)`
+- 3× `_slot_alternativen(..., assigned_employee_id=...)`
+- 5× `upsert_conversation(..., assigned_employee_id=...)` —
+  sticky-write: nur wenn noch nicht zugewiesen, sonst beibehalten
+
+`_versuche_buchung` reicht `employee_id` an `kalender.book_appointment`
+durch (Phase-1 nutzt das fuer Multi-OAuth, Phase-3 fuer Routing-Origin).
+`_slot_alternativen` analog an `kalender.find_free_slots`.
+
+`_notify_tenant_telegram` erweitert um `routing_decision`-Param:
+- Push geht an den vom Router gewaehlten Mitarbeiter (via Phase-2
+  `_resolve_chat_id_for_push`)
+- Bei skill-match / distance-Reason: Default-Employee bekommt
+  zusaetzlich Cc — Inhaber behaelt Ueberblick + kann ggf. umtragen
+- Telegram-Text enthaelt eine Routing-Begruendung
+  ("Zugewiesen: Sven Mueller (Skill-Match)") damit Inhaber falsche
+  Routings sofort erkennt
+
+### Verifikation
+
+Container-Smoke-Test (Test-Employee Anna mit Heizung+Sanitaer-Skill
+temporaer angelegt + sauber wieder geloescht):
+- "Heizung tropft" → `_test_anna` (skill-match, score=2)
+- "Wasserhahn tropft im Bad" → `_test_anna` (skill-match)
+- "Steckdose kaputt" → `default` (fallback-default, kein Elektriker)
+- "Bitte ein Angebot schicken" → `default` (fallback-default)
+- Sticky: vorhandene Conversation behaelt Employee → `_test_anna`
+
+KEYWORD_TO_SKILL Mapping greift sauber, alle 5 Test-Cases gruen.
+
+### Was noch nicht aktiv ist
+
+- **Voice-Pipeline** extrahiert keine Adresse + Anliegen ist oft kurz.
+  Skill-Routing dort wuerde oft default geben → fuer jetzt unveraendert.
+  Followup waere `voice_init/handler.py:_handle_save_contact` analog
+  zur mail_intake-Logic.
+- **Anfrage-Formular** (`anfrage_telegram`): defensiv `antworten.get('adresse')`
+  + `choose_employee` waere ein 5-Zeilen-Patch, kommt bei Bedarf.
+- **Multi-OAuth (Phase 1):** Skill-Router waehlt zwar den richtigen
+  Mitarbeiter, aber sein Termin landet weiterhin im EINEN Tenant-
+  Kalender (kein eigener Google-Account pro Mitarbeiter). Das ist OK
+  fuer kleine Betriebe (alle sehen alles in einem geteilten Kalender)
+  — bei Bedarf separate Phase-1-Session.
+
+### Gesamt-Bilanz heute (Phasen 0+2+3+4+5)
+
+| Phase | Commit | Feature |
+|---|---|---|
+| 0 | e41b5e9 | Employee-Modell + Default-Backfill (Foundation) |
+| 2 | 6d97beb | Telegram Multi-Chat-Routing + /start <slug>__<emp> |
+| 4 | d0d64f4 | /mitarbeiter-Wizard + assignee-Felder + Briefing-Filter |
+| 3 | 7bf69dc | Heimat-Geo per Employee + /werkstatt employee-aware |
+| 5 | (jetzt) | Skill-Router + Mail-Intake Auto-Zuweisung |
+
+Was du jetzt hast:
+- Tenant kann beliebig viele Mitarbeiter anlegen (`/mitarbeiter neu`)
+- Jeder hat eigenen Telegram-Chat, eigene Heim-Adresse, Skill-Liste
+- Eingehende Mails werden automatisch an den passenden Mitarbeiter
+  geroutet, der wird per Push informiert + Inhaber als Cc
+- Mitarbeiter sehen in `/briefing`, `/anrufe`, `/kunde` nur ihre
+  eigenen Termine (Inhaber sieht alles)
+
+Was noch fehlt:
+- Multi-OAuth pro Mitarbeiter (eigener Google-Calendar) — Phase 1
+- Voice + Anfrage-Formular Skill-Routing — kleine Followups
+
+### Critical: Container-Restart fuer Phase 2+3+4+5
+
+Phase 0+4-Schema ist via alembic in DB. Code steht im Repo, braucht aber
+einen Restart damit FastAPI die neuen Pfade benutzt:
+```
+docker compose restart framework
+```
+
+---
+
 ## TL;DR
 
 **Fertig und live:**

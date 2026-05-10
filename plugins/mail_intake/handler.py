@@ -130,6 +130,7 @@ async def upsert_conversation(
     last_q_reply: str | None = None,
     last_user_message: str | None = None,
     existing=None,
+    assigned_employee_id=None,
 ):
     """
     Erstellt eine neue Konversation oder aktualisiert eine bestehende
@@ -175,6 +176,11 @@ async def upsert_conversation(
             conv.last_user_message = last_user_message
         if proposed_slots is not None:
             conv.proposed_slots = proposed_slots
+        # Phase-5: Conversation-Sticky-Routing — nur setzen wenn noch
+        # nicht zugewiesen (sonst wuerde Folge-Mail den Mitarbeiter
+        # wechseln, was der Sticky-Logic im Router widerspricht)
+        if assigned_employee_id is not None and conv.assigned_employee_id is None:
+            conv.assigned_employee_id = assigned_employee_id
 
         await s.commit()
         await s.refresh(conv)
@@ -796,6 +802,33 @@ class Plugin(BasePlugin):
         )
         logger.info(f"Extracted: {extracted}")
 
+        # Phase-5-Skill-Routing: passenden Mitarbeiter waehlen.
+        # Sticky: bestehende Conversation behaelt ihren assigned_employee_id.
+        # Bei nur 1 Employee → Default (only-active). Best-effort, schluckt
+        # eigene Fehler — Fallback ist None und Code laeuft wie vor Phase 5.
+        routing_decision = None
+        try:
+            from core.routing import choose_employee
+            routing_decision = await choose_employee(
+                tenant.id,
+                anliegen_text=" ".join([
+                    extracted.get("anliegen") or "",
+                    subject or "",
+                    text_body[:500] if text_body else "",
+                ]),
+                kunde_adresse=extracted.get("kunde_adresse"),
+                existing_conversation=conv,
+            )
+            if routing_decision:
+                logger.info(
+                    f"Skill-Routing: {routing_decision.employee_slug} "
+                    f"(reason={routing_decision.reason} "
+                    f"score={routing_decision.score})"
+                )
+        except Exception as e:
+            logger.exception(f"choose_employee crashed (best-effort): {e}")
+        assigned_emp_id = routing_decision.employee_id if routing_decision else None
+
         klar = extracted.get("klar_genug_zum_buchen", False)
         begruendung = (extracted.get("begruendung") or "").upper()
         ist_storno = begruendung.startswith("STORNO") or "REINE ABSAGE" in begruendung
@@ -873,6 +906,7 @@ class Plugin(BasePlugin):
                         "wunschtermin_uhrzeit": gewaehlter_slot["uhrzeit"],
                         "telefon": extracted.get("telefon"),
                     },
+                    assigned_employee_id=assigned_emp_id,
                 )
                 action = "slot_gewaehlt"
 
@@ -888,7 +922,10 @@ class Plugin(BasePlugin):
             if verfuegbar:
                 # Alten canceln, neuen buchen
                 await self._cancel_via_kalender(tenant, conv.gcal_event_id)
-                booking_result = await self._versuche_buchung(tenant, sender_name, extracted)
+                booking_result = await self._versuche_buchung(
+                    tenant, sender_name, extracted,
+                    assigned_employee_id=assigned_emp_id,
+                )
                 action = "verschoben"
             else:
                 # Wunsch belegt -> Slots vorschlagen
@@ -897,6 +934,7 @@ class Plugin(BasePlugin):
                     extracted["wunschtermin_datum"],
                     extracted["wunschtermin_uhrzeit"],
                     kunde_adresse=extracted.get("kunde_adresse"),
+                    assigned_employee_id=assigned_emp_id,
                 )
                 conv = await upsert_conversation(
                     tenant_id=tenant.id,
@@ -907,11 +945,12 @@ class Plugin(BasePlugin):
                     state=STATE_PROPOSING_SLOTS,
                     proposed_slots=slots,
                     existing=conv,
+                    assigned_employee_id=assigned_emp_id,
                 )
                 action = "slots_vorgeschlagen"
                 # Auto-Reply mit Slot-Vorschlaegen
                 await self._send_slot_proposals(global_cfg, tenant, sender_email, sender_name, subject, message_id, extracted, slots)
-                await self._notify_tenant_telegram(tenant, sender_email, sender_name, subject, extracted, action="slots_vorgeschlagen", slots=slots)
+                await self._notify_tenant_telegram(tenant, sender_email, sender_name, subject, extracted, action="slots_vorgeschlagen", slots=slots, routing_decision=routing_decision)
                 return {"status": "slots_proposed", "tenant": tenant.slug, "slots_count": len(slots)}
 
         # Fall C: Verschiebung vage (kein Wunschtermin) oder ohne bestehenden Termin
@@ -928,7 +967,10 @@ class Plugin(BasePlugin):
                 extracted["wunschtermin_uhrzeit"],
             )
             if verfuegbar:
-                booking_result = await self._versuche_buchung(tenant, sender_name, extracted)
+                booking_result = await self._versuche_buchung(
+                    tenant, sender_name, extracted,
+                    assigned_employee_id=assigned_emp_id,
+                )
                 action = "neu_gebucht"
             else:
                 # Slot belegt -> Alternativen
@@ -937,6 +979,7 @@ class Plugin(BasePlugin):
                     extracted["wunschtermin_datum"],
                     extracted["wunschtermin_uhrzeit"],
                     kunde_adresse=extracted.get("kunde_adresse"),
+                    assigned_employee_id=assigned_emp_id,
                 )
                 conv = await upsert_conversation(
                     tenant_id=tenant.id,
@@ -946,10 +989,11 @@ class Plugin(BasePlugin):
                     last_subject=subject,
                     state=STATE_PROPOSING_SLOTS,
                     proposed_slots=slots,
+                    assigned_employee_id=assigned_emp_id,
                 )
                 action = "slots_vorgeschlagen"
                 await self._send_slot_proposals(global_cfg, tenant, sender_email, sender_name, subject, message_id, extracted, slots)
-                await self._notify_tenant_telegram(tenant, sender_email, sender_name, subject, extracted, action="slots_vorgeschlagen", slots=slots)
+                await self._notify_tenant_telegram(tenant, sender_email, sender_name, subject, extracted, action="slots_vorgeschlagen", slots=slots, routing_decision=routing_decision)
                 return {"status": "slots_proposed", "tenant": tenant.slug, "slots_count": len(slots)}
 
         # Fall E: Klare Anfrage aber Konversation existiert (Kunde mailt nochmal)
@@ -963,7 +1007,10 @@ class Plugin(BasePlugin):
             if verfuegbar:
                 if conv.gcal_event_id:
                     await self._cancel_via_kalender(tenant, conv.gcal_event_id)
-                booking_result = await self._versuche_buchung(tenant, sender_name, extracted)
+                booking_result = await self._versuche_buchung(
+                    tenant, sender_name, extracted,
+                    assigned_employee_id=assigned_emp_id,
+                )
                 action = "neu_gebucht"
             else:
                 slots = await self._slot_alternativen(
@@ -971,6 +1018,7 @@ class Plugin(BasePlugin):
                     extracted["wunschtermin_datum"],
                     extracted["wunschtermin_uhrzeit"],
                     kunde_adresse=extracted.get("kunde_adresse"),
+                    assigned_employee_id=assigned_emp_id,
                 )
                 conv = await upsert_conversation(
                     tenant_id=tenant.id,
@@ -980,11 +1028,12 @@ class Plugin(BasePlugin):
                     last_subject=subject,
                     state=STATE_PROPOSING_SLOTS,
                     proposed_slots=slots,
+                    assigned_employee_id=assigned_emp_id,
                     existing=conv,
                 )
                 action = "slots_vorgeschlagen"
                 await self._send_slot_proposals(global_cfg, tenant, sender_email, sender_name, subject, message_id, extracted, slots)
-                await self._notify_tenant_telegram(tenant, sender_email, sender_name, subject, extracted, action="slots_vorgeschlagen", slots=slots)
+                await self._notify_tenant_telegram(tenant, sender_email, sender_name, subject, extracted, action="slots_vorgeschlagen", slots=slots, routing_decision=routing_decision)
                 return {"status": "slots_proposed", "tenant": tenant.slug, "slots_count": len(slots)}
 
         # 7. Konversation persistieren (bei Buchung mit event_id)
@@ -1022,8 +1071,12 @@ class Plugin(BasePlugin):
                 existing=conv,
             )
 
-        # 8. Telegram-Push an Tenant
-        await self._notify_tenant_telegram(tenant, sender_email, sender_name, subject, extracted, action=action)
+        # 8. Telegram-Push an Tenant — geht an den vom Skill-Router
+        # gewaehlten Mitarbeiter (oder Default falls kein Routing).
+        await self._notify_tenant_telegram(
+            tenant, sender_email, sender_name, subject, extracted,
+            action=action, routing_decision=routing_decision,
+        )
 
         # 9. Auto-Reply an Kunden
         sent_html = await self._send_auto_reply(
@@ -1071,6 +1124,7 @@ class Plugin(BasePlugin):
         extracted: dict,
         action: str = "neu",
         slots: list | None = None,
+        routing_decision=None,
     ) -> None:
         klar = extracted.get("klar_genug_zum_buchen", False)
         begruendung = (extracted.get("begruendung") or "").upper()
@@ -1121,6 +1175,21 @@ class Plugin(BasePlugin):
         if extracted.get("kunde_adresse"):
             text += f"<b>Adresse:</b> {extracted['kunde_adresse']}\n"
 
+        # Phase-5: Routing-Entscheidung sichtbar machen, damit Inhaber
+        # falsch zugewiesene Termine erkennt und manuell umtragen kann.
+        if routing_decision is not None:
+            reason_label = {
+                "skill-match": "Skill-Match",
+                "distance": "Skill + kuerzeste Anfahrt",
+                "sticky-conversation": "Folge-Mail",
+                "only-active": "einziger aktiver Mitarbeiter",
+                "fallback-default": "Default (kein Skill-Match)",
+            }.get(routing_decision.reason, routing_decision.reason)
+            text += (
+                f"<b>Zugewiesen:</b> {routing_decision.employee_name} "
+                f"<i>({reason_label})</i>\n"
+            )
+
         # Slot-Vorschlaege mit Fahrtzeit-Info (nur fuer Tenant, nicht fuer Kunde)
         if action == "slots_vorgeschlagen" and slots:
             text += "\n<b>Vorgeschlagene Slots:</b>\n"
@@ -1131,15 +1200,42 @@ class Plugin(BasePlugin):
                     line += f"  <i>({fz})</i>"
                 text += line + "\n"
 
-        await TelegramNotifier.send_for_tenant(tenant.id, text)
+        # Push an den vom Router gewaehlten Mitarbeiter (Phase 2 + 5).
+        # Wenn kein Routing oder Mitarbeiter ohne Telegram-Chat: faellt
+        # auf Default-Employee/Legacy-chat_id zurueck (siehe
+        # _resolve_chat_id_for_push in telegram_notify).
+        target_emp_id = (
+            routing_decision.employee_id if routing_decision else None
+        )
+        await TelegramNotifier.send_for_tenant(
+            tenant.id, text, employee_id=target_emp_id,
+        )
+        # Falls Routing einen Nicht-Default gewaehlt hat, zusaetzlich den
+        # Inhaber als Cc informieren — er soll den Ueberblick behalten.
+        if routing_decision and routing_decision.reason in (
+            "skill-match", "distance",
+        ):
+            from core.models.employee import get_default_employee
+            default_emp = await get_default_employee(tenant.id)
+            if default_emp and default_emp.id != routing_decision.employee_id:
+                await TelegramNotifier.send_for_tenant(
+                    tenant.id, text, employee_id=default_emp.id,
+                )
 
     async def _versuche_buchung(
         self,
         tenant: Tenant,
         kunden_name: str,
         extracted: dict,
+        *,
+        assigned_employee_id=None,
     ) -> dict | None:
-        """Ruft kalender-Plugin direkt auf via dessen on_webhook."""
+        """Ruft kalender-Plugin direkt auf via dessen on_webhook.
+
+        Phase-5-Multi-Mitarbeiter: optional `assigned_employee_id`
+        wird ans Kalender-Plugin durchgereicht (Phase-1 nutzt das
+        fuer Multi-OAuth, Phase-3 fuer Routing-Origin).
+        """
         try:
             from core.plugin_system import get_plugin_for_tenant
             kalender = await get_plugin_for_tenant(tenant.slug, "kalender")
@@ -1155,6 +1251,8 @@ class Plugin(BasePlugin):
                 "datum": extracted["wunschtermin_datum"],
                 "uhrzeit": extracted["wunschtermin_uhrzeit"],
             }
+            if assigned_employee_id is not None:
+                payload["employee_id"] = str(assigned_employee_id)
             return await kalender.on_webhook("book_appointment", payload)
         except Exception as e:
             logger.exception(f"Buchung fehlgeschlagen: {e}")
@@ -1305,11 +1403,15 @@ class Plugin(BasePlugin):
         datum: str,
         uhrzeit: str,
         kunde_adresse: str | None = None,
+        *,
+        assigned_employee_id=None,
     ) -> list:
         """Holt freie Slots ueber kalender.find_free_slots.
 
         Wenn kunde_adresse gegeben: Smart-Filter im Kalender-Plugin
         rechnet Fahrtzeiten ein und filtert/sortiert Slots passend.
+        Wenn assigned_employee_id gegeben (Phase-5): Smart-Filter
+        nutzt dessen Heimat als Routing-Origin (Phase-3).
         """
         from core.plugin_system import get_plugin_for_tenant
         kalender = await get_plugin_for_tenant(tenant.slug, "kalender")
@@ -1318,6 +1420,8 @@ class Plugin(BasePlugin):
         payload = {"datum": datum, "uhrzeit": uhrzeit}
         if kunde_adresse:
             payload["kunde_adresse"] = kunde_adresse
+        if assigned_employee_id is not None:
+            payload["employee_id"] = str(assigned_employee_id)
         try:
             res = await kalender.on_webhook("find_free_slots", payload)
             if res.get("erfolg"):
