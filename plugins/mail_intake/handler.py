@@ -221,15 +221,21 @@ async def send_reply_via_brevo(
         "subject": subject,
         "htmlContent": html_body,
     }
-    headers = {}
+    headers = {
+        # RFC 3834 + RFC 2076: kennzeichnet automatische Antworten und
+        # verhindert dass andere Mailserver / Out-of-Office-Bots auf
+        # diese Mail wiederum antworten (Endlosschleife-Schutz).
+        "Auto-Submitted": "auto-replied",
+        "Precedence": "bulk",
+        "X-Auto-Response-Suppress": "All",
+    }
     if in_reply_to:
         headers["In-Reply-To"] = in_reply_to
         headers["References"] = in_reply_to
     if reply_to_email:
         # Brevo erwartet replyTo als top-level field
         payload["replyTo"] = {"email": reply_to_email, "name": sender_name}
-    if headers:
-        payload["headers"] = headers
+    payload["headers"] = headers
 
     try:
         async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
@@ -840,7 +846,18 @@ class Plugin(BasePlugin):
             text_body,
             proposed_slots=conv.proposed_slots if conv and conv.state == STATE_PROPOSING_SLOTS else None,
         )
-        logger.info(f"Extracted: {extracted}")
+        # DSGVO: keine PII roh loggen. Nur Indikator-Felder + Anonymisierung
+        # der Kunden-Identifier. Bei Bedarf detailliert -> DEBUG-Level.
+        logger.info(
+            "Extracted (sanitized): klar_genug=%s confidence=%s wunsch_datum=%s "
+            "hat_telefon=%s hat_adresse=%s",
+            extracted.get("klar_genug_zum_buchen"),
+            extracted.get("confidence"),
+            extracted.get("wunschtermin_datum"),
+            bool(extracted.get("telefon")),
+            bool(extracted.get("kunde_adresse")),
+        )
+        logger.debug(f"Extracted (full): {extracted}")
 
         # Phase-5-Skill-Routing: passenden Mitarbeiter waehlen.
         # Sticky: bestehende Conversation behaelt ihren assigned_employee_id.

@@ -334,12 +334,21 @@ async def track_mail_send(
     tenant_id: uuid.UUID | str | None = None,
     recipient_count: int = 1,
     operation: str = "transactional-mail",
+    recipient_email: str | None = None,
 ) -> None:
-    """Eine Mail-Versand-Zeile pro Mail."""
+    """Eine Mail-Versand-Zeile pro Mail.
+
+    Wenn recipient_email gesetzt: wird in metadata_json fuer
+    Throttle-Lookup gespeichert (lowercase, getrimmt).
+    """
+    metadata = None
+    if recipient_email:
+        metadata = {"recipient": recipient_email.lower().strip()}
     await track_api_usage(
         tenant_id=tenant_id,
         provider=provider,
         operation=operation,
         units=recipient_count,
         unit=UNIT_MAIL_SEND,
+        metadata=metadata,
     )

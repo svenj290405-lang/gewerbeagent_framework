@@ -140,6 +140,7 @@ class BrevoMailer:
                 from core.billing import track_mail_send
                 await track_mail_send(
                     "brevo", tenant_id=tenant_id, recipient_count=1,
+                    recipient_email=to.email,
                 )
             except Exception as e:
                 logger.debug(f"Brevo-Tracking failed (egal): {e}")

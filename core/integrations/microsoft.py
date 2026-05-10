@@ -207,6 +207,7 @@ async def send_mail_as_user(
                         tenant_id=tenant_id,
                         operation="mail-send",
                         recipient_count=1 + (len(cc) if cc else 0),
+                        recipient_email=to_email,
                     )
                 except Exception as e:
                     logger.debug(f"Microsoft-Tracking failed (egal): {e}")

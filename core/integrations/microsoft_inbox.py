@@ -32,6 +32,69 @@ from core.models import EmailConversation, Tenant
 logger = logging.getLogger(__name__)
 
 
+# ----------------------------------------------------------------------
+# Bounce / Auto-Reply Pre-Filter
+# ----------------------------------------------------------------------
+# Vor der Gemini-Klassifikation pruefen wir auf typische Bounce-Mails
+# und Out-of-Office-Antworten. Diese werden NICHT klassifiziert (spart
+# Tokens) und vor allem NICHT beantwortet (sonst Endlosschleife).
+#
+# Erkennung erfolgt drei-stufig (jede schon allein ist hinreichend):
+#  1) Header `Auto-Submitted` != "no" oder `Precedence: bulk`/`auto_reply`
+#  2) Sender `MAILER-DAEMON@`, `noreply@`, `bounce@`, `postmaster@`
+#  3) Subject enthaelt Bounce/OOO-Pattern (delivery failure, out of office,
+#     auto-reply, abwesenheitsnotiz, undeliverable, mail delivery, ...)
+
+BOUNCE_SUBJECT_PATTERNS = (
+    "delivery failure", "delivery status notification", "undeliverable",
+    "mail delivery failed", "returned mail", "mail returned",
+    "out of office", "out-of-office", "abwesenheitsnotiz",
+    "automatic reply", "automatische antwort", "auto-reply", "autoreply",
+    "vacation reply", "ferienabwesenheit", "ich bin abwesend",
+    "non-livraison",
+)
+
+BOUNCE_SENDER_PREFIXES = (
+    "mailer-daemon@", "postmaster@", "bounce@", "bounces@",
+    "no-reply@", "noreply@", "do-not-reply@", "donotreply@",
+)
+
+
+def is_bounce_or_autoreply(msg: dict) -> tuple[bool, str]:
+    """True + Grund wenn die Mail nicht beantwortet werden soll.
+
+    msg: Microsoft-Graph-Message-Objekt (oder kompatibles dict).
+    """
+    # 1) Internet-Header pruefen
+    headers_obj = msg.get("internetMessageHeaders") or []
+    for h in headers_obj:
+        name = (h.get("name") or "").lower()
+        value = (h.get("value") or "").lower()
+        if name == "auto-submitted" and value not in ("", "no"):
+            return True, f"auto-submitted={value}"
+        if name == "precedence" and value in ("bulk", "auto_reply", "list", "junk"):
+            return True, f"precedence={value}"
+        if name == "x-auto-response-suppress":
+            return True, "x-auto-response-suppress gesetzt"
+        if name == "x-autoreply" and value:
+            return True, f"x-autoreply={value}"
+
+    # 2) Sender-Adresse pruefen
+    sender = ((msg.get("from") or {}).get("emailAddress") or {}).get("address") or ""
+    sender_lc = sender.lower()
+    for prefix in BOUNCE_SENDER_PREFIXES:
+        if sender_lc.startswith(prefix):
+            return True, f"sender={sender_lc}"
+
+    # 3) Subject-Pattern pruefen
+    subject_lc = (msg.get("subject") or "").lower()
+    for pat in BOUNCE_SUBJECT_PATTERNS:
+        if pat in subject_lc:
+            return True, f"subject-pattern={pat!r}"
+
+    return False, ""
+
+
 async def fetch_unread_messages(
     tenant_id: UUID, top: int = 25,
     employee_id: UUID | None = None,
@@ -147,6 +210,49 @@ async def poll_microsoft_inbox(
         sender_name = from_email_obj.get("name", "") or sender_email
         body_preview = msg.get("bodyPreview", "") or ""
 
+        # ---- PRE-FILTER 1: Bounce / Out-of-Office ----
+        # Spart Gemini-Tokens UND verhindert Endlos-Schleifen wenn ein
+        # OOO-Bot auf Q antwortet.
+        is_bounce, bounce_reason = is_bounce_or_autoreply(msg)
+        if is_bounce:
+            logger.info(
+                f"poll: skip bounce/auto-reply tenant={tenant.slug} "
+                f"sender={sender_email} reason={bounce_reason}"
+            )
+            classified_counts["BOUNCE"] = classified_counts.get("BOUNCE", 0) + 1
+            results.append({
+                "message_id": msg.get("id"),
+                "subject": subject,
+                "sender": sender_email,
+                "classification": "BOUNCE",
+                "confidence": "high",
+                "reason": bounce_reason,
+                "skipped": True,
+            })
+            # Mail als gelesen markieren damit naechster Poll sie nicht erneut sieht
+            try:
+                await mark_as_read(tenant_id, msg.get("id"), employee_id=employee_id)
+            except Exception:
+                pass
+            continue
+
+        # ---- PRE-FILTER 2: Spam-Throttle pro Sender ----
+        # Wenn derselbe Absender in 24h schon >= 10 Mails geschickt hat:
+        # Klassifizieren und Kategorie setzen, aber NICHT auto-antworten.
+        try:
+            from core.integrations.mail_throttle import (
+                count_recent_replies_to,
+                MAX_REPLIES_PER_SENDER_PER_DAY,
+            )
+            recent_reply_count = await count_recent_replies_to(
+                tenant_id=tenant_id, sender_email=sender_email,
+                window_hours=24,
+            )
+            spam_throttled = recent_reply_count >= MAX_REPLIES_PER_SENDER_PER_DAY
+        except Exception as e:
+            logger.debug(f"spam-throttle Check failed (egal): {e}")
+            spam_throttled = False
+
         # Klassifikation - Subject + Sender + Preview als Hilfe
         # Hinweis: Wir geben Preview auch mit damit Gemini bessere Entscheidung trifft
         try:
@@ -167,23 +273,64 @@ async def poll_microsoft_inbox(
 
         classified_counts[classification] = classified_counts.get(classification, 0) + 1
 
-        # Auto-Verarbeitung NUR bei RELEVANT_KUNDE
+        # Auto-Verarbeitung NUR bei RELEVANT_KUNDE und nicht throttled.
+        # Confidence-Gate: bei "low" eskalieren statt blind auto-antworten,
+        # damit Q nicht auf falsch verstandene Mails halluziniert.
         process_result = None
         if classification == "RELEVANT_KUNDE":
-            try:
-                process_result = await process_relevant_kunde_mail(
-                    tenant_id=tenant_id,
-                    message_id=msg.get("id"),
-                    classification_result={
-                        "classification": classification,
-                        "confidence": confidence,
-                        "reason": reason,
-                    },
-                    employee_id=employee_id,
+            if spam_throttled:
+                logger.warning(
+                    f"poll: Spam-Throttle greift fuer {sender_email} "
+                    f"(>= {recent_reply_count} Antworten in 24h) - keine Auto-Reply"
                 )
-            except Exception as e:
-                logger.exception(f"process_relevant_kunde_mail fehler: {e}")
-                process_result = {"success": False, "error": str(e)}
+                process_result = {
+                    "success": False, "skipped": True, "reason": "spam-throttle",
+                }
+                # Trotzdem Outlook-Kategorie setzen damit der Tenant es manuell sieht
+                try:
+                    target_category = Q_CATEGORY_BY_CLASSIFICATION.get("UNSICHER")
+                    if target_category and msg.get("id"):
+                        await set_message_categories(
+                            tenant_id=tenant_id, message_id=msg.get("id"),
+                            categories=(msg.get("categories") or []) + [target_category],
+                            employee_id=employee_id,
+                        )
+                except Exception:
+                    pass
+            elif confidence == "low":
+                logger.info(
+                    f"poll: Low-Confidence-RELEVANT_KUNDE (sender={sender_email}) - "
+                    f"keine Auto-Action, Inhaber muss manuell schauen"
+                )
+                process_result = {
+                    "success": False, "skipped": True, "reason": "low-confidence",
+                }
+                # Outlook-Kategorie UNSICHER setzen damit es nicht verloren geht
+                try:
+                    target_category = Q_CATEGORY_BY_CLASSIFICATION.get("UNSICHER")
+                    if target_category and msg.get("id"):
+                        await set_message_categories(
+                            tenant_id=tenant_id, message_id=msg.get("id"),
+                            categories=(msg.get("categories") or []) + [target_category],
+                            employee_id=employee_id,
+                        )
+                except Exception:
+                    pass
+            else:
+                try:
+                    process_result = await process_relevant_kunde_mail(
+                        tenant_id=tenant_id,
+                        message_id=msg.get("id"),
+                        classification_result={
+                            "classification": classification,
+                            "confidence": confidence,
+                            "reason": reason,
+                        },
+                        employee_id=employee_id,
+                    )
+                except Exception as e:
+                    logger.exception(f"process_relevant_kunde_mail fehler: {e}")
+                    process_result = {"success": False, "error": str(e)}
         else:
             # Andere Klassifikationen: Outlook-Kategorie setzen, Mail bleibt in Inbox
             target_category = Q_CATEGORY_BY_CLASSIFICATION.get(classification)

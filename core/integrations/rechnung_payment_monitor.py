@@ -94,10 +94,20 @@ async def _check_one_invoice(
 
     Bei API-Fehler: (None, False) — Caller muss damit leben (last_check
     bleibt unveraendert, beim naechsten Lauf nochmal versuchen).
+
+    Sonderfall 404: Voucher wurde in Lexware geloescht. Wir markieren
+    sie als 'cancelled' damit der Cron die Rechnung nicht ewig erneut
+    pollt. Tenant sieht den Status in /rechnungen_anzeigen.
     """
     try:
         data = await provider.get_invoice(lexware_invoice_id)
     except AccountingError as exc:
+        if exc.status_code == 404:
+            logger.info(
+                f"Lexware-Voucher {lexware_invoice_id} = 404 (geloescht) "
+                f"-> als 'cancelled' markieren"
+            )
+            return "cancelled", False
         logger.warning(
             f"Lexware get_invoice({lexware_invoice_id}) failed: "
             f"{exc.status_code} — {exc}"

@@ -390,10 +390,17 @@ async def submit_anfrage(
     antworten: dict,
     submitted_ip: Optional[str] = None,
 ) -> tuple[bool, str]:
-    """Speichert die Antworten zu einem Token. Returns (success, message)."""
+    """Speichert die Antworten zu einem Token. Returns (success, message).
+
+    Schutz gegen Double-Submit-Race: SELECT FOR UPDATE serialisiert
+    parallele POSTs auf den gleichen Token, sodass der zweite garantiert
+    `submitted_at IS NOT NULL` sieht und mit "Schon abgesendet" abbricht.
+    """
     async with AsyncSessionLocal() as session:
         result = await session.execute(
-            select(AnfrageToken).where(AnfrageToken.token == token_str)
+            select(AnfrageToken)
+            .where(AnfrageToken.token == token_str)
+            .with_for_update()
         )
         token_obj = result.scalar_one_or_none()
         if not token_obj:

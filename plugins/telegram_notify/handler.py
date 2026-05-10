@@ -15,6 +15,19 @@ from core.database import AsyncSessionLocal
 from core.models import (
     ALLE_KATEGORIEN,
     KATEGORIE_LABELS,
+    TenantKalkulation,
+    ALLE_KALK_KATEGORIEN,
+    KALK_KATEGORIE_LABELS,
+    KALK_SOURCE_MANUAL,
+    KALK_SOURCE_EXCEL,
+    STATE_KALK_KATEGORIE,
+    STATE_KALK_NAME,
+    STATE_KALK_FORMEL,
+    STATE_KALK_EINHEIT,
+    STATE_KALK_BESCHREIBUNG,
+    STATE_KALK_LOESCHEN,
+    STATE_KALK_EXCEL_WAITING,
+    STATE_KALK_EXCEL_CONFIRM,
     STATE_BELEG_CONFIRMING,
     STATE_BELEG_WAITING_PHOTO,
     STATE_LEXWARE_SETUP_TOKEN,
@@ -419,6 +432,12 @@ async def _handle_help_command():
     msg += "/wissen_anzeigen - alle ansehen\n"
     msg += "/wissen_loeschen - Eintrag entfernen\n\n"
 
+    msg += "<b>🧮 KALKULATION (Formeln fuers Angebot)</b>\n"
+    msg += "/kalkulation - neue Formel anlegen (Wizard)\n"
+    msg += "/kalkulation_excel - Excel-Datei mit Formeln hochladen\n"
+    msg += "/kalkulation_anzeigen - alle Regeln ansehen\n"
+    msg += "/kalkulation_loeschen - Regel entfernen\n\n"
+
     msg += "<b>📋 ANFRAGE-FORMULAR</b>\n"
     msg += "/formular - Felder bearbeiten (Wizard)\n"
     msg += "/formular_anzeigen - aktuelle Felder ansehen\n"
@@ -590,6 +609,557 @@ async def _handle_wissen_loeschen_input(chat_id, text, state_data):
     await _clear_state(chat_id)
     return f"Eintrag in <b>{label}</b> geloescht."
 
+
+async def _apply_kalkulationen(tenant_id, extracted: dict) -> dict:
+    """
+    Hybrid-Berechnung: Wenn Gemini fuer eine Position eine `kalkulation`
+    mit regel_name + Variablen-Werten geliefert hat, suchen wir die
+    passende Regel in der DB und berechnen den Preis deterministisch
+    in Python aus Formel + Variablen.
+
+    Schreibt das Ergebnis in `position["preis_brutto_eur"]` und legt
+    `position["kalkulation"]["wert"]` fuer die Anzeige ab. Wenn die
+    Berechnung fehlschlaegt (Regel nicht gefunden, Variable fehlt),
+    bleibt der Original-Preis stehen und wir loggen die Warnung.
+    """
+    if not extracted or not isinstance(extracted, dict):
+        return extracted
+    positionen = extracted.get("positionen") or []
+    if not positionen:
+        return extracted
+
+    # Frueh aussteigen falls keine Position eine Regel referenziert
+    if not any(
+        isinstance(p.get("kalkulation"), dict) and p["kalkulation"].get("regel_name")
+        for p in positionen
+    ):
+        return extracted
+
+    # Regeln des Tenants laden (alle aktiven; Match per name case-insensitive)
+    async with AsyncSessionLocal() as s:
+        regeln = (await s.execute(
+            select(TenantKalkulation)
+            .where(TenantKalkulation.tenant_id == tenant_id)
+            .where(TenantKalkulation.aktiv.is_(True))
+        )).scalars().all()
+    by_name = {r.name.strip().lower(): r for r in regeln}
+
+    from core.ai.kalkulation import (
+        FormelError,
+        safe_eval_formel,
+    )
+
+    new_gesamt = 0.0
+    has_changes = False
+    for pos in positionen:
+        kalk = pos.get("kalkulation")
+        if not isinstance(kalk, dict):
+            continue
+        regel_name = (kalk.get("regel_name") or "").strip().lower()
+        if not regel_name or regel_name not in by_name:
+            logger.info(
+                "Kalkulation: Regel %r nicht gefunden, skip Position %r",
+                regel_name,
+                pos.get("name"),
+            )
+            continue
+        regel = by_name[regel_name]
+        vars_dict = kalk.get("variablen") or {}
+        if not isinstance(vars_dict, dict):
+            continue
+        try:
+            wert = safe_eval_formel(regel.formel, vars_dict)
+        except FormelError as exc:
+            logger.warning(
+                "Kalkulation '%s' fehlgeschlagen (%s) - Original-Preis bleibt",
+                regel.name, exc,
+            )
+            continue
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Kalkulation '%s' Ausnahme: %s - Original-Preis bleibt",
+                regel.name, exc, exc_info=True,
+            )
+            continue
+
+        # Position aktualisieren - Preis pro Einheit auf den Formel-Wert
+        # setzen, Menge auf 1, damit menge*preis = berechneter Wert.
+        pos["preis_brutto_eur"] = round(wert, 2)
+        pos["menge"] = 1.0
+        if not pos.get("einheit") or pos.get("einheit") == "Stueck":
+            pos["einheit"] = regel.einheit or "Pauschal"
+        # Kalkulations-Hinweis fuer die Preview-Anzeige zurueckschreiben
+        kalk["wert"] = round(wert, 2)
+        kalk["formel"] = regel.formel
+        has_changes = True
+        logger.info(
+            "Kalkulation '%s' angewandt: %s -> %.2f EUR (Position '%s')",
+            regel.name, vars_dict, wert, pos.get("name"),
+        )
+        new_gesamt += wert
+
+    if has_changes:
+        # Gesamtbetrag neu errechnen aus allen Positionen
+        try:
+            extracted["gesamtbetrag_brutto_eur"] = round(
+                sum(
+                    float(p.get("menge") or 1) * float(p.get("preis_brutto_eur") or 0)
+                    for p in positionen
+                ),
+                2,
+            )
+        except (TypeError, ValueError):
+            pass
+    return extracted
+
+
+# ===========================================================================
+# Kalkulation-Wizard (mathematische Formeln fuers Angebot)
+# ===========================================================================
+#
+# Schwester-Konzept zu /wissen, aber mit numerischen Formeln statt Freitext.
+# - /kalkulation                : Wizard Kategorie -> Name -> Formel -> Einheit
+# - /kalkulation_anzeigen       : Liste, gruppiert nach Kategorie
+# - /kalkulation_loeschen       : Eintrag entfernen
+# - /kalkulation_excel          : Excel-Datei hochladen (Formeln werden importiert)
+#
+# Beim Aufnahme-Wizard und Voice-Call werden alle aktiven Formeln des
+# Tenants in den Gemini-Prompt eingespeist; der eigentliche Preis wird
+# anschliessend deterministisch in Python berechnet (siehe core.ai.kalkulation).
+
+KALK_FORMEL_MAX_LEN = 1000
+KALK_NAME_MAX_LEN = 100
+KALK_BESCHREIBUNG_MAX_LEN = 500
+KALK_EXCEL_MAX_BYTES = 4 * 1024 * 1024  # 4 MB - Excel-Files sind selten groesser
+
+
+async def _handle_kalkulation_command(chat_id):
+    tenant = await _get_tenant_by_chat(chat_id)
+    if not tenant:
+        return ("Dieser Chat ist noch keinem Betrieb zugeordnet.\n"
+                "Bitte zuerst Aktivierungs-QR-Code scannen.")
+    await _save_state(chat_id, STATE_KALK_KATEGORIE, {})
+    msg = "<b>🧮 Neue Kalkulationsregel</b>\n\n"
+    msg += "Welche Kategorie passt?\n\n"
+    for i, key in enumerate(ALLE_KALK_KATEGORIEN, start=1):
+        label = KALK_KATEGORIE_LABELS.get(key, key)
+        msg += f"{i}) {label}\n"
+    msg += (
+        f"\nAntworten Sie mit der Nummer (1-{len(ALLE_KALK_KATEGORIEN)})"
+        " oder /abbrechen.\n\n"
+        "💡 Mit /kalkulation_excel koennen Sie auch eine .xlsx-Datei "
+        "hochladen, dann werden alle Formeln automatisch uebernommen."
+    )
+    return msg
+
+
+async def _handle_kalk_kategorie_input(chat_id, text):
+    text = text.strip()
+    if not text.isdigit():
+        return (
+            f"Bitte mit einer Nummer von 1 bis {len(ALLE_KALK_KATEGORIEN)}"
+            " antworten oder /abbrechen."
+        )
+    idx = int(text) - 1
+    if idx < 0 or idx >= len(ALLE_KALK_KATEGORIEN):
+        return (
+            f"Nur Nummern 1 bis {len(ALLE_KALK_KATEGORIEN)} sind gueltig."
+            " Bitte erneut waehlen."
+        )
+    kategorie = ALLE_KALK_KATEGORIEN[idx]
+    label = KALK_KATEGORIE_LABELS.get(kategorie, kategorie)
+    await _save_state(chat_id, STATE_KALK_NAME, {"kategorie": kategorie})
+    msg = f"Kategorie: <b>{label}</b>\n\n"
+    msg += "Wie heisst diese Regel? (Kurzer Name)\n\n"
+    msg += "<i>Beispiele:</i>\n"
+    msg += "<i>- Anfahrtspauschale</i>\n"
+    msg += "<i>- Notfall-Zuschlag</i>\n"
+    msg += "<i>- Material-Aufschlag</i>\n\n"
+    msg += "/abbrechen um abzubrechen."
+    return msg
+
+
+async def _handle_kalk_name_input(chat_id, text, state_data):
+    name = text.strip()
+    if len(name) < 3:
+        return "Der Name ist zu kurz (mind. 3 Zeichen). Bitte nochmal."
+    if len(name) > KALK_NAME_MAX_LEN:
+        return f"Der Name ist zu lang (max {KALK_NAME_MAX_LEN}). Bitte kuerzen."
+    state_data = dict(state_data or {})
+    state_data["name"] = name
+    await _save_state(chat_id, STATE_KALK_FORMEL, state_data)
+    msg = f"<b>{name}</b>\n\n"
+    msg += "Wie wird der Wert berechnet? Schreibe die Formel als Text.\n\n"
+    msg += "<b>Erlaubt:</b>\n"
+    msg += "- Variablen (kleinbuchstaben mit Unterstrich, z.B. <code>entfernung_km</code>)\n"
+    msg += "- Operatoren: + − × (oder *) ÷ (oder /), ** fuer Potenz\n"
+    msg += "- Funktionen: <code>min</code>, <code>max</code>, <code>round</code>, <code>abs</code>, <code>ceil</code>, <code>floor</code>\n"
+    msg += "- Bedingung: <code>x if bedingung else y</code>\n\n"
+    msg += "<b>Beispiele:</b>\n"
+    msg += "<code>entfernung_km * 0.50</code>\n"
+    msg += "<code>max(50, stunden * 75)</code>\n"
+    msg += "<code>einkaufspreis * 1.30 + 5</code>\n\n"
+    msg += "/abbrechen um abzubrechen."
+    return msg
+
+
+async def _handle_kalk_formel_input(chat_id, text, state_data):
+    # Formel-Engine erst hier importieren, damit der Modul-Import nicht
+    # zur Startup-Zeit knallt falls jemand die Datei kopiert.
+    from core.ai.kalkulation import FormelError, parse_variables
+
+    formel = text.strip()
+    if len(formel) > KALK_FORMEL_MAX_LEN:
+        return f"Die Formel ist zu lang (max {KALK_FORMEL_MAX_LEN} Zeichen)."
+    # Komfort: × und ÷ akzeptieren wir und uebersetzen
+    formel_norm = formel.replace("×", "*").replace("·", "*").replace("÷", "/")
+    try:
+        variablen = parse_variables(formel_norm)
+    except FormelError as exc:
+        return (
+            f"❌ Formel ungueltig: {exc}\n\n"
+            "Bitte korrigieren oder /abbrechen.\n"
+            "Tipp: Variablen mit kleinbuchstaben + Unterstrich, z.B."
+            " <code>entfernung_km</code>."
+        )
+
+    state_data = dict(state_data or {})
+    state_data["formel"] = formel_norm
+    state_data["variablen"] = variablen
+    await _save_state(chat_id, STATE_KALK_EINHEIT, state_data)
+
+    if variablen:
+        var_text = ", ".join(f"<code>{v}</code>" for v in variablen)
+    else:
+        var_text = "<i>(keine - konstanter Wert)</i>"
+    msg = "✅ Formel verstanden.\n\n"
+    msg += f"Variablen: {var_text}\n\n"
+    msg += (
+        "Welche Einheit hat das Ergebnis? Z.B. <code>EUR</code>, "
+        "<code>EUR/Stunde</code>, <code>%</code>.\n\n"
+        "Antworte mit <code>-</code> wenn keine Einheit."
+    )
+    return msg
+
+
+async def _handle_kalk_einheit_input(chat_id, text, state_data):
+    einheit = text.strip()
+    if einheit == "-" or einheit == "":
+        einheit = None
+    elif len(einheit) > 50:
+        return "Einheit ist zu lang (max 50 Zeichen)."
+    state_data = dict(state_data or {})
+    state_data["einheit"] = einheit
+    await _save_state(chat_id, STATE_KALK_BESCHREIBUNG, state_data)
+    msg = "Wann soll diese Regel greifen?\n\n"
+    msg += "Schreibe einen kurzen Satz fuer die KI, z.B.\n"
+    msg += "<i>'Bei jedem Auftrag mit Anfahrt zu Kundenadresse anwenden.'</i>\n\n"
+    msg += f"Mit <code>-</code> ueberspringen (max {KALK_BESCHREIBUNG_MAX_LEN} Zeichen)."
+    return msg
+
+
+async def _handle_kalk_beschreibung_input(chat_id, text, state_data):
+    beschreibung = text.strip()
+    if beschreibung == "-" or beschreibung == "":
+        beschreibung = None
+    elif len(beschreibung) > KALK_BESCHREIBUNG_MAX_LEN:
+        return (
+            f"Beschreibung zu lang (max {KALK_BESCHREIBUNG_MAX_LEN} Zeichen)."
+            " Bitte kuerzen."
+        )
+    data = dict(state_data or {})
+    kategorie = data.get("kategorie")
+    name = data.get("name")
+    formel = data.get("formel")
+    variablen = data.get("variablen") or []
+    einheit = data.get("einheit")
+    if not kategorie or not name or not formel:
+        await _clear_state(chat_id)
+        return "Etwas ging schief. Bitte mit /kalkulation neu starten."
+
+    tenant = await _get_tenant_by_chat(chat_id)
+    if not tenant:
+        await _clear_state(chat_id)
+        return "Tenant nicht gefunden. Bitte erneut /start ausfuehren."
+
+    async with AsyncSessionLocal() as s:
+        entry = TenantKalkulation(
+            tenant_id=tenant.id,
+            kategorie=kategorie,
+            name=name,
+            formel=formel,
+            variablen=variablen,
+            einheit=einheit,
+            beschreibung=beschreibung,
+            source=KALK_SOURCE_MANUAL,
+        )
+        s.add(entry)
+        await s.commit()
+
+    await _clear_state(chat_id)
+    label = KALK_KATEGORIE_LABELS.get(kategorie, kategorie)
+    msg = f"✅ Gespeichert in <b>{label}</b>:\n\n"
+    msg += f"<b>{name}</b>\n"
+    msg += f"<code>{formel}</code>"
+    if einheit:
+        msg += f"  →  {einheit}"
+    msg += "\n\n"
+    msg += "Diese Regel wird ab jetzt bei jedem neuen Angebot beachtet.\n\n"
+    msg += "/kalkulation - weitere Regel anlegen\n"
+    msg += "/kalkulation_anzeigen - alle ansehen"
+    return msg
+
+
+async def _handle_kalkulation_anzeigen(chat_id):
+    tenant = await _get_tenant_by_chat(chat_id)
+    if not tenant:
+        return "Dieser Chat ist keinem Betrieb zugeordnet."
+    async with AsyncSessionLocal() as s:
+        entries = (await s.execute(
+            select(TenantKalkulation)
+            .where(TenantKalkulation.tenant_id == tenant.id)
+            .where(TenantKalkulation.aktiv.is_(True))
+            .order_by(
+                TenantKalkulation.kategorie,
+                TenantKalkulation.sortierung,
+                TenantKalkulation.created_at,
+            )
+        )).scalars().all()
+    if not entries:
+        return (
+            "Noch keine Kalkulations-Regeln vorhanden.\n\n"
+            "Mit /kalkulation legst Du Deine erste Regel an, "
+            "oder mit /kalkulation_excel laedst Du eine Excel-Datei hoch."
+        )
+    by_kat: dict[str, list[TenantKalkulation]] = {}
+    for e in entries:
+        by_kat.setdefault(e.kategorie, []).append(e)
+    msg = f"<b>🧮 Kalkulationsregeln · {tenant.company_name}</b>\n\n"
+    total = 0
+    for kat in ALLE_KALK_KATEGORIEN:
+        if kat not in by_kat:
+            continue
+        label = KALK_KATEGORIE_LABELS.get(kat, kat)
+        msg += f"<b>{label}</b>\n"
+        for e in by_kat[kat]:
+            tail = f"  →  {e.einheit}" if e.einheit else ""
+            src_tag = "  (Excel)" if e.source == KALK_SOURCE_EXCEL else ""
+            msg += f"  • <b>{e.name}</b>{src_tag}\n"
+            msg += f"    <code>{e.formel}</code>{tail}\n"
+            total += 1
+        msg += "\n"
+    msg += f"<i>Insgesamt {total} Regel(n).</i>\n"
+    msg += "Mit /kalkulation_loeschen kannst Du Eintraege entfernen."
+    return msg
+
+
+async def _handle_kalkulation_loeschen_command(chat_id):
+    tenant = await _get_tenant_by_chat(chat_id)
+    if not tenant:
+        return "Dieser Chat ist keinem Betrieb zugeordnet."
+    async with AsyncSessionLocal() as s:
+        entries = (await s.execute(
+            select(TenantKalkulation)
+            .where(TenantKalkulation.tenant_id == tenant.id)
+            .where(TenantKalkulation.aktiv.is_(True))
+            .order_by(
+                TenantKalkulation.kategorie,
+                TenantKalkulation.created_at,
+            )
+        )).scalars().all()
+    if not entries:
+        return "Es gibt keine Regeln zum Loeschen."
+    id_map = {}
+    msg = "<b>Welche Regel loeschen?</b>\n\n"
+    for i, e in enumerate(entries, start=1):
+        id_map[str(i)] = str(e.id)
+        label = KALK_KATEGORIE_LABELS.get(e.kategorie, e.kategorie)
+        msg += f"{i}) [{label}] <b>{e.name}</b>: <code>{e.formel}</code>\n"
+    msg += "\nAntworte mit der Nummer oder /abbrechen."
+    await _save_state(chat_id, STATE_KALK_LOESCHEN, {"id_map": id_map})
+    return msg
+
+
+async def _handle_kalk_loeschen_input(chat_id, text, state_data):
+    text = text.strip()
+    id_map = (state_data or {}).get("id_map") or {}
+    if text not in id_map:
+        return "Ungueltige Nummer. Bitte eine angezeigte Nummer eingeben oder /abbrechen."
+    entry_id = id_map[text]
+    async with AsyncSessionLocal() as s:
+        entry = (await s.execute(
+            select(TenantKalkulation).where(
+                TenantKalkulation.id == uuid.UUID(entry_id)
+            )
+        )).scalar_one_or_none()
+        if entry is None:
+            await _clear_state(chat_id)
+            return "Regel nicht mehr vorhanden (eventuell schon geloescht)."
+        name = entry.name
+        await s.delete(entry)
+        await s.commit()
+    await _clear_state(chat_id)
+    return f"✅ Regel <b>{name}</b> geloescht."
+
+
+async def _handle_kalkulation_excel_command(chat_id):
+    tenant = await _get_tenant_by_chat(chat_id)
+    if not tenant:
+        return "Dieser Chat ist keinem Betrieb zugeordnet."
+    await _save_state(chat_id, STATE_KALK_EXCEL_WAITING, {})
+    msg = "<b>📊 Excel-Datei hochladen</b>\n\n"
+    msg += "Schicke jetzt eine <b>.xlsx</b>-Datei mit Deinen Formeln.\n\n"
+    msg += "Ich lese alle Zellen mit Formeln (z.B. <code>=B2*0,5</code>) "
+    msg += "und uebernehme sie als Kalkulationsregeln. Den Namen lese ich "
+    msg += "aus der Beschriftung links bzw. oberhalb der Zelle.\n\n"
+    msg += "Unterstuetzt: arithmetische Formeln, WENN/IF, MIN, MAX, RUNDEN.\n"
+    msg += "Nicht unterstuetzt: SVERWEIS, INDIREKT, INDEX, Zellbereiche (B2:B5).\n\n"
+    msg += "/abbrechen um abzubrechen."
+    return msg
+
+
+async def _handle_kalk_excel_received(chat_id, document, bot_token):
+    """Verarbeitet eine via Telegram hochgeladene .xlsx-Datei."""
+    if not document:
+        return ("Bitte schicke eine <b>.xlsx</b>-Datei (kein Foto).")
+
+    file_name = (document.get("file_name") or "").lower()
+    file_size = int(document.get("file_size") or 0)
+    file_id = document.get("file_id")
+
+    if not file_id:
+        return "Datei ohne ID empfangen - bitte nochmal."
+    if not file_name.endswith(".xlsx"):
+        return (
+            "Nur <b>.xlsx</b>-Dateien werden unterstuetzt. "
+            "Bitte als Excel-2007+-Format speichern."
+        )
+    if file_size > KALK_EXCEL_MAX_BYTES:
+        return (
+            f"Datei zu gross ({file_size // 1024} KB). "
+            f"Maximum: {KALK_EXCEL_MAX_BYTES // 1024} KB."
+        )
+
+    # Datei laden
+    file_path = await _telegram_get_file_path(bot_token, file_id)
+    if not file_path:
+        return "Konnte die Datei nicht von Telegram abholen."
+    try:
+        file_bytes = await _telegram_download_file(bot_token, file_path)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Excel-Download fehlgeschlagen: %s", exc)
+        return "Download fehlgeschlagen - bitte nochmal."
+
+    # Parsen
+    from core.integrations.excel_kalkulation import (
+        ExcelImportError,
+        extract_formulas_from_xlsx,
+    )
+
+    try:
+        result = extract_formulas_from_xlsx(file_bytes)
+    except ExcelImportError as exc:
+        await _clear_state(chat_id)
+        return f"❌ Excel-Datei nicht lesbar: {exc}"
+
+    if not result.eintraege:
+        warn_text = ("\n\n" + "\n".join(result.warnungen[:5])) if result.warnungen else ""
+        await _clear_state(chat_id)
+        return (
+            "⚠️ Keine importierbaren Formeln gefunden.\n\n"
+            f"Sheets gelesen: {', '.join(result.sheets_gelesen)}"
+            f"{warn_text}"
+        )
+
+    # State auf "Confirm" setzen mit den gefundenen Eintraegen
+    eintraege_serial = [
+        {
+            "name": e.name,
+            "formel": e.formel,
+            "variablen": e.variablen,
+            "raw_excel": e.raw_excel,
+            "cell": e.cell,
+            "sheet": e.sheet,
+        }
+        for e in result.eintraege
+    ]
+    await _save_state(
+        chat_id,
+        STATE_KALK_EXCEL_CONFIRM,
+        {
+            "eintraege": eintraege_serial,
+            "filename": document.get("file_name"),
+            "warnungen": result.warnungen[:10],
+        },
+    )
+
+    msg = f"<b>📊 Gefunden: {len(result.eintraege)} Formel(n)</b>\n\n"
+    for i, e in enumerate(result.eintraege[:15], start=1):
+        msg += f"{i}) <b>{e.name}</b>\n"
+        msg += f"   <code>{e.formel}</code>\n"
+    if len(result.eintraege) > 15:
+        msg += f"\n... und {len(result.eintraege) - 15} weitere.\n"
+    if result.warnungen:
+        msg += "\n<b>⚠️ Hinweise:</b>\n"
+        for w in result.warnungen[:5]:
+            msg += f"• {w}\n"
+        if len(result.warnungen) > 5:
+            msg += f"... und {len(result.warnungen) - 5} weitere Warnungen.\n"
+    msg += "\nAlle als Kategorie <b>'Sonstiges'</b> uebernehmen?\n"
+    msg += "Antworte mit <b>ja</b> zum Speichern oder /abbrechen."
+    return msg
+
+
+async def _handle_kalk_excel_confirm_input(chat_id, text, state_data):
+    if text.strip().lower() not in {"ja", "j", "yes", "ok"}:
+        return ("Antworte mit <b>ja</b> um die Formeln zu speichern, "
+                "oder /abbrechen um zu verwerfen.")
+
+    data = state_data or {}
+    eintraege = data.get("eintraege") or []
+    filename = data.get("filename")
+    if not eintraege:
+        await _clear_state(chat_id)
+        return "Keine Eintraege im State - bitte nochmal /kalkulation_excel."
+
+    tenant = await _get_tenant_by_chat(chat_id)
+    if not tenant:
+        await _clear_state(chat_id)
+        return "Tenant nicht gefunden. Bitte /start erneut ausfuehren."
+
+    saved = 0
+    async with AsyncSessionLocal() as s:
+        for entry in eintraege:
+            s.add(TenantKalkulation(
+                tenant_id=tenant.id,
+                kategorie="sonstiges",
+                name=entry.get("name") or "ohne Namen",
+                formel=entry.get("formel") or "",
+                variablen=entry.get("variablen") or [],
+                source=KALK_SOURCE_EXCEL,
+                excel_filename=filename,
+                beschreibung=(
+                    f"Aus {filename} ({entry.get('sheet')}!{entry.get('cell')}, "
+                    f"Original: {entry.get('raw_excel')})"
+                ),
+            ))
+            saved += 1
+        await s.commit()
+
+    await _clear_state(chat_id)
+    msg = f"✅ <b>{saved} Formel(n) gespeichert.</b>\n\n"
+    msg += "Mit /kalkulation_anzeigen siehst Du alle Regeln. "
+    msg += "Mit /kalkulation_loeschen kannst Du einzelne entfernen.\n\n"
+    msg += "💡 Du kannst die Kategorien spaeter pro Eintrag anpassen, "
+    msg += "indem Du sie loeschst und mit /kalkulation neu anlegst."
+    return msg
+
+
+# ===========================================================================
+# Ende Kalkulation-Wizard
+# ===========================================================================
+
+
 async def process_telegram_update(payload):
     # Callback-Query (Button-Klick) hat eigene Top-Level-Struktur
     callback_query = payload.get("callback_query")
@@ -638,7 +1208,11 @@ async def process_telegram_update(payload):
     if (photo_array or document) and not text:
         state = await _load_state(chat_id)
         bot_token = None
-        if state and state.state_key in (STATE_VIZ_WAITING_PHOTO, STATE_BELEG_WAITING_PHOTO):
+        if state and state.state_key in (
+            STATE_VIZ_WAITING_PHOTO,
+            STATE_BELEG_WAITING_PHOTO,
+            STATE_KALK_EXCEL_WAITING,
+        ):
             bot_token = await _load_global_bot_token()
             if not bot_token:
                 await _send_to_chat(
@@ -662,6 +1236,11 @@ async def process_telegram_update(payload):
             reply = await _handle_beleg_photo_received(
                 chat_id, photo_array, document, bot_token
             )
+            await _send_to_chat(chat_id, reply)
+            return {"ok": True}
+
+        if state and state.state_key == STATE_KALK_EXCEL_WAITING:
+            reply = await _handle_kalk_excel_received(chat_id, document, bot_token)
             await _send_to_chat(chat_id, reply)
             return {"ok": True}
 
@@ -722,6 +1301,15 @@ async def process_telegram_update(payload):
         reply = await _handle_wissen_anzeigen(chat_id)
     elif text == "/wissen_loeschen":
         reply = await _handle_wissen_loeschen_command(chat_id)
+    elif text == "/kalkulation":
+        reply = await _handle_kalkulation_command(chat_id)
+    elif text == "/kalkulation_anzeigen":
+        await _clear_state(chat_id)
+        reply = await _handle_kalkulation_anzeigen(chat_id)
+    elif text == "/kalkulation_loeschen":
+        reply = await _handle_kalkulation_loeschen_command(chat_id)
+    elif text == "/kalkulation_excel":
+        reply = await _handle_kalkulation_excel_command(chat_id)
     elif text == "/visualisierung":
         reply = await _handle_visualisierung_command(chat_id)
     elif text == "/lexware_setup":
@@ -807,6 +1395,22 @@ async def process_telegram_update(payload):
             reply = await _handle_wissen_text_input(chat_id, text, state.state_data)
         elif state.state_key == STATE_WISSEN_LOESCHEN:
             reply = await _handle_wissen_loeschen_input(chat_id, text, state.state_data)
+        elif state.state_key == STATE_KALK_KATEGORIE:
+            reply = await _handle_kalk_kategorie_input(chat_id, text)
+        elif state.state_key == STATE_KALK_NAME:
+            reply = await _handle_kalk_name_input(chat_id, text, state.state_data)
+        elif state.state_key == STATE_KALK_FORMEL:
+            reply = await _handle_kalk_formel_input(chat_id, text, state.state_data)
+        elif state.state_key == STATE_KALK_EINHEIT:
+            reply = await _handle_kalk_einheit_input(chat_id, text, state.state_data)
+        elif state.state_key == STATE_KALK_BESCHREIBUNG:
+            reply = await _handle_kalk_beschreibung_input(chat_id, text, state.state_data)
+        elif state.state_key == STATE_KALK_LOESCHEN:
+            reply = await _handle_kalk_loeschen_input(chat_id, text, state.state_data)
+        elif state.state_key == STATE_KALK_EXCEL_WAITING:
+            reply = "Bitte schicke eine .xlsx-Datei (kein Text). Oder /abbrechen."
+        elif state.state_key == STATE_KALK_EXCEL_CONFIRM:
+            reply = await _handle_kalk_excel_confirm_input(chat_id, text, state.state_data)
         elif state.state_key == STATE_VIZ_WAITING_PHOTO:
             reply = "Bitte schicken Sie ein Foto (kein Text). Oder /abbrechen."
         elif state.state_key == STATE_VIZ_WAITING_DESCRIPTION:
@@ -2744,6 +3348,16 @@ def _format_aufnahme_preview(extracted: dict) -> str:
             else:
                 ohne_preis += 1
                 msg += f"  {i}. {name}: {menge} {einheit} (Preis offen)\n"
+            # Hinweis falls Preis aus Kalkulationsregel berechnet wurde
+            kalk = p.get("kalkulation")
+            if isinstance(kalk, dict) and kalk.get("formel"):
+                vars_str = ", ".join(
+                    f"{k}={v}" for k, v in (kalk.get("variablen") or {}).items()
+                )
+                msg += f"     🧮 <i>{kalk.get('regel_name')}: {kalk['formel']}"
+                if vars_str:
+                    msg += f"  ({vars_str})"
+                msg += "</i>\n"
         if gesamt > 0:
             msg += f"  <b>Summe (genannte Preise): {gesamt:.2f}€</b>\n"
         if ohne_preis > 0:
@@ -2803,13 +3417,22 @@ async def _handle_aufnahme_audio_received(chat_id, voice_dict, bot_token=None):
     # Audio-Dauer aus voice_dict (Telegram liefert "duration" in Sekunden)
     audio_dauer = voice_dict.get("duration")
 
-    # Gemini-Analyse
+    # Gemini-Analyse - mit Kalkulationsregeln des Tenants als Kontext.
+    # Gemini fuellt pro Position das `kalkulation`-Feld; wir berechnen den
+    # finalen Preis gleich darunter deterministisch in Python.
     try:
-        extracted = await analyse_kundengespraech_from_audio(audio_bytes, mime_type=audio_mime)
+        extracted = await analyse_kundengespraech_from_audio(
+            audio_bytes,
+            mime_type=audio_mime,
+            tenant_id=tenant.id,
+        )
     except Exception as e:
         logger.error(f"analyse_kundengespraech fehler: {e}", exc_info=True)
         await _clear_state(chat_id)
         return f"❌ Fehler bei Analyse: {e}\n\nBitte erneut versuchen."
+
+    # Hybrid-Berechnung: Preise aus Kalkulationsregeln einsetzen
+    extracted = await _apply_kalkulationen(tenant.id, extracted)
 
     # Pflicht: kunde_name muss da sein
     if not extracted.get("kunde_name"):

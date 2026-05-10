@@ -120,7 +120,9 @@ async def choose_employee(
     """
     from core.models.employee import Employee, get_default_employee
 
-    # 1) Sticky: bestehende Conversation behaelt ihren Employee
+    # 1) Sticky: bestehende Conversation behaelt ihren Employee — aber nur
+    # wenn der Employee noch aktiv ist. Sonst Re-Routing (sticky-recovered),
+    # sonst landen Folge-Mails bei jemandem der nicht mehr da ist.
     if existing_conversation is not None:
         sticky_id = getattr(existing_conversation, "assigned_employee_id", None)
         if sticky_id is not None:
@@ -128,7 +130,7 @@ async def choose_employee(
                 emp = (await s.execute(
                     select(Employee).where(Employee.id == sticky_id)
                 )).scalar_one_or_none()
-            if emp is not None:
+            if emp is not None and emp.is_active:
                 return RoutingDecision(
                     employee_id=emp.id,
                     employee_name=emp.name,
@@ -136,6 +138,16 @@ async def choose_employee(
                     reason="sticky-conversation",
                     score=1.0,
                     debug={"conversation_id": str(getattr(existing_conversation, "id", ""))},
+                )
+            # Employee deaktiviert oder geloescht: Sticky bricht, normales
+            # Routing greift weiter unten. Wir loggen das fuer Audit.
+            if emp is not None:
+                logger.info(
+                    f"sticky-conversation auf inaktiven Employee {emp.slug} - re-route"
+                )
+            else:
+                logger.info(
+                    f"sticky-conversation auf geloeschten Employee {sticky_id} - re-route"
                 )
 
     # 2) Aktive Employees laden

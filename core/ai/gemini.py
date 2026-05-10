@@ -282,6 +282,28 @@ RECHNUNG_RESPONSE_SCHEMA = {
                     "einheit": {"type": "STRING"},
                     "preis_brutto_eur": {"type": "NUMBER"},
                     "mwst_prozent": {"type": "INTEGER"},
+                    # Optional: Wenn eine Kalkulationsregel auf diese
+                    # Position passt, fuellt Gemini die Variable-Werte aus.
+                    # Der eigentliche Preis wird dann im Handler in Python
+                    # neu berechnet (Hybrid-Modus, siehe core.ai.kalkulation).
+                    "kalkulation": {
+                        "type": "OBJECT",
+                        "nullable": True,
+                        "properties": {
+                            "regel_name": {"type": "STRING"},
+                            "variablen": {
+                                "type": "ARRAY",
+                                "items": {
+                                    "type": "OBJECT",
+                                    "properties": {
+                                        "name": {"type": "STRING"},
+                                        "wert": {"type": "NUMBER"},
+                                    },
+                                    "required": ["name", "wert"],
+                                },
+                            },
+                        },
+                    },
                 },
                 "required": ["name", "menge", "einheit", "preis_brutto_eur", "mwst_prozent"],
             },
@@ -343,6 +365,32 @@ def _normalize_rechnung_extraction(data: dict) -> dict:
             else:
                 preis = float(preis or 0)
             mwst = int(p.get("mwst_prozent") or 19)
+            # Kalkulations-Hinweis (optional): Gemini hat eine Regel
+            # erkannt und die Variablenwerte mitgeliefert. Der Aufnahme-
+            # Handler matcht das spaeter gegen tenant_kalkulationen
+            # und rechnet den Preis deterministisch neu aus.
+            kalk = p.get("kalkulation")
+            kalk_clean = None
+            if isinstance(kalk, dict):
+                regel_name = (kalk.get("regel_name") or "").strip()
+                vars_raw = kalk.get("variablen") or []
+                vars_clean: dict[str, float] = {}
+                if isinstance(vars_raw, list):
+                    for v in vars_raw:
+                        if not isinstance(v, dict):
+                            continue
+                        vn = (v.get("name") or "").strip()
+                        try:
+                            vw = float(v.get("wert"))
+                        except (TypeError, ValueError):
+                            continue
+                        if vn:
+                            vars_clean[vn] = vw
+                if regel_name and vars_clean:
+                    kalk_clean = {
+                        "regel_name": regel_name,
+                        "variablen": vars_clean,
+                    }
             cleaned.append({
                 "name": name,
                 "beschreibung": p.get("beschreibung"),
@@ -350,6 +398,7 @@ def _normalize_rechnung_extraction(data: dict) -> dict:
                 "einheit": einheit,
                 "preis_brutto_eur": round(preis, 2),
                 "mwst_prozent": mwst,
+                "kalkulation": kalk_clean,
             })
         except Exception:
             continue
@@ -403,6 +452,14 @@ POSITIONEN (Liste, kann leer sein wenn unklar):
   * einheit: Default "Stueck". Andere: "Stunde", "Meter", "Liter", "kg", "qm", "Tag", "lfm", "Pauschal"
   * preis_brutto_eur: Brutto-Einzelpreis falls Tenant einen genannt hat. Wenn nicht genannt: null.
   * mwst_prozent: Default 19. Photovoltaik 0, Buecher 7.
+  * kalkulation: Optional. Wenn auf diese Position eine der oben gelisteten
+    KALKULATIONSREGELN passt (z.B. Anfahrtspauschale, Notfall-Zuschlag),
+    setze hier {"regel_name": "<exakter Name der Regel>", "variablen":
+    [{"name":"entfernung_km","wert":42}, ...]}. Liefere die Variablen-
+    Werte gemaess der Formel-Definition - der Endpreis wird vom System
+    automatisch aus der Formel berechnet, du musst preis_brutto_eur dann
+    nicht selbst setzen (es wird ueberschrieben). Wenn keine Regel passt:
+    weglassen / null.
 
 WICHTIG: Erfinde KEINE Preise. Wenn der Tenant keinen Preis nannte, setze preis_brutto_eur=null.
 Erfinde KEINE Mengen. Wenn unklar, setze menge=1 und nimm einheit="Pauschal".
@@ -449,6 +506,28 @@ GESPRAECH_RESPONSE_SCHEMA = {
                     "einheit": {"type": "STRING", "nullable": True},
                     "preis_brutto_eur": {"type": "NUMBER", "nullable": True},
                     "mwst_prozent": {"type": "INTEGER", "nullable": True},
+                    # Optional: Wenn eine Kalkulationsregel des Tenants
+                    # passt, fuellt Gemini Variable-Werte hier aus. Der
+                    # finale Preis wird dann deterministisch in Python
+                    # neu berechnet (siehe core.ai.kalkulation).
+                    "kalkulation": {
+                        "type": "OBJECT",
+                        "nullable": True,
+                        "properties": {
+                            "regel_name": {"type": "STRING"},
+                            "variablen": {
+                                "type": "ARRAY",
+                                "items": {
+                                    "type": "OBJECT",
+                                    "properties": {
+                                        "name": {"type": "STRING"},
+                                        "wert": {"type": "NUMBER"},
+                                    },
+                                    "required": ["name", "wert"],
+                                },
+                            },
+                        },
+                    },
                 },
                 "required": ["name"],
             },
@@ -622,6 +701,30 @@ def _normalize_gespraech_extraction(data: dict) -> dict:
                     preis = float(preis)
                 except (ValueError, TypeError):
                     preis = None
+            # Kalkulations-Hinweis (optional, wie in _normalize_rechnung)
+            kalk = raw.get("kalkulation")
+            kalk_clean = None
+            if isinstance(kalk, dict):
+                regel_name = (kalk.get("regel_name") or "").strip()
+                vars_raw = kalk.get("variablen") or []
+                vars_clean: dict[str, float] = {}
+                if isinstance(vars_raw, list):
+                    for v in vars_raw:
+                        if not isinstance(v, dict):
+                            continue
+                        vn = (v.get("name") or "").strip()
+                        try:
+                            vw = float(v.get("wert"))
+                        except (TypeError, ValueError):
+                            continue
+                        if vn:
+                            vars_clean[vn] = vw
+                if regel_name and vars_clean:
+                    kalk_clean = {
+                        "regel_name": regel_name,
+                        "variablen": vars_clean,
+                    }
+
             out["positionen"].append({
                 "name": str(raw.get("name", "")).strip(),
                 "beschreibung": raw.get("beschreibung"),
@@ -629,6 +732,7 @@ def _normalize_gespraech_extraction(data: dict) -> dict:
                 "einheit": (raw.get("einheit") or "Stueck").strip(),
                 "preis_brutto_eur": preis,
                 "mwst_prozent": int(raw.get("mwst_prozent") or 19),
+                "kalkulation": kalk_clean,
             })
 
     # Pflicht-Check
@@ -714,6 +818,8 @@ async def _gemini_analyse_gespraech(parts: list, mode: str) -> dict:
 async def analyse_kundengespraech_from_audio(
     audio_bytes: bytes,
     mime_type: str = "audio/ogg",
+    *,
+    tenant_id=None,
 ) -> dict:
     """Analysiert eine Audio-Aufnahme eines Kundengespraechs.
 
@@ -728,6 +834,11 @@ async def analyse_kundengespraech_from_audio(
     mime_type: audio/ogg fuer Telegram-Voice (Opus codec).
                audio/mpeg, audio/wav, audio/flac auch unterstuetzt.
 
+    tenant_id (optional): Wenn gesetzt, werden Kalkulationsregeln des
+    Tenants in den Prompt eingespeist (Hybrid-Modus). Pro Position kann
+    Gemini dann eine Regel + Variablen-Werte angeben; der finale Preis
+    wird in Python neu berechnet (siehe core.ai.kalkulation).
+
     Returns: dict mit allen Feldern aus GESPRAECH_RESPONSE_SCHEMA.
     """
     if not audio_bytes:
@@ -735,9 +846,14 @@ async def analyse_kundengespraech_from_audio(
 
     from google.genai.types import Part
 
+    kalk_block = await _build_kalkulation_block(tenant_id)
+    prompt_text = (
+        (kalk_block + "\n\n" if kalk_block else "")
+        + GESPRAECH_PROMPT
+    )
     audio_part = Part.from_bytes(data=audio_bytes, mime_type=mime_type)
     return await _gemini_analyse_gespraech(
-        [audio_part, GESPRAECH_PROMPT],
+        [audio_part, prompt_text],
         mode=f"audio/{mime_type}",
     )
 
@@ -769,7 +885,12 @@ Kategorien:
 
 Wenn Absender bekannt-privat (Banken, Versicherungen, Steuerberater): PRIVAT
 Wenn typische Werbung-Subjects oder noreply-Adressen: NICHT_RELEVANT
-Wenn Subject eindeutig Anfrage: RELEVANT_KUNDE"""
+Wenn Subject eindeutig Anfrage: RELEVANT_KUNDE
+
+WICHTIG bei Mails in anderer Sprache (Englisch/Tuerkisch/Polnisch/...):
+Klassifiziere trotzdem nach dem Anliegen — eine deutsche Anfrage bleibt
+RELEVANT_KUNDE auch wenn auf Englisch geschrieben. Nutze fuer reason
+einen kurzen deutschen Satz."""
 
 
 CLASSIFY_RESPONSE_SCHEMA = {
@@ -955,6 +1076,77 @@ async def generate_anfrage_reply(
 # gleichen Felder: kunde_*, positionen[], gesamtbetrag).
 # =====================================================================
 
+async def _build_kalkulation_block(tenant_id) -> str:
+    """
+    Laedt aktive Kalkulationsregeln des Tenants und formatiert sie als
+    Prompt-Block fuer Gemini. Wird vor ANGEBOT_PROMPT gehaengt.
+
+    Idee (Hybrid-Modus): Gemini bekommt Name + Formel + Variablen jeder
+    Regel. Die LLM entscheidet pro Position welche Regel passt und liefert
+    nur die Variablen-Werte mit. Der eigentliche Preis wird anschliessend
+    deterministisch in Python aus Formel + Variablen-Werten berechnet
+    (siehe core.ai.kalkulation.safe_eval_formel).
+    """
+    # Lazy-Import - keine zyklische Abhaengigkeit beim Modul-Load
+    from core.database import AsyncSessionLocal
+    from core.models import TenantKalkulation, KALK_KATEGORIE_LABELS
+    from sqlalchemy import select
+
+    if not tenant_id:
+        return ""
+
+    async with AsyncSessionLocal() as s:
+        regeln = (await s.execute(
+            select(TenantKalkulation)
+            .where(TenantKalkulation.tenant_id == tenant_id)
+            .where(TenantKalkulation.aktiv.is_(True))
+            .order_by(
+                TenantKalkulation.kategorie,
+                TenantKalkulation.sortierung,
+                TenantKalkulation.created_at,
+            )
+        )).scalars().all()
+
+    if not regeln:
+        return ""
+
+    # Gruppiert nach Kategorie ausgeben - macht es fuer Gemini leichter
+    # zu erkennen, "fuer Anfahrt nimm Anfahrt-Regel".
+    by_kat: dict[str, list[TenantKalkulation]] = {}
+    for r in regeln:
+        by_kat.setdefault(r.kategorie, []).append(r)
+
+    lines = [
+        "## KALKULATIONSREGELN (verbindlich anwenden)",
+        "",
+        "Der Handwerker hat eigene Berechnungsregeln hinterlegt. Wenn eine "
+        "dieser Regeln auf eine Angebotsposition passt, fuelle das Feld "
+        "`kalkulation` der Position mit dem `regel_name` und den passenden "
+        "Variablen-Werten aus. Der finale Preis wird vom System "
+        "deterministisch aus der Formel berechnet - du lieferst NUR die "
+        "Variablen-Werte (z.B. entfernung_km, stunden, einkaufspreis), "
+        "nicht den Endbetrag.",
+        "",
+        "Wenn keine Regel passt: lass `kalkulation` weg (null), und gib den "
+        "Preis wie gewohnt direkt an.",
+        "",
+    ]
+    for kat, rs in by_kat.items():
+        label = KALK_KATEGORIE_LABELS.get(kat, kat)
+        lines.append(f"### {label}")
+        for r in rs:
+            einheit = f" ({r.einheit})" if r.einheit else ""
+            vars_txt = ", ".join(r.variablen) if r.variablen else "(keine)"
+            lines.append(
+                f"- **{r.name}**{einheit}: `{r.formel}`  · "
+                f"Variablen: {vars_txt}"
+            )
+            if r.beschreibung:
+                lines.append(f"  Wann: {r.beschreibung}")
+        lines.append("")
+    return "\n".join(lines)
+
+
 ANGEBOT_PROMPT = """Du bekommst entweder einen Text oder eine Sprachnachricht eines Handwerkers, der ein Angebot fuer einen Kunden erstellen will.
 
 Extrahiere strukturierte Felder als JSON. Wenn ein Feld nicht erwaehnt wird, setze es auf null. Erfinde KEINE Werte.
@@ -974,6 +1166,11 @@ POSITIONEN (Liste - mindestens 1 Eintrag):
   * einheit: Default "Stueck". Andere: "Stunde", "Meter", "Liter", "kg", "qm", "Tag"
   * preis_brutto_eur: Einzelpreis brutto pro Einheit. Bei "Netto"-Angabe Brutto errechnen (Netto * 1.19).
   * mwst_prozent: Default 19. Photovoltaik 0, Buecher 7.
+  * kalkulation: Optional. Wenn ueber dieser Aufgabe ein Block "KALKULATIONS-
+    REGELN" steht und eine der Regeln passt, setze hier {"regel_name":
+    "<exakter Name>", "variablen": [{"name":"<varname>","wert":<zahl>}, ...]}.
+    Liefere NUR die Variablen-Werte - der Preis wird vom System aus der Formel
+    berechnet und ueberschreibt preis_brutto_eur. Wenn keine Regel passt: weglassen.
 
 GESAMT:
 - gesamtbetrag_brutto_eur: Summe aller (menge * preis_brutto_eur). Pflicht.
@@ -988,15 +1185,22 @@ Antworte AUSSCHLIESSLICH mit dem JSON, kein Markdown, keine Erlaeuterung.
 """
 
 
-async def extract_angebot_from_text(text: str) -> dict:
+async def extract_angebot_from_text(text: str, *, tenant_id=None) -> dict:
     """Extrahiert Angebots-Felder aus Text-Eingabe (analog Rechnung).
     Schema ist identisch (RECHNUNG_RESPONSE_SCHEMA).
+
+    tenant_id (optional): Wenn gesetzt, werden die Kalkulationsregeln des
+    Tenants in den Prompt eingespeist (Hybrid-Modus). Pro Position kann
+    Gemini dann eine Regel mit Variablenwerten benennen, der Preis wird
+    anschliessend deterministisch in Python berechnet.
     """
     if not text or not text.strip():
         return _normalize_rechnung_extraction({"missing_fields": ["alle"]})
 
+    kalk_block = await _build_kalkulation_block(tenant_id)
     full_prompt = (
-        ANGEBOT_PROMPT
+        (kalk_block + "\n\n" if kalk_block else "")
+        + ANGEBOT_PROMPT
         + "\n\n--- Text-Eingabe des Handwerkers: ---\n"
         + text.strip()
     )
@@ -1006,16 +1210,26 @@ async def extract_angebot_from_text(text: str) -> dict:
 async def extract_angebot_from_audio(
     audio_bytes: bytes,
     mime_type: str = "audio/ogg",
+    *,
+    tenant_id=None,
 ) -> dict:
-    """Extrahiert Angebots-Felder aus Sprachnachricht."""
+    """Extrahiert Angebots-Felder aus Sprachnachricht.
+
+    tenant_id (optional): siehe extract_angebot_from_text.
+    """
     if not audio_bytes:
         return _normalize_rechnung_extraction({"missing_fields": ["alle"]})
 
     from google.genai.types import Part
 
+    kalk_block = await _build_kalkulation_block(tenant_id)
+    prompt_text = (
+        (kalk_block + "\n\n" if kalk_block else "")
+        + ANGEBOT_PROMPT
+    )
     audio_part = Part.from_bytes(data=audio_bytes, mime_type=mime_type)
     return await _gemini_extract_rechnung(
-        [audio_part, ANGEBOT_PROMPT],
+        [audio_part, prompt_text],
         mode=f"angebot/audio/{mime_type}",
     )
 
