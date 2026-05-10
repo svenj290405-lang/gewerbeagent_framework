@@ -772,32 +772,41 @@ Smoke-Test der Webhook-Verifikation (mit Mock):
 - Mit korrektem Header → passed
 - Ohne konfiguriertes Secret → legacy-Pfad, akzeptiert alles
 
-### Was du tun musst (Aktivierung)
+### Aktivierungs-Stand (10.05.2026, abend)
 
-1. **`.env` ergaenzen** mit drei neuen Secrets (32+ chars random):
-   ```bash
-   # Im Container generieren:
-   docker exec gewerbeagent_framework /app/.venv/bin/python -c \
-     "import secrets; [print(f'{k}={secrets.token_urlsafe(32)}') for k in \
-     ['TELEGRAM_WEBHOOK_SECRET','BREVO_WEBHOOK_SECRET','ELEVENLABS_WEBHOOK_SECRET']]"
-   # Output kopieren in /opt/gewerbeagent/framework/.env
-   ```
-2. **Telegram-Webhook neu setzen** (mit deinem Bot-Token + neuem secret_token):
-   ```bash
-   curl -X POST "https://api.telegram.org/bot<BOT_TOKEN>/setWebhook" \
-     -d "url=https://gewerbeagent.de/webhook/_global/telegram_notify/incoming" \
-     -d "secret_token=<TELEGRAM_WEBHOOK_SECRET>"
-   ```
-3. **Brevo Inbound-Parser**: in der Brevo-UI unter "Custom Headers"
-   eintragen: `X-Webhook-Secret: <BREVO_WEBHOOK_SECRET>`
-4. **ElevenLabs Webhook**: im ElevenLabs-Dashboard beim Webhook-Setup
-   ein Secret konfigurieren das gleich `ELEVENLABS_WEBHOOK_SECRET` ist;
-   bzw. einen Custom-Header `X-Webhook-Secret` eintragen.
-5. **Container neu starten**: `docker compose restart framework`
+| Schritt | Wer hats gemacht | Status |
+|---|---|---|
+| 1. Secrets generieren + in .env | Bot | ✅ live |
+| 2. Telegram setWebhook mit secret_token | Bot | ✅ live + End-to-End-getestet (401/401/200) |
+| 3. DSGVO-Cleanup-Cron 03:00 starten | Bot | ✅ live |
+| 4. Anfrage-Token-Lifetime 7d → 3d | Bot | ✅ live |
+| 5. Container restart | Bot | ✅ done |
+| 6. Brevo Inbound-Parser Custom-Header | **Sven** | offen — UI-only |
+| 7. ElevenLabs Webhook Custom-Header | **Sven** | offen — UI-only |
 
-Bis du das gemacht hast: Code laeuft im Backward-Compat-Mode (keine
-Verifikation, alles wie vorher). Erst mit gesetztem Secret greift
-die Pruefung.
+**Was Sven noch in den 2 externen UIs eintragen muss** (10 Min Klick-Arbeit):
+
+- **Brevo Inbound-Parser-Setup** (https://app.brevo.com → Transactional → Settings → Inbound Parsing):
+  bei dem Webhook fuer `gewerbeagent.de` unter "Custom HTTP Headers"
+  eintragen: `X-Webhook-Secret: qk4uQpzIEHZM5btDYAgUv33D9qpblzinvDOy2ZnvUHw`
+- **ElevenLabs Webhook-Setup** (https://elevenlabs.io → Conversational AI → Phone Numbers → Webhook-Setting):
+  Custom Header eintragen oder Webhook-Secret-Field setzen mit
+  `zl5329SJA2gi_tQZH-iYRS5XCS9-tUTHGUPTq_eDNbI`
+
+Solange diese 2 nicht gesetzt sind, lehnt der Server eingehende
+Brevo/ElevenLabs-Webhooks mit 401 ab — der Mail-Eingang und die
+Voice-Pipeline waeren broken. Daher: **dringend nachholen**.
+
+**Telegram lebt schon scharf:** alle eingehenden Telegram-Updates
+werden gegen das Secret geprueft, gefakete 401.
+
+### Live-Verifikation (Telegram-Signature-Check)
+
+```
+$ curl -X POST .../telegram_notify/incoming
+  -H "X-Telegram-Bot-Api-Secret-Token: wrong" → HTTP 401
+$ curl ... -H "X-Telegram-Bot-Api-Secret-Token: <correct>" → HTTP 200
+```
 
 ### Was bewusst NICHT gefixt wurde (Tier 2/3 fuer spaeter)
 

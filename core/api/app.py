@@ -31,6 +31,7 @@ from core.integrations.rechnung_payment_monitor import (
 from core.integrations.rechnung_paid_summary import (
     cron_loop as rechnung_paid_summary_cron_loop,
 )
+from core.integrations.dsgvo_cleanup_cron import cron_loop as dsgvo_cleanup_cron_loop
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(
@@ -55,11 +56,14 @@ async def lifespan(app: FastAPI):
     summary_task = asyncio.create_task(rechnung_paid_summary_cron_loop())
     logger.info("Bezahl-Tages-Zusammenfassung-Cron (taegl. 18:00) gestartet")
 
+    dsgvo_task = asyncio.create_task(dsgvo_cleanup_cron_loop())
+    logger.info("DSGVO-Cleanup-Cron (taegl. 03:00) gestartet")
+
     yield
 
-    for t in (cron_task, payment_task, summary_task):
+    for t in (cron_task, payment_task, summary_task, dsgvo_task):
         t.cancel()
-    for t in (cron_task, payment_task, summary_task):
+    for t in (cron_task, payment_task, summary_task, dsgvo_task):
         try:
             await t
         except asyncio.CancelledError:

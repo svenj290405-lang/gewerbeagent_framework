@@ -314,11 +314,17 @@ async def create_anfrage_token(
     anfrage_typ: str = ANFRAGE_TYP_ALLGEMEIN,
     original_subject: Optional[str] = None,
     original_message_id: Optional[str] = None,
-    valid_days: int = 7,
+    valid_days: int = 3,
 ) -> AnfrageToken:
     """Erstellt einen neuen Anfrage-Token fuer einen Kunden.
 
     Returns: AnfrageToken-Instance (mit token-String und URL).
+
+    Hardening (Tier-1): Default-Lebensdauer von 7 auf 3 Tage reduziert.
+    Wenn der Token-Link in einer Spam-Mail oder einem geleakten Mail-
+    Postfach landet, ist das Zeitfenster fuer Termin-Spoofing kuerzer.
+    Caller (Mail-Antwort-Generator) kann ueberschreiben wenn ein
+    laengerer Zeitraum bewusst gewollt ist.
     """
     expires_at = datetime.now(timezone.utc) + timedelta(days=valid_days)
 
