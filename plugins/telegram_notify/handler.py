@@ -419,7 +419,8 @@ async def _handle_help_command():
 
     msg += "<b>💰 RECHNUNGEN</b>\n"
     msg += "/rechnung - neue anlegen (Text oder Sprache)\n"
-    msg += "/rechnungen_anzeigen - letzte 10\n\n"
+    msg += "/rechnungen_anzeigen - letzte 10\n"
+    msg += "/rechnung_pruefen - jetzt Bezahl-Status pollen (sonst alle 30min)\n\n"
 
     msg += "<b>📞 KUNDENGESPRAECHE</b>\n"
     msg += "/aufnahme - Gespraech aufnehmen + Lexware-Angebot\n"
@@ -1369,6 +1370,9 @@ async def process_telegram_update(payload):
     elif text == "/rechnungen_anzeigen":
         await _clear_state(chat_id)
         reply = await _handle_rechnungen_anzeigen_command(chat_id)
+    elif text == "/rechnung_pruefen":
+        await _clear_state(chat_id)
+        reply = await _handle_rechnung_pruefen_command(chat_id)
     elif text == "/werkstatt":
         reply = await _handle_werkstatt_command(chat_id)
     elif text == "/werkstatt_status":
@@ -4030,6 +4034,40 @@ async def _create_rechnung_in_lexware(chat_id, rechnung_id, bot_token):
     ]
     await _save_state(chat_id, STATE_RECHNUNG_AWAITING_MAIL, {"rechnung_id": str(rechnung_id)})
     await _send_with_inline_buttons(chat_id, msg, buttons, bot_token=bot_token)
+
+
+async def _handle_rechnung_pruefen_command(chat_id) -> str:
+    """Manueller 'Jetzt pruefen'-Befehl: triggert Lexware-Polling sofort
+    statt auf den naechsten 30min-Cron-Lauf zu warten.
+    """
+    tenant = await _get_tenant_by_chat(chat_id)
+    if not tenant:
+        return "Dieser Chat ist noch keinem Betrieb zugeordnet."
+
+    try:
+        from core.integrations.rechnung_payment_monitor import (
+            check_pending_invoices_for_tenant,
+        )
+        summary = await check_pending_invoices_for_tenant(tenant.id)
+    except Exception as e:
+        logger.exception(f"Manueller /rechnung_pruefen failed: {e}")
+        return f"Pruefung fehlgeschlagen: {str(e)[:120]}"
+
+    if summary["checked"] == 0:
+        return "Keine offenen Rechnungen zum Pruefen."
+
+    parts = [
+        f"<b>Pruefung fertig</b>",
+        f"• {summary['checked']} Rechnungen geprueft",
+    ]
+    if summary["paid"] > 0:
+        parts.append(f"• 💰 {summary['paid']} neu als bezahlt markiert")
+    if summary["errors"] > 0:
+        parts.append(f"• ⚠️ {summary['errors']} API-Fehler")
+    if summary["no_change"] == summary["checked"] and summary["paid"] == 0:
+        parts.append("• Status unveraendert (alle weiter offen)")
+    parts.append("\nDetails: /rechnungen_anzeigen")
+    return "\n".join(parts)
 
 
 async def _handle_rechnungen_anzeigen_command(chat_id):

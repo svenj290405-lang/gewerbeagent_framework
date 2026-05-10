@@ -207,6 +207,44 @@ async def check_pending_invoices_for_tenant(
     return summary
 
 
+async def cleanup_stale_creating_rechnungen(stale_minutes: int = 5) -> int:
+    """Findet Rechnungen die seit > stale_minutes auf Status 'creating'
+    haengen — Container-Restart oder unbeantworteter Lexware-Call hat
+    sie verwaist. Setzt sie auf 'error' damit der Tenant den Wizard
+    erneut starten kann.
+
+    Returns: Anzahl bereinigter Rechnungen.
+    """
+    from datetime import timedelta
+    from core.models.rechnung import RECHNUNG_STATUS_CREATING, RECHNUNG_STATUS_ERROR
+
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=stale_minutes)
+    async with AsyncSessionLocal() as session:
+        res = await session.execute(
+            update(Rechnung)
+            .where(Rechnung.status == RECHNUNG_STATUS_CREATING)
+            .where(Rechnung.updated_at < cutoff)
+            .values(
+                status=RECHNUNG_STATUS_ERROR,
+                error_message=(
+                    "Verwaister 'creating'-Status — Lexware-Call hat nicht "
+                    "geantwortet oder Container restartete. Bitte erneut "
+                    "starten."
+                ),
+                updated_at=datetime.now(timezone.utc),
+            )
+            .returning(Rechnung.id)
+        )
+        recovered = list(res.scalars().all())
+        await session.commit()
+    if recovered:
+        logger.warning(
+            f"Cleanup verwaiste 'creating'-Rechnungen: {len(recovered)} "
+            f"Eintraege auf 'error' gesetzt: {[str(r) for r in recovered[:5]]}"
+        )
+    return len(recovered)
+
+
 async def poll_all_tenants_once() -> dict:
     """Ein Polling-Lauf ueber alle Tenants mit aktiver Lexware-Verbindung."""
     summary = {
@@ -214,7 +252,11 @@ async def poll_all_tenants_once() -> dict:
         "total_invoices_checked": 0,
         "total_paid": 0,
         "total_errors": 0,
+        "stale_creating_recovered": 0,
     }
+
+    # Vor jedem Lauf: verwaiste Rechnungen bereinigen.
+    summary["stale_creating_recovered"] = await cleanup_stale_creating_rechnungen()
 
     # Wir brauchen alle Tenants die Lexware konfiguriert haben — also
     # JOIN auf ToolConfig.
@@ -235,6 +277,19 @@ async def poll_all_tenants_once() -> dict:
             summary["total_invoices_checked"] += t_summary["checked"]
             summary["total_paid"] += t_summary["paid"]
             summary["total_errors"] += t_summary["errors"]
+
+            # Tenant-Health-Check: wenn alle Calls fehlgeschlagen sind
+            # und mindestens 3 Rechnungen geprueft wurden, ist der
+            # Lexware-Key vermutlich tot — Push schicken.
+            if (
+                t_summary["checked"] >= 3
+                and t_summary["errors"] == t_summary["checked"]
+            ):
+                try:
+                    from core.integrations.tenant_alert import notify_lexware_dead
+                    await notify_lexware_dead(tenant_id=tenant_id, days_silent=1)
+                except Exception as exc_alert:
+                    logger.debug(f"Lexware-Alert failed (egal): {exc_alert}")
         except Exception as exc:  # noqa: BLE001
             logger.exception(
                 f"Bezahl-Polling Tenant {slug} crashed: {exc}"
