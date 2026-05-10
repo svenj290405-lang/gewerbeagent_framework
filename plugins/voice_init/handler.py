@@ -116,6 +116,8 @@ class Plugin(BasePlugin):
             return await self._handle_initiation(payload)
         if endpoint == "save_contact":
             return await self._handle_save_contact(payload)
+        if endpoint == "call_ended":
+            return await self._handle_call_ended(payload)
         return {"error": f"Unbekannter Endpunkt: {endpoint}"}
 
     async def _handle_initiation(self, payload):
@@ -216,6 +218,37 @@ class Plugin(BasePlugin):
                 f"save_contact: name oder tenant_slug fehlt: name={name!r} slug={tenant_slug!r}"
             )
             return {"success": False, "error": "name und tenant_slug sind Pflicht"}
+
+        # Schutz gegen Leere-Anrufe: Anrufer hat nichts gesagt, Q hat
+        # 'unbekannt'/'(silent)'/'.' als Namen. Kein Lexware-Eintrag,
+        # nur leiser Push an Inhaber damit er weiss dass jemand kurz
+        # angerufen hat.
+        name_clean = name.lower().strip(" .,-_")
+        suspicious = (
+            len(name) < 2
+            or name_clean in {
+                "unbekannt", "silent", "no name", "noname",
+                "test", "anonym", "anonymous", "(silent)", "n/a",
+            }
+        )
+        if suspicious:
+            logger.info(
+                f"save_contact: leerer Anruf erkannt name={name!r} - "
+                f"kein Lexware-Eintrag, nur Hinweis-Push"
+            )
+            # Tenant-Telegram nachschlagen
+            async with AsyncSessionLocal() as s:
+                t = (await s.execute(
+                    select(Tenant).where(Tenant.slug == tenant_slug)
+                )).scalar_one_or_none()
+                tg_chat = t.telegram_chat_id if t else None
+            if tg_chat:
+                await self._push_to_tenant(
+                    tg_chat,
+                    f"📞 <b>Kurzer Anruf</b> — Anrufer ohne Anliegen "
+                    f"(Name: {name!r}). Kein Lexware-Eintrag angelegt.",
+                )
+            return {"success": True, "skipped": True, "reason": "suspicious-name"}
 
         # Tenant laden
         async with AsyncSessionLocal() as s:
@@ -324,6 +357,90 @@ class Plugin(BasePlugin):
                 logger.warning(f"Lexware-API-Key Entschluesselung fehlgeschlagen: {e}")
                 return None
             return LexwareProvider(api_key=api_key)
+
+
+    async def _handle_call_ended(self, payload):
+        """Webhook von ElevenLabs nach Anrufende.
+
+        Erwartet:
+          {
+            "tenant_slug": "demo",
+            "called_number": "+49 211 87...",
+            "caller_id": "+49 ...",
+            "duration_seconds": 142,
+            "char_count": 1230,           # falls TTS-Zeichen-Count separat
+            "conversation_id": "...",
+            "call_outcome": "completed" | "incomplete" | "no_audio",
+          }
+
+        Trackt:
+          - ElevenLabs TTS chars (falls geliefert)
+          - Deepgram seconds (Anruf-Dauer fuer Transcription)
+          - Sipgate inbound seconds (kostenfrei in DE)
+        """
+        tenant_slug = (payload.get("tenant_slug") or "").strip()
+        called_number = payload.get("called_number") or payload.get("to_number")
+        duration_s = float(payload.get("duration_seconds") or 0)
+        char_count = int(payload.get("char_count") or 0)
+        outcome = (payload.get("call_outcome") or "completed").lower()
+
+        # Tenant-Lookup: erst via slug, sonst via called_number
+        tenant_id = None
+        async with AsyncSessionLocal() as s:
+            if tenant_slug:
+                t = (await s.execute(
+                    select(Tenant).where(Tenant.slug == tenant_slug)
+                )).scalar_one_or_none()
+                if t:
+                    tenant_id = t.id
+        if tenant_id is None and called_number:
+            t = await _find_tenant_by_phone(called_number)
+            if t:
+                tenant_id = t.id
+
+        if duration_s <= 0:
+            logger.info(
+                f"call_ended ohne duration_seconds — skip tracking "
+                f"(tenant={tenant_slug}, outcome={outcome})"
+            )
+            return {"success": True, "tracked": False}
+
+        # Failsafe Usage-Tracking
+        try:
+            from core.billing import (
+                track_deepgram_seconds, track_elevenlabs_chars,
+                track_api_usage,
+            )
+            # Deepgram: jede Sekunde wird transcribiert
+            await track_deepgram_seconds(
+                duration_s, tenant_id=tenant_id,
+            )
+            # ElevenLabs: Zeichen-Count wenn vorhanden
+            if char_count > 0:
+                await track_elevenlabs_chars(
+                    char_count, tenant_id=tenant_id,
+                )
+            # Sipgate: inbound, kostenfrei aber wir tracken Volume
+            await track_api_usage(
+                tenant_id=tenant_id,
+                provider="sipgate",
+                operation="inbound-de",
+                units=duration_s,
+                unit="second",
+                metadata={
+                    "called_number": called_number,
+                    "outcome": outcome,
+                    "conversation_id": payload.get("conversation_id"),
+                },
+            )
+        except Exception as e:
+            logger.warning(f"voice call_ended tracking failed: {e}")
+
+        logger.info(
+            f"call_ended tracked: tenant={tenant_slug} "
+            f"duration={duration_s}s chars={char_count} outcome={outcome}"
+        )
+        return {"success": True, "tracked": True}
 
 
     async def _push_to_tenant(self, telegram_chat_id, html_message):

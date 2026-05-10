@@ -393,7 +393,10 @@ async def fetch_full_message(
         return None
 
     params = {
-        "$select": "id,subject,from,toRecipients,body,bodyPreview,receivedDateTime,isRead,internetMessageId",
+        "$select": (
+            "id,subject,from,toRecipients,body,bodyPreview,receivedDateTime,"
+            "isRead,internetMessageId,hasAttachments"
+        ),
     }
 
     try:
@@ -412,6 +415,156 @@ async def fetch_full_message(
     except Exception as e:
         logger.exception(f"fetch_full_message Exception: {e}")
         return None
+
+
+async def _forward_attachments_to_telegram(
+    *, tenant_id: UUID, message_id: str, sender_label: str,
+    subject: str, employee_id: UUID | None = None,
+) -> int:
+    """Lädt alle relevanten Anhaenge einer Mail und sendet sie als
+    Telegram-Document/Photo an den passenden Mitarbeiter-Chat.
+
+    Returns: Anzahl erfolgreich weitergeleiteter Anhaenge.
+    """
+    attachments = await fetch_attachments(
+        tenant_id, message_id, employee_id=employee_id,
+    )
+    if not attachments:
+        return 0
+
+    # Telegram-Chat finden via _resolve_chat_id_for_push
+    try:
+        from plugins.telegram_notify.handler import (
+            _resolve_chat_id_for_push,  # type: ignore
+        )
+        chat_id, bot_token = await _resolve_chat_id_for_push(
+            tenant_id=tenant_id, employee_id=employee_id,
+        )
+    except Exception as e:
+        logger.debug(f"Anhang-Forward: chat_id-Lookup failed: {e}")
+        return 0
+
+    if not chat_id or not bot_token:
+        return 0
+
+    # Pre-Header: was kommt
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            await client.post(
+                f"https://api.telegram.org/bot{bot_token}/sendMessage",
+                json={
+                    "chat_id": chat_id,
+                    "text": (
+                        f"📎 <b>{len(attachments)} Anhang/Anhaenge</b> "
+                        f"von {sender_label}\n"
+                        f"Subject: {subject[:80]}"
+                    ),
+                    "parse_mode": "HTML",
+                },
+            )
+    except Exception:
+        pass
+
+    sent = 0
+    for att in attachments:
+        ct = (att.get("content_type") or "").lower()
+        name = att.get("name") or "anhang"
+        raw = att.get("bytes")
+        if not raw:
+            continue
+        # Bilder via sendPhoto, alles andere via sendDocument
+        is_image = ct.startswith("image/")
+        endpoint = "sendPhoto" if is_image else "sendDocument"
+        field_name = "photo" if is_image else "document"
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                r = await client.post(
+                    f"https://api.telegram.org/bot{bot_token}/{endpoint}",
+                    data={"chat_id": chat_id, "caption": name[:200]},
+                    files={field_name: (name, raw, ct)},
+                )
+                if r.status_code == 200:
+                    sent += 1
+                else:
+                    logger.warning(
+                        f"Telegram-{endpoint} HTTP {r.status_code}: {r.text[:120]}"
+                    )
+        except Exception as e:
+            logger.warning(f"Telegram-{endpoint} crashed: {e}")
+
+    logger.info(
+        f"Anhang-Forward: tenant={tenant_id} {sent}/{len(attachments)} "
+        f"weitergeleitet"
+    )
+    return sent
+
+
+async def fetch_attachments(
+    tenant_id: UUID, message_id: str,
+    employee_id: UUID | None = None,
+    max_size_bytes: int = 10_000_000,
+) -> list[dict]:
+    """Holt alle FileAttachments einer Mail.
+
+    Returns: [{'name': str, 'content_type': str, 'size': int, 'bytes': bytes}]
+
+    Filter: ueberspringt Inline-Bilder (cid: Embedded), Anhaenge > 10MB
+    und solche ohne contentBytes.
+    """
+    try:
+        access_token = await get_microsoft_token(tenant_id, employee_id=employee_id)
+    except Exception as e:
+        logger.error(f"fetch_attachments Token-Fehler: {e}")
+        return []
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.get(
+                f"{GRAPH_API_BASE}/me/messages/{message_id}/attachments",
+                headers={"Authorization": f"Bearer {access_token}"},
+                params={
+                    "$select": "id,name,contentType,size,isInline,@odata.type,contentBytes",
+                },
+            )
+            if resp.status_code != 200:
+                logger.warning(
+                    f"fetch_attachments fehlgeschlagen: {resp.status_code} {resp.text[:200]}"
+                )
+                return []
+            data = resp.json().get("value", [])
+    except Exception as e:
+        logger.exception(f"fetch_attachments Exception: {e}")
+        return []
+
+    import base64 as _b64
+    out = []
+    for att in data:
+        # Nur fileAttachment, keine itemAttachment (eingebettete Mails)
+        if att.get("@odata.type") != "#microsoft.graph.fileAttachment":
+            continue
+        if att.get("isInline"):
+            continue
+        size = int(att.get("size") or 0)
+        if size > max_size_bytes:
+            logger.info(
+                f"fetch_attachments skip {att.get('name')!r} - "
+                f"{size} bytes > {max_size_bytes}"
+            )
+            continue
+        content_b64 = att.get("contentBytes")
+        if not content_b64:
+            continue
+        try:
+            raw = _b64.b64decode(content_b64)
+        except Exception:
+            continue
+        out.append({
+            "name": att.get("name") or "anhang",
+            "content_type": att.get("contentType") or "application/octet-stream",
+            "size": size,
+            "bytes": raw,
+        })
+    return out
 
 
 # =====================================================================
@@ -709,6 +862,22 @@ async def process_relevant_kunde_mail(
                 )
         except Exception as e:
             logger.warning(f"mark_as_read fehler (non-fatal): {e}")
+
+        # 6c) Anhaenge an Telegram weiterleiten (Bilder, PDFs).
+        # Best-effort, schluckt eigene Fehler. Inhaber sieht so direkt
+        # das Foto vom kaputten Heizkessel oder den PDF-Plan.
+        if full.get("hasAttachments"):
+            try:
+                await _forward_attachments_to_telegram(
+                    tenant_id=tenant_id,
+                    message_id=message_id,
+                    sender_label=f"{sender_name} ({sender_email})",
+                    subject=subject,
+                    employee_id=employee_id,
+                )
+            except Exception as e:
+                logger.warning(f"Anhang-Forward fehler (non-fatal): {e}")
+
         try:
             moved = await move_to_gewerbeagent(
                 tenant_id, message_id, employee_id=employee_id,
