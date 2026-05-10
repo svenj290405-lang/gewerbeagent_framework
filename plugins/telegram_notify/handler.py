@@ -106,7 +106,14 @@ WISSEN_MAX_LEN = 2000
 
 class TelegramNotifier:
     @staticmethod
-    async def send_for_tenant(tenant_id, text):
+    async def send_for_tenant(tenant_id, text, *, employee_id=None):
+        """Push an einen Tenant.
+
+        Wenn employee_id gesetzt: Push an den Telegram-Chat dieses
+        Mitarbeiters (Multi-User, Phase 2). Sonst: Push an den
+        Default-Employee — oder als Fallback an die Chat-ID aus
+        tool_configs (Legacy, falls noch kein Backfill gelaufen ist).
+        """
         try:
             async with AsyncSessionLocal() as session:
                 result = await session.execute(
@@ -120,13 +127,43 @@ class TelegramNotifier:
                     return False
                 cfg = {**MANIFEST.default_config, **(tc.config or {})}
                 bot_token = cfg.get("bot_token", "")
-                chat_id = cfg.get("chat_id", "")
+
+                # Chat-ID-Aufloesung: Employee > Default-Employee > Legacy-Config
+                chat_id = await _resolve_chat_id_for_push(
+                    session, tenant_id, employee_id, fallback=cfg.get("chat_id", ""),
+                )
                 if not bot_token or not chat_id:
                     return False
             return await TelegramNotifier._send_raw(bot_token, chat_id, text)
         except Exception as e:
             logger.exception(f"Telegram-Versand fehlgeschlagen: {e}")
             return False
+
+    @staticmethod
+    async def broadcast_to_tenant(tenant_id, text):
+        """Push an ALLE aktiven Mitarbeiter eines Tenants.
+
+        Fuer tenant-weite Notifications (z.B. 18:00-Bezahl-Push,
+        Anfragen-Eingang, generelle Status-Meldungen). Failsafe:
+        Versand pro Mitarbeiter wird einzeln versucht; ein einzelner
+        Fehler stoppt nicht die anderen.
+        """
+        from core.models.employee import get_employees_for_tenant
+        try:
+            employees = await get_employees_for_tenant(tenant_id, active_only=True)
+        except Exception as e:
+            logger.exception(f"broadcast_to_tenant: employees-Lookup failed: {e}")
+            return 0
+        sent = 0
+        for emp in employees:
+            if not emp.telegram_chat_id:
+                continue
+            ok = await TelegramNotifier.send_for_tenant(
+                tenant_id, text, employee_id=emp.id,
+            )
+            if ok:
+                sent += 1
+        return sent
 
     @staticmethod
     async def send_admin(bot_token, chat_id, text):
@@ -198,13 +235,62 @@ async def _clear_state(chat_id):
             await s.commit()
 
 async def _get_tenant_by_chat(chat_id):
-    async with AsyncSessionLocal() as s:
-        t = (await s.execute(
-            select(Tenant).where(Tenant.telegram_chat_id == chat_id)
+    """Tenant zu Chat-ID. Drop-in fuer alle 50+ Aufrufstellen.
+
+    Phase 2 der Multi-Mitarbeiter-Erweiterung
+    (`das-machen-wir-gleich-foamy-frost.md`):
+    Sucht intern erst employees.telegram_chat_id (Multi-User), faellt
+    auf tenants.telegram_chat_id zurueck (Legacy + Default-Employee).
+    Return-Typ unveraendert (Tenant | None) — alle bestehenden Caller
+    funktionieren ohne Aenderung.
+    """
+    from core.models.employee import get_employee_by_telegram_chat
+    res = await get_employee_by_telegram_chat(chat_id)
+    return res[0] if res else None
+
+
+async def _get_current_employee(chat_id):
+    """(Tenant, Employee) zu Chat-ID, oder None.
+
+    Fuer personalisierte Befehle die wissen muessen WER gerade tippt —
+    z.B. /briefing (zeigt nur eigene Termine), /werkstatt (setzt
+    eigene Heimat), /mitarbeiter (Inhaber-only). Default-Employee
+    bei Legacy-Chats (chat_id steht nur am Tenant, nicht am Employee).
+    """
+    from core.models.employee import get_employee_by_telegram_chat
+    return await get_employee_by_telegram_chat(chat_id)
+
+
+async def _resolve_chat_id_for_push(session, tenant_id, employee_id, *, fallback):
+    """Chat-ID-Aufloesung mit 3-stufigem Fallback.
+
+    1. Wenn employee_id gesetzt: dessen telegram_chat_id (oder None
+       wenn Mitarbeiter noch nicht onboarded ist)
+    2. Sonst: telegram_chat_id des Default-Employee
+    3. Sonst: Legacy-Wert aus tool_configs.telegram_notify (chat_id-Key)
+    """
+    from core.models.employee import Employee
+    if employee_id is not None:
+        emp = (await session.execute(
+            select(Employee).where(Employee.id == employee_id)
         )).scalar_one_or_none()
-        if t:
-            s.expunge(t)
-        return t
+        if emp and emp.telegram_chat_id:
+            return str(emp.telegram_chat_id)
+        # employee_id war gesetzt aber Mitarbeiter hat keine Chat-ID →
+        # NICHT auf Default zurueckfallen (sonst kriegt der Inhaber
+        # Notifications die einem anderen gehoert haetten).
+        return None
+    # Kein employee_id → Default-Employee
+    default_emp = (await session.execute(
+        select(Employee).where(
+            Employee.tenant_id == tenant_id,
+            Employee.is_default.is_(True),
+        )
+    )).scalar_one_or_none()
+    if default_emp and default_emp.telegram_chat_id:
+        return str(default_emp.telegram_chat_id)
+    # Legacy-Fallback (vor Backfill / unkonfigurierte Tenants)
+    return fallback or None
 
 async def _load_global_bot_token():
     async with AsyncSessionLocal() as s:
@@ -237,9 +323,18 @@ async def _handle_start_command(text, chat_id, from_data):
         msg += "Falls Sie sich gerade einrichten, scannen Sie bitte den QR-Code, "
         msg += "den Sie von uns erhalten haben."
         return msg
-    tenant_slug = parts[1].strip().lower()
-    if not tenant_slug.replace("-", "").replace("_", "").isalnum():
-        return "Aktivierungs-Link ungueltig. Bitte verwenden Sie den QR-Code."
+    raw = parts[1].strip().lower()
+    # Format: "<tenant_slug>" (Owner-Onboarding, Default-Employee)
+    # oder:   "<tenant_slug>__<employee_slug>" (Mitarbeiter-Onboarding)
+    if "__" in raw:
+        tenant_slug, _, employee_slug = raw.partition("__")
+    else:
+        tenant_slug, employee_slug = raw, "default"
+    for token in (tenant_slug, employee_slug):
+        if not token or not token.replace("-", "").replace("_", "").isalnum():
+            return "Aktivierungs-Link ungueltig. Bitte verwenden Sie den QR-Code."
+
+    from core.models.employee import Employee
     async with AsyncSessionLocal() as s:
         tenant = (await s.execute(
             select(Tenant).where(Tenant.slug == tenant_slug)
@@ -248,15 +343,47 @@ async def _handle_start_command(text, chat_id, from_data):
             return f"Aktivierungs-Link ungueltig (Tenant {tenant_slug} nicht gefunden)."
         if tenant_slug == GLOBAL_TENANT_SLUG:
             return "Dieser Aktivierungs-Link ist nicht fuer Endkunden bestimmt."
-        if tenant.telegram_chat_id and tenant.telegram_chat_id != chat_id:
-            logger.warning(f"Tenant {tenant_slug}: Chat-ID-Wechsel zu {chat_id}")
-        tenant.telegram_chat_id = chat_id
+
+        # Employee finden (oder beim Default-Slug 'default' garantiert
+        # da dank Phase-0-Backfill)
+        emp = (await s.execute(
+            select(Employee).where(
+                Employee.tenant_id == tenant.id,
+                Employee.slug == employee_slug,
+            )
+        )).scalar_one_or_none()
+        if emp is None:
+            return (
+                f"Mitarbeiter-Slug '{employee_slug}' nicht gefunden. "
+                "Der Inhaber muss diesen Mitarbeiter erst anlegen "
+                "(/mitarbeiter neu)."
+            )
+
+        # Falls schon eine andere Chat-ID hier haengt: warnen + ueberschreiben
+        if emp.telegram_chat_id and emp.telegram_chat_id != chat_id:
+            logger.warning(
+                f"Mitarbeiter {tenant_slug}/{employee_slug}: "
+                f"Chat-ID-Wechsel von {emp.telegram_chat_id} zu {chat_id}"
+            )
+        # Chat-ID auf Mitarbeiter setzen
+        emp.telegram_chat_id = chat_id
+        # Fuer Default-Employee zusaetzlich tenant.telegram_chat_id mitspiegeln
+        # (Backward-Compat fuer Code-Pfade die noch nicht employee-aware sind)
+        if emp.is_default:
+            tenant.telegram_chat_id = chat_id
         await s.commit()
+
         first_name = (from_data.get("first_name") or "").strip() or "dort"
         reply = f"Willkommen, {first_name}!\n\n"
-        reply += f"Ihr Telegram ist jetzt mit <b>{tenant.company_name}</b> verbunden.\n\n"
+        if emp.is_default:
+            reply += f"Ihr Telegram ist jetzt mit <b>{tenant.company_name}</b> verbunden.\n\n"
+        else:
+            reply += (
+                f"Sie sind als Mitarbeiter <b>{emp.name}</b> "
+                f"bei <b>{tenant.company_name}</b> angemeldet.\n\n"
+            )
         reply += "Ab jetzt erhalten Sie hier:\n"
-        reply += "- Push-Nachrichten zu neuen Anrufen und Mails\n"
+        reply += "- Push-Nachrichten zu Ihren Anrufen und Mails\n"
         reply += "- Bestaetigungen ueber gebuchte Termine\n"
         reply += "- Hinweise wenn Q nicht weiterkommt\n\n"
         reply += "Mit /help sehen Sie alle verfuegbaren Befehle."

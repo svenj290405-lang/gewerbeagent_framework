@@ -202,6 +202,10 @@ async def get_employee_by_telegram_chat(
     zurueck auf tenants.telegram_chat_id (= Legacy / Default-Employee).
     Im Fallback-Fall wird der Default-Employee als Employee
     zurueckgegeben.
+
+    Die zurueckgegebenen Objekte sind aus der Session expunged —
+    der Caller kann sie ohne aktive Session weiterverwenden, darf
+    aber keine relationships lazy-loaden.
     """
     from core.database import AsyncSessionLocal
     from core.models.tenant import Tenant
@@ -214,6 +218,8 @@ async def get_employee_by_telegram_chat(
             tenant = (await session.execute(
                 select(Tenant).where(Tenant.id == emp.tenant_id)
             )).scalar_one()
+            session.expunge(emp)
+            session.expunge(tenant)
             return tenant, emp
         # 2) Fallback: alter tenants.telegram_chat_id-Pfad
         tenant = (await session.execute(
@@ -231,4 +237,6 @@ async def get_employee_by_telegram_chat(
             # Tenant existiert, aber kein Default-Employee — sollte
             # nicht vorkommen wenn Migration sauber lief.
             return None
+        session.expunge(emp)
+        session.expunge(tenant)
         return tenant, emp
