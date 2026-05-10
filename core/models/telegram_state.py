@@ -36,6 +36,12 @@ STATE_KALK_EXCEL_CONFIRM = "kalk_excel_confirm"
 STATE_VIZ_WAITING_PHOTO = "viz_waiting_photo"
 STATE_VIZ_WAITING_DESCRIPTION = "viz_waiting_description"
 STATE_VIZ_WAITING_KUNDE = "viz_waiting_kunde"
+# Post-Generation: User entscheidet was mit dem Bild passieren soll
+# (Mail an Kunde / Drive-Archiv / fertig). Inline-Buttons setzen den
+# Folge-State der dann auf Email-Adresse oder Kunden-Name wartet.
+STATE_VIZ_POST_ACTION = "viz_post_action"
+STATE_VIZ_POST_MAIL_EMAIL = "viz_post_mail_email"
+STATE_VIZ_POST_DRIVE_KUNDE = "viz_post_drive_kunde"
 # Beleg-Wizard (Lexware)
 STATE_BELEG_WAITING_PHOTO = "beleg_waiting_photo"
 STATE_BELEG_CONFIRMING = "beleg_confirming"

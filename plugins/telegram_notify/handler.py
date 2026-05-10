@@ -34,6 +34,9 @@ from core.models import (
     STATE_VIZ_WAITING_DESCRIPTION,
     STATE_VIZ_WAITING_KUNDE,
     STATE_VIZ_WAITING_PHOTO,
+    STATE_VIZ_POST_ACTION,
+    STATE_VIZ_POST_MAIL_EMAIL,
+    STATE_VIZ_POST_DRIVE_KUNDE,
     STATE_WISSEN_KATEGORIE,
     STATE_WISSEN_LOESCHEN,
     STATE_WISSEN_TEXT,
@@ -1364,6 +1367,8 @@ async def process_telegram_update(payload):
             await _handle_formular_callback(cq_chat_id, cq_data, cq_id, bot_token)
         elif cq_data and cq_data.startswith("kal:"):
             await _handle_kalender_callback(cq_chat_id, cq_data, cq_id, bot_token)
+        elif cq_data and cq_data.startswith("viz:"):
+            await _handle_viz_callback(cq_chat_id, cq_data, cq_id, bot_token)
         else:
             # Unbekannte Callback-Daten - nur bestätigen
             await _answer_callback_query(cq_id, "Unbekannte Aktion", bot_token)
@@ -1678,8 +1683,33 @@ async def process_telegram_update(payload):
             reply = await _handle_kalk_excel_confirm_input(chat_id, text, state.state_data)
         elif state.state_key == STATE_VIZ_WAITING_PHOTO:
             reply = "Bitte schicken Sie ein Foto (kein Text). Oder /abbrechen."
+        elif state.state_key == STATE_VIZ_POST_ACTION:
+            reply = (
+                "Bitte einen der Buttons oben antippen "
+                "(Mail / Drive / Fertig) oder /abbrechen schicken."
+            )
+        elif state.state_key == STATE_VIZ_POST_MAIL_EMAIL:
+            reply_or_none = await _handle_viz_mail_email_input(
+                chat_id, text, state.state_data,
+            )
+            if reply_or_none is None:
+                return {"ok": True}
+            reply = reply_or_none
+        elif state.state_key == STATE_VIZ_POST_DRIVE_KUNDE:
+            reply_or_none = await _handle_viz_drive_kunde_input(
+                chat_id, text, state.state_data,
+            )
+            if reply_or_none is None:
+                return {"ok": True}
+            reply = reply_or_none
         elif state.state_key == STATE_VIZ_WAITING_DESCRIPTION:
-            reply = await _handle_viz_description_input(chat_id, text, state.state_data)
+            reply_or_none = await _handle_viz_description_input(
+                chat_id, text, state.state_data,
+            )
+            if reply_or_none is None:
+                # Inline-Buttons schon gesendet (Bild + Post-Action-Wahl)
+                return {"ok": True}
+            reply = reply_or_none
         elif state.state_key == STATE_LEXWARE_SETUP_TOKEN:
             reply = await _handle_lexware_setup_token_input(chat_id, text)
         elif state.state_key == STATE_BELEG_WAITING_PHOTO:
@@ -1989,11 +2019,351 @@ async def _handle_viz_description_input(chat_id, text, state_data):
         await _clear_state(chat_id)
         return "Bild generiert, aber Versand an Telegram fehlgeschlagen."
 
-    # Wizard zu Ende - kein Mail-Versand in Phase 1
-    await _clear_state(chat_id)
-    return (
-        "Mit /visualisierung koennen Sie eine weitere Visualisierung starten."
+    # Post-Action-Buttons: Mail / Drive / Fertig.
+    # State STATE_VIZ_POST_ACTION laesst /abbrechen funktionieren und
+    # speichert viz_id + Bild-Bytes-Verfuegbarkeit (Bild kommt aus DB
+    # bei Bedarf, kein Re-Download).
+    await _save_state(
+        chat_id,
+        STATE_VIZ_POST_ACTION,
+        {"viz_id": viz_id, "prompt": text},
     )
+    await _send_with_inline_buttons(
+        chat_id,
+        "Was soll mit dem Bild passieren?",
+        [
+            [
+                {"text": "📧 Per Mail senden", "callback_data": f"viz:mail:{viz_id}"},
+                {"text": "☁️ Im Drive ablegen", "callback_data": f"viz:drive:{viz_id}"},
+            ],
+            [
+                {"text": "✅ Fertig (nichts mehr)", "callback_data": f"viz:done:{viz_id}"},
+            ],
+        ],
+    )
+    return None  # type: ignore[return-value]
+
+
+# =====================================================================
+# Visualisierung — Post-Action (Mail + Drive)
+# =====================================================================
+# Nach dem Bild-Versand bekommt der User Inline-Buttons zum
+# weiterverarbeiten:
+#   📧 Per Mail senden  → State STATE_VIZ_POST_MAIL_EMAIL
+#                         User schickt Email-Adresse
+#                         Bot mailt das Bild als Anhang via Brevo
+#   ☁️ Im Drive ablegen → State STATE_VIZ_POST_DRIVE_KUNDE
+#                         User schickt Kunden-Name
+#                         Bot uploadet via google_drive-Helper
+#   ✅ Fertig             clear_state — kein Versand
+#
+# Beide Aktionen koennen nacheinander ausgefuehrt werden: nach Mail
+# bekommt der User wieder die Buttons (Drive ist dann noch sinnvoll),
+# umgekehrt analog.
+
+
+async def _handle_viz_callback(chat_id, callback_data, callback_query_id, bot_token):
+    """Verarbeitet Klicks auf die viz:-Inline-Buttons."""
+    parts = callback_data.split(":", 2)
+    if len(parts) != 3:
+        await _answer_callback_query(callback_query_id, "Falsches Format", bot_token)
+        return
+    _, action, viz_id = parts
+
+    if action == "done":
+        await _answer_callback_query(callback_query_id, "Fertig", bot_token)
+        await _clear_state(chat_id)
+        await _send_to_chat(
+            chat_id,
+            "Mit /visualisierung kannst du eine weitere Visualisierung starten.",
+        )
+        return
+
+    if action == "mail":
+        await _save_state(
+            chat_id, STATE_VIZ_POST_MAIL_EMAIL, {"viz_id": viz_id},
+        )
+        await _answer_callback_query(callback_query_id, "Email eingeben", bot_token)
+        await _send_to_chat(
+            chat_id,
+            "<b>📧 Per Mail senden</b>\n\n"
+            "An welche <b>Email-Adresse</b> soll das Bild gehen?\n\n"
+            "<i>Beispiel: kunde@beispiel.de</i>\n\n"
+            "/abbrechen um stattdessen nichts zu schicken.",
+        )
+        return
+
+    if action == "drive":
+        await _save_state(
+            chat_id, STATE_VIZ_POST_DRIVE_KUNDE, {"viz_id": viz_id},
+        )
+        await _answer_callback_query(callback_query_id, "Kunden-Name eingeben", bot_token)
+        await _send_to_chat(
+            chat_id,
+            "<b>☁️ Im Drive ablegen</b>\n\n"
+            "Fuer welchen <b>Kunden</b> soll das Bild archiviert werden?\n"
+            "Schick mir einfach den Kunden-Namen.\n\n"
+            "<i>Beispiel: Mueller</i>\n\n"
+            "/abbrechen um stattdessen nicht zu archivieren.",
+        )
+        return
+
+    await _answer_callback_query(callback_query_id, "Unbekannte Aktion", bot_token)
+
+
+async def _show_viz_post_action_buttons(chat_id, viz_id, prompt_text):
+    """Zeigt die Inline-Buttons erneut (z.B. nach erfolgreicher Aktion).
+
+    Damit kann der User Mail UND Drive nacheinander machen.
+    """
+    await _save_state(
+        chat_id, STATE_VIZ_POST_ACTION,
+        {"viz_id": viz_id, "prompt": prompt_text},
+    )
+    await _send_with_inline_buttons(
+        chat_id,
+        "Was soll noch passieren?",
+        [
+            [
+                {"text": "📧 Per Mail senden", "callback_data": f"viz:mail:{viz_id}"},
+                {"text": "☁️ Im Drive ablegen", "callback_data": f"viz:drive:{viz_id}"},
+            ],
+            [
+                {"text": "✅ Fertig (nichts mehr)", "callback_data": f"viz:done:{viz_id}"},
+            ],
+        ],
+    )
+
+
+async def _load_viz_image(viz_id_str: str) -> tuple[bytes | None, str | None]:
+    """Liest result_image_data + prompt aus der DB. Failsafe."""
+    import uuid as _uuid
+    try:
+        vid = _uuid.UUID(viz_id_str)
+    except (ValueError, TypeError):
+        return None, None
+    async with AsyncSessionLocal() as s:
+        viz = (await s.execute(
+            select(Visualisierung).where(Visualisierung.id == vid)
+        )).scalar_one_or_none()
+        if viz is None or not viz.result_image_data:
+            return None, None
+        return viz.result_image_data, viz.prompt or ""
+
+
+async def _handle_viz_mail_email_input(chat_id, text, state_data):
+    """User schickt Email-Adresse → wir mailen das Bild als Anhang."""
+    email = (text or "").strip().lower()
+    # Sehr einfache Email-Validierung
+    if "@" not in email or "." not in email.split("@", 1)[1] or " " in email:
+        return (
+            "Das sieht nicht wie eine Email-Adresse aus. "
+            "Bitte erneut oder /abbrechen."
+        )
+    if len(email) > 254:
+        return "Email-Adresse ist zu lang."
+
+    viz_id = (state_data or {}).get("viz_id") or ""
+    image_bytes, prompt = await _load_viz_image(viz_id)
+    if image_bytes is None:
+        await _clear_state(chat_id)
+        return (
+            "Bild nicht mehr verfuegbar. "
+            "Bitte mit /visualisierung neu starten."
+        )
+
+    tenant = await _get_tenant_by_chat(chat_id)
+    if tenant is None:
+        await _clear_state(chat_id)
+        return "Tenant nicht gefunden — bitte /start ausfuehren."
+
+    # Brevo-Config aus globalem Tenant laden (gleicher Pattern wie Rechnung)
+    async with AsyncSessionLocal() as s:
+        tc = (await s.execute(
+            select(ToolConfig)
+            .join(Tenant, ToolConfig.tenant_id == Tenant.id)
+            .where(
+                Tenant.slug == GLOBAL_TENANT_SLUG,
+                ToolConfig.tool_name == "mail_intake",
+            )
+        )).scalar_one_or_none()
+        if not tc or not tc.config:
+            await _clear_state(chat_id)
+            return (
+                "Mail-Konfiguration fehlt — bitte den Betreiber kontaktieren."
+            )
+        cfg = tc.config or {}
+        brevo_api_key = cfg.get("brevo_api_key")
+        sender_email = cfg.get("sender_email")
+        sender_name = cfg.get("sender_name") or tenant.company_name
+
+    if not all([brevo_api_key, sender_email]):
+        await _clear_state(chat_id)
+        return "Mail-Konfiguration unvollstaendig — bitte Betreiber kontaktieren."
+
+    # Tenant-Kontaktdaten
+    tenant_company = tenant.company_name
+    tenant_contact_name = tenant.contact_name
+    tenant_contact_email = tenant.contact_email
+
+    await _send_to_chat(chat_id, "<i>Bild wird versendet...</i>")
+
+    # Mail bauen + senden
+    from core.integrations.brevo import (
+        BrevoMailer, MailRecipient, MailAttachment, BrevoError,
+    )
+
+    subject = f"Visualisierung von {tenant_company}"
+    intro = (
+        f"<p>Hallo,</p>"
+        f"<p>anbei die Visualisierung wie wir besprochen haben.</p>"
+    )
+    if prompt:
+        intro += f"<p><i>Beschreibung: {_h_safe(prompt)}</i></p>"
+    intro += (
+        f"<p>Bei Fragen koennen Sie diese Mail einfach beantworten.</p>"
+        f"<p>Mit freundlichen Gruessen<br>"
+        f"{_h_safe(tenant_contact_name)}<br>"
+        f"{_h_safe(tenant_company)}</p>"
+    )
+
+    mailer = BrevoMailer(api_key=brevo_api_key)
+    filename = "visualisierung.jpg"
+
+    try:
+        result = await mailer.send(
+            sender_email=sender_email,
+            sender_name=sender_name,
+            to=MailRecipient(email=email),
+            subject=subject,
+            html_body=intro,
+            reply_to_email=tenant_contact_email,
+            reply_to_name=tenant_contact_name,
+            attachments=[MailAttachment(
+                filename=filename,
+                content_bytes=image_bytes,
+                content_type="image/jpeg",
+            )],
+            tenant_id=str(tenant.id),
+        )
+        msg_id = result.get("messageId", "?")
+        logger.info(f"Visualisierung-Mail an {email} gesendet: {msg_id}")
+    except BrevoError as e:
+        logger.warning(f"Visualisierung-Mail fehlgeschlagen: {e}")
+        # Buttons wieder zeigen damit User es nochmal probieren kann
+        await _show_viz_post_action_buttons(chat_id, viz_id, prompt or "")
+        return f"⚠️ Mailversand fehlgeschlagen (HTTP {e.status_code}). Du kannst es nochmal probieren."
+    except Exception as e:
+        logger.exception(f"Visualisierung-Mail unbekannter Fehler: {e}")
+        await _show_viz_post_action_buttons(chat_id, viz_id, prompt or "")
+        return "⚠️ Mailversand fehlgeschlagen. Du kannst es nochmal probieren."
+
+    # Erfolgs-Bestaetigung + Buttons fuer naechste Aktion (Drive)
+    await _send_to_chat(
+        chat_id,
+        f"✅ <b>Mail an {_h_safe(email)} gesendet.</b>",
+    )
+    await _show_viz_post_action_buttons(chat_id, viz_id, prompt or "")
+    return None  # type: ignore[return-value]
+
+
+async def _handle_viz_drive_kunde_input(chat_id, text, state_data):
+    """User schickt Kunden-Name → Bild ins Drive-Archiv des Kunden uploaden."""
+    kunde_name = (text or "").strip()
+    if len(kunde_name) < 2:
+        return (
+            "Kunden-Name ist zu kurz. Bitte erneut oder /abbrechen."
+        )
+    if len(kunde_name) > 200:
+        return "Kunden-Name ist zu lang (max 200 Zeichen)."
+
+    viz_id = (state_data or {}).get("viz_id") or ""
+    image_bytes, prompt = await _load_viz_image(viz_id)
+    if image_bytes is None:
+        await _clear_state(chat_id)
+        return (
+            "Bild nicht mehr verfuegbar. "
+            "Bitte mit /visualisierung neu starten."
+        )
+
+    res = await _get_current_employee(chat_id)
+    if res is None:
+        await _clear_state(chat_id)
+        return "Tenant nicht gefunden — bitte /start ausfuehren."
+    tenant, emp = res
+
+    # Drive-Verbindung pruefen
+    from core.security.oauth_token_lookup import find_oauth_token
+    from core.integrations.google_drive import (
+        is_drive_configured, upload_file_to_kunde_folder,
+    )
+    tok = await find_oauth_token(tenant.id, "google", emp.id)
+    if not tok or not is_drive_configured(tok):
+        # Buttons zurueck damit User stattdessen Mail probieren kann
+        await _show_viz_post_action_buttons(chat_id, viz_id, prompt or "")
+        return (
+            "⚠️ <b>Drive ist noch nicht verbunden.</b>\n\n"
+            "Bitte einmal /drive_verbinden ausfuehren — danach klappt "
+            "auch das Archivieren direkt aus der Visualisierung."
+        )
+
+    await _send_to_chat(chat_id, "<i>Bild wird in Drive abgelegt...</i>")
+
+    # Filename aus Prompt + Timestamp ableiten
+    ts = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d_%H%M%S")
+    safe_prompt = (prompt or "visualisierung")[:40]
+    # Filename-sichere Zeichen
+    safe_prompt = "".join(
+        c if (c.isalnum() or c in "-_") else "_" for c in safe_prompt
+    )
+    filename = f"viz_{ts}_{safe_prompt}.jpg"
+
+    try:
+        result = await upload_file_to_kunde_folder(
+            tenant_id=tenant.id,
+            kunde_name=kunde_name,
+            file_bytes=image_bytes,
+            filename=filename,
+            mime_type="image/jpeg",
+            employee_id=emp.id,
+        )
+    except ValueError as e:
+        logger.warning(f"Drive-Upload aus Viz fehlgeschlagen: {e}")
+        await _show_viz_post_action_buttons(chat_id, viz_id, prompt or "")
+        return (
+            f"⚠️ <b>Drive-Upload fehlgeschlagen</b>\n\n"
+            f"{_h_safe(str(e))}\n\n"
+            "Bitte ggf. /drive_verbinden ausfuehren."
+        )
+    except Exception as e:
+        err = str(e)
+        logger.exception(f"Drive-Upload aus Viz: {err[:200]}")
+        await _show_viz_post_action_buttons(chat_id, viz_id, prompt or "")
+        if "quotaExceeded" in err or "storageQuotaExceeded" in err:
+            hint = "Drive-Speicher voll. Bitte aufraeumen oder Plan upgraden."
+        else:
+            hint = "Unerwarteter Drive-Fehler. Bitte erneut versuchen."
+        return f"⚠️ <b>Upload fehlgeschlagen</b>\n\n{hint}"
+
+    folder_url = result.get("kunde_folder_url") or ""
+    upload_count = result.get("upload_count", 0)
+
+    # Erfolgs-Nachricht mit Drive-Link-Button
+    success_msg = (
+        f"✅ <b>{_h_safe(filename)}</b> abgelegt "
+        f"(insgesamt {upload_count} fuer {_h_safe(kunde_name)})"
+    )
+    if folder_url:
+        await _send_with_inline_buttons(
+            chat_id, success_msg,
+            [[{"text": f"📁 Drive-Ordner: {kunde_name}", "url": folder_url}]],
+        )
+    else:
+        await _send_to_chat(chat_id, success_msg)
+
+    # Buttons wieder zeigen — User kann jetzt noch Mail schicken
+    await _show_viz_post_action_buttons(chat_id, viz_id, prompt or "")
+    return None  # type: ignore[return-value]
 
 
 # =====================================================================
