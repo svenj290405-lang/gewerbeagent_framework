@@ -1,0 +1,118 @@
+{% extends "_base.html" %}
+{% set active = 'tenants' %}
+{% block title %}{{ tenant.company_name }} — Features{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <div>
+        <a href="/admin/tenants/{{ tenant.id }}" style="font-size:13px;color:var(--ink-muted);">&larr; {{ tenant.company_name }}</a>
+        <h1 style="margin-top:8px;">Features &amp; Paket</h1>
+        <p>
+            {{ tenant.contact_name }} · {{ tenant.contact_email }} ·
+            <code>{{ tenant.slug }}</code>
+        </p>
+    </div>
+</div>
+
+{# ===== Quick-Switch Pakete ===== #}
+<div class="card" style="margin-bottom: 24px;">
+    <h3 style="margin-top:0;">Paket-Tier</h3>
+    <p style="color:var(--ink-muted); font-size: 13px; margin-bottom: 16px;">
+        Aktuelles Paket: <strong>
+            {% if current_tier == 'basis' %}📦 Basis
+            {% elif current_tier == 'pro' %}📦 Pro
+            {% elif current_tier == 'enterprise' %}📦 Enterprise
+            {% else %}🛠 {{ current_tier }}{% endif %}
+        </strong>
+        {% if is_drift %}
+            <br><span style="color:var(--warn);">⚠ Aktuelle Features matchen
+            <strong>{{ detected_tier }}</strong> — willst du den Tier auf
+            {{ detected_tier }} angleichen?</span>
+        {% endif %}
+    </p>
+
+    <form method="post" action="/admin/tenants/{{ tenant.id }}/features/package"
+          style="display: flex; gap: 12px; flex-wrap: wrap;">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        {% for pkg_key, pkg_label in packages %}
+            <button type="submit" name="package" value="{{ pkg_key }}"
+                    class="btn {% if current_tier == pkg_key %}btn-primary{% else %}btn{% endif %}"
+                    {% if current_tier == pkg_key %}disabled
+                       title="Aktuelles Paket"{% endif %}>
+                {{ pkg_label }}
+            </button>
+        {% endfor %}
+    </form>
+    <p style="color:var(--ink-muted); font-size: 12px; margin-top: 12px;">
+        <strong>Basis:</strong> Telegram, Kalender, Wissensbasis ·
+        <strong>Pro:</strong> + Mail, Anfrage-Form, Lexware, Material, Kalkulation, Werkstatt ·
+        <strong>Enterprise:</strong> + Voice, Drive-Archiv, Visualisierung, Mitarbeiter ·
+        <strong>Custom:</strong> manuell zusammengestellt
+    </p>
+    <p style="color:var(--ink-muted); font-size: 12px;">
+        Paket-Wechsel ueberschreibt alle Toggle-Werte unten und setzt sie auf
+        die Standard-Werte des neuen Pakets.
+    </p>
+</div>
+
+{# ===== Feature-Listen pro Sektion ===== #}
+{% for section in sections %}
+    {% if section.rows %}
+    <div class="card" style="margin-bottom: 16px;">
+        <h3 style="margin-top:0;">{{ section.label }}</h3>
+        <table class="data-table" style="width: 100%;">
+            <thead>
+                <tr>
+                    <th style="width: 40px;">Status</th>
+                    <th>Feature</th>
+                    <th>Beschreibung</th>
+                    <th style="width: 120px; text-align:right;">Aktion</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for row in section.rows %}
+                <tr>
+                    <td>
+                        {% if row.enabled %}
+                            <span class="pill pill-green">✓</span>
+                        {% else %}
+                            <span class="pill pill-yellow">✗</span>
+                        {% endif %}
+                    </td>
+                    <td>
+                        <strong>{{ row.label }}</strong>
+                        <br><code style="font-size: 11px; color: var(--ink-muted);">{{ row.key }}</code>
+                    </td>
+                    <td style="font-size: 13px; color: var(--ink-muted);">
+                        {{ row.description }}
+                    </td>
+                    <td style="text-align: right;">
+                        {% if row.always_on %}
+                            <span style="color: var(--ink-muted); font-size: 12px;">immer aktiv</span>
+                        {% else %}
+                            <form method="post"
+                                  action="/admin/tenants/{{ tenant.id }}/features/{{ row.key }}/toggle"
+                                  style="display:inline;">
+                                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                                <button type="submit"
+                                        class="btn btn"
+                                        style="font-size: 12px; padding: 4px 12px;">
+                                    {% if row.enabled %}Deaktivieren{% else %}Aktivieren{% endif %}
+                                </button>
+                            </form>
+                        {% endif %}
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% endif %}
+{% endfor %}
+
+<p style="color: var(--ink-muted); font-size: 12px;">
+    Toggle-Aktionen werden im Audit-Log dokumentiert
+    (<code>tenant.features.toggle</code> + <code>tenant.features.package</code>).
+</p>
+
+{% endblock %}

@@ -7,7 +7,22 @@
     <div>
         <a href="/admin/tenants" style="font-size:13px;color:var(--ink-muted);">&larr; alle Tenants</a>
         <h1 style="margin-top:8px;">{{ tenant.company_name }}</h1>
-        <p>{{ tenant.branche or 'Handwerk' }} · slug <code>{{ tenant.slug }}</code> · status <span class="pill pill-{{ 'green' if tenant.status == 'active' else 'yellow' }}">{{ tenant.status }}</span></p>
+        <p>
+            {{ tenant.branche or 'Handwerk' }} · slug <code>{{ tenant.slug }}</code>
+            · status <span class="pill pill-{{ 'green' if tenant.status == 'active' else 'yellow' }}">{{ tenant.status }}</span>
+            · Paket
+            {% if tenant.package_tier == 'basis' %}<span class="pill pill-blue">📦 Basis</span>
+            {% elif tenant.package_tier == 'pro' %}<span class="pill pill-green">📦 Pro</span>
+            {% elif tenant.package_tier == 'enterprise' %}<span class="pill pill-blue">📦 Enterprise</span>
+            {% else %}<span class="pill pill-yellow">🛠 {{ tenant.package_tier }}</span>{% endif %}
+        </p>
+    </div>
+    <div>
+        <a href="/admin/tenants/{{ tenant.id }}/features"
+           class="btn btn-primary"
+           style="text-decoration:none;">
+           Features &amp; Paket bearbeiten →
+        </a>
     </div>
 </div>
 
