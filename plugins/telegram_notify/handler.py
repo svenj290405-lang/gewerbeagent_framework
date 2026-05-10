@@ -42,6 +42,11 @@ from core.models import (
     STATE_RECHNUNG_AWAITING_MAIL,
     STATE_AUFNAHME_WAITING_AUDIO,
     STATE_AUFNAHME_PREVIEWING,
+    STATE_MATERIAL_NEU_NAME,
+    STATE_MATERIAL_NEU_LINK,
+    STATE_MATERIAL_NEU_LIEFERANT,
+    STATE_MATERIAL_NEU_PREVIEWING,
+    STATE_BESTELLEN_MENGE,
     STATE_LEISTUNG_WAITING_NAME,
     STATE_LEISTUNG_WAITING_PREIS,
     STATE_LEISTUNG_WAITING_BESCHREIBUNG,
@@ -421,6 +426,13 @@ async def _handle_help_command():
     msg += "/rechnung - neue anlegen (Text oder Sprache)\n"
     msg += "/rechnungen_anzeigen - letzte 10\n"
     msg += "/rechnung_pruefen - jetzt Bezahl-Status pollen (sonst alle 30min)\n\n"
+    msg += "<b>🛒 Material & Bestellungen</b>\n"
+    msg += "/material - Liste der Verbrauchsartikel\n"
+    msg += "/material neu - neuen Artikel anlegen\n"
+    msg += "/material &lt;slug&gt; - Details + Historie\n"
+    msg += "/bestellen - Liste mit Quick-Order\n"
+    msg += "/bestellen &lt;slug&gt; [menge] - jetzt bestellen\n"
+    msg += "/bestellungen - letzte 20 Bestellungen\n\n"
 
     msg += "<b>📞 KUNDENGESPRAECHE</b>\n"
     msg += "/aufnahme - Gespraech aufnehmen + Lexware-Angebot\n"
@@ -1341,6 +1353,24 @@ async def process_telegram_update(payload):
         reply = await _handle_formular_anzeigen_command(chat_id)
     elif text == "/formular_zuruecksetzen":
         reply = await _handle_formular_zuruecksetzen_command(chat_id)
+    elif text == "/material":
+        await _clear_state(chat_id)
+        reply = await _handle_material_list_command(chat_id)
+    elif text == "/material neu" or text == "/material_neu":
+        reply = await _handle_material_neu_command(chat_id)
+    elif text.startswith("/material "):
+        await _clear_state(chat_id)
+        args = text[len("/material "):].strip()
+        reply = await _handle_material_command(chat_id, args)
+    elif text == "/bestellen":
+        await _clear_state(chat_id)
+        reply = await _handle_bestellen_list_command(chat_id)
+    elif text.startswith("/bestellen "):
+        args = text[len("/bestellen "):].strip()
+        reply = await _handle_bestellen_command(chat_id, args)
+    elif text == "/bestellungen":
+        await _clear_state(chat_id)
+        reply = await _handle_bestellungen_list_command(chat_id)
     elif text == "/leistungen":
         await _clear_state(chat_id)
         reply = await _handle_leistungen_command(chat_id)
@@ -1457,6 +1487,22 @@ async def process_telegram_update(payload):
             reply = await _handle_mitarbeiter_neu_name_input(chat_id, text)
         elif state.state_key == STATE_MITARBEITER_NEU_SKILLS:
             reply = await _handle_mitarbeiter_neu_skills_input(
+                chat_id, text, state.state_data,
+            )
+        elif state.state_key == STATE_MATERIAL_NEU_NAME:
+            reply = await _handle_material_neu_name_input(chat_id, text)
+        elif state.state_key == STATE_MATERIAL_NEU_LINK:
+            reply = await _handle_material_neu_link_input(
+                chat_id, text, state.state_data,
+            )
+        elif state.state_key == STATE_MATERIAL_NEU_LIEFERANT:
+            reply = await _handle_material_neu_lieferant_input(
+                chat_id, text, state.state_data,
+            )
+        elif state.state_key == STATE_MATERIAL_NEU_PREVIEWING:
+            reply = "Bitte einen der Buttons oben antippen oder /abbrechen schicken."
+        elif state.state_key == STATE_BESTELLEN_MENGE:
+            reply = await _handle_bestellen_menge_input(
                 chat_id, text, state.state_data,
             )
         elif state.state_key == STATE_RECHNUNG_AWAITING_MAIL:
@@ -2157,10 +2203,15 @@ async def _send_with_inline_buttons(chat_id, text, buttons, bot_token=None):
     for row in buttons:
         kb_row = []
         for btn in row:
-            kb_row.append({
-                "text": btn["text"],
-                "callback_data": btn["callback_data"],
-            })
+            # Unterstuetzt sowohl callback_data (interner State) als auch
+            # url (oeffnet Webseite — z.B. fuer Bestell-Buttons).
+            if btn.get("url"):
+                kb_row.append({"text": btn["text"], "url": btn["url"]})
+            else:
+                kb_row.append({
+                    "text": btn["text"],
+                    "callback_data": btn["callback_data"],
+                })
         inline_keyboard.append(kb_row)
 
     url = f"{TELEGRAM_API_BASE}/bot{bot_token}/sendMessage"
@@ -5951,3 +6002,487 @@ class Plugin(BasePlugin):
         if endpoint == "incoming":
             return await process_telegram_update(payload)
         return {"ok": True, "note": f"unknown endpoint: {endpoint}"}
+
+
+# =====================================================================
+# Material-Verwaltung + /bestellen
+# =====================================================================
+# Verbrauchs-Artikel (Schrauben, Klebstoff, Akku, ...) die der Handwerker
+# regelmaessig nachbestellt. Tenant pflegt einen Katalog mit Bestell-URL,
+# /bestellen <slug> zeigt einen anklickbaren Telegram-Button.
+# Bewusst KEINE Mail-Bestellung — Sven wollte URL-only.
+
+async def _handle_material_list_command(chat_id):
+    """Zeigt alle aktiven Materialien des Tenants."""
+    from core.models.tenant_material import TenantMaterial
+    tenant = await _get_tenant_by_chat(chat_id)
+    if not tenant:
+        return "Dieser Chat ist noch keinem Betrieb zugeordnet."
+    async with AsyncSessionLocal() as s:
+        materialien = (await s.execute(
+            select(TenantMaterial)
+            .where(TenantMaterial.tenant_id == tenant.id)
+            .where(TenantMaterial.aktiv.is_(True))
+            .order_by(TenantMaterial.name)
+        )).scalars().all()
+
+    if not materialien:
+        return (
+            "Noch keine Materialien angelegt.\n\n"
+            "Mit <b>/material neu</b> das erste anlegen — du gibst Name "
+            "und einen Bestell-Link, der Bot zeigt dir den dann auf Wunsch "
+            "als anklickbaren Button."
+        )
+
+    lines = [f"<b>Materialien ({len(materialien)}):</b>\n"]
+    for m in materialien:
+        lieferant_label = f" · {m.lieferant_name}" if m.lieferant_name else ""
+        lines.append(
+            f"• <code>{_h_safe(m.slug)}</code> — {_h_safe(m.name)}{lieferant_label}"
+        )
+    lines.append("")
+    lines.append("Bestellen: <b>/bestellen &lt;slug&gt; [menge]</b>")
+    lines.append("Details:   <b>/material &lt;slug&gt;</b>")
+    return "\n".join(lines)
+
+
+async def _handle_material_neu_command(chat_id):
+    """Startet den Anlege-Wizard (4 Schritte)."""
+    tenant = await _get_tenant_by_chat(chat_id)
+    if not tenant:
+        return "Dieser Chat ist noch keinem Betrieb zugeordnet."
+    # Inhaber-Schutz: nur Default-Employee darf neue Materialien anlegen
+    ok, err, _, _ = await _ensure_inhaber_or_explain(chat_id)
+    if not ok:
+        return err
+
+    await _save_state(chat_id, STATE_MATERIAL_NEU_NAME, {})
+    return (
+        "<b>➕ Neues Material anlegen</b>\n\n"
+        "<b>Schritt 1/4 — Wie heisst es?</b>\n\n"
+        "Beispiele:\n"
+        "• <i>Schrauben Edelstahl 5mm</i>\n"
+        "• <i>Akku Bohrer XL18</i>\n"
+        "• <i>Silikon transparent</i>\n\n"
+        "/abbrechen um abzubrechen."
+    )
+
+
+async def _handle_material_neu_name_input(chat_id, text: str):
+    """Schritt 1: Name."""
+    name = (text or "").strip()
+    if not name or len(name) < 2:
+        return "Name ist zu kurz (min. 2 Zeichen). Bitte erneut oder /abbrechen."
+    if len(name) > 200:
+        return "Name ist zu lang (max 200 Zeichen). Bitte kuerzer."
+    await _save_state(
+        chat_id, STATE_MATERIAL_NEU_LINK, {"name": name},
+    )
+    return (
+        f"<b>{_h_safe(name)}</b>\n\n"
+        "<b>Schritt 2/4 — Bestell-Link</b>\n\n"
+        "Schick mir die URL wo du das Material bestellst. Beispiele:\n"
+        "• <i>https://www.toolnation.de/p/12345</i>\n"
+        "• <i>https://www.amazon.de/dp/B0XXXXXXX</i>\n"
+        "• <i>https://www.wuerth.de/...</i>\n\n"
+        "Tip: wenn der Shop einen 'Direkt-in-Warenkorb'-Link unterstuetzt "
+        "(Amazon: <code>/gp/aws/cart/add.html?ASIN.1=...</code>), kannst du "
+        "den hier eintragen. Dann landet der Artikel beim Klick direkt im "
+        "Warenkorb und du musst nur noch zur Kasse."
+    )
+
+
+async def _handle_material_neu_link_input(chat_id, text: str, state_data: dict | None):
+    """Schritt 2: URL."""
+    url = (text or "").strip()
+    if not url:
+        return "URL fehlt. Bitte einen kompletten Link schicken oder /abbrechen."
+    if not (url.startswith("http://") or url.startswith("https://")):
+        return (
+            "Bitte einen kompletten Link mit <code>http://</code> oder "
+            "<code>https://</code> schicken. Oder /abbrechen."
+        )
+    if len(url) > 2000:
+        return "URL ist zu lang (max 2000 Zeichen)."
+    data = dict(state_data or {})
+    data["bestell_link"] = url
+    await _save_state(chat_id, STATE_MATERIAL_NEU_LIEFERANT, data)
+    return (
+        "<b>Schritt 3/4 — Lieferant (optional)</b>\n\n"
+        "Wer ist der Lieferant? Wird im Bestell-Button angezeigt z.B. "
+        "<i>'Schrauben jetzt bei Toolnation bestellen'</i>.\n\n"
+        "Schick den Namen — oder <b>/skip</b> falls dir das egal ist."
+    )
+
+
+async def _handle_material_neu_lieferant_input(
+    chat_id, text: str, state_data: dict | None,
+):
+    """Schritt 3: Lieferant + Speichern."""
+    txt = (text or "").strip()
+    data = dict(state_data or {})
+    if txt.lower() in {"/skip", "skip", "nein", "-"}:
+        data["lieferant_name"] = None
+    else:
+        if len(txt) > 200:
+            return "Lieferant-Name ist zu lang (max 200 Zeichen)."
+        data["lieferant_name"] = txt
+
+    # Direkt speichern — keine vierte Bestaetigungs-Stufe noetig wenn die
+    # Daten schon validiert sind. Tenant kann mit /material <slug>
+    # bearbeiten/loeschen falls nicht passt.
+    return await _save_material_from_wizard(chat_id, data)
+
+
+async def _save_material_from_wizard(chat_id, data: dict) -> str:
+    """Persistiert das neue Material + clearet den State."""
+    from core.models.tenant_material import TenantMaterial
+    tenant = await _get_tenant_by_chat(chat_id)
+    if not tenant:
+        await _clear_state(chat_id)
+        return "Tenant nicht gefunden. Bitte /start erneut machen."
+
+    name = data.get("name") or ""
+    bestell_link = data.get("bestell_link") or ""
+    lieferant_name = data.get("lieferant_name")
+
+    # Slug + Kollisions-Check
+    base_slug = _slugify(name) or "material"
+    async with AsyncSessionLocal() as s:
+        existing_slugs = {
+            r[0] for r in (await s.execute(
+                select(TenantMaterial.slug)
+                .where(TenantMaterial.tenant_id == tenant.id)
+            )).all()
+        }
+    slug = base_slug
+    counter = 2
+    while slug in existing_slugs:
+        slug = f"{base_slug}-{counter}"
+        counter += 1
+        if counter > 99:
+            await _clear_state(chat_id)
+            return "Zu viele Materialien mit diesem Namen. Bitte anders nennen."
+
+    async with AsyncSessionLocal() as s:
+        m = TenantMaterial(
+            tenant_id=tenant.id,
+            slug=slug,
+            name=name,
+            bestell_link=bestell_link,
+            lieferant_name=lieferant_name,
+            einheit="Stück",
+            standard_menge=1,
+            aktiv=True,
+        )
+        s.add(m)
+        await s.commit()
+
+    await _clear_state(chat_id)
+
+    lieferant_line = f"\n<b>Lieferant:</b> {_h_safe(lieferant_name)}" if lieferant_name else ""
+    return (
+        "<b>✅ Material angelegt</b>\n\n"
+        f"<b>Name:</b> {_h_safe(name)}\n"
+        f"<b>Slug:</b> <code>{slug}</code>{lieferant_line}\n\n"
+        f"Jetzt bestellen mit:\n<b>/bestellen {slug}</b>"
+    )
+
+
+async def _handle_material_command(chat_id, args: str):
+    """Detail-View oder Sub-Befehle: /material <slug> [bearbeiten|loeschen|aktivieren|deaktivieren]"""
+    from core.models.tenant_material import TenantMaterial, MaterialBestellung
+    parts = args.split(None, 1)
+    if not parts:
+        return await _handle_material_list_command(chat_id)
+    slug = parts[0].strip().lower()
+    sub = parts[1].strip().lower() if len(parts) > 1 else ""
+
+    tenant = await _get_tenant_by_chat(chat_id)
+    if not tenant:
+        return "Dieser Chat ist noch keinem Betrieb zugeordnet."
+
+    async with AsyncSessionLocal() as s:
+        m = (await s.execute(
+            select(TenantMaterial)
+            .where(TenantMaterial.tenant_id == tenant.id)
+            .where(TenantMaterial.slug == slug)
+        )).scalar_one_or_none()
+
+        if not m:
+            return f"Material <code>{_h_safe(slug)}</code> nicht gefunden. Liste mit /material"
+
+        # Sub-Aktionen (Inhaber-only)
+        if sub in {"loeschen", "deaktivieren"}:
+            ok, err, _, _ = await _ensure_inhaber_or_explain(chat_id)
+            if not ok:
+                return err
+            m.aktiv = False
+            await s.commit()
+            return f"❌ <b>{_h_safe(m.name)}</b> deaktiviert. Mit /material {slug} aktivieren wieder anschalten."
+
+        if sub == "aktivieren":
+            ok, err, _, _ = await _ensure_inhaber_or_explain(chat_id)
+            if not ok:
+                return err
+            m.aktiv = True
+            await s.commit()
+            return f"✅ <b>{_h_safe(m.name)}</b> aktiviert."
+
+        # Detail-View — letzte 5 Bestellungen
+        recent = (await s.execute(
+            select(MaterialBestellung)
+            .where(MaterialBestellung.material_id == m.id)
+            .order_by(MaterialBestellung.created_at.desc())
+            .limit(5)
+        )).scalars().all()
+
+    parts_msg = [
+        f"<b>{_h_safe(m.name)}</b>",
+        f"<i>slug:</i> <code>{m.slug}</code>",
+    ]
+    if m.lieferant_name:
+        parts_msg.append(f"<i>Lieferant:</i> {_h_safe(m.lieferant_name)}")
+    parts_msg.append(f"<i>Standard-Menge:</i> {m.standard_menge} {m.einheit}")
+    parts_msg.append(f"<i>Status:</i> {'aktiv' if m.aktiv else 'deaktiviert'}")
+    parts_msg.append(f"\n<b>Bestell-Link:</b>\n{_h_safe(m.bestell_link)}")
+    if recent:
+        parts_msg.append("\n<b>Letzte Bestellungen:</b>")
+        for r in recent:
+            ts = r.created_at.strftime("%d.%m. %H:%M") if r.created_at else "-"
+            parts_msg.append(f"  • {ts} — {r.menge} {r.einheit}")
+    parts_msg.append("")
+    parts_msg.append(f"<b>Bestellen:</b> /bestellen {m.slug}")
+    if m.aktiv:
+        parts_msg.append(f"<b>Deaktivieren:</b> /material {m.slug} deaktivieren")
+    else:
+        parts_msg.append(f"<b>Aktivieren:</b> /material {m.slug} aktivieren")
+    return "\n".join(parts_msg)
+
+
+# =====================================================================
+# /bestellen — Inline-URL-Button auf Bestellseite
+# =====================================================================
+
+async def _handle_bestellen_list_command(chat_id):
+    """/bestellen ohne Argument: Quick-Liste der aktiven Materialien."""
+    from core.models.tenant_material import TenantMaterial
+    tenant = await _get_tenant_by_chat(chat_id)
+    if not tenant:
+        return "Dieser Chat ist noch keinem Betrieb zugeordnet."
+    async with AsyncSessionLocal() as s:
+        materialien = (await s.execute(
+            select(TenantMaterial)
+            .where(TenantMaterial.tenant_id == tenant.id)
+            .where(TenantMaterial.aktiv.is_(True))
+            .order_by(TenantMaterial.name)
+            .limit(20)
+        )).scalars().all()
+
+    if not materialien:
+        return (
+            "Noch keine Materialien zum Bestellen.\n\n"
+            "Mit <b>/material neu</b> das erste anlegen."
+        )
+
+    lines = ["<b>🛒 Materialien zum Nachbestellen:</b>\n"]
+    for m in materialien:
+        lines.append(f"• /bestellen {m.slug} — {_h_safe(m.name)}")
+    lines.append("")
+    lines.append("Mit Menge: <b>/bestellen &lt;slug&gt; 5</b>")
+    return "\n".join(lines)
+
+
+async def _handle_bestellen_command(chat_id, args: str):
+    """/bestellen <slug> [menge] — zeigt URL-Button + loggt die Bestellung."""
+    from core.models.tenant_material import (
+        TenantMaterial, MaterialBestellung, BESTELL_ART_LINK,
+    )
+
+    parts = args.split()
+    slug = parts[0].strip().lower() if parts else ""
+    if not slug:
+        return await _handle_bestellen_list_command(chat_id)
+
+    # Optional menge im Argument
+    menge_arg = None
+    if len(parts) > 1:
+        try:
+            menge_arg = int(parts[1])
+            if menge_arg <= 0 or menge_arg > 9999:
+                return "Menge muss zwischen 1 und 9999 sein."
+        except ValueError:
+            return f"'{_h_safe(parts[1])}' ist keine Zahl. Format: /bestellen {slug} 5"
+
+    tenant = await _get_tenant_by_chat(chat_id)
+    if not tenant:
+        return "Dieser Chat ist noch keinem Betrieb zugeordnet."
+
+    # Material laden
+    async with AsyncSessionLocal() as s:
+        m = (await s.execute(
+            select(TenantMaterial)
+            .where(TenantMaterial.tenant_id == tenant.id)
+            .where(TenantMaterial.slug == slug)
+            .where(TenantMaterial.aktiv.is_(True))
+        )).scalar_one_or_none()
+
+    if not m:
+        return (
+            f"Kein aktives Material <code>{_h_safe(slug)}</code> gefunden.\n\n"
+            "Liste: /material"
+        )
+
+    # Wenn keine Menge angegeben + standard_menge > 1: zurueck-fragen
+    if menge_arg is None and m.standard_menge != 1:
+        await _save_state(
+            chat_id, STATE_BESTELLEN_MENGE,
+            {"material_id": str(m.id)},
+        )
+        return (
+            f"<b>{_h_safe(m.name)}</b>\n\n"
+            f"Wie viele <b>{m.einheit}</b> bestellen?\n\n"
+            f"Standard: {m.standard_menge}\n"
+            f"Schick eine Zahl oder <b>/skip</b> für Standard."
+        )
+
+    menge = menge_arg if menge_arg is not None else m.standard_menge
+    return await _ausloesen_bestellung(chat_id, m, menge)
+
+
+async def _handle_bestellen_menge_input(
+    chat_id, text: str, state_data: dict | None,
+):
+    """Schritt 2 wenn /bestellen ohne Menge geschickt wurde."""
+    from core.models.tenant_material import TenantMaterial
+
+    txt = (text or "").strip().lower()
+    data = state_data or {}
+    material_id = data.get("material_id")
+    if not material_id:
+        await _clear_state(chat_id)
+        return "Wizard-Session abgelaufen. Bitte /bestellen erneut."
+
+    tenant = await _get_tenant_by_chat(chat_id)
+    if not tenant:
+        await _clear_state(chat_id)
+        return "Tenant nicht gefunden."
+
+    async with AsyncSessionLocal() as s:
+        m = (await s.execute(
+            select(TenantMaterial)
+            .where(TenantMaterial.id == material_id)
+        )).scalar_one_or_none()
+    if not m:
+        await _clear_state(chat_id)
+        return "Material nicht mehr gefunden."
+
+    if txt in {"/skip", "skip", "-"}:
+        menge = m.standard_menge
+    else:
+        try:
+            menge = int(txt)
+            if menge <= 0 or menge > 9999:
+                return "Menge muss zwischen 1 und 9999 sein. Erneut?"
+        except ValueError:
+            return f"'{_h_safe(text)}' ist keine Zahl. Bitte Zahl oder /skip."
+
+    await _clear_state(chat_id)
+    return await _ausloesen_bestellung(chat_id, m, menge)
+
+
+async def _ausloesen_bestellung(chat_id, material, menge: int) -> str:
+    """Erzeugt den Telegram-URL-Button + loggt die Bestellung in DB."""
+    from core.models.tenant_material import MaterialBestellung, BESTELL_ART_LINK
+
+    tenant = await _get_tenant_by_chat(chat_id)
+    if not tenant:
+        return "Tenant nicht gefunden."
+
+    # Optional employee_id ermitteln (wer hat den Befehl gegeben)
+    employee_id = None
+    try:
+        emp = await _get_current_employee(chat_id)
+        if emp:
+            employee_id = emp[1].id if isinstance(emp, tuple) else None
+    except Exception:
+        pass
+
+    # Audit-Log einfuegen
+    try:
+        async with AsyncSessionLocal() as s:
+            log = MaterialBestellung(
+                tenant_id=tenant.id,
+                material_id=material.id,
+                employee_id=employee_id,
+                material_name=material.name,
+                bestell_link=material.bestell_link,
+                menge=menge,
+                einheit=material.einheit,
+                bestell_art=BESTELL_ART_LINK,
+            )
+            s.add(log)
+            await s.commit()
+    except Exception as e:
+        logger.warning(f"material_bestellung-Log failed: {e}")
+
+    # Button-Text + URL
+    lieferant_part = f" bei {_h_safe(material.lieferant_name)}" if material.lieferant_name else ""
+    btn_text = f"🛒 {menge} {material.einheit} {material.name[:40]} bestellen{lieferant_part if material.lieferant_name else ''}"
+    if len(btn_text) > 64:  # Telegram-Limit fuer Button-Text
+        btn_text = f"🛒 {menge}x {material.name[:50]} bestellen"
+    if len(btn_text) > 64:
+        btn_text = f"🛒 Jetzt bestellen ({menge} {material.einheit})"
+
+    text_msg = (
+        f"<b>🛒 Bestellung vorbereitet</b>\n\n"
+        f"<b>{_h_safe(material.name)}</b>\n"
+        f"Menge: {menge} {material.einheit}\n"
+    )
+    if material.lieferant_name:
+        text_msg += f"Lieferant: {_h_safe(material.lieferant_name)}\n"
+    text_msg += "\nKlick den Button zum Bestellen:"
+
+    bot_token = await _load_global_bot_token()
+    if bot_token is None:
+        # Fallback: Link als Text
+        return text_msg + f"\n\n{material.bestell_link}"
+
+    sent = await _send_with_inline_buttons(
+        chat_id, text_msg,
+        [[{"text": btn_text, "url": material.bestell_link}]],
+        bot_token=bot_token,
+    )
+    if not sent:
+        return text_msg + f"\n\n{material.bestell_link}"
+    return None  # Button schon gesendet, kein zusaetzlicher Reply
+
+
+async def _handle_bestellungen_list_command(chat_id):
+    """Letzte 20 Bestellungen des Tenants."""
+    from core.models.tenant_material import MaterialBestellung
+    tenant = await _get_tenant_by_chat(chat_id)
+    if not tenant:
+        return "Dieser Chat ist noch keinem Betrieb zugeordnet."
+    async with AsyncSessionLocal() as s:
+        bestellungen = (await s.execute(
+            select(MaterialBestellung)
+            .where(MaterialBestellung.tenant_id == tenant.id)
+            .order_by(MaterialBestellung.created_at.desc())
+            .limit(20)
+        )).scalars().all()
+
+    if not bestellungen:
+        return "Noch keine Bestellungen ausgeloest.\n\nMit /bestellen die erste auswählen."
+
+    lines = [f"<b>Letzte {len(bestellungen)} Bestellungen:</b>\n"]
+    for b in bestellungen:
+        ts = b.created_at.strftime("%d.%m. %H:%M") if b.created_at else "-"
+        lines.append(f"• {ts} — {b.menge} {b.einheit} <b>{_h_safe(b.material_name)}</b>")
+    return "\n".join(lines)
+
+
+def _h_safe(s) -> str:
+    """HTML-escape einen String fuer Telegram-HTML-parse_mode."""
+    import html as _html
+    return _html.escape(str(s or ""))

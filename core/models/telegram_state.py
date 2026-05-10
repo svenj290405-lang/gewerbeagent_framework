@@ -66,6 +66,13 @@ STATE_MITARBEITER_NEU_SKILLS = "mitarbeiter_neu_skills"
 # Kalender-Verbinden-Wizard (Outlook-Calendar-Support)
 STATE_KALENDER_PROVIDER_CHOICE = "kalender_provider_choice"
 
+# Material-Wizard (Verbrauchsartikel-Nachbestellung)
+STATE_MATERIAL_NEU_NAME = "material_neu_name"
+STATE_MATERIAL_NEU_LINK = "material_neu_link"
+STATE_MATERIAL_NEU_LIEFERANT = "material_neu_lieferant"
+STATE_MATERIAL_NEU_PREVIEWING = "material_neu_previewing"
+STATE_BESTELLEN_MENGE = "bestellen_menge"
+
 # Formular-Editor-Wizard
 STATE_FORMULAR_TYP_WAEHLEN = "formular_typ_waehlen"
 STATE_FORMULAR_HAUPTMENU = "formular_hauptmenu"
