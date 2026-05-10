@@ -38,48 +38,92 @@ class MicrosoftNotConnectedError(Exception):
 async def _refresh_access_token(oauth_token: OAuthToken) -> tuple[str, datetime]:
     """Holt neuen access_token via refresh_token.
 
+    Race-Schutz: SELECT FOR UPDATE auf der Token-Zeile serialisiert
+    parallele Refreshes. Wenn Request A bereits refreshed hat und der
+    Token in der DB schon frisch ist, gibt B den frischen Token direkt
+    zurueck statt einen zweiten Refresh-Call zu machen.
+
     Returns: (new_access_token, expires_at)
     """
-    cfg = await _load_microsoft_config()
-
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        resp = await client.post(
-            MICROSOFT_TOKEN_URL,
-            data={
-                "client_id": cfg["client_id"],
-                "client_secret": cfg["client_secret"],
-                "refresh_token": oauth_token.refresh_token,
-                "grant_type": "refresh_token",
-                "scope": " ".join(MICROSOFT_SCOPES),
-            },
-            headers={"Accept": "application/json"},
+    # 1) Pessimistic Lock auf die Token-Zeile + Re-Check: vielleicht hat
+    # ein paralleler Request bereits refreshed.
+    async with AsyncSessionLocal() as lock_session:
+        result = await lock_session.execute(
+            select(OAuthToken)
+            .where(OAuthToken.id == oauth_token.id)
+            .with_for_update()
         )
+        locked_token = result.scalar_one()
+        now = datetime.now(timezone.utc)
+        expires = locked_token.access_token_expires_at
+        if expires and expires.tzinfo is None:
+            expires = expires.replace(tzinfo=timezone.utc)
+
+        if locked_token.access_token and expires and expires > now:
+            # Anderer Request war schneller — wir nutzen seinen Token.
+            await lock_session.commit()
+            return locked_token.access_token, expires
+
+        # Wir muessen tatsaechlich refreshen. Lock bleibt bis Commit.
+        cfg = await _load_microsoft_config()
+
+        try:
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                resp = await client.post(
+                    MICROSOFT_TOKEN_URL,
+                    data={
+                        "client_id": cfg["client_id"],
+                        "client_secret": cfg["client_secret"],
+                        "refresh_token": locked_token.refresh_token,
+                        "grant_type": "refresh_token",
+                        "scope": " ".join(MICROSOFT_SCOPES),
+                    },
+                    headers={"Accept": "application/json"},
+                )
+        except Exception as exc:
+            await lock_session.rollback()
+            raise ValueError(f"Microsoft Token-Refresh Connection-Fehler: {exc}") from exc
+
         if resp.status_code != 200:
+            # 401/400 = refresh_token ungueltig (User hat Zugriff entzogen).
+            # Wir benachrichtigen den Tenant ueber Telegram damit er
+            # /kalender_verbinden erneut macht. Failsafe — Telegram-
+            # Fehler bricht den Refresh-Pfad nicht.
+            if resp.status_code in (400, 401):
+                try:
+                    from core.integrations.tenant_alert import (
+                        notify_oauth_revoked,
+                    )
+                    await notify_oauth_revoked(
+                        tenant_id=locked_token.tenant_id,
+                        provider="microsoft",
+                        employee_id=locked_token.employee_id,
+                    )
+                except Exception as alert_exc:
+                    logger.debug(f"OAuth-Alert failed (egal): {alert_exc}")
+            await lock_session.rollback()
             raise ValueError(
                 f"Microsoft Token-Refresh fehlgeschlagen: "
                 f"{resp.status_code} {resp.text[:300]}"
             )
+
         tokens = resp.json()
+        new_access = tokens.get("access_token")
+        new_refresh = tokens.get("refresh_token")
+        expires_in = int(tokens.get("expires_in", 3600))
 
-    new_access = tokens.get("access_token")
-    new_refresh = tokens.get("refresh_token")
-    expires_in = int(tokens.get("expires_in", 3600))
+        if not new_access:
+            await lock_session.rollback()
+            raise ValueError("Microsoft hat keinen access_token zurueckgegeben")
 
-    if not new_access:
-        raise ValueError("Microsoft hat keinen access_token zurueckgegeben")
+        expires_at = datetime.now(timezone.utc) + timedelta(seconds=expires_in - 60)
 
-    expires_at = datetime.now(timezone.utc) + timedelta(seconds=expires_in - 60)
-
-    async with AsyncSessionLocal() as session:
-        result = await session.execute(
-            select(OAuthToken).where(OAuthToken.id == oauth_token.id)
-        )
-        token_db = result.scalar_one()
-        token_db.access_token = new_access
-        token_db.access_token_expires_at = expires_at
+        # Update unter dem Lock — Commit gibt den Lock frei.
+        locked_token.access_token = new_access
+        locked_token.access_token_expires_at = expires_at
         if new_refresh:
-            token_db.refresh_token = new_refresh
-        await session.commit()
+            locked_token.refresh_token = new_refresh
+        await lock_session.commit()
 
     logger.info(
         f"Microsoft access_token erneuert fuer tenant_id={oauth_token.tenant_id}"

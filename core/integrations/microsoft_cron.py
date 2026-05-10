@@ -87,6 +87,8 @@ async def cron_loop() -> None:
     # Initial 30 Sek warten damit App komplett gestartet ist
     await asyncio.sleep(30)
 
+    from core.integrations.cron_health import record_heartbeat
+
     while True:
         try:
             started = datetime.now(timezone.utc)
@@ -102,6 +104,7 @@ async def cron_loop() -> None:
                     f"{summary['errors']} Fehler"
                 )
 
+            record_heartbeat("microsoft_cron")
             await asyncio.sleep(POLL_INTERVAL_SECONDS)
         except asyncio.CancelledError:
             logger.info("Microsoft-Cron gestoppt")

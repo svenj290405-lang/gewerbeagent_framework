@@ -256,6 +256,8 @@ async def cron_loop() -> None:
     )
     await asyncio.sleep(INITIAL_DELAY_SECONDS)
 
+    from core.integrations.cron_health import record_heartbeat
+
     while True:
         try:
             started = datetime.now(timezone.utc)
@@ -274,6 +276,7 @@ async def cron_loop() -> None:
                     f"{summary['total_errors']} Fehler"
                 )
 
+            record_heartbeat("rechnung_payment_monitor")
             await asyncio.sleep(POLL_INTERVAL_SECONDS)
         except asyncio.CancelledError:
             logger.info("Bezahl-Polling-Cron gestoppt")

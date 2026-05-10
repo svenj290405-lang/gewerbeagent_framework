@@ -242,6 +242,7 @@ async def cron_loop() -> None:
     await asyncio.sleep(INITIAL_DELAY_SECONDS)
 
     last_run_date: date | None = None
+    from core.integrations.cron_health import record_heartbeat
 
     while True:
         try:
@@ -271,6 +272,7 @@ async def cron_loop() -> None:
                 )
                 last_run_date = today
 
+            record_heartbeat("rechnung_paid_summary")
             await asyncio.sleep(TICK_SECONDS)
         except asyncio.CancelledError:
             logger.info("Tages-Zusammenfassung-Cron gestoppt")

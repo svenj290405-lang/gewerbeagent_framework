@@ -499,14 +499,29 @@ async def api_health(
     request: Request,
     user: AdminUser = Depends(require_admin),
 ):
-    """Health-Probe fuer das Live-Indikator-Dot oben rechts."""
+    """Health-Probe fuer das Live-Indikator-Dot oben rechts.
+
+    Greift jetzt auch auf den Cron-Heartbeat zu — wenn ein Background-
+    Cron seit > Toleranz keinen Heartbeat geschrieben hat, status
+    'degraded' mit Liste der toten Crons.
+    """
     try:
         async with get_session() as s:
-            # Trivialer DB-Reach-Check
             await s.execute(text("SELECT 1"))
-        return {"status": "ok"}
     except Exception as e:
-        return {"status": "degraded", "error": str(e)[:80]}
+        return {"status": "degraded", "db_error": str(e)[:80]}
+
+    # Cron-Health pruefen
+    try:
+        from core.integrations.cron_health import get_health_report
+        cron_report = get_health_report()
+        return {
+            "status": cron_report["status"],
+            "db": "ok",
+            "crons": cron_report["crons"],
+        }
+    except Exception as e:
+        return {"status": "ok", "db": "ok", "cron_check_error": str(e)[:80]}
 
 
 # =====================================================================

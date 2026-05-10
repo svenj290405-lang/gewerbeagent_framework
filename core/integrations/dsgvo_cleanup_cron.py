@@ -69,12 +69,14 @@ async def cron_loop() -> None:
         f"(taegl. {CLEANUP_HOUR_LOCAL:02d}:00 Europe/Berlin, "
         f"retention {RETENTION_DAYS}d)"
     )
+    from core.integrations.cron_health import record_heartbeat
     try:
         while True:
             try:
                 await _maybe_run_cleanup()
             except Exception as e:  # noqa: BLE001
                 logger.exception(f"Cleanup-Tick crashed: {e}")
+            record_heartbeat("dsgvo_cleanup")
             await asyncio.sleep(TICK_INTERVAL_SECONDS)
     except asyncio.CancelledError:
         logger.info("DSGVO-Cleanup-Cron gestoppt")
