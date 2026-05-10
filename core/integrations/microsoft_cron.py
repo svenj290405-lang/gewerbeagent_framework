@@ -1,7 +1,12 @@
-"""Background-Task: alle Microsoft-Tenants regelmaessig pollen.
+"""Background-Task: alle Microsoft-Postfaecher regelmaessig pollen.
 
 Wird in core/api/app.py ueber asyncio.create_task() gestartet.
-Polled alle 2 Min alle Tenants mit aktiver Microsoft-Verbindung.
+Polled alle 2 Min alle Postfaecher (Tenant + Mitarbeiter) mit aktiver
+Microsoft-Verbindung.
+
+Phase 1 Multi-OAuth: iteriert ueber alle OAuthTokens (statt nur ueber
+Tenants), damit jedes verbundene Mitarbeiter-Postfach sein eigenes
+Polling bekommt.
 """
 from __future__ import annotations
 
@@ -22,27 +27,33 @@ POLL_INTERVAL_SECONDS = 120  # 2 Minuten
 ERROR_RETRY_SECONDS = 60     # Bei Fehler kuerzer warten
 
 
-async def get_microsoft_tenants() -> list[Tenant]:
-    """Laedt alle Tenants die Microsoft verbunden haben."""
+async def get_microsoft_mailboxes() -> list[tuple[Tenant, OAuthToken]]:
+    """Laedt alle (Tenant, OAuthToken) Paare mit Microsoft-Verbindung.
+
+    Mit Multi-OAuth kann ein Tenant mehrere Tokens haben (1 pro
+    Mitarbeiter). Jeder Token = ein Postfach das gepollt werden soll.
+    """
     async with AsyncSessionLocal() as session:
         result = await session.execute(
-            select(Tenant)
+            select(Tenant, OAuthToken)
             .join(OAuthToken, OAuthToken.tenant_id == Tenant.id)
             .where(OAuthToken.provider == "microsoft")
         )
-        return list(result.scalars().all())
+        return [(t, ot) for t, ot in result.all()]
 
 
 async def poll_all_tenants_once() -> dict:
-    """Ein Polling-Lauf fuer alle verbundenen Tenants."""
-    tenants = await get_microsoft_tenants()
-    logger.info(f"Cron-Polling: {len(tenants)} Tenants mit Microsoft-Verbindung")
+    """Ein Polling-Lauf fuer alle verbundenen Postfaecher."""
+    mailboxes = await get_microsoft_mailboxes()
+    logger.info(f"Cron-Polling: {len(mailboxes)} Microsoft-Postfaecher")
 
     summary = {"tenants_checked": 0, "total_mails": 0, "total_processed": 0, "errors": 0}
 
-    for tenant in tenants:
+    for tenant, token in mailboxes:
+        emp_id = token.employee_id
+        label = f"{tenant.slug}{('/'+str(emp_id)[:8]) if emp_id else ''}"
         try:
-            result = await poll_microsoft_inbox(tenant.id)
+            result = await poll_microsoft_inbox(tenant.id, employee_id=emp_id)
             summary["tenants_checked"] += 1
             n_checked = result.get("checked", 0)
             summary["total_mails"] += n_checked
@@ -55,14 +66,14 @@ async def poll_all_tenants_once() -> dict:
 
             if n_checked > 0:
                 logger.info(
-                    f"Cron-Tenant {tenant.slug}: {n_checked} neue Mails, "
+                    f"Cron-Postfach {label}: {n_checked} neue Mails, "
                     f"Verteilung: {result.get('classified', {})}"
                 )
         except Exception as e:
             summary["errors"] += 1
-            logger.exception(f"Cron-Polling-Fehler fuer Tenant {tenant.slug}: {e}")
+            logger.exception(f"Cron-Polling-Fehler fuer {label}: {e}")
 
-        # Kleine Pause zwischen Tenants um nicht alle gleichzeitig auf Microsoft zu hauen
+        # Pause zwischen Postfaechern um nicht alle gleichzeitig zu pollen
         await asyncio.sleep(0.5)
 
     return summary

@@ -197,20 +197,30 @@ from core.security.oauth_flow import generate_auth_url, handle_callback
 async def oauth_start(
     tenant: str = Query(..., description="Tenant-Slug, z.B. 'dietz'"),
     provider: str = Query("google", description="OAuth-Provider"),
+    employee: str | None = Query(
+        None,
+        description="Optionaler Mitarbeiter-Slug (Phase 1 Multi-OAuth). "
+                    "Ohne diesen Param landet der Token beim Default-Employee.",
+    ),
 ) -> RedirectResponse:
     """
-    Startet den OAuth-Flow: leitet Nutzer zu Google-Login weiter.
+    Startet den OAuth-Flow: leitet Nutzer zu Google/Microsoft-Login weiter.
 
-    Hardening: Tenant-Slug-Format wird strikt validiert bevor er an die
-    OAuth-Funktion geht — keine sonderzeichen-basierten Bypasses.
+    Hardening: Tenant- und Employee-Slug-Format wird strikt validiert
+    bevor sie an die OAuth-Funktion gehen — keine sonderzeichen-basierten
+    Bypasses.
     """
     import re
     if not re.fullmatch(r"[a-z0-9_-]{1,50}", tenant):
         raise HTTPException(status_code=400, detail="Ungueltiger Tenant-Slug")
+    if employee is not None and not re.fullmatch(r"[a-z0-9_-]{1,64}", employee):
+        raise HTTPException(status_code=400, detail="Ungueltiger Employee-Slug")
     if provider not in ("google", "microsoft"):
         raise HTTPException(status_code=400, detail="Unbekannter OAuth-Provider")
     try:
-        auth_url = await generate_auth_url(tenant_slug=tenant, provider=provider)
+        auth_url = await generate_auth_url(
+            tenant_slug=tenant, provider=provider, employee_slug=employee,
+        )
         return RedirectResponse(url=auth_url, status_code=302)
     except Exception as e:
         # Internal-Fehler nicht ans Frontend leaken (kein str(e))

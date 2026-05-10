@@ -76,15 +76,18 @@ class GoogleCalendarAdapter(CalendarAdapter):
     """Wrappt die bestehende google_auth + googleapiclient-Logik."""
     provider_name = "google"
 
-    def __init__(self, tenant_id: uuid.UUID, calendar_id: str):
+    def __init__(self, tenant_id: uuid.UUID, calendar_id: str, employee_id: uuid.UUID | None = None):
         self.tenant_id = tenant_id
         self.calendar_id = calendar_id
-        self._service = None  # lazy
+        self.employee_id = employee_id
+        self._service = None
 
     async def _get_service(self):
         if self._service is None:
             from plugins.kalender.google_auth import get_calendar_service
-            self._service = await get_calendar_service(self.tenant_id)
+            self._service = await get_calendar_service(
+                self.tenant_id, employee_id=self.employee_id,
+            )
         return self._service
 
     @staticmethod
@@ -192,8 +195,13 @@ class MicrosoftCalendarAdapter(CalendarAdapter):
     """Nutzt core/integrations/microsoft_calendar.py (Graph API)."""
     provider_name = "microsoft"
 
-    def __init__(self, tenant_id: uuid.UUID, calendar_id: str | None = None):
+    def __init__(
+        self, tenant_id: uuid.UUID,
+        calendar_id: str | None = None,
+        employee_id: uuid.UUID | None = None,
+    ):
         self.tenant_id = tenant_id
+        self.employee_id = employee_id
         # calendar_id wird aktuell nicht genutzt — Microsoft schreibt
         # immer in /me/events (primaerer Kalender). Feld vorgesehen
         # damit spaeter sekundaere Outlook-Kalender unterstuetzt werden
@@ -202,12 +210,17 @@ class MicrosoftCalendarAdapter(CalendarAdapter):
 
     async def is_slot_busy(self, start, end):
         from core.integrations.microsoft_calendar import get_free_busy
-        busy = await get_free_busy(self.tenant_id, start=start, end=end)
+        busy = await get_free_busy(
+            self.tenant_id, start=start, end=end, employee_id=self.employee_id,
+        )
         return bool(busy)
 
     async def get_busy_periods(self, time_min, time_max):
         from core.integrations.microsoft_calendar import get_free_busy
-        busy = await get_free_busy(self.tenant_id, start=time_min, end=time_max)
+        busy = await get_free_busy(
+            self.tenant_id, start=time_min, end=time_max,
+            employee_id=self.employee_id,
+        )
         # Format-Angleichung an Google: {"start": iso, "end": iso}
         return [
             {
@@ -219,7 +232,9 @@ class MicrosoftCalendarAdapter(CalendarAdapter):
 
     async def list_events_for_day(self, target_date):
         from core.integrations.microsoft_calendar import list_events_for_day
-        return await list_events_for_day(self.tenant_id, target_date)
+        return await list_events_for_day(
+            self.tenant_id, target_date, employee_id=self.employee_id,
+        )
 
     async def create_event(self, *, summary, description, location, start, end, timezone):
         # Microsoft nutzt fixe Tenant-Default-TZ via Helper; timezone-
@@ -230,11 +245,14 @@ class MicrosoftCalendarAdapter(CalendarAdapter):
             self.tenant_id,
             summary=summary, description=description,
             location=location, start=start, end=end,
+            employee_id=self.employee_id,
         )
 
     async def delete_event(self, event_id):
         from core.integrations.microsoft_calendar import delete_event
-        return await delete_event(self.tenant_id, event_id)
+        return await delete_event(
+            self.tenant_id, event_id, employee_id=self.employee_id,
+        )
 
 
 # =====================================================================
@@ -274,6 +292,11 @@ async def get_calendar_adapter(
     provider = (emp.calendar_provider if emp else None) or CALENDAR_PROVIDER_GOOGLE
     cal_id = (emp.calendar_id if emp else None) or fallback_calendar_id
 
+    emp_id = emp.id if emp else None
     if provider == CALENDAR_PROVIDER_MICROSOFT:
-        return MicrosoftCalendarAdapter(tenant_id=tenant_id, calendar_id=cal_id)
-    return GoogleCalendarAdapter(tenant_id=tenant_id, calendar_id=cal_id)
+        return MicrosoftCalendarAdapter(
+            tenant_id=tenant_id, calendar_id=cal_id, employee_id=emp_id,
+        )
+    return GoogleCalendarAdapter(
+        tenant_id=tenant_id, calendar_id=cal_id, employee_id=emp_id,
+    )

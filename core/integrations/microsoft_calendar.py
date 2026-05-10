@@ -58,6 +58,7 @@ async def get_free_busy(
     start: dt.datetime,
     end: dt.datetime,
     schedule_emails: list[str] | None = None,
+    employee_id: UUID | None = None,
 ) -> list[dict[str, Any]]:
     """Liefert busy-Slots im Zeitraum [start, end] fuer den verbundenen Mitarbeiter.
 
@@ -66,7 +67,7 @@ async def get_free_busy(
 
     Returns: Liste von {"start_dt": datetime (naive), "end_dt": ...}
     """
-    token = await get_microsoft_token(tenant_id)
+    token = await get_microsoft_token(tenant_id, employee_id=employee_id)
     if schedule_emails is None:
         # 'me' funktioniert nicht im getSchedule — wir brauchen die
         # E-Mail-Adresse des verbundenen Accounts.
@@ -117,13 +118,14 @@ async def get_free_busy(
 
 async def list_events_for_day(
     tenant_id: UUID, target_date: dt.date,
+    employee_id: UUID | None = None,
 ) -> list[dict[str, Any]]:
     """Alle Events des Tages mit Lokation. Wird von Smart-Filter genutzt
     um Vor-/Nach-Termine zu finden.
 
     Returns: Liste von {"start_dt": datetime, "end_dt": datetime, "location": str}
     """
-    token = await get_microsoft_token(tenant_id)
+    token = await get_microsoft_token(tenant_id, employee_id=employee_id)
     day_start = dt.datetime.combine(target_date, dt.time(0, 0))
     day_end = dt.datetime.combine(target_date, dt.time(23, 59))
 
@@ -172,9 +174,10 @@ async def create_event(
     location: str,
     start: dt.datetime,
     end: dt.datetime,
+    employee_id: UUID | None = None,
 ) -> dict[str, Any]:
     """Erstellt einen Termin. Returns: {"id": ..., "html_link": ...}"""
-    token = await get_microsoft_token(tenant_id)
+    token = await get_microsoft_token(tenant_id, employee_id=employee_id)
     body = {
         "subject": summary,
         "body": {"contentType": "HTML", "content": description.replace("\n", "<br>")},
@@ -202,9 +205,12 @@ async def create_event(
 # EVENT-DELETE
 # ---------------------------------------------------------------------
 
-async def delete_event(tenant_id: UUID, event_id: str) -> bool:
+async def delete_event(
+    tenant_id: UUID, event_id: str,
+    employee_id: UUID | None = None,
+) -> bool:
     """Loescht einen Termin. Returns True wenn 204/404 (404 = schon weg)."""
-    token = await get_microsoft_token(tenant_id)
+    token = await get_microsoft_token(tenant_id, employee_id=employee_id)
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS) as client:
         resp = await client.delete(
             f"{GRAPH_API_BASE}/me/events/{event_id}",

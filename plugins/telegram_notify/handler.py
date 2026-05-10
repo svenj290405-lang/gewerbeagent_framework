@@ -2499,13 +2499,20 @@ async def _handle_leistung_loeschen_command(chat_id, args: str):
 async def _handle_microsoft_setup_command(chat_id):
     """Generiert OAuth-URL und schickt sie als klickbaren Link."""
     from config.settings import settings
+    from urllib.parse import urlencode
 
-    tenant = await _get_tenant_by_chat(chat_id)
-    if not tenant:
+    res = await _get_current_employee(chat_id)
+    if res is None:
         return "Dieser Chat ist noch keinem Betrieb zugeordnet."
+    tenant, emp = res
 
     public_url = settings.public_url.rstrip("/")
-    setup_url = f"{public_url}/oauth/start?tenant={tenant.slug}&provider=microsoft"
+    qs = urlencode({
+        "tenant": tenant.slug,
+        "provider": "microsoft",
+        "employee": emp.slug,
+    })
+    setup_url = f"{public_url}/oauth/start?{qs}"
 
     msg = "<b>Microsoft 365 Mail-Anbindung</b>\n\n"
     msg += "Klick den Link um deinen Microsoft-Account zu verbinden:\n\n"
@@ -4805,7 +4812,10 @@ async def _format_mitarbeiter_list(tenant_id) -> str:
 async def _format_mitarbeiter_detail(tenant_id, slug) -> str:
     """Detail-Anzeige eines Mitarbeiters."""
     from core.database import AsyncSessionLocal
-    from core.models import Employee
+    from core.models import Employee, Tenant
+    from config.settings import settings as _settings
+    from urllib.parse import urlencode as _urlencode
+
     async with AsyncSessionLocal() as s:
         emp = (await s.execute(
             select(Employee).where(
@@ -4815,15 +4825,35 @@ async def _format_mitarbeiter_detail(tenant_id, slug) -> str:
         )).scalar_one_or_none()
         if emp is None:
             return f"Mitarbeiter <b>{slug}</b> nicht gefunden."
+        tenant = (await s.execute(
+            select(Tenant).where(Tenant.id == tenant_id)
+        )).scalar_one()
+
     bot_username = await _get_bot_username()
-    deeplink = (
-        f"https://t.me/{bot_username}?start={slug}"
-        if bot_username and emp.is_default
-        else (
-            f"https://t.me/{bot_username}?start=__SLUG_PLACEHOLDER__"
-            if bot_username else "(Bot-Username unbekannt)"
-        )
-    )
+    # Telegram-Deeplink: Inhaber bekommt einfachen tenant-Slug,
+    # weitere Mitarbeiter brauchen das __<emp_slug>-Suffix damit der
+    # Bot beim ersten /start die richtige Person zuordnet.
+    if bot_username:
+        if emp.is_default:
+            tg_deeplink = f"https://t.me/{bot_username}?start={tenant.slug}"
+        else:
+            tg_deeplink = (
+                f"https://t.me/{bot_username}?start={tenant.slug}__{emp.slug}"
+            )
+    else:
+        tg_deeplink = "(Bot-Username unbekannt)"
+
+    # OAuth-Deeplink — funktioniert sobald Provider gewaehlt ist
+    base = (_settings.public_url or "").rstrip("/")
+    oauth_deeplink = ""
+    if base and emp.calendar_provider:
+        qs = _urlencode({
+            "tenant": tenant.slug,
+            "provider": emp.calendar_provider,
+            "employee": emp.slug,
+        })
+        oauth_deeplink = f"{base}/oauth/start?{qs}"
+
     flag = " 👑 Inhaber" if emp.is_default else ""
     active = "" if emp.is_active else " <b>(deaktiviert)</b>"
     chat_str = (
@@ -4834,15 +4864,28 @@ async def _format_mitarbeiter_detail(tenant_id, slug) -> str:
         f"{emp.heimat_strasse}, {emp.heimat_plz} {emp.heimat_ort}"
         if (emp.heimat_strasse or emp.heimat_ort) else "—"
     )
-    msg = (
-        f"<b>{emp.name}</b>{flag}{active}\n"
-        f"Slug: <code>{emp.slug}</code>\n"
-        f"E-Mail: {emp.contact_email or '—'}\n"
-        f"Telegram: {chat_str}\n"
-        f"Heimat: {heimat}\n"
-        f"Skills: {_format_skills(emp.skills)}\n"
-    )
-    return msg
+    cal_label = _kalender_label(emp.calendar_provider)
+    parts = [
+        f"<b>{emp.name}</b>{flag}{active}",
+        f"Slug: <code>{emp.slug}</code>",
+        f"E-Mail: {emp.contact_email or '—'}",
+        f"Telegram: {chat_str}",
+        f"Heimat: {heimat}",
+        f"Kalender: {cal_label}",
+        f"Skills: {_format_skills(emp.skills)}",
+        "",
+        f"<b>Telegram-Onboarding:</b>\n<code>{tg_deeplink}</code>",
+    ]
+    if oauth_deeplink:
+        parts.append(
+            f"\n<b>OAuth-Connect-Link:</b>\n<code>{oauth_deeplink}</code>"
+        )
+    elif not emp.calendar_provider:
+        parts.append(
+            "\n<i>Kein Kalender gewaehlt — Mitarbeiter soll "
+            "/kalender_verbinden im eigenen Chat ausfuehren.</i>"
+        )
+    return "\n".join(parts)
 
 
 async def _ensure_inhaber_or_explain(chat_id) -> tuple[bool, str | None, object | None, object | None]:
@@ -5186,9 +5229,17 @@ async def _handle_kalender_callback(chat_id, cq_data, cq_id, bot_token) -> None:
     await _answer_callback_query(cq_id, f"{provider.capitalize()} gewaehlt", bot_token)
 
     # OAuth-Deeplink generieren — public_url + /oauth/start
+    # Phase 1 Multi-OAuth: employee-Slug mitgeben damit Token am
+    # Mitarbeiter-Datensatz landet (nicht nur tenant-weit).
     from config.settings import settings
+    from urllib.parse import urlencode
     base = (settings.public_url or "").rstrip("/")
-    oauth_url = f"{base}/oauth/start?tenant={tenant.slug}&provider={provider}"
+    qs = urlencode({
+        "tenant": tenant.slug,
+        "provider": provider,
+        "employee": emp.slug,
+    })
+    oauth_url = f"{base}/oauth/start?{qs}"
 
     label = _kalender_label(provider)
     msg = (

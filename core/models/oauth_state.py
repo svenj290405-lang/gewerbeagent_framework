@@ -16,6 +16,9 @@ class OAuthState(Base):
     tenant_slug: Mapped[str] = mapped_column(String(100), nullable=False)
     provider: Mapped[str] = mapped_column(String(50), nullable=False)
     code_verifier: Mapped[str] = mapped_column(Text, nullable=False)
+    # Phase 1 Multi-OAuth: optional welcher Mitarbeiter den Flow startet
+    # (NULL = Tenant-Owner / Default-Employee).
+    employee_slug: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),

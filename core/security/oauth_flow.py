@@ -92,7 +92,9 @@ def _get_redirect_uri() -> str:
     return f"{settings.public_url.rstrip('/')}/oauth/callback"
 
 
-async def _generate_auth_url_microsoft(tenant_slug: str) -> str:
+async def _generate_auth_url_microsoft(
+    tenant_slug: str, employee_slug: str | None = None,
+) -> str:
     """Microsoft-OAuth-Autorisierungs-URL mit PKCE."""
     from urllib.parse import urlencode
 
@@ -125,20 +127,30 @@ async def _generate_auth_url_microsoft(tenant_slug: str) -> str:
             tenant_slug=tenant_slug,
             provider="microsoft",
             code_verifier=code_verifier,
+            employee_slug=employee_slug,
         )
         session.add(oauth_state)
         await session.commit()
 
     logger.info(
-        f"Microsoft-OAuth-URL generiert fuer Tenant {tenant_slug} (state={state[:8]}...)"
+        f"Microsoft-OAuth-URL generiert fuer Tenant {tenant_slug}"
+        f"{('/'+employee_slug) if employee_slug else ''} (state={state[:8]}...)"
     )
     return auth_url
 
 
-async def generate_auth_url(tenant_slug: str, provider: str = "google") -> str:
-    """Erzeugt OAuth-Autorisierungs-URL und persistiert State in DB."""
+async def generate_auth_url(
+    tenant_slug: str, provider: str = "google",
+    employee_slug: str | None = None,
+) -> str:
+    """Erzeugt OAuth-Autorisierungs-URL und persistiert State in DB.
+
+    Phase 1 Multi-OAuth: optional employee_slug — wird im OAuth-State
+    gespeichert damit der Callback weiss FUER WEN der Token abgelegt
+    werden soll.
+    """
     if provider == "microsoft":
-        return await _generate_auth_url_microsoft(tenant_slug)
+        return await _generate_auth_url_microsoft(tenant_slug, employee_slug)
     if provider != "google":
         raise NotImplementedError(f"Provider {provider} noch nicht unterstuetzt")
 
@@ -167,14 +179,93 @@ async def generate_auth_url(tenant_slug: str, provider: str = "google") -> str:
             tenant_slug=tenant_slug,
             provider=provider,
             code_verifier=flow.code_verifier or "",
+            employee_slug=employee_slug,
         )
         session.add(oauth_state)
         await session.commit()
 
     logger.info(
-        f"OAuth-URL generiert fuer Tenant {tenant_slug} (state={state[:8]}...)"
+        f"OAuth-URL generiert fuer Tenant {tenant_slug}"
+        f"{('/'+employee_slug) if employee_slug else ''} (state={state[:8]}...)"
     )
     return auth_url
+
+
+async def _resolve_employee_id(
+    session, tenant_id, employee_slug: str | None,
+):
+    """Phase 1 Multi-OAuth: ermittelt employee_id fuer Token-Upsert.
+
+    - employee_slug gesetzt: Employee per (tenant_id, slug) suchen.
+      Existiert keiner mit dem Slug → ValueError (Onboarding-Bug).
+    - employee_slug None: Default-Employee des Tenants (immer existent
+      durch Phase-0-Backfill).
+    """
+    from core.models.employee import Employee, get_default_employee
+
+    if employee_slug:
+        result = await session.execute(
+            select(Employee).where(
+                Employee.tenant_id == tenant_id,
+                Employee.slug == employee_slug,
+            )
+        )
+        emp = result.scalar_one_or_none()
+        if not emp:
+            raise ValueError(
+                f"Employee slug='{employee_slug}' nicht gefunden "
+                f"fuer tenant_id={tenant_id}"
+            )
+        return emp.id
+
+    emp = await get_default_employee(tenant_id)
+    return emp.id if emp else None
+
+
+async def _upsert_oauth_token(
+    session,
+    *,
+    tenant_id,
+    employee_id,
+    provider: str,
+) -> OAuthToken:
+    """Sucht bestehenden Token via (employee_id, provider) — sonst neu.
+
+    Phase 1: bevorzugt Lookup ueber employee_id. Fallback: tenant-weiter
+    Legacy-Token (employee_id IS NULL) der noch nicht migriert ist —
+    den uebernehmen wir und schreiben employee_id rein.
+    """
+    if employee_id is not None:
+        result = await session.execute(
+            select(OAuthToken).where(
+                OAuthToken.employee_id == employee_id,
+                OAuthToken.provider == provider,
+            )
+        )
+        oauth_token = result.scalar_one_or_none()
+        if oauth_token is not None:
+            return oauth_token
+
+    # Legacy-Fallback: tenant-weiter Token ohne employee_id
+    result = await session.execute(
+        select(OAuthToken).where(
+            OAuthToken.tenant_id == tenant_id,
+            OAuthToken.provider == provider,
+            OAuthToken.employee_id.is_(None),
+        )
+    )
+    legacy = result.scalar_one_or_none()
+    if legacy is not None:
+        legacy.employee_id = employee_id
+        return legacy
+
+    new_token = OAuthToken(
+        tenant_id=tenant_id,
+        employee_id=employee_id,
+        provider=provider,
+    )
+    session.add(new_token)
+    return new_token
 
 
 async def _handle_callback_microsoft(
@@ -182,6 +273,7 @@ async def _handle_callback_microsoft(
     state: str,
     tenant_slug: str,
     code_verifier: str,
+    employee_slug: str | None = None,
 ) -> OAuthToken:
     """Verarbeitet Microsoft-OAuth-Callback."""
     cfg = await _load_microsoft_config()
@@ -230,7 +322,7 @@ async def _handle_callback_microsoft(
 
     expires_at = datetime.now(timezone.utc) + timedelta(seconds=int(expires_in) - 60)
 
-    # In DB speichern (upsert)
+    # In DB speichern (upsert via employee_id-aware Helper)
     async with AsyncSessionLocal() as session:
         result = await session.execute(
             select(Tenant).where(Tenant.slug == tenant_slug)
@@ -239,19 +331,13 @@ async def _handle_callback_microsoft(
         if not tenant:
             raise ValueError(f"Tenant {tenant_slug} nicht gefunden")
 
-        result = await session.execute(
-            select(OAuthToken).where(
-                OAuthToken.tenant_id == tenant.id,
-                OAuthToken.provider == "microsoft",
-            )
+        employee_id = await _resolve_employee_id(session, tenant.id, employee_slug)
+        oauth_token = await _upsert_oauth_token(
+            session,
+            tenant_id=tenant.id,
+            employee_id=employee_id,
+            provider="microsoft",
         )
-        oauth_token = result.scalar_one_or_none()
-        if oauth_token is None:
-            oauth_token = OAuthToken(
-                tenant_id=tenant.id,
-                provider="microsoft",
-            )
-            session.add(oauth_token)
 
         oauth_token.refresh_token = refresh_token
         oauth_token.access_token = access_token
@@ -263,7 +349,8 @@ async def _handle_callback_microsoft(
         await session.refresh(oauth_token)
 
     logger.info(
-        f"Microsoft-OAuth-Token gespeichert: tenant={tenant_slug} email={account_email}"
+        f"Microsoft-OAuth-Token gespeichert: tenant={tenant_slug}"
+        f"{('/'+employee_slug) if employee_slug else ''} email={account_email}"
     )
     return oauth_token
 
@@ -288,12 +375,15 @@ async def handle_callback(code: str, state: str) -> OAuthToken:
         tenant_slug = oauth_state.tenant_slug
         provider = oauth_state.provider
         code_verifier = oauth_state.code_verifier
+        employee_slug = oauth_state.employee_slug
         await session.delete(oauth_state)
         await session.commit()
 
     # Provider-Routing: Microsoft-spezifischer Pfad
     if provider == "microsoft":
-        return await _handle_callback_microsoft(code, state, tenant_slug, code_verifier)
+        return await _handle_callback_microsoft(
+            code, state, tenant_slug, code_verifier, employee_slug,
+        )
 
     # Token von Google holen
     client_config = _load_client_config()
@@ -319,7 +409,7 @@ async def handle_callback(code: str, state: str) -> OAuthToken:
         user_info = resp.json()
         account_email = user_info.get("email", "")
 
-    # In DB speichern (upsert)
+    # In DB speichern (upsert via employee_id-aware Helper)
     async with AsyncSessionLocal() as session:
         result = await session.execute(
             select(Tenant).where(Tenant.slug == tenant_slug)
@@ -328,20 +418,13 @@ async def handle_callback(code: str, state: str) -> OAuthToken:
         if not tenant:
             raise ValueError(f"Tenant {tenant_slug} nicht gefunden")
 
-        result = await session.execute(
-            select(OAuthToken).where(
-                OAuthToken.tenant_id == tenant.id,
-                OAuthToken.provider == provider,
-            )
+        employee_id = await _resolve_employee_id(session, tenant.id, employee_slug)
+        oauth_token = await _upsert_oauth_token(
+            session,
+            tenant_id=tenant.id,
+            employee_id=employee_id,
+            provider=provider,
         )
-        oauth_token = result.scalar_one_or_none()
-
-        if oauth_token is None:
-            oauth_token = OAuthToken(
-                tenant_id=tenant.id,
-                provider=provider,
-            )
-            session.add(oauth_token)
 
         oauth_token.refresh_token = creds.refresh_token or ""
         oauth_token.access_token = creds.token
@@ -356,6 +439,7 @@ async def handle_callback(code: str, state: str) -> OAuthToken:
         await session.refresh(oauth_token)
 
         logger.info(
-            f"OAuth-Token gespeichert: tenant={tenant_slug} account={account_email}"
+            f"OAuth-Token gespeichert: tenant={tenant_slug}"
+            f"{('/'+employee_slug) if employee_slug else ''} account={account_email}"
         )
         return oauth_token

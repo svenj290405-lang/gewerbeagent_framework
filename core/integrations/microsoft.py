@@ -87,23 +87,28 @@ async def _refresh_access_token(oauth_token: OAuthToken) -> tuple[str, datetime]
     return new_access, expires_at
 
 
-async def get_microsoft_token(tenant_id: UUID) -> str:
-    """Liefert gueltigen access_token fuer Tenant. Refreshed wenn noetig.
+async def get_microsoft_token(
+    tenant_id: UUID, employee_id: UUID | None = None,
+) -> str:
+    """Liefert gueltigen access_token fuer einen Tenant/Mitarbeiter.
 
-    Raises MicrosoftNotConnectedError wenn Tenant nicht verbunden.
+    Phase 1 Multi-OAuth: optional employee_id — nutzt zentralen Lookup
+    mit 3-stufigem Fallback (employee → default-emp → legacy-tenant).
+    Backward-Compat: ohne employee_id verhaelt sich die Funktion exakt
+    wie vorher (Tenant-weiter Lookup via Default-Employee-Backfill).
+
+    Refreshed access_token automatisch wenn abgelaufen.
+
+    Raises MicrosoftNotConnectedError wenn kein Token zu finden ist.
     """
-    async with AsyncSessionLocal() as session:
-        result = await session.execute(
-            select(OAuthToken).where(
-                OAuthToken.tenant_id == tenant_id,
-                OAuthToken.provider == "microsoft",
-            )
-        )
-        oauth_token = result.scalar_one_or_none()
+    from core.security.oauth_token_lookup import find_oauth_token
 
+    oauth_token = await find_oauth_token(tenant_id, "microsoft", employee_id)
     if not oauth_token:
+        scope = f"emp={employee_id}" if employee_id else f"tenant={tenant_id}"
         raise MicrosoftNotConnectedError(
-            "Microsoft-Account nicht verbunden. Tenant soll /microsoft_setup nutzen."
+            f"Microsoft-Account nicht verbunden ({scope}). "
+            "Mit /kalender_verbinden im Telegram einrichten."
         )
 
     now = datetime.now(timezone.utc)
@@ -145,14 +150,18 @@ async def send_mail_as_user(
     cc: Optional[list[str]] = None,
     save_to_sent: bool = True,
     attachments: Optional[list[dict]] = None,
+    employee_id: UUID | None = None,
 ) -> bool:
     """Sendet Mail im Namen des verbundenen Microsoft-Users via Graph API.
+
+    Phase 1 Multi-OAuth: optional employee_id — sendet aus dem Postfach
+    eines bestimmten Mitarbeiters (statt nur Tenant-Default).
 
     attachments: [{"filename": "...", "bytes": b"...", "content_type": "application/pdf"}]
     Returns: True bei Erfolg, False bei Fehler.
     """
     try:
-        access_token = await get_microsoft_token(tenant_id)
+        access_token = await get_microsoft_token(tenant_id, employee_id=employee_id)
     except MicrosoftNotConnectedError:
         logger.warning(f"send_mail_as_user: Tenant {tenant_id} nicht mit Microsoft verbunden")
         return False
@@ -219,6 +228,7 @@ async def send_tracked_mail(
     body_html: str,
     cc: Optional[list[str]] = None,
     attachments: Optional[list[dict]] = None,
+    employee_id: UUID | None = None,
 ) -> dict:
     """Versendet eine Mail im Two-Step-Modus (Draft-Create + Send) damit wir
     die Microsoft-IDs bekommen, ueber die wir spaeter Antworten zuordnen koennen.
@@ -244,7 +254,7 @@ async def send_tracked_mail(
         "error": None,
     }
     try:
-        access_token = await get_microsoft_token(tenant_id)
+        access_token = await get_microsoft_token(tenant_id, employee_id=employee_id)
     except MicrosoftNotConnectedError:
         out["error"] = "Microsoft nicht verbunden"
         return out
@@ -324,19 +334,19 @@ async def send_tracked_mail(
     return out
 
 
-async def get_microsoft_status(tenant_id: UUID) -> dict:
-    """Zeigt Verbindungs-Status fuer Tenant.
+async def get_microsoft_status(
+    tenant_id: UUID, employee_id: UUID | None = None,
+) -> dict:
+    """Zeigt Verbindungs-Status fuer Tenant/Mitarbeiter.
+
+    Phase 1 Multi-OAuth: optional employee_id — nutzt zentralen Lookup
+    (employee → default-employee → legacy-tenant).
 
     Returns: {connected, account_email, expires_at, scopes}
     """
-    async with AsyncSessionLocal() as session:
-        result = await session.execute(
-            select(OAuthToken).where(
-                OAuthToken.tenant_id == tenant_id,
-                OAuthToken.provider == "microsoft",
-            )
-        )
-        oauth_token = result.scalar_one_or_none()
+    from core.security.oauth_token_lookup import find_oauth_token
+
+    oauth_token = await find_oauth_token(tenant_id, "microsoft", employee_id)
 
     if not oauth_token:
         return {

@@ -922,6 +922,151 @@ OAuth-Flow.
 
 ---
 
+## TEIL J — PHASE 1: MULTI-OAUTH PRO MITARBEITER (10.05.2026 Nacht)
+
+### Status: ✅ Live, Bestand laeuft unveraendert weiter
+
+Bisher hatte jeder Tenant **einen** OAuth-Token pro Provider — egal
+wie viele Mitarbeiter er hat. D.h. wenn Sven (Inhaber) seinen Google-
+Account verbunden hat, landeten ALLE Termine + Mails dort, auch die
+seiner Angestellten Anna und Bernd. Mit Phase 1 hat jeder Mitarbeiter
+sein eigenes Google- bzw. Outlook-Konto verbunden — Termine landen
+in seinem Kalender, Mails werden aus seinem Postfach gesendet.
+
+### Was gebaut wurde
+
+**Schema (Migration q3l7h2j5g9k4_oauth_per_employee):**
+- `oauth_tokens.employee_id UUID NULL FK -> employees.id ON DELETE CASCADE`
+- Backfill: alle bestehenden Tokens → Default-Employee des Tenants
+- 2 partial-unique-Indizes parallel zum alten Constraint:
+  - `uq_oauth_tenant_provider_when_no_employee` UNIQUE (tenant_id, provider) WHERE employee_id IS NULL
+  - `uq_oauth_employee_provider` UNIQUE (employee_id, provider) WHERE employee_id IS NOT NULL
+- Alter `uq_tenant_provider`-Constraint bleibt zunaechst — Code muss
+  beide Welten unterstuetzen (M2-Drop spaeter, sobald 100% safe)
+- `oauth_states.employee_slug VARCHAR(64) NULL` — der OAuth-Callback
+  weiss damit, an welchen Employee der Token gehoert
+
+**Zentraler Lookup (`core/security/oauth_token_lookup.py`):**
+- Neuer Helper `find_oauth_token(tenant_id, provider, employee_id=None)`
+  mit 3-stufigem Fallback:
+  1. employee-spezifischer Token (employee_id, provider)
+  2. Default-Employee Token (Tenant-Backfill-Fallback)
+  3. Legacy tenant-weiter Token (employee_id IS NULL)
+- Alle OAuth-Konsumer rufen NUR noch diesen Helper — keine direkten
+  oauth_tokens-Queries mehr
+
+**Code-Refactor:**
+- `core/security/oauth_flow.py`:
+  - `generate_auth_url(tenant_slug, provider, employee_slug=None)` —
+    employee_slug wird im OAuthState mitgespeichert
+  - Neue Helper `_resolve_employee_id` + `_upsert_oauth_token` als
+    DRY-Pattern fuer Google + Microsoft Callbacks
+  - Beide Callback-Pfade lesen employee_slug aus oauth_state und
+    schreiben Token mit korrekter employee_id
+- `core/integrations/microsoft.py`:
+  - `get_microsoft_token(tenant_id, employee_id=None)` via Lookup
+  - `send_mail_as_user(... employee_id=None)`
+  - `send_tracked_mail(... employee_id=None)`
+  - `get_microsoft_status(tenant_id, employee_id=None)`
+- `core/integrations/microsoft_inbox.py`: alle 8 Funktionen
+  (fetch_unread_messages, mark_as_read, poll_microsoft_inbox,
+  fetch_full_message, ensure_gewerbeagent_folder, move_to_gewerbeagent,
+  process_relevant_kunde_mail, set_message_categories) durchgaengig
+  employee_id-aware. Folder-ID-Cache hat (tenant, employee)-Key.
+- `core/integrations/microsoft_calendar.py`: alle 4 Funktionen
+  (get_free_busy, list_events_for_day, create_event, delete_event)
+  employee_id-aware
+- `core/integrations/microsoft_cron.py`: iteriert jetzt ueber alle
+  OAuthTokens (nicht nur Tenants) — pollt jedes Mitarbeiter-Postfach
+  separat. Logs zeigen "tenant.slug/empid_prefix" pro Lauf.
+- `plugins/kalender/google_auth.py` + `plugins/kalender/adapters.py`:
+  schon in Outlook-Phase employee_id-aware geschrieben — verifiziert
+  dass Lookup ueber neuen Helper laeuft
+
+**Onboarding-UX:**
+- `/oauth/start?tenant=X&provider=google&employee=Y` — neuer Query-
+  Param mit strikter Slug-Validierung (`[a-z0-9_-]{1,64}`)
+- `/kalender_verbinden`-Wizard schickt Deeplink mit `&employee=<slug>`
+  — Token landet automatisch beim richtigen Mitarbeiter
+- `/microsoft_setup` (alter Mail-Setup-Flow) ebenfalls migriert
+- `/mitarbeiter <slug>` Detail-View zeigt:
+  - Telegram-Onboarding-Link `https://t.me/<bot>?start=<tenant>__<slug>`
+  - OAuth-Connect-Link `https://gewerbeagent.de/oauth/start?…&employee=<slug>`
+  - Aktueller Kalender-Provider-Status
+
+### Live-Verifikation
+
+```sql
+SELECT t.slug, e.slug as emp_slug, e.is_default, ot.provider,
+       ot.account_email,
+       CASE WHEN ot.employee_id IS NULL THEN 'NULL' ELSE 'SET' END
+FROM tenants t
+LEFT JOIN employees e ON e.tenant_id = t.id
+LEFT JOIN oauth_tokens ot ON ot.employee_id = e.id;
+```
+→ demo/default Google + Microsoft beide mit `emp_id_set='SET'`.
+
+OAuth-Endpoint:
+- `/oauth/start?tenant=demo&provider=google&employee=default` → 302 Google
+- `/oauth/start?tenant=demo&provider=microsoft&employee=default` → 302 MS
+- `/oauth/start?...&employee=invalid!` → 400 (Slug-Validierung)
+- `oauth_states` haelt employee_slug nach jedem Start-Call korrekt
+
+Microsoft-Cron-Log: `Cron-Polling: 1 Microsoft-Postfaecher` →
+employee-aware Iteration laeuft.
+
+### Was du jetzt machen kannst
+
+1. Inhaber legt im Telegram an: `/mitarbeiter neu`
+2. Wizard erstellt Employee + zeigt Telegram-Onboarding-Link
+3. Mitarbeiter scannt QR / klickt Link → `/start <tenant>__<slug>`
+4. Mitarbeiter im eigenen Chat: `/kalender_verbinden` → Provider-Wahl
+5. Inline-Button-Klick → personalisierter OAuth-Deeplink (mit `&employee=`)
+6. Login mit eigenem Google/Microsoft-Account → Token landet **am
+   Employee-Datensatz**, nicht am Tenant
+7. Termine werden ab jetzt in seinen Kalender gebucht; Mails aus
+   seinem Postfach gesendet/gepollt
+8. Inhaber sieht via `/mitarbeiter` die Liste aller Mitarbeiter, per
+   `/mitarbeiter <slug>` Details inkl. OAuth-Link zum erneuten
+   Verbinden
+
+### Nicht-gemachte Folgeaufgaben
+
+- **M2-Migration:** alten `uq_tenant_provider`-Constraint droppen.
+  Erst sicher wenn alle Code-Pfade definitiv Multi-OAuth-aware sind
+  (~1 Woche Beobachtung in Prod).
+- **Voice-Pipeline:** `voice_init`-Plugin ist noch tenant-weit; muss
+  Skill-Routing bekommen (Phase 5) damit Anrufe automatisch dem
+  richtigen Mitarbeiter zugeteilt werden.
+- **Skill-Router** (Phase 5): Mail-Intake routet eingehende Kunden-
+  Mails noch an Default-Employee. `core/routing/employee_router.py`
+  mit Keyword-Map → Skill-Match → Distanz-Score steht aus.
+- **Conversation-Sticky-Routing:** `EmailConversation.assigned_employee_id`
+  als Spalte vorhanden, aber Mail-Intake setzt sie noch nicht. Folge-
+  Mails sollten am selben Mitarbeiter landen.
+- **Web-UI fuer Mitarbeiter-Verwaltung:** alles laeuft via Telegram-
+  Wizard. Falls spaeter Browser-UI gewollt: separate Phase.
+- **Tenant-Spalten droppen** (telegram_chat_id, heimat_*, etc.): erst
+  nach mehreren Wochen Mirror-Betrieb safe.
+
+### Bekannte Limitationen
+
+1. **Default-Employee als Fallback:** wenn ein Mitarbeiter keinen
+   eigenen OAuth-Token hat, faellt der Lookup auf den Default-
+   Employee zurueck. Das ist meist gewollt (z.B. Kalender-Suche bei
+   Skill-Routing), kann aber bei Mail-Send unerwartet sein wenn der
+   Mitarbeiter eigentlich seinen eigenen Account erwartet hat. Wenn
+   das ein Problem wird: in Skill-Router explizit `assigned_employee_id`
+   pruefen und bei fehlendem Token einen Hinweis zurueckgeben.
+2. **Token-Refresh-Race:** wenn zwei parallele Requests fuer denselben
+   Mitarbeiter den abgelaufenen Token erkennen, wird beide refreshen.
+   Microsoft akzeptiert das (gibt 2 verschiedene Tokens), aber nur der
+   spaeter geschriebene gilt — der erste Request bekommt einen sofort
+   verfallenen Token. Loesung waere ein DB-Lock auf der Token-Zeile;
+   in der Praxis sehr selten.
+
+---
+
 ## TL;DR (alt unten)
 
 ### Was bewusst NICHT gefixt wurde (Tier 2/3 fuer spaeter)

@@ -33,13 +33,17 @@ logger = logging.getLogger(__name__)
 
 
 async def fetch_unread_messages(
-    tenant_id: UUID, top: int = 25
+    tenant_id: UUID, top: int = 25,
+    employee_id: UUID | None = None,
 ) -> list[dict]:
     """Holt die letzten N ungelesenen Mails (Header + Preview, nicht voller Body).
 
+    Phase 1 Multi-OAuth: optional employee_id — pollt das Postfach
+    eines bestimmten Mitarbeiters (statt nur Tenant-Default).
+
     Returns: Liste von Mail-Dicts mit id, subject, from, bodyPreview, receivedDateTime, isRead
     """
-    access_token = await get_microsoft_token(tenant_id)
+    access_token = await get_microsoft_token(tenant_id, employee_id=employee_id)
 
     # Nur Felder holen die wir brauchen - bodyPreview ist max 255 Zeichen
     # Filter: ungelesen UND noch keine Q-Kategorie
@@ -74,10 +78,13 @@ async def fetch_unread_messages(
         return data.get("value", [])
 
 
-async def mark_as_read(tenant_id: UUID, message_id: str) -> bool:
+async def mark_as_read(
+    tenant_id: UUID, message_id: str,
+    employee_id: UUID | None = None,
+) -> bool:
     """Markiert eine Mail als gelesen via Graph API."""
     try:
-        access_token = await get_microsoft_token(tenant_id)
+        access_token = await get_microsoft_token(tenant_id, employee_id=employee_id)
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.patch(
                 f"{GRAPH_API_BASE}/me/messages/{message_id}",
@@ -93,8 +100,14 @@ async def mark_as_read(tenant_id: UUID, message_id: str) -> bool:
         return False
 
 
-async def poll_microsoft_inbox(tenant_id: UUID) -> dict:
-    """Hauptfunktion: Hol ungelesene Mails fuer Tenant, klassifiziere alle.
+async def poll_microsoft_inbox(
+    tenant_id: UUID, employee_id: UUID | None = None,
+) -> dict:
+    """Hauptfunktion: Hol ungelesene Mails fuer Tenant/Mitarbeiter,
+    klassifiziere alle.
+
+    Phase 1 Multi-OAuth: optional employee_id — bestimmt welches
+    Postfach gepollt wird (jeder Mitarbeiter hat sein eigenes).
 
     Returns: {checked: N, classified: {RELEVANT_KUNDE: 3, NICHT_RELEVANT: 5, ...},
               messages: [{subject, sender, classification, confidence, reason}, ...]}
@@ -110,7 +123,9 @@ async def poll_microsoft_inbox(tenant_id: UUID) -> dict:
     tenant_branche = getattr(tenant, "branche", None) or "Handwerk"
 
     try:
-        messages = await fetch_unread_messages(tenant_id, top=25)
+        messages = await fetch_unread_messages(
+            tenant_id, top=25, employee_id=employee_id,
+        )
     except MicrosoftNotConnectedError:
         return {"error": "Microsoft nicht verbunden", "checked": 0}
     except Exception as e:
@@ -164,6 +179,7 @@ async def poll_microsoft_inbox(tenant_id: UUID) -> dict:
                         "confidence": confidence,
                         "reason": reason,
                     },
+                    employee_id=employee_id,
                 )
             except Exception as e:
                 logger.exception(f"process_relevant_kunde_mail fehler: {e}")
@@ -180,6 +196,7 @@ async def poll_microsoft_inbox(tenant_id: UUID) -> dict:
                         tenant_id=tenant_id,
                         message_id=msg.get("id"),
                         categories=new_cats,
+                        employee_id=employee_id,
                     )
                 except Exception as e:
                     logger.warning(f"Kategorie setzen fehler (non-fatal): {e}")
@@ -214,13 +231,16 @@ async def poll_microsoft_inbox(tenant_id: UUID) -> dict:
 # Vollen Mail-Body holen (fuer Reply-Generierung)
 # =====================================================================
 
-async def fetch_full_message(tenant_id: UUID, message_id: str) -> dict | None:
+async def fetch_full_message(
+    tenant_id: UUID, message_id: str,
+    employee_id: UUID | None = None,
+) -> dict | None:
     """Holt vollen Mail-Inhalt inkl. Body via Graph API.
 
     Returns: dict mit subject, from, body (text/html), receivedDateTime
     """
     try:
-        access_token = await get_microsoft_token(tenant_id)
+        access_token = await get_microsoft_token(tenant_id, employee_id=employee_id)
     except Exception as e:
         logger.error(f"fetch_full_message Token-Fehler: {e}")
         return None
@@ -253,21 +273,25 @@ async def fetch_full_message(tenant_id: UUID, message_id: str) -> dict | None:
 
 GEWERBEAGENT_FOLDER_NAME = "Gewerbeagent"
 
-# In-Memory-Cache: tenant_id -> folder_id
+# In-Memory-Cache: (tenant_id, employee_id) -> folder_id
+# Phase 1 Multi-OAuth: jeder Mitarbeiter hat eigenes Postfach mit
+# eigenem Gewerbeagent-Ordner — Cache-Key entsprechend trennen.
 _folder_id_cache: dict[str, str] = {}
 
 
-async def ensure_gewerbeagent_folder(tenant_id: UUID) -> str | None:
+async def ensure_gewerbeagent_folder(
+    tenant_id: UUID, employee_id: UUID | None = None,
+) -> str | None:
     """Stellt sicher dass der 'Gewerbeagent'-Ordner existiert. Returnt Ordner-ID.
 
-    Cached die ID in-memory pro Tenant.
+    Cached die ID in-memory pro Tenant+Mitarbeiter.
     """
-    cache_key = str(tenant_id)
+    cache_key = f"{tenant_id}:{employee_id or 'default'}"
     if cache_key in _folder_id_cache:
         return _folder_id_cache[cache_key]
 
     try:
-        access_token = await get_microsoft_token(tenant_id)
+        access_token = await get_microsoft_token(tenant_id, employee_id=employee_id)
     except Exception as e:
         logger.error(f"ensure_gewerbeagent_folder Token-Fehler: {e}")
         return None
@@ -325,15 +349,18 @@ async def ensure_gewerbeagent_folder(tenant_id: UUID) -> str | None:
         return None
 
 
-async def move_to_gewerbeagent(tenant_id: UUID, message_id: str) -> bool:
+async def move_to_gewerbeagent(
+    tenant_id: UUID, message_id: str,
+    employee_id: UUID | None = None,
+) -> bool:
     """Verschiebt eine Mail in den Gewerbeagent-Ordner. Erstellt Ordner falls noetig."""
-    folder_id = await ensure_gewerbeagent_folder(tenant_id)
+    folder_id = await ensure_gewerbeagent_folder(tenant_id, employee_id=employee_id)
     if not folder_id:
         logger.warning(f"move_to_gewerbeagent: kein folder_id, Mail bleibt in Inbox")
         return False
 
     try:
-        access_token = await get_microsoft_token(tenant_id)
+        access_token = await get_microsoft_token(tenant_id, employee_id=employee_id)
         async with httpx.AsyncClient(timeout=15.0) as client:
             resp = await client.post(
                 f"{GRAPH_API_BASE}/me/messages/{message_id}/move",
@@ -367,6 +394,7 @@ async def process_relevant_kunde_mail(
     tenant_id: UUID,
     message_id: str,
     classification_result: dict,
+    employee_id: UUID | None = None,
 ) -> dict:
     """Verarbeitet eine als RELEVANT_KUNDE klassifizierte Mail komplett.
 
@@ -392,7 +420,7 @@ async def process_relevant_kunde_mail(
     result = {"success": False, "sent": False, "moved": False, "token": None}
 
     # 1) Vollen Body holen
-    full = await fetch_full_message(tenant_id, message_id)
+    full = await fetch_full_message(tenant_id, message_id, employee_id=employee_id)
     if not full:
         result["error"] = "fetch_full_message fehlgeschlagen"
         return result
@@ -500,7 +528,7 @@ async def process_relevant_kunde_mail(
         contact_phone=getattr(tenant, "contact_phone", "") or "",
     )
 
-    # Mail senden via Microsoft Graph
+    # Mail senden via Microsoft Graph (aus dem Postfach des Mitarbeiters)
     try:
         sent_ok = await send_mail_as_user(
             tenant_id=tenant_id,
@@ -508,6 +536,7 @@ async def process_relevant_kunde_mail(
             subject=f"Re: {subject}" if not subject.lower().startswith("re:") else subject,
             body_html=body_html,
             save_to_sent=True,
+            employee_id=employee_id,
         )
         result["sent"] = bool(sent_ok)
         if not sent_ok:
@@ -525,7 +554,7 @@ async def process_relevant_kunde_mail(
     #    b) Dann in Gewerbeagent-Ordner verschieben.
     if result["sent"]:
         try:
-            read_ok = await mark_as_read(tenant_id, message_id)
+            read_ok = await mark_as_read(tenant_id, message_id, employee_id=employee_id)
             if not read_ok:
                 logger.warning(
                     f"mark_as_read returnte False: tenant={tenant_id} "
@@ -534,7 +563,9 @@ async def process_relevant_kunde_mail(
         except Exception as e:
             logger.warning(f"mark_as_read fehler (non-fatal): {e}")
         try:
-            moved = await move_to_gewerbeagent(tenant_id, message_id)
+            moved = await move_to_gewerbeagent(
+                tenant_id, message_id, employee_id=employee_id,
+            )
             result["moved"] = moved
         except Exception as e:
             logger.warning(f"Mail-Move fehler (non-fatal): {e}")
@@ -566,7 +597,8 @@ ALL_Q_CATEGORIES = list(Q_CATEGORY_BY_CLASSIFICATION.values())
 
 
 async def set_message_categories(
-    tenant_id: UUID, message_id: str, categories: list[str]
+    tenant_id: UUID, message_id: str, categories: list[str],
+    employee_id: UUID | None = None,
 ) -> bool:
     """Setzt Outlook-Kategorien auf einer Mail via Graph API.
 
@@ -575,7 +607,7 @@ async def set_message_categories(
     Returns True bei Erfolg.
     """
     try:
-        access_token = await get_microsoft_token(tenant_id)
+        access_token = await get_microsoft_token(tenant_id, employee_id=employee_id)
     except Exception as e:
         logger.error(f"set_message_categories Token-Fehler: {e}")
         return False

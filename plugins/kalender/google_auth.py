@@ -26,26 +26,37 @@ def _get_google_client_creds() -> tuple[str, str]:
     return web_cfg.get("client_id", ""), web_cfg.get("client_secret", "")
 
 
-async def get_calendar_service(tenant_id: uuid.UUID):
+async def get_calendar_service(
+    tenant_id: uuid.UUID,
+    employee_id: uuid.UUID | None = None,
+):
     """
     Gibt authentifizierten Google Calendar Service zurueck.
 
-    Raises:
-        ValueError: wenn kein OAuth-Token fuer diesen Tenant existiert
-    """
-    async with AsyncSessionLocal() as session:
-        result = await session.execute(
-            select(OAuthToken).where(
-                OAuthToken.tenant_id == tenant_id,
-                OAuthToken.provider == "google",
-            )
-        )
-        oauth_token = result.scalar_one_or_none()
+    Phase 1 Multi-OAuth: optional employee_id — nutzt zentralen
+    Lookup-Helper mit 3-stufigem Fallback (employee → default-emp →
+    legacy-tenant-token).
 
-        if not oauth_token:
-            raise ValueError(
-                f"Kein Google-OAuth-Token fuer Tenant {tenant_id} in der DB"
-            )
+    Raises:
+        ValueError: wenn kein Google-OAuth-Token zu finden ist
+    """
+    from core.security.oauth_token_lookup import find_oauth_token
+
+    oauth_token = await find_oauth_token(tenant_id, "google", employee_id)
+    if not oauth_token:
+        scope = f"emp={employee_id}" if employee_id else f"tenant={tenant_id}"
+        raise ValueError(
+            f"Kein Google-OAuth-Token fuer {scope} in der DB"
+        )
+
+    # Token-Refresh: in der gleichen Session weitermachen damit der
+    # commit() den access_token zurueckschreibt
+    async with AsyncSessionLocal() as session:
+        # Re-fetch in dieser Session damit ORM den Token tracked
+        result = await session.execute(
+            select(OAuthToken).where(OAuthToken.id == oauth_token.id)
+        )
+        oauth_token = result.scalar_one()
 
         client_id, client_secret = _get_google_client_creds()
 
