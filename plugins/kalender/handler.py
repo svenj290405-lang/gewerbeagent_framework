@@ -237,6 +237,9 @@ class Plugin(BasePlugin):
             wunsch_uhrzeit = payload.get("uhrzeit", "")
             dauer = payload.get("dauer_minuten", self.config["termin_dauer_minuten"])
             kunde_adresse = (payload.get("kunde_adresse") or "").strip()
+            # Phase-3: optional welcher Mitarbeiter — entscheidet welche
+            # Heimat-Adresse fuer Routing-Origin verwendet wird.
+            employee_id = payload.get("employee_id")
 
             wunsch = self._parse_datum_uhrzeit(wunsch_datum, wunsch_uhrzeit)
             service = await get_calendar_service(self.tenant_id)
@@ -263,6 +266,7 @@ class Plugin(BasePlugin):
             try:
                 slots, smart_meta = await self._smart_filter_slots(
                     slots, kunde_adresse, dauer, service,
+                    employee_id=employee_id,
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.warning(f"Smart-Filter crashed, using raw slots: {exc}")
@@ -282,18 +286,75 @@ class Plugin(BasePlugin):
     # SMART-SLOT-FILTER (Travel-Time aware)
     # ------------------------------------------------------------------
 
+    async def _resolve_routing_origin(
+        self, tenant, employee_id,
+    ) -> tuple[float | None, float | None, int, str]:
+        """Ermittelt Werkstatt-Origin (lat, lon, puffer, source) fuer Routing.
+
+        Hierarchie:
+        1. employee_id gesetzt + Mitarbeiter mit eigener Heimat → diese
+           ('employee')
+        2. Default-Employee mit eigener Heimat → diese ('default-employee')
+        3. tenant.heimat_* (Mirror / Legacy) → diese ('tenant')
+        4. nichts gesetzt → (None, None, 15, 'none')
+        """
+        from core.models.employee import Employee, get_default_employee
+
+        async def _from_employee(emp_id):
+            async with AsyncSessionLocal() as s:
+                return (await s.execute(
+                    select(Employee).where(Employee.id == emp_id)
+                )).scalar_one_or_none()
+
+        if employee_id is not None:
+            emp = await _from_employee(employee_id)
+            if emp and emp.heimat_lat is not None and emp.heimat_lon is not None:
+                return (
+                    float(emp.heimat_lat), float(emp.heimat_lon),
+                    int(emp.fahrtzeit_puffer_min or 15), "employee",
+                )
+
+        # Default-Employee als Fallback (auch wenn employee_id None war
+        # oder Mitarbeiter selbst keine Heimat hat)
+        default_emp = await get_default_employee(tenant.id)
+        if (default_emp and default_emp.heimat_lat is not None
+                and default_emp.heimat_lon is not None):
+            return (
+                float(default_emp.heimat_lat), float(default_emp.heimat_lon),
+                int(default_emp.fahrtzeit_puffer_min or 15),
+                "default-employee",
+            )
+
+        # Letzter Fallback: Tenant-Mirror (Backward-Compat fuer Tenants
+        # die /werkstatt vor Phase-3 durchlaufen sind)
+        if tenant.heimat_lat is not None and tenant.heimat_lon is not None:
+            return (
+                float(tenant.heimat_lat), float(tenant.heimat_lon),
+                int(tenant.fahrtzeit_puffer_min or 15), "tenant",
+            )
+
+        return (None, None, 15, "none")
+
     async def _smart_filter_slots(
         self,
         slots: list[dict],
         kunde_adresse: str,
         dauer_min: int,
         service,
+        employee_id=None,
     ) -> tuple[list[dict], dict]:
         """Filtert Slots gegen Travel-Time-Constraints.
 
         Returns: (gefilterte Liste, Meta-Dict mit Diagnose-Infos).
         Bei jedem Skip-Grund (kein Key, kein Tenant-Geo, keine Adresse)
         liefern wir die Original-Liste unveraendert zurueck.
+
+        Phase-3-Multi-Mitarbeiter (`das-machen-wir-gleich-foamy-frost.md`):
+        Werkstatt-Geo wird employee-aware aufgeloest. Bei employee_id
+        gesetzt + Mitarbeiter mit eigener Heimat: dessen lat/lon.
+        Sonst: Default-Employee-Heimat oder Tenant-Mirror als Fallback.
+        Damit kann jeder Mitarbeiter morgens von seiner Heimat-Adresse
+        losfahren statt von der Werkstatt.
         """
         meta = {"applied": False, "reason": None, "removed": 0}
 
@@ -307,7 +368,11 @@ class Plugin(BasePlugin):
             meta["reason"] = "ors-not-configured"
             return slots, meta
 
-        # Tenant-Werkstatt-Geo holen
+        # Routing-Origin (Werkstatt) ermitteln: Employee > Default-Employee
+        # > Tenant-Mirror. Fallback-Hierarchie damit Phase-3-Migration
+        # graceful funktioniert auch fuer Tenants die /werkstatt vor der
+        # Migration durchlaufen sind.
+        from core.models.employee import Employee, get_default_employee
         async with AsyncSessionLocal() as session:
             tenant = (await session.execute(
                 select(Tenant).where(Tenant.id == self.tenant_id)
@@ -315,12 +380,16 @@ class Plugin(BasePlugin):
         if tenant is None:
             meta["reason"] = "tenant-not-found"
             return slots, meta
-        if tenant.heimat_lat is None or tenant.heimat_lon is None:
+
+        origin_lat, origin_lon, puffer, origin_source = await self._resolve_routing_origin(
+            tenant, employee_id,
+        )
+        if origin_lat is None or origin_lon is None:
             meta["reason"] = "no-werkstatt-geo"
             return slots, meta
+        meta["origin_source"] = origin_source
 
-        werkstatt = GeoPoint(float(tenant.heimat_lat), float(tenant.heimat_lon))
-        puffer = int(tenant.fahrtzeit_puffer_min or 15)
+        werkstatt = GeoPoint(float(origin_lat), float(origin_lon))
 
         # Kunden-Adresse geocoden (cache-first)
         kunde_geo = await ors_geocode_address(kunde_adresse)

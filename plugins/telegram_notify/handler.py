@@ -3458,75 +3458,103 @@ YES_TRIGGERS = ("ja", "j", "yes", "y", "ok", "speichern", "passt", "stimmt")
 NO_TRIGGERS = ("nein", "n", "no", "abbrechen", "nochmal", "neu", "falsch")
 
 
-def _format_werkstatt_status(tenant) -> str:
-    """Liefert Anzeige-Text der aktuellen Werkstatt-Daten."""
-    if not tenant.heimat_strasse and not tenant.heimat_ort:
+def _format_werkstatt_status(employee, *, label="Werkstatt-Adresse") -> str:
+    """Liefert Anzeige-Text der Heimat-Daten eines Mitarbeiters.
+
+    Phase-3-Multi-Mitarbeiter: zeigt employee.heimat_* statt
+    tenant.heimat_*. Der Wizard arbeitet ab jetzt pro Mitarbeiter.
+    """
+    if not employee.heimat_strasse and not employee.heimat_ort:
         return (
-            "<b>Werkstatt-Adresse</b>\n\n"
+            f"<b>{label}</b>\n\n"
             "Noch keine Heimat-Adresse hinterlegt.\n\n"
             "Mit /werkstatt eintragen — wird gebraucht damit "
             "Q bei Termin-Vorschlaegen die Fahrtzeiten zwischen "
             "Kunden einrechnen kann."
         )
     addr_parts = []
-    if tenant.heimat_strasse:
-        addr_parts.append(tenant.heimat_strasse)
-    if tenant.heimat_plz or tenant.heimat_ort:
+    if employee.heimat_strasse:
+        addr_parts.append(employee.heimat_strasse)
+    if employee.heimat_plz or employee.heimat_ort:
         addr_parts.append(
-            f"{tenant.heimat_plz or ''} {tenant.heimat_ort or ''}".strip()
+            f"{employee.heimat_plz or ''} {employee.heimat_ort or ''}".strip()
         )
     addr = ", ".join(addr_parts)
     geo = ""
-    if tenant.heimat_lat is not None and tenant.heimat_lon is not None:
+    if employee.heimat_lat is not None and employee.heimat_lon is not None:
         geo = (
-            f"\n📍 Geo: {tenant.heimat_lat}, {tenant.heimat_lon}"
+            f"\n📍 Geo: {employee.heimat_lat}, {employee.heimat_lon}"
             f" (fuer Routing geocoded)"
         )
-    msg = "<b>Werkstatt-Adresse</b>\n\n"
+    owner = " 👑" if employee.is_default else ""
+    msg = f"<b>{label} — {employee.name}{owner}</b>\n\n"
     msg += f"📍 {addr}{geo}\n\n"
-    msg += f"⏱ Puffer pro Termin: {tenant.fahrtzeit_puffer_min} Min\n\n"
+    msg += f"⏱ Puffer pro Termin: {employee.fahrtzeit_puffer_min} Min\n\n"
     msg += "Mit /werkstatt aendern."
     return msg
 
 
-async def _update_tenant_werkstatt(
-    tenant_id, *, strasse, plz, ort, lat, lon,
+async def _update_employee_werkstatt(
+    employee_id, *, strasse, plz, ort, lat, lon, mirror_to_tenant_id=None,
 ):
-    """UPDATE auf tenants — heimat_*-Felder setzen."""
+    """UPDATE auf employees — heimat_*-Felder setzen.
+
+    Wenn mirror_to_tenant_id gesetzt (= Default-Employee): zusaetzlich
+    tenant.heimat_* spiegeln, damit Code-Pfade die noch nicht employee-
+    aware sind (rechnung_paid_summary, voice_init etc.) konsistent
+    bleiben. Spaeter werden diese ebenfalls migriert.
+    """
     from sqlalchemy import update
     from decimal import Decimal
+    from core.models.employee import Employee
+    lat_dec = Decimal(str(round(lat, 6))) if lat is not None else None
+    lon_dec = Decimal(str(round(lon, 6))) if lon is not None else None
     async with AsyncSessionLocal() as s:
         await s.execute(
-            update(Tenant).where(Tenant.id == tenant_id).values(
+            update(Employee).where(Employee.id == employee_id).values(
                 heimat_strasse=strasse,
                 heimat_plz=plz,
                 heimat_ort=ort,
-                heimat_lat=Decimal(str(round(lat, 6))) if lat is not None else None,
-                heimat_lon=Decimal(str(round(lon, 6))) if lon is not None else None,
+                heimat_lat=lat_dec,
+                heimat_lon=lon_dec,
             )
         )
+        if mirror_to_tenant_id is not None:
+            await s.execute(
+                update(Tenant).where(Tenant.id == mirror_to_tenant_id).values(
+                    heimat_strasse=strasse,
+                    heimat_plz=plz,
+                    heimat_ort=ort,
+                    heimat_lat=lat_dec,
+                    heimat_lon=lon_dec,
+                )
+            )
         await s.commit()
 
 
 async def _handle_werkstatt_command(chat_id):
-    """Startet den Werkstatt-Setup-Wizard.
+    """Startet den Werkstatt-Setup-Wizard fuer den AKTUELLEN Mitarbeiter.
 
-    Wenn schon Adresse hinterlegt: zeigt Status + bietet Aenderung an.
-    Sonst: fragt nach Adresse.
+    Phase-3-Multi-Mitarbeiter: jeder Mitarbeiter pflegt seine eigene
+    Heimat. Default-Employee (Inhaber) spiegelt zusaetzlich auf
+    tenant.heimat_* damit Legacy-Code-Pfade konsistent bleiben.
     """
-    tenant = await _get_tenant_by_chat(chat_id)
-    if not tenant:
+    res = await _get_current_employee(chat_id)
+    if res is None:
         return (
             "Dieser Chat ist noch keinem Betrieb zugeordnet.\n"
             "Bitte zuerst den Aktivierungs-QR-Code scannen."
         )
+    tenant, employee = res
 
-    has_address = bool(tenant.heimat_strasse and tenant.heimat_ort)
+    has_address = bool(employee.heimat_strasse and employee.heimat_ort)
 
     await _save_state(chat_id, STATE_WERKSTATT_WAITING_ADDRESS, {})
 
+    label = "Heimat-Adresse" if not employee.is_default else "Werkstatt-Adresse"
+
     if has_address:
-        msg = _format_werkstatt_status(tenant) + "\n\n"
+        msg = _format_werkstatt_status(employee, label=label) + "\n\n"
         msg += (
             "<b>Neue Adresse?</b>\n"
             "Schicke einfach die komplette Adresse, z.B.:\n"
@@ -3535,12 +3563,19 @@ async def _handle_werkstatt_command(chat_id):
         )
         return msg
 
-    msg = "<b>Werkstatt einrichten</b>\n\n"
-    msg += (
-        "Q braucht deine Werkstatt-Adresse um bei Termin-Vorschlaegen "
-        "die Fahrtzeit von einem Kunden zum naechsten einzurechnen — "
-        "damit du nicht im Stress hetzen musst.\n\n"
-    )
+    msg = f"<b>{label} einrichten — {employee.name}</b>\n\n"
+    if employee.is_default:
+        msg += (
+            "Q braucht deine Werkstatt-Adresse um bei Termin-Vorschlaegen "
+            "die Fahrtzeit von einem Kunden zum naechsten einzurechnen — "
+            "damit du nicht im Stress hetzen musst.\n\n"
+        )
+    else:
+        msg += (
+            "Wenn du morgens von zuhause direkt zum ersten Kunden faehrst, "
+            "trage hier deine Heim-Adresse ein. Q rechnet dann bei deinen "
+            "Termin-Vorschlaegen die Anfahrt von dort statt von der Werkstatt.\n\n"
+        )
     if not ors_is_configured():
         msg += (
             "<i>⚠ Hinweis: Smart-Routing-API noch nicht aktiviert "
@@ -3559,10 +3594,12 @@ async def _handle_werkstatt_command(chat_id):
 async def _handle_werkstatt_status_command(chat_id):
     """/werkstatt_status — nur Anzeige, keinen Wizard starten."""
     await _clear_state(chat_id)
-    tenant = await _get_tenant_by_chat(chat_id)
-    if not tenant:
+    res = await _get_current_employee(chat_id)
+    if res is None:
         return "Dieser Chat ist noch keinem Betrieb zugeordnet."
-    return _format_werkstatt_status(tenant)
+    _, employee = res
+    label = "Heimat-Adresse" if not employee.is_default else "Werkstatt-Adresse"
+    return _format_werkstatt_status(employee, label=label)
 
 
 async def _handle_werkstatt_address_input(chat_id, text):
@@ -3574,10 +3611,11 @@ async def _handle_werkstatt_address_input(chat_id, text):
             "<code>Hauptstr. 5, 54290 Trier</code>"
         )
 
-    tenant = await _get_tenant_by_chat(chat_id)
-    if not tenant:
+    res = await _get_current_employee(chat_id)
+    if res is None:
         await _clear_state(chat_id)
         return "Tenant nicht gefunden."
+    tenant, employee = res
 
     # 1. Versuche zu geocoden
     point = await ors_geocode_address(text)
@@ -3640,25 +3678,31 @@ async def _handle_werkstatt_address_input(chat_id, text):
 
 
 async def _handle_werkstatt_confirm_input(chat_id, text, state_data):
-    """Tenant tippt JA / NEIN."""
+    """Mitarbeiter tippt JA / NEIN."""
     t = (text or "").strip().lower()
     state_data = state_data or {}
 
     if t in YES_TRIGGERS or t.startswith("ja"):
-        tenant = await _get_tenant_by_chat(chat_id)
-        if not tenant:
+        res = await _get_current_employee(chat_id)
+        if res is None:
             await _clear_state(chat_id)
             return "Tenant nicht gefunden."
-        await _update_tenant_werkstatt(
-            tenant.id,
+        tenant, employee = res
+        # Default-Employee spiegelt zusaetzlich auf tenant.heimat_*
+        # damit Legacy-Code weiter konsistent liest.
+        mirror = tenant.id if employee.is_default else None
+        await _update_employee_werkstatt(
+            employee.id,
             strasse=state_data.get("strasse"),
             plz=state_data.get("plz"),
             ort=state_data.get("ort"),
             lat=state_data.get("lat"),
             lon=state_data.get("lon"),
+            mirror_to_tenant_id=mirror,
         )
         await _clear_state(chat_id)
-        msg = "✅ <b>Werkstatt gespeichert</b>\n\n"
+        label = "Werkstatt" if employee.is_default else "Heimat"
+        msg = f"✅ <b>{label} gespeichert ({employee.name})</b>\n\n"
         if state_data.get("lat") is None:
             msg += (
                 "<i>Hinweis: Geo-Koordinaten fehlen noch. "

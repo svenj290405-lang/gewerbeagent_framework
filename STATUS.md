@@ -426,15 +426,97 @@ Smoke-Tests im Container alle gruen:
    eigenen Google-Calendar — alle Termine landen weiter im Tenant-
    Kalender. Wenn Inhaber sagt "Termin fuer Sven Mueller" passiert
    nichts Anderes als heute. Wird mit Phase 1 freigeschaltet.
-2. **Heimat-pro-Mitarbeiter (Phase 3):** /werkstatt setzt aktuell
-   weiter `tenant.heimat_*` (nicht `employee.heimat_*`). Smart-Filter
-   nutzt also weiter EINE Werkstatt fuer alle. Phase 3 trennt das.
-3. **Skill-Routing (Phase 5):** Anliegen aus Mail wird noch nicht
+2. **Skill-Routing (Phase 5):** Anliegen aus Mail wird noch nicht
    automatisch dem skill-passenden Mitarbeiter zugewiesen. Bis dahin:
    alle Anfragen → Default-Employee.
-4. **anfrage_responses.assigned_employee_id** wird beim Eingang noch
+3. **anfrage_responses.assigned_employee_id** wird beim Eingang noch
    nicht aktiv gesetzt (kommt in Phase 5). Backfill auf Default ist
    trotzdem sauber.
+
+---
+
+## TEIL G3 — PHASE 3: Heimat-Geo pro Mitarbeiter (10.05.2026 abend)
+
+### Status: ✅ Fertig + live
+
+In Fortsetzung von Phase 0+2+4: Smart-Termin-Routing und
+/werkstatt-Wizard arbeiten ab jetzt employee-aware. Jeder Mitarbeiter
+kann seine eigene Heim-Adresse setzen und das Slot-Routing rechnet
+seine Anfahrt von dort statt von der Werkstatt.
+
+### plugins/kalender/handler.py (Smart-Filter)
+
+- Neue Methode `_resolve_routing_origin(tenant, employee_id)` liefert
+  `(lat, lon, puffer, source)` mit 3-stufigem Fallback:
+  1. employee_id gesetzt + Mitarbeiter mit eigener Heimat → diese
+     (`source='employee'`)
+  2. Default-Employee mit eigener Heimat → diese
+     (`source='default-employee'`)
+  3. tenant.heimat_* (Mirror) → diese (`source='tenant'`)
+- `_smart_filter_slots` nimmt jetzt optionalen `employee_id`-Param.
+  Tenant-Lookup bleibt fuer den Fallback. Smart-Routing-Meta enthaelt
+  zusaetzlich `origin_source` zur Diagnose.
+- `_find_free_slots` liest `payload['employee_id']` (optional) und
+  reicht es an Smart-Filter weiter. Mail-Caller (Phase 5) wird das
+  setzen wenn der Skill-Router einen Mitarbeiter waehlt.
+
+### plugins/telegram_notify/handler.py (/werkstatt-Wizard)
+
+- `_format_werkstatt_status(employee, label=...)` zeigt Employee-
+  Daten statt Tenant-Daten, mit personalisiertem Label
+  ("Werkstatt-Adresse" fuer Default, "Heimat-Adresse" fuer andere).
+- `_update_employee_werkstatt(emp_id, ..., mirror_to_tenant_id=None)`:
+  setzt employee.heimat_*; bei Default-Employee zusaetzlich
+  tenant.heimat_* (Mirror fuer Legacy-Code).
+- Alle 4 Wizard-Funktionen (`_handle_werkstatt_command`,
+  `_handle_werkstatt_status_command`, `_handle_werkstatt_address_input`,
+  `_handle_werkstatt_confirm_input`) nutzen jetzt
+  `_get_current_employee` statt `_get_tenant_by_chat`.
+- Personalisierte Erklaer-Texte: Inhaber bekommt "Werkstatt-Adresse",
+  Mitarbeiter bekommt "trage hier deine Heim-Adresse ein, dann
+  rechnet Q die Anfahrt von dort statt von der Werkstatt".
+
+### Verifikation
+
+- Syntax + Imports sauber (kalender + telegram_notify)
+- `_resolve_routing_origin` mit Default-Employee → null/null/15/'none'
+  (weil aktuell weder ORS-Key noch geocoded heimat_lat/lon — exakt
+  das aktuelle Verhalten, kein Bruch)
+- `/werkstatt_status` zeigt "Werkstatt-Adresse — Sven Jantos 👑"
+  mit der bestehenden Adresse (Mirror)
+
+### Was du jetzt machen kannst (nach Container-Restart)
+
+1. **Inhaber:** /werkstatt → Adresse eintragen → wird auf
+   Default-Employee + Tenant gespiegelt
+2. **Mitarbeiter:** /start <slug>__<emp_slug> → /werkstatt
+   → setzt EIGENE Heimat (Tenant-Werkstatt bleibt unangetastet)
+3. **Smart-Filter** nutzt automatisch die jeweilige Heimat sobald
+   `employee_id` im Slot-Search-Payload steht (kommt mit Phase 5)
+
+### Zusammenfassung der heutigen Multi-Mitarbeiter-Arbeit
+
+| Phase | Commit | Was | Risk |
+|---|---|---|---|
+| 0 | e41b5e9 | Employee-Modell + Backfill | sehr niedrig |
+| 2 | 6d97beb | Telegram Multi-Chat-Routing + /start <slug>__<emp> | mittel |
+| 4 | d0d64f4 | /mitarbeiter-Wizard + assignee-Felder + Briefing-Filter | niedrig |
+| 3 | (jetzt) | Heimat-Geo per Employee + /werkstatt employee-aware | niedrig |
+
+Damit hat ein Tenant: 1..N Mitarbeiter, jeder mit eigenem Telegram-Chat,
+eigener Heimat-Adresse, eigener Skill-Liste, gefilterten Briefing-
+Befehlen. Was noch fehlt: Multi-OAuth (jeder eigenen Google-Calendar)
+und automatisches Skill-Routing (Mail "Heizung tropft" → an
+Heizungs-Spezialist).
+
+### Critical: Container-Restart
+
+Damit alle 4 Phasen live sind, brauchen wir einen Container-Restart:
+```
+docker compose restart framework
+```
+Phase 0 + 4 (Schema) ist bereits in der Live-DB durch alembic upgrade.
+Phase 2 + 3 + 4 (Code) braucht den Restart.
 
 ---
 
