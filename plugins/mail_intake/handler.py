@@ -282,6 +282,7 @@ async def extract_termin_aus_mail(
             "wunschtermin_datum": None,
             "wunschtermin_uhrzeit": None,
             "telefon": None,
+            "kunde_adresse": None,
             "klar_genug_zum_buchen": False,
             "begruendung": "Gemini nicht verfuegbar",
         }
@@ -301,10 +302,18 @@ Antworte AUSSCHLIESSLICH mit gueltigem JSON in diesem Format:
   "wunschtermin_datum": "DD.MM.YYYY oder null",
   "wunschtermin_uhrzeit": "HH:MM oder null",
   "telefon": "+49... oder null",
+  "kunde_adresse": "Strasse + Hausnr, PLZ Ort — oder null wenn nicht erkennbar",
   "klar_genug_zum_buchen": true oder false,
   "begruendung": "warum klar oder unklar (max 120 Zeichen)",
   "gewaehlter_slot_index": null
 }}
+
+Hinweis fuer kunde_adresse:
+- Adresse aus dem Mailtext extrahieren wenn der Kunde sie nennt
+  ('koennen Sie zu mir nach Hauptstr. 5 in Trier kommen?')
+- Auch eine Adresse in der Signatur zaehlt
+- Wenn nur 'bei mir' / 'zu Hause' ohne Anschrift: null
+- Format wenn moeglich: 'Strasse Hausnr, PLZ Ort'
 
 WICHTIG fuer klar_genug_zum_buchen=true:
 - Es muss ein konkretes Datum genannt sein (Mittwoch, 29.04., 'naechsten Montag', usw.)
@@ -887,6 +896,7 @@ class Plugin(BasePlugin):
                     tenant,
                     extracted["wunschtermin_datum"],
                     extracted["wunschtermin_uhrzeit"],
+                    kunde_adresse=extracted.get("kunde_adresse"),
                 )
                 conv = await upsert_conversation(
                     tenant_id=tenant.id,
@@ -926,6 +936,7 @@ class Plugin(BasePlugin):
                     tenant,
                     extracted["wunschtermin_datum"],
                     extracted["wunschtermin_uhrzeit"],
+                    kunde_adresse=extracted.get("kunde_adresse"),
                 )
                 conv = await upsert_conversation(
                     tenant_id=tenant.id,
@@ -959,6 +970,7 @@ class Plugin(BasePlugin):
                     tenant,
                     extracted["wunschtermin_datum"],
                     extracted["wunschtermin_uhrzeit"],
+                    kunde_adresse=extracted.get("kunde_adresse"),
                 )
                 conv = await upsert_conversation(
                     tenant_id=tenant.id,
@@ -1274,18 +1286,39 @@ class Plugin(BasePlugin):
             logger.exception(f"check_slot fehlgeschlagen: {e}")
             return False
 
-    async def _slot_alternativen(self, tenant, datum: str, uhrzeit: str) -> list:
-        """Holt freie Slots ueber kalender.find_free_slots."""
+    async def _slot_alternativen(
+        self,
+        tenant,
+        datum: str,
+        uhrzeit: str,
+        kunde_adresse: str | None = None,
+    ) -> list:
+        """Holt freie Slots ueber kalender.find_free_slots.
+
+        Wenn kunde_adresse gegeben: Smart-Filter im Kalender-Plugin
+        rechnet Fahrtzeiten ein und filtert/sortiert Slots passend.
+        """
         from core.plugin_system import get_plugin_for_tenant
         kalender = await get_plugin_for_tenant(tenant.slug, "kalender")
         if not kalender:
             return []
+        payload = {"datum": datum, "uhrzeit": uhrzeit}
+        if kunde_adresse:
+            payload["kunde_adresse"] = kunde_adresse
         try:
-            res = await kalender.on_webhook(
-                "find_free_slots",
-                {"datum": datum, "uhrzeit": uhrzeit},
-            )
+            res = await kalender.on_webhook("find_free_slots", payload)
             if res.get("erfolg"):
+                # smart_routing-Meta in Logs (nicht zurueckgeben — Format
+                # waere Slot-List-Konsument-breaking)
+                meta = res.get("smart_routing") or {}
+                if meta.get("applied"):
+                    logger.info(
+                        f"Slot-Smart-Filter aktiv: {meta.get('removed', 0)} Slots "
+                        f"wegen Fahrtzeit gefiltert, Puffer "
+                        f"{meta.get('puffer_min')}min"
+                    )
+                elif meta.get("reason"):
+                    logger.info(f"Slot-Smart-Filter inaktiv: {meta['reason']}")
                 return res.get("slots", [])
         except Exception as e:
             logger.exception(f"slot_alternativen fehlgeschlagen: {e}")

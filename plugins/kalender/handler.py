@@ -5,16 +5,33 @@ Refaktorierte Version des alten webhook_server.py:
 - Multi-Tenant: Konfiguration + OAuth-Token pro Tenant aus DB
 - Plugin-Architektur: erbt von BasePlugin, dispatch ueber on_webhook()
 - Saubere Error-Responses statt generischer Exception-Strings
+- Smart-Slot-Filter: wenn Tenant Werkstatt-Adresse + Kunden-Adresse +
+  OPENROUTESERVICE_API_KEY verfuegbar ist, wird die Fahrtzeit zwischen
+  Vor-Termin/Nach-Termin und neuem Kunden eingerechnet — Slots die
+  nicht passen fallen raus, der Rest wird nach Gesamt-Fahrtzeit sortiert.
 """
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta
 from typing import Any
 
+from sqlalchemy import select
+
+from core.database import AsyncSessionLocal
+from core.integrations.openrouteservice import (
+    GeoPoint,
+    geocode_address as ors_geocode_address,
+    is_configured as ors_is_configured,
+    travel_time_minutes as ors_travel_time_minutes,
+)
+from core.models import Tenant
 from core.plugin_system import BasePlugin
 from plugins.kalender.google_auth import get_calendar_service
 from plugins.kalender.manifest import MANIFEST
 from plugins.telegram_notify.handler import TelegramNotifier
+
+logger = logging.getLogger(__name__)
 
 
 class Plugin(BasePlugin):
@@ -207,12 +224,19 @@ class Plugin(BasePlugin):
         - bis zu 2 Slots am naechsten Werktag
         - bis zu 1 Slot am uebernaechsten Werktag
 
-        Maximale Antwortliste: 6 Slots (geordnet nach Datum/Uhrzeit).
+        Maximale Antwortliste: 6 Slots.
+
+        Smart-Filter (optional, wenn payload['kunde_adresse'] + Werkstatt
+        + ORS-API-Key verfuegbar): nach FreeBusy-Filter werden Slots
+        gegen Travel-Time-Constraints geprueft. Slots wo Anfahrt vom
+        Vor-Termin oder Weiterfahrt zum Nach-Termin nicht passen, fallen
+        raus. Sortierung nach kuerzester Gesamt-Fahrtzeit.
         """
         try:
             wunsch_datum = payload.get("datum", "")
             wunsch_uhrzeit = payload.get("uhrzeit", "")
             dauer = payload.get("dauer_minuten", self.config["termin_dauer_minuten"])
+            kunde_adresse = (payload.get("kunde_adresse") or "").strip()
 
             wunsch = self._parse_datum_uhrzeit(wunsch_datum, wunsch_uhrzeit)
             service = await get_calendar_service(self.tenant_id)
@@ -234,14 +258,200 @@ class Plugin(BasePlugin):
                 service, uebernaechster_tag, wunsch_uhrzeit_anker=None, max_count=1, dauer=dauer
             ))
 
+            # Smart-Filter (best-effort, schluckt eigene Fehler)
+            smart_meta = {"applied": False, "reason": None, "removed": 0}
+            try:
+                slots, smart_meta = await self._smart_filter_slots(
+                    slots, kunde_adresse, dauer, service,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"Smart-Filter crashed, using raw slots: {exc}")
+                smart_meta = {"applied": False, "reason": "filter-error", "removed": 0}
+
             return {
                 "erfolg": True,
                 "slots": slots,
                 "anzahl": len(slots),
+                "smart_routing": smart_meta,
             }
 
         except Exception as e:
             return {"erfolg": False, "nachricht": f"Fehler bei Slot-Suche: {str(e)}"}
+
+    # ------------------------------------------------------------------
+    # SMART-SLOT-FILTER (Travel-Time aware)
+    # ------------------------------------------------------------------
+
+    async def _smart_filter_slots(
+        self,
+        slots: list[dict],
+        kunde_adresse: str,
+        dauer_min: int,
+        service,
+    ) -> tuple[list[dict], dict]:
+        """Filtert Slots gegen Travel-Time-Constraints.
+
+        Returns: (gefilterte Liste, Meta-Dict mit Diagnose-Infos).
+        Bei jedem Skip-Grund (kein Key, kein Tenant-Geo, keine Adresse)
+        liefern wir die Original-Liste unveraendert zurueck.
+        """
+        meta = {"applied": False, "reason": None, "removed": 0}
+
+        if not slots:
+            meta["reason"] = "no-slots"
+            return slots, meta
+        if not kunde_adresse:
+            meta["reason"] = "no-customer-address"
+            return slots, meta
+        if not ors_is_configured():
+            meta["reason"] = "ors-not-configured"
+            return slots, meta
+
+        # Tenant-Werkstatt-Geo holen
+        async with AsyncSessionLocal() as session:
+            tenant = (await session.execute(
+                select(Tenant).where(Tenant.id == self.tenant_id)
+            )).scalar_one_or_none()
+        if tenant is None:
+            meta["reason"] = "tenant-not-found"
+            return slots, meta
+        if tenant.heimat_lat is None or tenant.heimat_lon is None:
+            meta["reason"] = "no-werkstatt-geo"
+            return slots, meta
+
+        werkstatt = GeoPoint(float(tenant.heimat_lat), float(tenant.heimat_lon))
+        puffer = int(tenant.fahrtzeit_puffer_min or 15)
+
+        # Kunden-Adresse geocoden (cache-first)
+        kunde_geo = await ors_geocode_address(kunde_adresse)
+        if kunde_geo is None:
+            meta["reason"] = "customer-not-geocodable"
+            return slots, meta
+
+        # Cache fuer Tagespläne (1 GCal-Call pro Tag, nicht pro Slot)
+        day_events_cache: dict[str, list[dict]] = {}
+
+        def _events_for_day(target_date) -> list[dict]:
+            key = target_date.isoformat()
+            if key in day_events_cache:
+                return day_events_cache[key]
+            try:
+                from datetime import datetime as _dt, time as _time
+                day_start = _dt.combine(target_date, _time(0, 0)).isoformat() + "+02:00"
+                day_end = _dt.combine(target_date, _time(23, 59)).isoformat() + "+02:00"
+                resp = service.events().list(
+                    calendarId=self.config["calendar_id"],
+                    timeMin=day_start,
+                    timeMax=day_end,
+                    singleEvents=True,
+                    orderBy="startTime",
+                ).execute()
+                items = resp.get("items", [])
+                events = []
+                from dateutil import parser as _p  # type: ignore
+                for ev in items:
+                    s = ev.get("start", {})
+                    e = ev.get("end", {})
+                    s_iso = s.get("dateTime") or s.get("date")
+                    e_iso = e.get("dateTime") or e.get("date")
+                    if not s_iso or not e_iso:
+                        continue
+                    events.append({
+                        "start_dt": _p.isoparse(s_iso).replace(tzinfo=None),
+                        "end_dt": _p.isoparse(e_iso).replace(tzinfo=None),
+                        "location": (ev.get("location") or "").strip(),
+                    })
+                day_events_cache[key] = events
+                return events
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    f"Smart-Filter: events.list({target_date}) crashed: {exc}"
+                )
+                day_events_cache[key] = []
+                return []
+
+        async def _location_geo(loc_text: str) -> GeoPoint:
+            """Adresse aus Calendar-Event geocoden, oder Werkstatt-Fallback."""
+            if not loc_text:
+                return werkstatt
+            geo = await ors_geocode_address(loc_text)
+            return geo or werkstatt
+
+        # Pro Slot: Travel-Time-Check + Sortier-Score
+        enriched: list[dict] = []
+        for slot in slots:
+            try:
+                slot_dt = datetime.strptime(
+                    f"{slot['datum']} {slot['uhrzeit']}", "%d.%m.%Y %H:%M",
+                )
+            except Exception:
+                # Slot-Parsing failed — best-effort durchlassen
+                enriched.append(slot)
+                continue
+            slot_end = slot_dt + timedelta(minutes=dauer_min)
+            day_events = _events_for_day(slot_dt.date())
+
+            # Vor-Termin (letzter, der vor slot_dt endet)
+            vor = max(
+                (e for e in day_events if e["end_dt"] <= slot_dt),
+                key=lambda e: e["end_dt"],
+                default=None,
+            )
+            # Nach-Termin (erster, der nach slot_end startet)
+            nach = min(
+                (e for e in day_events if e["start_dt"] >= slot_end),
+                key=lambda e: e["start_dt"],
+                default=None,
+            )
+
+            vor_geo = await _location_geo(vor["location"]) if vor else werkstatt
+            nach_geo = await _location_geo(nach["location"]) if nach else werkstatt
+
+            t_in = await ors_travel_time_minutes(vor_geo, kunde_geo)
+            t_out = await ors_travel_time_minutes(kunde_geo, nach_geo)
+
+            if t_in is None or t_out is None:
+                # ORS-Fail — Slot durchlassen ohne Bewertung
+                slot["_total_travel"] = 9999
+                enriched.append(slot)
+                continue
+
+            # Constraint: passt Slot zwischen Vor und Nach?
+            if vor is not None:
+                avail = (slot_dt - vor["end_dt"]).total_seconds() / 60.0
+                if avail < (t_in + puffer):
+                    meta["removed"] += 1
+                    continue
+            if nach is not None:
+                avail = (nach["start_dt"] - slot_end).total_seconds() / 60.0
+                if avail < (t_out + puffer):
+                    meta["removed"] += 1
+                    continue
+
+            slot["_total_travel"] = t_in + t_out
+            slot["fahrtzeit_min"] = t_in + t_out
+            slot["fahrtzeit_info"] = (
+                f"Anfahrt {t_in} Min" + (
+                    f", Weiterfahrt {t_out} Min" if nach is not None
+                    else f", danach Heimfahrt ca. {t_out} Min"
+                )
+            )
+            enriched.append(slot)
+
+        # Sortieren: kuerzeste Gesamt-Fahrtzeit oben, dann Datum/Uhrzeit
+        enriched.sort(
+            key=lambda s: (
+                s.get("_total_travel", 9999), s["datum"], s["uhrzeit"],
+            ),
+        )
+        for s in enriched:
+            s.pop("_total_travel", None)
+
+        meta["applied"] = True
+        meta["puffer_min"] = puffer
+        meta["kunde_lat"] = kunde_geo.lat
+        meta["kunde_lon"] = kunde_geo.lon
+        return enriched, meta
 
     async def _cancel_appointment(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Loescht einen Termin per Google-Calendar event_id."""
