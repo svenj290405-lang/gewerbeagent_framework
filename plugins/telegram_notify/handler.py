@@ -53,6 +53,7 @@ from core.models import (
     Kundengespraech,
     RECHNUNG_INPUT_TEXT,
     RECHNUNG_INPUT_VOICE,
+    RECHNUNG_STATUS_BEZAHLT,
     RECHNUNG_STATUS_CANCELLED,
     RECHNUNG_STATUS_CREATING,
     RECHNUNG_STATUS_DRAFTED,
@@ -3214,7 +3215,33 @@ async def _handle_rechnungen_anzeigen_command(chat_id):
         ts = rg.created_at.strftime("%d.%m %H:%M") if rg.created_at else "-"
         kunde = rg.kunde_name or "?"
         betrag = f"{float(rg.betrag_brutto_eur):.0f}€" if rg.betrag_brutto_eur is not None else "?"
-        if rg.status == RECHNUNG_STATUS_DRAFTED and rg.lexware_invoice_id:
+
+        if rg.status == RECHNUNG_STATUS_BEZAHLT:
+            paid_str = rg.bezahlt_am.strftime("%d.%m.") if rg.bezahlt_am else "?"
+            if rg.lexware_invoice_id:
+                link = LexwareProvider.invoice_deeplink_view(rg.lexware_invoice_id)
+                lines.append(
+                    f'• {ts} {kunde} {betrag} ✅ bezahlt {paid_str} '
+                    f'<a href="{link}">Lexware</a>'
+                )
+            else:
+                lines.append(f'• {ts} {kunde} {betrag} ✅ bezahlt {paid_str}')
+        elif rg.status == RECHNUNG_STATUS_MAIL_SENT:
+            # Versendet, noch nicht bezahlt — zusaetzlich Lexware-Cache zeigen
+            if rg.lexware_voucher_status == "voided":
+                marker = "🚫 storniert"
+            elif rg.last_paid_check_at:
+                check_str = rg.last_paid_check_at.strftime("%d.%m. %H:%M")
+                marker = f"⏳ offen (geprueft {check_str})"
+            else:
+                marker = "⏳ offen"
+            link = (
+                LexwareProvider.invoice_deeplink_view(rg.lexware_invoice_id)
+                if rg.lexware_invoice_id else None
+            )
+            tail = f' <a href="{link}">Lexware</a>' if link else ""
+            lines.append(f'• {ts} {kunde} {betrag} {marker}{tail}')
+        elif rg.status == RECHNUNG_STATUS_DRAFTED and rg.lexware_invoice_id:
             link = LexwareProvider.invoice_deeplink_view(rg.lexware_invoice_id)
             lines.append(f'• {ts} {kunde} {betrag} <a href="{link}">in Lexware</a>')
         elif rg.status == RECHNUNG_STATUS_ERROR:
