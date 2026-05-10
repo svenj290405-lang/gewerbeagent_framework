@@ -54,16 +54,64 @@ async def render_anfrage_form(token: str):
 
 @router.post("/anfrage/{token}/submit")
 async def submit_anfrage_form(token: str, request: Request):
-    """Verarbeitet das abgesendete Formular."""
+    """Verarbeitet das abgesendete Formular.
+
+    Unterstuetzt jetzt File-Uploads als multipart/form-data:
+    - Bilder (jpeg/png/webp/heic) und PDFs
+    - max 5MB pro Datei, max 3 Dateien pro Anfrage
+    - Files werden base64-encoded in antworten[<field>] = [{filename,
+      content_type, size, base64}, ...] gespeichert
+    """
+    from starlette.datastructures import UploadFile as _UploadFile
+    from core.integrations.anfrage_forms import (
+        ANFRAGE_FILE_MAX_BYTES,
+        ANFRAGE_FILE_MAX_COUNT,
+        ANFRAGE_FILE_ALLOWED_MIME,
+    )
+    import base64 as _b64
+
     form_data = await request.form()
-    # multi-select kommt mit []-Suffix; sammeln zu Listen
     antworten: dict = {}
+    file_count_total = 0
+
     for key, value in form_data.multi_items():
+        # Ist das eine hochgeladene Datei?
+        if isinstance(value, _UploadFile):
+            if file_count_total >= ANFRAGE_FILE_MAX_COUNT:
+                logger.info(
+                    f"submit_anfrage: max {ANFRAGE_FILE_MAX_COUNT} Files "
+                    f"erreicht, weitere ignoriert"
+                )
+                continue
+            ct = (value.content_type or "").lower()
+            if ct not in ANFRAGE_FILE_ALLOWED_MIME:
+                logger.info(
+                    f"submit_anfrage: skip File mit content_type={ct!r}"
+                )
+                continue
+            raw = await value.read()
+            if len(raw) > ANFRAGE_FILE_MAX_BYTES:
+                logger.info(
+                    f"submit_anfrage: skip File {value.filename!r} - "
+                    f"{len(raw)} bytes > {ANFRAGE_FILE_MAX_BYTES}"
+                )
+                continue
+            file_obj = {
+                "filename": (value.filename or "datei")[:200],
+                "content_type": ct,
+                "size": len(raw),
+                "base64": _b64.b64encode(raw).decode("ascii"),
+            }
+            base = key[:-2] if key.endswith("[]") else key
+            antworten.setdefault(base, []).append(file_obj)
+            file_count_total += 1
+            continue
+
+        # Text-Eintraege wie bisher
         if key.endswith("[]"):
             base = key[:-2]
             antworten.setdefault(base, []).append(value)
         else:
-            # Wenn schon vorhanden -> Liste
             if key in antworten:
                 if isinstance(antworten[key], list):
                     antworten[key].append(value)

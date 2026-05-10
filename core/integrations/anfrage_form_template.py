@@ -176,6 +176,18 @@ def render_field(field: dict) -> str:
             </div>
         </div>'''
 
+    if ftype == "file":
+        return f'''
+        <div class="field">
+            {label_html}
+            <input type="file" id="f-{name}" name="{name}[]" {req_attr}
+                   accept="image/*,application/pdf" multiple
+                   class="field-input field-file">
+            <small class="field-hint">
+                Bilder oder PDF, maximal 3 Dateien à 5 MB.
+            </small>
+        </div>'''
+
     # Fallback
     return f'''
     <div class="field">
@@ -848,7 +860,7 @@ def render_anfrage_form_html(
     </div>
 </div>
 
-<form class="page" method="POST" action="/anfrage/{_html.escape(token)}/submit" autocomplete="off" novalidate>
+<form class="page" method="POST" action="/anfrage/{_html.escape(token)}/submit" autocomplete="off" novalidate enctype="multipart/form-data">
 
     <div class="brand">{company}</div>
 

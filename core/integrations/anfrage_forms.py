@@ -194,7 +194,16 @@ def get_schema(anfrage_typ: str) -> dict:
 ALLOWED_FIELD_TYPES = {
     "text", "tel", "date", "textarea",
     "radio", "checkbox_multi", "select", "masse",
+    "file",  # NEU: File-Upload (Bilder/PDFs, max 5MB pro Datei, max 3 Dateien)
 }
+
+# Limits fuer File-Uploads im Anfrage-Formular
+ANFRAGE_FILE_MAX_BYTES = 5_000_000  # 5 MB pro Datei
+ANFRAGE_FILE_MAX_COUNT = 3          # 3 Dateien pro Anfrage
+ANFRAGE_FILE_ALLOWED_MIME = (
+    "image/jpeg", "image/jpg", "image/png", "image/webp", "image/heic",
+    "application/pdf",
+)
 
 # Reserviert weil im Mail-Pipeline / Submit-Logik anders behandelt
 RESERVED_FIELD_NAMES = {"name", "email", "token"}

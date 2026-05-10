@@ -18,10 +18,64 @@ def _format_value(value) -> str:
     Nachricht (parse_mode="HTML"). Ohne Escape koennte ein Angreifer
     mit boesartigem Form-Input fremde Bot-Antworten injizieren oder
     falsch verschachteltes HTML generieren.
+
+    File-Antworten (Listen aus Dicts) werden zu '📎 N Datei(en)' kompakt
+    — die Files selbst werden separat als sendPhoto/sendDocument
+    gepusht (siehe notify_tenant_anfrage_submitted).
     """
     if isinstance(value, list):
+        if value and all(isinstance(v, dict) and v.get("filename") for v in value):
+            return f"📎 {len(value)} Datei(en)"
         return _h(", ".join(str(v) for v in value if v))
     return _h(str(value or ""))
+
+
+def _extract_files(antworten: dict) -> list[dict]:
+    """Sammelt alle hochgeladenen Files aus den Antworten."""
+    files = []
+    for key, value in antworten.items():
+        if not isinstance(value, list):
+            continue
+        for v in value:
+            if isinstance(v, dict) and v.get("filename") and v.get("base64"):
+                files.append({
+                    "field": key,
+                    "filename": v["filename"],
+                    "content_type": v.get("content_type") or "application/octet-stream",
+                    "base64": v["base64"],
+                })
+    return files
+
+
+async def _send_file_to_telegram(
+    *, bot_token: str, chat_id, file_obj: dict,
+) -> bool:
+    """Sendet eine einzelne Datei an Telegram via sendPhoto oder sendDocument."""
+    import base64 as _b64
+    import httpx
+    try:
+        raw = _b64.b64decode(file_obj["base64"])
+    except Exception:
+        return False
+    ct = (file_obj.get("content_type") or "").lower()
+    name = file_obj.get("filename") or "datei"
+    is_image = ct.startswith("image/")
+    endpoint = "sendPhoto" if is_image else "sendDocument"
+    field_name = "photo" if is_image else "document"
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            r = await client.post(
+                f"https://api.telegram.org/bot{bot_token}/{endpoint}",
+                data={
+                    "chat_id": chat_id,
+                    "caption": f"{file_obj.get('field','')}: {name[:160]}",
+                },
+                files={field_name: (name, raw, ct)},
+            )
+            return r.status_code == 200
+    except Exception as e:
+        logger.warning(f"_send_file_to_telegram failed: {e}")
+        return False
 
 
 async def notify_tenant_anfrage_submitted(token_str: str, antworten: dict) -> None:
@@ -74,3 +128,31 @@ async def notify_tenant_anfrage_submitted(token_str: str, antworten: dict) -> No
         logger.info(f"Anfrage-Push an Tenant {tenant.slug} gesendet")
     except Exception as e:
         logger.exception(f"Telegram-Push fehler: {e}")
+        return
+
+    # Hochgeladene Dateien einzeln nachsenden (sendPhoto / sendDocument).
+    # Failsafe — schluckt eigene Fehler, schickt niemals den ganzen Push down.
+    try:
+        files = _extract_files(antworten)
+        if not files:
+            return
+        # bot_token holen analog send_telegram_message
+        from core.models import ToolConfig
+        async with AsyncSessionLocal() as session:
+            tc = (await session.execute(
+                select(ToolConfig)
+                .join(Tenant, ToolConfig.tenant_id == Tenant.id)
+                .where(
+                    Tenant.slug == "_global",
+                    ToolConfig.tool_name == "telegram_notify",
+                )
+            )).scalar_one_or_none()
+        bot_token = (tc.config or {}).get("bot_token") if tc else None
+        if not bot_token:
+            return
+        for f in files:
+            await _send_file_to_telegram(
+                bot_token=bot_token, chat_id=chat_id, file_obj=f,
+            )
+    except Exception as e:
+        logger.warning(f"Anfrage-Files-Forward failed (non-fatal): {e}")
