@@ -68,6 +68,25 @@ class Kundengespraech(Base):
         String(50), default="erfasst", nullable=False
     )
 
+    # Phase-4-Multi-Mitarbeiter:
+    # - assigned_employee_id: wer fuehrt das Gespraech durch / kuemmert
+    #   sich um den daraus entstehenden Termin (gesetzt vom Skill-Router
+    #   Phase 5, oder manuell beim /aufnahme-Wizard)
+    # - created_by_employee_id: wer hat die Aufnahme angelegt
+    # Beide UUID NULL (Backfill auf Default-Employee, neue Eintraege
+    # explizit gesetzt). FK SET NULL damit deaktivierte Mitarbeiter
+    # die Historie nicht killen.
+    assigned_employee_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("employees.id", ondelete="SET NULL"),
+        nullable=True, index=True,
+    )
+    created_by_employee_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("employees.id", ondelete="SET NULL"),
+        nullable=True, index=True,
+    )
+
     # created_at + updated_at aus Base
 
     def __repr__(self) -> str:

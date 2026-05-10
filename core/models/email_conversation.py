@@ -105,6 +105,18 @@ class EmailConversation(Base):
     classification_confidence: Mapped[str | None] = mapped_column(String(10), nullable=True)
     classification_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     classified_at: Mapped["dt.datetime | None"] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # Phase-4-Multi-Mitarbeiter: welcher Employee bearbeitet diese
+    # Konversation? Phase-5-Skill-Router setzt das beim ersten Eingang;
+    # Folge-Mails sind sticky (kein Re-Routing). Bei deaktivierten
+    # Employees wird der FK auf NULL gesetzt (ON DELETE SET NULL),
+    # damit Konversation nicht verloren geht.
+    assigned_employee_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("employees.id", ondelete="SET NULL"),
+        nullable=True, index=True,
+    )
+
     # Relationship zum Tenant
     tenant: Mapped["Tenant"] = relationship()  # noqa: F821
 

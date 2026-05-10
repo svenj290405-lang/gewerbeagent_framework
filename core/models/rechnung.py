@@ -154,6 +154,16 @@ class Rechnung(Base):
         nullable=False,
     )
 
+    # Phase-4-Multi-Mitarbeiter: wer ist verantwortlich (z.B. fuer
+    # Bezahl-Tracking, Mahnungen). Backfill auf Default-Employee,
+    # neue Rechnungen setzen das beim Anlegen. SET NULL bei deaktivierten
+    # Mitarbeitern.
+    responsible_employee_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("employees.id", ondelete="SET NULL"),
+        nullable=True, index=True,
+    )
+
     def __repr__(self) -> str:
         return (
             f"<Rechnung id={self.id} tenant={self.tenant_id} "

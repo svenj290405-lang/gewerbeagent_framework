@@ -35,6 +35,8 @@ from core.models import (
     STATE_LEISTUNG_PREVIEWING,
     STATE_WERKSTATT_WAITING_ADDRESS,
     STATE_WERKSTATT_CONFIRMING,
+    STATE_MITARBEITER_NEU_NAME,
+    STATE_MITARBEITER_NEU_SKILLS,
     STATE_FORMULAR_TYP_WAEHLEN,
     STATE_FORMULAR_HAUPTMENU,
     STATE_FORMULAR_NEU_NAME,
@@ -424,6 +426,8 @@ async def _handle_help_command():
     msg += "/lexware_status - Verbindung pruefen\n"
     msg += "/werkstatt - Werkstatt-Adresse einrichten (fuer Smart-Termine)\n"
     msg += "/werkstatt_status - aktuelle Heimat-Adresse anzeigen\n"
+    msg += "/mitarbeiter - Mitarbeiter-Liste anzeigen\n"
+    msg += "/mitarbeiter neu - Mitarbeiter anlegen (nur Inhaber)\n"
     msg += "/start - Bot mit Betrieb verbinden\n"
     msg += "/status - Agent-Status pruefen\n"
     msg += "/abbrechen - laufende Aktion abbrechen\n"
@@ -771,6 +775,9 @@ async def process_telegram_update(payload):
         reply = await _handle_werkstatt_command(chat_id)
     elif text == "/werkstatt_status":
         reply = await _handle_werkstatt_status_command(chat_id)
+    elif text == "/mitarbeiter" or text.startswith("/mitarbeiter "):
+        await _clear_state(chat_id)
+        reply = await _handle_mitarbeiter_command(chat_id, text)
     elif text.startswith("/"):
         reply = await _handle_unknown()
     else:
@@ -819,6 +826,12 @@ async def process_telegram_update(payload):
             reply = await _handle_werkstatt_address_input(chat_id, text)
         elif state.state_key == STATE_WERKSTATT_CONFIRMING:
             reply = await _handle_werkstatt_confirm_input(
+                chat_id, text, state.state_data,
+            )
+        elif state.state_key == STATE_MITARBEITER_NEU_NAME:
+            reply = await _handle_mitarbeiter_neu_name_input(chat_id, text)
+        elif state.state_key == STATE_MITARBEITER_NEU_SKILLS:
+            reply = await _handle_mitarbeiter_neu_skills_input(
                 chat_id, text, state.state_data,
             )
         elif state.state_key == STATE_RECHNUNG_AWAITING_MAIL:
@@ -1890,19 +1903,24 @@ async def _handle_briefing_command(chat_id):
     """Zeigt naechsten anstehenden Termin mit Briefing.
 
     Faellt zurueck auf juengstes Gespraech wenn kein zukuenftiger Termin.
+
+    Phase-4-Multi-Mitarbeiter: Default-Employee (Inhaber) sieht alle
+    Termine; Nicht-Default-Mitarbeiter sieht nur seine zugewiesenen
+    (assigned_employee_id == eigene id).
     """
     from datetime import datetime, timezone
     from sqlalchemy import select, and_, or_
 
-    tenant = await _get_tenant_by_chat(chat_id)
-    if not tenant:
+    res = await _get_current_employee(chat_id)
+    if res is None:
         return "Dieser Chat ist noch keinem Betrieb zugeordnet."
+    tenant, current_emp = res
 
     now = datetime.now(timezone.utc)
 
     async with AsyncSessionLocal() as s:
         # Erst: zukuenftiger Termin
-        future = (await s.execute(
+        stmt = (
             select(Kundengespraech)
             .where(
                 Kundengespraech.tenant_id == tenant.id,
@@ -1911,7 +1929,12 @@ async def _handle_briefing_command(chat_id):
             )
             .order_by(Kundengespraech.termin_datum.asc())
             .limit(1)
-        )).scalar_one_or_none()
+        )
+        if not current_emp.is_default:
+            stmt = stmt.where(
+                Kundengespraech.assigned_employee_id == current_emp.id
+            )
+        future = (await s.execute(stmt)).scalar_one_or_none()
 
         if future:
             msg = "<b>🔔 Naechster Termin</b>\n\n"
@@ -1919,16 +1942,22 @@ async def _handle_briefing_command(chat_id):
             return msg
 
         # Kein zukuenftiger Termin -> juengstes Gespraech zeigen
-        latest = (await s.execute(
+        stmt2 = (
             select(Kundengespraech)
             .where(Kundengespraech.tenant_id == tenant.id)
             .order_by(Kundengespraech.gespraech_datum.desc())
             .limit(1)
-        )).scalar_one_or_none()
+        )
+        if not current_emp.is_default:
+            stmt2 = stmt2.where(
+                Kundengespraech.assigned_employee_id == current_emp.id
+            )
+        latest = (await s.execute(stmt2)).scalar_one_or_none()
 
         if not latest:
+            scope = "" if current_emp.is_default else " (auf dich zugewiesen)"
             return (
-                "Noch kein Kundengespraech erfasst.\n\n"
+                f"Noch kein Kundengespraech{scope} erfasst.\n\n"
                 "Mit /aufnahme das erste anlegen."
             )
 
@@ -1951,14 +1980,15 @@ async def _handle_kunde_command(chat_id, args):
             "Beispiel: <code>/kunde Mueller</code>"
         )
 
-    tenant = await _get_tenant_by_chat(chat_id)
-    if not tenant:
+    res = await _get_current_employee(chat_id)
+    if res is None:
         return "Dieser Chat ist noch keinem Betrieb zugeordnet."
+    tenant, current_emp = res
 
     suchbegriff = args.strip().lower()
 
     async with AsyncSessionLocal() as s:
-        gespraeche = (await s.execute(
+        stmt = (
             select(Kundengespraech)
             .where(
                 Kundengespraech.tenant_id == tenant.id,
@@ -1966,7 +1996,12 @@ async def _handle_kunde_command(chat_id, args):
             )
             .order_by(Kundengespraech.gespraech_datum.desc())
             .limit(10)
-        )).scalars().all()
+        )
+        if not current_emp.is_default:
+            stmt = stmt.where(
+                Kundengespraech.assigned_employee_id == current_emp.id
+            )
+        gespraeche = (await s.execute(stmt)).scalars().all()
 
     if not gespraeche:
         return f"Keine Gespraeche zu <i>{suchbegriff}</i> gefunden."
@@ -1990,28 +2025,40 @@ async def _handle_kunde_command(chat_id, args):
 
 
 async def _handle_anrufe_command(chat_id):
-    """Zeigt die letzten 10 Kundengespraeche."""
+    """Zeigt die letzten 10 Kundengespraeche.
+
+    Phase-4-Filter: Default-Employee sieht alle, andere nur eigene
+    (assigned_employee_id == current_emp.id).
+    """
     from sqlalchemy import select
 
-    tenant = await _get_tenant_by_chat(chat_id)
-    if not tenant:
+    res = await _get_current_employee(chat_id)
+    if res is None:
         return "Dieser Chat ist noch keinem Betrieb zugeordnet."
+    tenant, current_emp = res
 
     async with AsyncSessionLocal() as s:
-        gespraeche = (await s.execute(
+        stmt = (
             select(Kundengespraech)
             .where(Kundengespraech.tenant_id == tenant.id)
             .order_by(Kundengespraech.gespraech_datum.desc())
             .limit(10)
-        )).scalars().all()
+        )
+        if not current_emp.is_default:
+            stmt = stmt.where(
+                Kundengespraech.assigned_employee_id == current_emp.id
+            )
+        gespraeche = (await s.execute(stmt)).scalars().all()
 
     if not gespraeche:
+        scope = "" if current_emp.is_default else " (auf dich zugewiesen)"
         return (
-            "Noch kein Kundengespraech erfasst.\n\n"
+            f"Noch kein Kundengespraech{scope} erfasst.\n\n"
             "Mit /aufnahme das erste anlegen."
         )
 
-    msg = f"<b>📞 Letzte {len(gespraeche)} Gespraeche</b>\n\n"
+    title_scope = "" if current_emp.is_default else " (deine)"
+    msg = f"<b>📞 Letzte {len(gespraeche)} Gespraeche{title_scope}</b>\n\n"
     for i, g in enumerate(gespraeche, 1):
         msg += f"{_format_kundengespraech_short(g)}"
         if g.termin_datum:
@@ -4614,6 +4661,354 @@ async def _handle_formular_callback(chat_id, callback_data, callback_query_id, b
         return
 
     await _answer_callback_query(callback_query_id, "Unbekannt", bot_token)
+
+
+# =====================================================================
+# Mitarbeiter-Wizard (Phase 4 Multi-Mitarbeiter)
+# =====================================================================
+
+
+def _slugify(name: str) -> str:
+    """Erzeugt einen URL-/DB-kompatiblen Slug aus einem Namen.
+
+    'Sven Müller' → 'sven-mueller'. Ohne Sonderzeichen, lowercase,
+    Bindestrich-getrennt. Garantiert nicht-leer fuer nicht-leeren Input.
+    """
+    s = (name or "").strip().lower()
+    # Umlaute
+    s = (
+        s.replace("ä", "ae").replace("ö", "oe").replace("ü", "ue")
+         .replace("ß", "ss")
+    )
+    out = []
+    last_dash = False
+    for ch in s:
+        if ch.isalnum():
+            out.append(ch)
+            last_dash = False
+        elif not last_dash:
+            out.append("-")
+            last_dash = True
+    result = "".join(out).strip("-")
+    return result or "mitarbeiter"
+
+
+async def _get_bot_username(bot_token: str | None = None) -> str | None:
+    """Liefert den @-Username des Bots fuer Deep-Links."""
+    if bot_token is None:
+        bot_token = await _load_global_bot_token()
+    if not bot_token:
+        return None
+    url = f"{TELEGRAM_API_BASE}/bot{bot_token}/getMe"
+    try:
+        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS) as client:
+            resp = await client.get(url)
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+            if not data.get("ok"):
+                return None
+            return data["result"].get("username")
+    except Exception as e:
+        logger.warning(f"_get_bot_username failed: {e}")
+        return None
+
+
+def _format_skills(skills: list[str] | None) -> str:
+    if not skills:
+        return "—"
+    return ", ".join(skills)
+
+
+async def _format_mitarbeiter_list(tenant_id) -> str:
+    """Liste aller Mitarbeiter eines Tenants."""
+    from core.models import get_employees_for_tenant
+    emps = await get_employees_for_tenant(tenant_id, active_only=False)
+    if not emps:
+        return "Noch keine Mitarbeiter angelegt."
+    lines = ["<b>👥 Mitarbeiter</b>", ""]
+    for e in emps:
+        flag = " 👑" if e.is_default else ""
+        active = "" if e.is_active else " <i>(deaktiviert)</i>"
+        chat = "✅" if e.telegram_chat_id else "—"
+        lines.append(
+            f"• <b>{e.name}</b> ({e.slug}){flag}{active}\n"
+            f"   Telegram: {chat}  Skills: {_format_skills(e.skills)}"
+        )
+    lines.append("")
+    lines.append("<i>Details:</i> /mitarbeiter &lt;slug&gt;")
+    lines.append("<i>Neu anlegen:</i> /mitarbeiter neu")
+    return "\n".join(lines)
+
+
+async def _format_mitarbeiter_detail(tenant_id, slug) -> str:
+    """Detail-Anzeige eines Mitarbeiters."""
+    from core.database import AsyncSessionLocal
+    from core.models import Employee
+    async with AsyncSessionLocal() as s:
+        emp = (await s.execute(
+            select(Employee).where(
+                Employee.tenant_id == tenant_id,
+                Employee.slug == slug,
+            )
+        )).scalar_one_or_none()
+        if emp is None:
+            return f"Mitarbeiter <b>{slug}</b> nicht gefunden."
+    bot_username = await _get_bot_username()
+    deeplink = (
+        f"https://t.me/{bot_username}?start={slug}"
+        if bot_username and emp.is_default
+        else (
+            f"https://t.me/{bot_username}?start=__SLUG_PLACEHOLDER__"
+            if bot_username else "(Bot-Username unbekannt)"
+        )
+    )
+    flag = " 👑 Inhaber" if emp.is_default else ""
+    active = "" if emp.is_active else " <b>(deaktiviert)</b>"
+    chat_str = (
+        f"verbunden (Chat-ID {emp.telegram_chat_id})"
+        if emp.telegram_chat_id else "noch nicht verbunden"
+    )
+    heimat = (
+        f"{emp.heimat_strasse}, {emp.heimat_plz} {emp.heimat_ort}"
+        if (emp.heimat_strasse or emp.heimat_ort) else "—"
+    )
+    msg = (
+        f"<b>{emp.name}</b>{flag}{active}\n"
+        f"Slug: <code>{emp.slug}</code>\n"
+        f"E-Mail: {emp.contact_email or '—'}\n"
+        f"Telegram: {chat_str}\n"
+        f"Heimat: {heimat}\n"
+        f"Skills: {_format_skills(emp.skills)}\n"
+    )
+    return msg
+
+
+async def _ensure_inhaber_or_explain(chat_id) -> tuple[bool, str | None, object | None, object | None]:
+    """Gemeinsame Berechtigungs-Pruefung: nur Default-Employee = Inhaber.
+
+    Return: (ok, error_message, tenant, employee)
+    """
+    res = await _get_current_employee(chat_id)
+    if res is None:
+        return False, (
+            "Dieser Chat ist noch keinem Betrieb zugeordnet. "
+            "Bitte zuerst /start ausfuehren."
+        ), None, None
+    tenant, emp = res
+    if not emp.is_default:
+        return False, (
+            "Nur der Inhaber kann Mitarbeiter verwalten. "
+            "Bitte den Inhaber bitten, dies fuer dich zu tun."
+        ), tenant, emp
+    return True, None, tenant, emp
+
+
+async def _handle_mitarbeiter_command(chat_id, text):
+    """Top-Level-Dispatcher fuer /mitarbeiter*.
+
+    /mitarbeiter                 → Liste
+    /mitarbeiter neu             → Wizard-Start (Inhaber-only)
+    /mitarbeiter <slug>          → Detail
+    /mitarbeiter <slug> deaktivieren / aktivieren
+    /mitarbeiter <slug> skills <s1,s2,...>
+    """
+    res = await _get_current_employee(chat_id)
+    if res is None:
+        return (
+            "Dieser Chat ist noch keinem Betrieb zugeordnet. "
+            "Bitte zuerst /start ausfuehren."
+        )
+    tenant, current_emp = res
+    args = text[len("/mitarbeiter"):].strip()
+
+    # Liste
+    if not args:
+        return await _format_mitarbeiter_list(tenant.id)
+
+    parts = args.split(maxsplit=1)
+    sub = parts[0].lower()
+    rest = parts[1] if len(parts) > 1 else ""
+
+    # Neu-Wizard
+    if sub == "neu":
+        ok, err, _, _ = await _ensure_inhaber_or_explain(chat_id)
+        if not ok:
+            return err
+        await _save_state(chat_id, STATE_MITARBEITER_NEU_NAME, {})
+        return (
+            "<b>Neuer Mitarbeiter anlegen</b>\n\n"
+            "Schicke mir den Namen des Mitarbeiters (z.B. 'Sven Mueller')."
+            "\n\nMit /abbrechen verwirfst du den Vorgang."
+        )
+
+    # Sub-Befehle auf einem konkreten Slug
+    sub_slug = sub
+    sub_args = rest.strip().lower() if rest else ""
+    # Wenn nur slug → Detail (kein Inhaber-Check, alle duerfen lesen)
+    if not sub_args:
+        return await _format_mitarbeiter_detail(tenant.id, sub_slug)
+
+    # Schreib-Operationen sind Inhaber-only
+    ok, err, _, _ = await _ensure_inhaber_or_explain(chat_id)
+    if not ok:
+        return err
+
+    from core.database import AsyncSessionLocal
+    from core.models import Employee, ALLE_SKILLS
+    async with AsyncSessionLocal() as s:
+        emp = (await s.execute(
+            select(Employee).where(
+                Employee.tenant_id == tenant.id, Employee.slug == sub_slug,
+            )
+        )).scalar_one_or_none()
+        if emp is None:
+            return f"Mitarbeiter <b>{sub_slug}</b> nicht gefunden."
+
+        if sub_args in ("deaktivieren", "deactivate", "off"):
+            if emp.is_default:
+                return "Der Inhaber-Account kann nicht deaktiviert werden."
+            emp.is_active = False
+            await s.commit()
+            return f"✅ Mitarbeiter <b>{emp.name}</b> deaktiviert."
+        if sub_args in ("aktivieren", "activate", "on"):
+            emp.is_active = True
+            await s.commit()
+            return f"✅ Mitarbeiter <b>{emp.name}</b> aktiviert."
+        if sub_args.startswith("skills "):
+            raw = sub_args[len("skills "):].strip()
+            new_skills = [
+                t.strip().lower() for t in raw.split(",") if t.strip()
+            ]
+            unbekannt = [sk for sk in new_skills if sk not in ALLE_SKILLS]
+            if unbekannt:
+                return (
+                    f"Unbekannte Skills: {', '.join(unbekannt)}.\n"
+                    f"Erlaubt: {', '.join(ALLE_SKILLS)}."
+                )
+            emp.skills = new_skills or None
+            await s.commit()
+            return (
+                f"✅ Skills fuer <b>{emp.name}</b> gesetzt: "
+                f"{_format_skills(emp.skills)}"
+            )
+
+    return (
+        f"Unbekannter Befehl: <code>/mitarbeiter {args}</code>\n\n"
+        "Verfuegbar:\n"
+        "• /mitarbeiter — Liste\n"
+        "• /mitarbeiter neu — anlegen\n"
+        "• /mitarbeiter &lt;slug&gt; — Details\n"
+        "• /mitarbeiter &lt;slug&gt; aktivieren / deaktivieren\n"
+        "• /mitarbeiter &lt;slug&gt; skills heizung,sanitaer"
+    )
+
+
+async def _handle_mitarbeiter_neu_name_input(chat_id, text):
+    """Wizard Schritt 1: Name → Slug-Vorschlag → State weiter."""
+    name = text.strip()
+    if len(name) < 2:
+        return "Bitte einen vollstaendigen Namen schicken (oder /abbrechen)."
+    res = await _get_current_employee(chat_id)
+    if res is None:
+        await _clear_state(chat_id)
+        return "Dieser Chat ist nicht zugeordnet."
+    tenant, _ = res
+
+    slug = _slugify(name)
+    # Slug-Kollisions-Check + ggf. Suffix anhaengen
+    from core.database import AsyncSessionLocal
+    from core.models import Employee
+    async with AsyncSessionLocal() as s:
+        existing = (await s.execute(
+            select(Employee.slug).where(Employee.tenant_id == tenant.id)
+        )).scalars().all()
+    final_slug = slug
+    suffix = 2
+    while final_slug in existing:
+        final_slug = f"{slug}-{suffix}"
+        suffix += 1
+
+    await _save_state(
+        chat_id, STATE_MITARBEITER_NEU_SKILLS,
+        {"name": name, "slug": final_slug},
+    )
+    from core.models import ALLE_SKILLS
+    return (
+        f"Slug wird <code>{final_slug}</code>.\n\n"
+        "<b>Welche Skills hat der Mitarbeiter?</b>\n"
+        f"Erlaubt: {', '.join(ALLE_SKILLS)}\n\n"
+        "Mehrere mit Komma trennen (z.B. <code>heizung, sanitaer</code>),\n"
+        "oder <b>keine</b> tippen wenn keine Spezialisierung."
+    )
+
+
+async def _handle_mitarbeiter_neu_skills_input(chat_id, text, state_data):
+    """Wizard Schritt 2: Skills setzen, Employee anlegen, Deeplink ausgeben."""
+    res = await _get_current_employee(chat_id)
+    if res is None:
+        await _clear_state(chat_id)
+        return "Dieser Chat ist nicht zugeordnet."
+    tenant, _ = res
+
+    raw = (text or "").strip().lower()
+    if raw in ("keine", "none", "-"):
+        new_skills = None
+    else:
+        new_skills = [t.strip() for t in raw.split(",") if t.strip()]
+        from core.models import ALLE_SKILLS
+        unbekannt = [sk for sk in new_skills if sk not in ALLE_SKILLS]
+        if unbekannt:
+            return (
+                f"Unbekannte Skills: {', '.join(unbekannt)}.\n"
+                f"Erlaubt: {', '.join(ALLE_SKILLS)}.\n\n"
+                "Bitte korrigieren oder <b>keine</b> tippen."
+            )
+
+    name = state_data.get("name", "")
+    slug = state_data.get("slug", "")
+    if not name or not slug:
+        await _clear_state(chat_id)
+        return "Wizard-Daten verloren — bitte mit /mitarbeiter neu erneut starten."
+
+    # Anlegen
+    from core.database import AsyncSessionLocal
+    from core.models import Employee
+    async with AsyncSessionLocal() as s:
+        emp = Employee(
+            tenant_id=tenant.id,
+            slug=slug,
+            name=name,
+            is_default=False,
+            is_active=True,
+            skills=new_skills,
+        )
+        s.add(emp)
+        try:
+            await s.commit()
+        except Exception as e:
+            await s.rollback()
+            await _clear_state(chat_id)
+            logger.exception(f"Employee-Insert fehlgeschlagen: {e}")
+            return f"Anlegen fehlgeschlagen: {e}"
+        await s.refresh(emp)
+
+    await _clear_state(chat_id)
+
+    bot_username = await _get_bot_username()
+    deeplink = (
+        f"https://t.me/{bot_username}?start={tenant.slug}__{slug}"
+        if bot_username else "(Bot-Username unbekannt — pruefe Bot-Konfig)"
+    )
+    return (
+        f"✅ Mitarbeiter <b>{name}</b> angelegt (Slug <code>{slug}</code>).\n\n"
+        f"<b>Telegram-Onboarding-Link</b> an den Mitarbeiter weiterleiten:\n"
+        f"<code>{deeplink}</code>\n\n"
+        "Sobald er den Link oeffnet + /start drueckt, wird er als "
+        f"<b>{name}</b> mit dem Bot verbunden.\n\n"
+        "Spaeter kann er optional <i>/werkstatt</i> ausfuehren um seine "
+        "eigene Heimat-Adresse zu setzen (fuer Smart-Termin-Routing)."
+    )
 
 
 # =====================================================================

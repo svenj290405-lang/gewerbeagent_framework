@@ -313,6 +313,131 @@ Erste user-sichtbare Aenderung kommt in Phase 4 mit dem
 
 ---
 
+## TEIL G2 — PHASE 2 + 4: Telegram-Multi-Chat + Mitarbeiter-Wizard (10.05.2026 spaeter Nachmittag)
+
+### Status: ✅ Phase 2 + Phase 4 fertig + live
+
+In direkter Fortsetzung von Phase 0:
+- **Phase 2 (Telegram Multi-Chat):** Bot-Routing wird employee-aware
+  ohne Bestands-Bruch. /start unterstuetzt jetzt das Format
+  `<tenant_slug>__<employee_slug>` fuer Mitarbeiter-Onboarding.
+- **Phase 4 (Skills + Assignees + /mitarbeiter-Wizard):** Schema-
+  Erweiterung um assignee-Felder + UI fuer Mitarbeiter-Verwaltung
+  via Telegram.
+
+### Phase 2: Telegram Multi-Chat (commit 6d97beb)
+
+`plugins/telegram_notify/handler.py`:
+- `_get_tenant_by_chat` Drop-in-Refactor: ruft intern den neuen
+  `get_employee_by_telegram_chat`. Sucht erst employees.telegram_chat_id,
+  faellt auf tenants.telegram_chat_id zurueck. Return-Typ unveraendert
+  → 50+ bestehende Aufrufer unbeeinflusst.
+- `_get_current_employee(chat_id)` neu — fuer personalisierte Befehle
+  die wissen muessen WER tippt (Briefing-Filter, /werkstatt-Phase-3).
+- `_resolve_chat_id_for_push` neu — 3-stufige Aufloesung:
+  Employee > Default-Employee > Legacy tool_configs.chat_id.
+  Wenn employee_id gesetzt aber Mitarbeiter ohne Chat: NICHT auf Default
+  zurueckfallen (sonst kriegt Inhaber Notifications die einem anderen
+  gehoert haetten).
+- `TelegramNotifier.send_for_tenant(tenant_id, text, employee_id=None)`:
+  optionaler employee_id-Param fuer gezielten Push.
+- `TelegramNotifier.broadcast_to_tenant(tenant_id, text)` neu —
+  Push an ALLE aktiven Mitarbeiter eines Tenants (failsafe pro
+  Mitarbeiter, gibt Anzahl erfolgreicher Sends zurueck).
+- `_handle_start_command` erweitert: Format `/start <slug>__<emp_slug>`.
+  Ohne `__` wie bisher (Default-Employee, Backward-Compat). Setzt
+  employee.telegram_chat_id; bei Default-Employee zusaetzlich
+  tenant.telegram_chat_id (Mirror fuer Code-Pfade die noch nicht
+  employee-aware sind).
+
+### Phase 4: Schema-Erweiterung (Migration o8j5f0h3e7g1)
+
+Vier neue assignee-Spalten + Backfill auf Default-Employee:
+- `email_conversations.assigned_employee_id`
+- `kundengespraeche.assigned_employee_id` (wer kuemmert sich)
+- `kundengespraeche.created_by_employee_id` (wer hat aufgenommen)
+- `rechnungen.responsible_employee_id`
+- `anfrage_responses.assigned_employee_id`
+
+Alle UUID NULL FK auf employees.id mit ON DELETE SET NULL — deaktivierte
+Mitarbeiter zerstoeren Historie nicht. Backfill verifiziert:
+1/1 emails, 7/7 gespraeche, 21/21 rechnungen, 3/3 anfragen → alle
+Default-Employee.
+
+### Phase 4: /mitarbeiter-Wizard
+
+Neue Telegram-Befehle in telegram_notify/handler.py:
+- `/mitarbeiter` — Liste aller Mitarbeiter (jeder darf sehen)
+- `/mitarbeiter neu` — Wizard: Name → auto-Slug + Kollisions-Check →
+  Skill-Auswahl → Telegram-Deeplink ausgeben (Inhaber-only)
+- `/mitarbeiter <slug>` — Detail-Anzeige
+- `/mitarbeiter <slug> aktivieren / deaktivieren` (Inhaber-only,
+  Default-Employee nicht deaktivierbar)
+- `/mitarbeiter <slug> skills heizung,sanitaer` (Inhaber-only,
+  Validierung gegen ALLE_SKILLS-Konstanten)
+
+Helper:
+- `_slugify(name)` — 'Sven Müller' → 'sven-mueller', umlaut-aware
+- `_get_bot_username(bot_token)` — getMe-Call fuer Deep-Links
+- `_ensure_inhaber_or_explain(chat_id)` — Berechtigungs-Pruefung
+
+Berechtigung: nur Default-Employee (Inhaber) darf neu/skills/aktiv-toggle.
+Lese-Operationen sind frei.
+
+States: `STATE_MITARBEITER_NEU_NAME`, `STATE_MITARBEITER_NEU_SKILLS`.
+
+Slug-Kollision: bei doppeltem Vorschlag wird automatisch -2/-3/...
+angehaengt.
+
+### Phase 4: Briefing-Filter
+
+`/briefing`, `/anrufe`, `/kunde` filtern jetzt fuer Nicht-Default-
+Employees nach `assigned_employee_id == eigene id`. Default-Employee
+sieht weiter alles (Inhaber-Sicht).
+
+UX-Hinweis: bei leeren Ergebnissen wird der Scope mitgeteilt
+("Noch kein Kundengespraech (auf dich zugewiesen) erfasst").
+
+### Verifikation
+
+Smoke-Tests im Container alle gruen:
+- /mitarbeiter Liste zeigt Sven Jantos mit 👑-Default-Marker
+- /mitarbeiter default Detail zeigt Heimat + Telegram-Status
+- /mitarbeiter unbekannt → "nicht gefunden"
+- /mitarbeiter neu → Wizard-Start + State-Setzen
+- /briefing als Default-Employee zeigt alles (Sven-Sicht unveraendert)
+
+### Was du jetzt machen kannst (nach Container-Restart)
+
+1. **Container neu starten** damit die neuen Befehle scharf sind:
+   `docker compose restart framework`
+2. **Test-Mitarbeiter anlegen via Telegram:**
+   `/mitarbeiter neu` → Name eingeben → Skills auswaehlen
+   → Bot gibt Deeplink aus
+3. **Deeplink an zweites Telegram-Konto** (eigenes Handy-Profil oder
+   Family-Member) schicken → der scannt → /start → ist verbunden
+4. **Test-Push:** beim demo-Tenant gehen Termin-Notifications jetzt an
+   den richtigen Employee (sofern Multi-OAuth = Phase 1 schon da
+   waere — bis dahin bleibt alles am Default-Employee dank Mirror)
+
+### Bekannte Limitationen / kommt in naechsten Phasen
+
+1. **Multi-OAuth (Phase 1):** angelegte Mitarbeiter haben noch keinen
+   eigenen Google-Calendar — alle Termine landen weiter im Tenant-
+   Kalender. Wenn Inhaber sagt "Termin fuer Sven Mueller" passiert
+   nichts Anderes als heute. Wird mit Phase 1 freigeschaltet.
+2. **Heimat-pro-Mitarbeiter (Phase 3):** /werkstatt setzt aktuell
+   weiter `tenant.heimat_*` (nicht `employee.heimat_*`). Smart-Filter
+   nutzt also weiter EINE Werkstatt fuer alle. Phase 3 trennt das.
+3. **Skill-Routing (Phase 5):** Anliegen aus Mail wird noch nicht
+   automatisch dem skill-passenden Mitarbeiter zugewiesen. Bis dahin:
+   alle Anfragen → Default-Employee.
+4. **anfrage_responses.assigned_employee_id** wird beim Eingang noch
+   nicht aktiv gesetzt (kommt in Phase 5). Backfill auf Default ist
+   trotzdem sauber.
+
+---
+
 ## TL;DR
 
 **Fertig und live:**

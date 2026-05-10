@@ -67,4 +67,13 @@ class AnfrageResponse(Base):
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
 
+    # Phase-4-Multi-Mitarbeiter: wer bekommt die Anfrage zugewiesen.
+    # Phase-5-Skill-Router setzt das anhand der Antwort-Inhalte; bis
+    # dahin Backfill auf Default-Employee.
+    assigned_employee_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("employees.id", ondelete="SET NULL"),
+        nullable=True, index=True,
+    )
+
     token: Mapped["AnfrageToken"] = relationship("AnfrageToken", back_populates="responses")

@@ -49,6 +49,10 @@ STATE_LEISTUNG_PREVIEWING = "leistung_previewing"
 STATE_WERKSTATT_WAITING_ADDRESS = "werkstatt_waiting_address"
 STATE_WERKSTATT_CONFIRMING = "werkstatt_confirming"
 
+# Mitarbeiter-Wizard (Phase 4 Multi-Mitarbeiter)
+STATE_MITARBEITER_NEU_NAME = "mitarbeiter_neu_name"
+STATE_MITARBEITER_NEU_SKILLS = "mitarbeiter_neu_skills"
+
 # Formular-Editor-Wizard
 STATE_FORMULAR_TYP_WAEHLEN = "formular_typ_waehlen"
 STATE_FORMULAR_HAUPTMENU = "formular_hauptmenu"
