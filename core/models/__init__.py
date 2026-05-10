@@ -252,3 +252,9 @@ from core.models.admin import (
     PROVIDER_LEXWARE,
     PROVIDER_TELEGRAM,
 )
+from core.models.tenant_material import (
+    TenantMaterial,
+    MaterialBestellung,
+    BESTELL_ART_LINK,
+    BESTELL_ART_MANUAL,
+)
