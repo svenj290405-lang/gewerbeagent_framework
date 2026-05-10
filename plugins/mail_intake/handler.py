@@ -911,7 +911,7 @@ class Plugin(BasePlugin):
                 action = "slots_vorgeschlagen"
                 # Auto-Reply mit Slot-Vorschlaegen
                 await self._send_slot_proposals(global_cfg, tenant, sender_email, sender_name, subject, message_id, extracted, slots)
-                await self._notify_tenant_telegram(tenant, sender_email, sender_name, subject, extracted, action="slots_vorgeschlagen")
+                await self._notify_tenant_telegram(tenant, sender_email, sender_name, subject, extracted, action="slots_vorgeschlagen", slots=slots)
                 return {"status": "slots_proposed", "tenant": tenant.slug, "slots_count": len(slots)}
 
         # Fall C: Verschiebung vage (kein Wunschtermin) oder ohne bestehenden Termin
@@ -949,7 +949,7 @@ class Plugin(BasePlugin):
                 )
                 action = "slots_vorgeschlagen"
                 await self._send_slot_proposals(global_cfg, tenant, sender_email, sender_name, subject, message_id, extracted, slots)
-                await self._notify_tenant_telegram(tenant, sender_email, sender_name, subject, extracted, action="slots_vorgeschlagen")
+                await self._notify_tenant_telegram(tenant, sender_email, sender_name, subject, extracted, action="slots_vorgeschlagen", slots=slots)
                 return {"status": "slots_proposed", "tenant": tenant.slug, "slots_count": len(slots)}
 
         # Fall E: Klare Anfrage aber Konversation existiert (Kunde mailt nochmal)
@@ -984,7 +984,7 @@ class Plugin(BasePlugin):
                 )
                 action = "slots_vorgeschlagen"
                 await self._send_slot_proposals(global_cfg, tenant, sender_email, sender_name, subject, message_id, extracted, slots)
-                await self._notify_tenant_telegram(tenant, sender_email, sender_name, subject, extracted, action="slots_vorgeschlagen")
+                await self._notify_tenant_telegram(tenant, sender_email, sender_name, subject, extracted, action="slots_vorgeschlagen", slots=slots)
                 return {"status": "slots_proposed", "tenant": tenant.slug, "slots_count": len(slots)}
 
         # 7. Konversation persistieren (bei Buchung mit event_id)
@@ -1070,6 +1070,7 @@ class Plugin(BasePlugin):
         subject: str,
         extracted: dict,
         action: str = "neu",
+        slots: list | None = None,
     ) -> None:
         klar = extracted.get("klar_genug_zum_buchen", False)
         begruendung = (extracted.get("begruendung") or "").upper()
@@ -1117,6 +1118,18 @@ class Plugin(BasePlugin):
             text += f"<b>Wunschtermin:</b> {extracted['wunschtermin_datum']} {extracted.get('wunschtermin_uhrzeit', '')}\n"
         if extracted.get("telefon"):
             text += f"<b>Telefon:</b> {extracted['telefon']}\n"
+        if extracted.get("kunde_adresse"):
+            text += f"<b>Adresse:</b> {extracted['kunde_adresse']}\n"
+
+        # Slot-Vorschlaege mit Fahrtzeit-Info (nur fuer Tenant, nicht fuer Kunde)
+        if action == "slots_vorgeschlagen" and slots:
+            text += "\n<b>Vorgeschlagene Slots:</b>\n"
+            for s in slots[:6]:
+                line = f"  • {s.get('wochentag', '')} {s['datum']} {s['uhrzeit']}"
+                fz = s.get("fahrtzeit_info")
+                if fz:
+                    line += f"  <i>({fz})</i>"
+                text += line + "\n"
 
         await TelegramNotifier.send_for_tenant(tenant.id, text)
 

@@ -110,6 +110,135 @@ In `_handle_rechnungen_anzeigen_command` (handler.py:3195):
 
 ---
 
+## TEIL F — SMART-TERMIN-ROUTING (10.05.2026 mittags)
+
+### Status: ✅ Fertig + Live (deaktiviert bis API-Key gesetzt)
+
+Sven-Wunsch: Termine sollen Fahrtzeiten zwischen Kunden einrechnen,
+damit Handwerker keine raumlich auseinanderliegenden Slots vorgeschlagen
+bekommt. Map-Service: OpenRouteService (EU, kostenfrei). Werkstatt-
+Adresse pro Tenant ueber Telegram-Wizard. Routing-Modus: Slots
+filtern + nach kuerzester Gesamt-Fahrtzeit sortieren.
+
+### Neue DB-Felder (tenants-Tabelle)
+
+Migration `k4f1a8b2d6e3` (additiv):
+- heimat_strasse, heimat_plz, heimat_ort: Werkstatt-Adresse
+- heimat_lat, heimat_lon: Numeric(9,6), ~10cm Genauigkeit
+- fahrtzeit_puffer_min: int default 15
+
+Neue Tabelle `geocode_cache`:
+- address_key: SHA-256 der normalisierten Adresse, unique
+- lat, lon, formatted, geocoded_at, hit_count
+- Cross-Tenant-Sharing OK (Adressen nicht tenant-spezifisch)
+
+### OpenRouteService-Provider
+
+`core/integrations/openrouteservice.py`:
+- `geocode_address(addr)` — Pelias /geocode/search, cache-first
+- `travel_time_minutes(a, b)` — /v2/matrix/driving-car
+- `travel_time_matrix(points)` — N×N
+- `normalize_address()` — 'Hauptstr.' / 'Hauptstrasse' → selber Hash
+
+ENV-Var: `OPENROUTESERVICE_API_KEY` in `.env` setzen
+(kostenfrei via openrouteservice.org/sign-up — 2.000 Req/Tag).
+
+Failsafe ohne Key: Provider liefert None, Smart-Routing skippt mit
+Log "ors-not-configured", Slot-Suche faellt sauber auf bisherige
+Logik zurueck.
+
+### Telegram-Wizard
+
+Zwei neue Commands in /help-Liste:
+- `/werkstatt`: setzt Heimat-Adresse (mit ORS-Geocode + Bestaetigung)
+- `/werkstatt_status`: zeigt aktuell gespeicherte Adresse + Geo
+
+Flow:
+1. Tenant tippt /werkstatt
+2. Bot fragt 'Schicke die komplette Adresse'
+3. Tenant tippt 'Hauptstr. 5, 54290 Trier'
+4. Bot ruft ORS-Geocode → bekommt lat/lon → zeigt Bestaetigung
+   inkl. OpenStreetMap-Karten-Link
+5. Tenant tippt JA → DB-Update
+
+Bei nicht-konfiguriertem ORS: Adresse wird trotzdem gespeichert (lat/lon=NULL),
+Routing greift sobald Key gesetzt + Tenant /werkstatt nochmal durchlaeuft.
+
+### Smart-Slot-Filter im Kalender-Plugin
+
+`plugins/kalender/handler.py:_find_free_slots()`:
+- Payload um optional `kunde_adresse` erweitert
+- Neue Method `_smart_filter_slots()` laeuft NACH FreeBusy-Filter:
+  * Tenant-Werkstatt-Geo holen
+  * Kunden-Adresse via ORS geocoden (cache-first)
+  * Pro Slot: Vor-/Nach-Termin am gleichen Tag finden
+    (1 GCal events.list-Call pro Tag, gecached)
+  * Vor-/Nach-Standorte aus event.location geocoden, oder Werkstatt-
+    Fallback wenn leer
+  * Travel-Times rechnen, gegen Puffer + Slot-Dauer abwaegen
+  * Slot raus wenn Vor- oder Nach-Termin nicht erreichbar
+  * Sortieren nach Gesamt-Fahrtzeit (kuerzeste oben)
+  * fahrtzeit_info-String pro Slot ('Anfahrt 12 Min, Weiterfahrt 8 Min')
+- Smart-Routing-Meta wird zurueckgegeben (applied/reason/removed)
+- Schluckt eigene Fehler — bei Filter-Crash: Original-Slots durchgereicht
+
+Mail-Caller (`plugins/mail_intake/handler.py`):
+- extract_termin_aus_mail() Gemini-Prompt erweitert um kunde_adresse
+- _slot_alternativen() Param erweitert
+- 3 Aufrufstellen propagieren extracted.kunde_adresse durch
+
+### Aktivierungs-Schritte (von dir)
+
+1. **ORS-Key holen:** openrouteservice.org/sign-up → kostenfreier Tier-Account
+2. In `.env` eintragen: `OPENROUTESERVICE_API_KEY=eyJ...`
+3. Container neu starten (oder: docker compose restart framework)
+4. **Werkstatt-Adresse setzen:** /werkstatt im Telegram-Bot
+5. Test: schick eine Mail mit Wunschtermin + Adresse rein
+6. Logs sollten zeigen: 'Slot-Smart-Filter aktiv: N Slots wegen Fahrtzeit gefiltert'
+
+### Skip-Reasons (wenn Smart-Filter nicht greift)
+
+Pro Slot-Lookup loggen wir EINE der folgenden Reasons (ein Log-Eintrag,
+nicht spammig):
+
+| Reason | Bedeutung |
+|---|---|
+| `no-customer-address` | Mail/Voice ohne extrahierte Kundenadresse |
+| `ors-not-configured` | OPENROUTESERVICE_API_KEY fehlt |
+| `no-werkstatt-geo` | Tenant hat /werkstatt nicht durchlaufen |
+| `customer-not-geocodable` | Pelias kennt Adresse nicht |
+| `tenant-not-found` | DB-State-Mismatch — sollte nicht passieren |
+| `filter-error` | Filter-Code-Crash — Failsafe greift |
+
+### Bekannte Limitationen
+
+1. **Voice-Bot extrahiert noch keine Adresse.** ElevenLabs-Voice-Pipeline
+   speichert nur Phone/Email, ohne Adresse kann der Smart-Filter im
+   Voice-Flow nicht greifen. Fix waere: ElevenLabs-Tool 'speichere_kontakt'
+   um adresse-Feld erweitern. Aktuell ueberspringt Filter mit
+   `no-customer-address` und Slots werden wie heute berechnet.
+
+2. **Bestehende Calendar-Events ohne event.location** werden behandelt
+   als waere der Tenant in der Werkstatt zwischen Terminen. Das ist
+   pragmatisch falsch (er ist real beim Kunden), aber besser als gar
+   keine Fahrtzeit. Workaround: Tenant kann manuell bei jedem
+   Calendar-Eintrag eine Adresse setzen — die wird dann verwendet.
+
+3. **ORS-Free-Tier** ist 2.000 Requests/Tag (Geocode + Matrix gemeinsam).
+   Mit Geocode-Cache halten wir das ueber 1.000 Slot-Lookups locker. Bei
+   echtem Volumen-Wachstum: ORS Standard-Plan (~50€/Monat) oder
+   Google Distance Matrix.
+
+4. **Anfrage-Web-Formular** uebergibt aktuell keine Adresse an
+   _find_free_slots, weil das Schema nicht standardisiert ist. Eine
+   adresse-Standard-Frage wuerde Smart-Routing auch dort einschalten.
+
+5. **Travel-Time-Cache fehlt.** Wir cachen nur Geocoding-Ergebnisse,
+   nicht die paarweisen Reisezeiten. Bei Performance-Bedarf spaeter
+   ein 1h-In-Memory-LRU einbauen.
+
+---
+
 ## TL;DR
 
 **Fertig und live:**
