@@ -21,9 +21,14 @@ from core.models import OAuthState, OAuthToken, Tenant
 
 logger = logging.getLogger(__name__)
 
-# OAuth Scopes fuer Google Calendar
+# OAuth Scopes fuer Google Calendar + Drive
+# drive.file: nur Q-erstellte Ordner sichtbar (Privacy-by-Design).
+# Bestehende Tokens haben den drive.file-Scope NICHT — Tenant muss
+# einmal /drive_verbinden machen damit Drive-Funktionen greifen.
+# Calendar bleibt davon unbeeinflusst.
 GOOGLE_SCOPES = [
     "https://www.googleapis.com/auth/calendar",
+    "https://www.googleapis.com/auth/drive.file",
     "https://www.googleapis.com/auth/userinfo.email",
     "openid",
 ]

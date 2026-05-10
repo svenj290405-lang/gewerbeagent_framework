@@ -263,3 +263,4 @@ from core.models.tenant_material import (
     BESTELL_ART_LINK,
     BESTELL_ART_MANUAL,
 )
+from core.models.tenant_kunde_drive import TenantKundeDrive
