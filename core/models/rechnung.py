@@ -13,6 +13,7 @@ import uuid
 
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     DateTime,
     ForeignKey,
     Numeric,
@@ -33,8 +34,14 @@ RECHNUNG_STATUS_PREVIEWING = "previewing"      # Vorschau angezeigt, wartet auf 
 RECHNUNG_STATUS_CREATING = "creating"          # Lexware-Call laeuft
 RECHNUNG_STATUS_DRAFTED = "drafted"            # Draft in Lexware fertig
 RECHNUNG_STATUS_MAIL_SENT = "mail_sent"        # PDF per Mail an Kunde verschickt
+RECHNUNG_STATUS_BEZAHLT = "bezahlt"            # Lexware hat voucherStatus=paid gemeldet
 RECHNUNG_STATUS_ERROR = "error"
 RECHNUNG_STATUS_CANCELLED = "cancelled"        # User hat abgebrochen
+
+# Lexware voucherStatus-Werte die wir als "bezahlt" werten.
+# 'paid' ist der dokumentierte Standardwert; 'paidoff' kommt in einigen
+# alten Tenants vor. Beide Schreibweisen abdecken um robust zu sein.
+LEXWARE_PAID_STATES = frozenset({"paid", "paidoff"})
 
 # Eingabe-Typen
 RECHNUNG_INPUT_TEXT = "text"
@@ -113,6 +120,23 @@ class Rechnung(Base):
     )
     mail_sent_at: Mapped[dt.datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
+    )
+
+    # Bezahl-Tracking (Phase A3 — Lexware-Polling alle 30 Min).
+    # Migration: j2c8e5f1a4d6_rechnung_bezahl_tracking.
+    bezahlt_am: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    lexware_voucher_status: Mapped[str | None] = mapped_column(
+        String(30), nullable=True
+    )
+    last_paid_check_at: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    paid_notification_sent: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        server_default="false",
     )
 
     # Timestamps
