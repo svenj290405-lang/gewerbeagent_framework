@@ -53,6 +53,7 @@ from core.models.telegram_state import (
     STATE_FORMULAR_NEU_REQUIRED,
     STATE_FORMULAR_LOESCHEN,
     STATE_FORMULAR_RESET_CONFIRM,
+    STATE_ARCHIV_WAITING_FILES,
 )
 from core.models.visualisierung import (
     Visualisierung,
@@ -221,6 +222,8 @@ __all__ = [
     "STATE_MITARBEITER_NEU_NAME",
     "STATE_MITARBEITER_NEU_SKILLS",
     "STATE_KALENDER_PROVIDER_CHOICE",
+    "STATE_ARCHIV_WAITING_FILES",
+    "TenantKundeDrive",
 ]
 from core.models.tenant_leistung import TenantLeistung
 from core.models.angebot import Angebot

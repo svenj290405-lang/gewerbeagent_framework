@@ -73,6 +73,9 @@ STATE_MATERIAL_NEU_LIEFERANT = "material_neu_lieferant"
 STATE_MATERIAL_NEU_PREVIEWING = "material_neu_previewing"
 STATE_BESTELLEN_MENGE = "bestellen_menge"
 
+# Archiv-Wizard (Google-Drive-Upload pro Kunde)
+STATE_ARCHIV_WAITING_FILES = "archiv_waiting_files"
+
 # Formular-Editor-Wizard
 STATE_FORMULAR_TYP_WAEHLEN = "formular_typ_waehlen"
 STATE_FORMULAR_HAUPTMENU = "formular_hauptmenu"

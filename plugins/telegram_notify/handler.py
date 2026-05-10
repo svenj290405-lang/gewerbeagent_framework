@@ -47,6 +47,7 @@ from core.models import (
     STATE_MATERIAL_NEU_LIEFERANT,
     STATE_MATERIAL_NEU_PREVIEWING,
     STATE_BESTELLEN_MENGE,
+    STATE_ARCHIV_WAITING_FILES,
     STATE_LEISTUNG_WAITING_NAME,
     STATE_LEISTUNG_WAITING_PREIS,
     STATE_LEISTUNG_WAITING_BESCHREIBUNG,
@@ -458,6 +459,13 @@ async def _handle_help_command():
 
     msg += "<b>🎨 VISUALISIERUNG</b>\n"
     msg += "/visualisierung - Foto + KI-Rendering\n\n"
+
+    msg += "<b>☁️ KUNDEN-ARCHIV (Google Drive)</b>\n"
+    msg += "/drive_verbinden - Drive-Zugriff erlauben (einmalig)\n"
+    msg += "/drive_status - Verbindung + Statistik pruefen\n"
+    msg += "/archiv - Liste der Kunden mit Drive-Ordner\n"
+    msg += "/archiv &lt;name&gt; - Bilder/PDFs hochladen (Wizard)\n"
+    msg += "/fertig - Upload-Wizard abschliessen\n\n"
 
     msg += "<b>⚙️ SETUP</b>\n"
     msg += "/lexware_setup - Lexware verbinden\n"
@@ -1257,6 +1265,22 @@ async def process_telegram_update(payload):
             await _send_to_chat(chat_id, reply)
             return {"ok": True}
 
+        if state and state.state_key == STATE_ARCHIV_WAITING_FILES:
+            if not bot_token:
+                bot_token = await _load_global_bot_token()
+                if not bot_token:
+                    await _send_to_chat(
+                        chat_id,
+                        "Bot-Konfiguration fehlt - bitte beim Betreiber melden.",
+                    )
+                    return {"ok": True}
+            reply = await _handle_archiv_file_received(
+                chat_id, photo_array, document, bot_token, state.state_data,
+            )
+            if reply:
+                await _send_to_chat(chat_id, reply)
+            return {"ok": True}
+
         # Foto/Dokument ohne aktiven State - ignorieren
         logger.info("Photo/Document ohne passenden State ignoriert")
         return {"ok": True}
@@ -1388,7 +1412,10 @@ async def process_telegram_update(payload):
         reply = await _handle_leistung_show_command(chat_id, args)
     elif text == "/briefing":
         await _clear_state(chat_id)
-        reply = await _handle_briefing_command(chat_id)
+        reply_or_none = await _handle_briefing_command(chat_id)
+        if reply_or_none is None:
+            return {"ok": True}
+        reply = reply_or_none
     elif text == "/anrufe":
         await _clear_state(chat_id)
         reply = await _handle_anrufe_command(chat_id)
@@ -1396,7 +1423,10 @@ async def process_telegram_update(payload):
         await _clear_state(chat_id)
         # Argumente nach '/kunde' extrahieren
         args = text[len("/kunde"):].strip()
-        reply = await _handle_kunde_command(chat_id, args)
+        reply_or_none = await _handle_kunde_command(chat_id, args)
+        if reply_or_none is None:
+            return {"ok": True}
+        reply = reply_or_none
     elif text == "/rechnungen_anzeigen":
         await _clear_state(chat_id)
         reply = await _handle_rechnungen_anzeigen_command(chat_id)
@@ -1417,6 +1447,33 @@ async def process_telegram_update(payload):
         return {"ok": True}
     elif text == "/kalender_status":
         reply = await _handle_kalender_status_command(chat_id)
+    elif text == "/drive_verbinden":
+        await _clear_state(chat_id)
+        reply = await _handle_drive_verbinden_command(chat_id)
+    elif text == "/drive_status":
+        reply = await _handle_drive_status_command(chat_id)
+    elif text == "/archiv":
+        await _clear_state(chat_id)
+        reply = await _handle_archiv_list_command(chat_id)
+    elif text.startswith("/archiv "):
+        args = text[len("/archiv "):].strip()
+        reply = await _handle_archiv_command(chat_id, args)
+    elif text == "/fertig":
+        # /fertig ist nur sinnvoll im Archiv-Wizard. Sonst freundlicher Hinweis.
+        state = await _load_state(chat_id)
+        if state and state.state_key == STATE_ARCHIV_WAITING_FILES:
+            reply_or_none = await _handle_archiv_fertig_command(
+                chat_id, state.state_data,
+            )
+            if reply_or_none is None:
+                # Inline-Button wurde schon gesendet
+                return {"ok": True}
+            reply = reply_or_none
+        else:
+            reply = (
+                "/fertig hat hier keine Wirkung. Im /archiv-Wizard schliesst "
+                "es den Upload ab."
+            )
     elif text.startswith("/"):
         reply = await _handle_unknown()
     else:
@@ -1504,6 +1561,13 @@ async def process_telegram_update(payload):
         elif state.state_key == STATE_BESTELLEN_MENGE:
             reply = await _handle_bestellen_menge_input(
                 chat_id, text, state.state_data,
+            )
+        elif state.state_key == STATE_ARCHIV_WAITING_FILES:
+            kunde = (state.state_data or {}).get("kunde_name") or "diesen Kunden"
+            reply = (
+                f"Schick mir Bilder, PDFs oder andere Dokumente fuer "
+                f"<b>{_h_safe(kunde)}</b>. Mit <b>/fertig</b> abschliessen "
+                f"oder /abbrechen."
             )
         elif state.state_key == STATE_RECHNUNG_AWAITING_MAIL:
             stage = (state.state_data or {}).get("stage")
@@ -2575,6 +2639,61 @@ def _format_kundengespraech_full(g) -> str:
     return msg
 
 
+async def _drive_link_section(tenant_id, kunde_name) -> tuple[str, str | None]:
+    """Bereite den Drive-Link-Block fuer /briefing + /kunde vor.
+
+    Returns: (text_block, folder_url | None)
+      - folder_url=None: noch kein Ordner, text_block ist Hinweis
+      - folder_url=str: Ordner vorhanden, text_block ist HTML-<a>-Link
+    Failsafe: bei Fehlern leerer Text + None.
+    """
+    try:
+        from core.integrations.google_drive import get_kunde_folder_link
+        url = await get_kunde_folder_link(tenant_id, kunde_name)
+    except Exception as e:
+        logger.debug(f"_drive_link_section failed (egal): {e}")
+        return "", None
+
+    if url:
+        return f"\n\n📁 <a href=\"{url}\">Drive-Ordner oeffnen</a>", url
+
+    # Kein Ordner -> Hinweis (kein Button, nur Text-Tipp)
+    return (
+        f"\n\n📁 <i>Noch kein Drive-Ordner — mit "
+        f"<code>/archiv {_h_safe(kunde_name)}</code> Bilder/PDFs ablegen.</i>",
+        None,
+    )
+
+
+async def _send_kundengespraech_with_drive(
+    chat_id, header: str, gespraech, tenant_id,
+) -> str | None:
+    """Hilfsfunktion: formatiert Briefing + Drive-Link, sendet ggf. mit Button.
+
+    Returns:
+        - str (final message) wenn Caller via _send_to_chat senden soll
+        - None wenn schon mit Inline-Button gesendet (Caller short-circuit)
+    """
+    base = header + _format_kundengespraech_full(gespraech)
+    drive_block, folder_url = await _drive_link_section(
+        tenant_id, gespraech.kunde_name or "",
+    )
+    msg = base + drive_block
+
+    if folder_url:
+        sent = await _send_with_inline_buttons(
+            chat_id, msg,
+            [[{
+                "text": f"📁 Drive-Ordner: {gespraech.kunde_name or 'Kunde'}",
+                "url": folder_url,
+            }]],
+        )
+        if sent:
+            return None
+        # Inline-Button-Send fehlgeschlagen -> Plain-Text-Fallback
+    return msg
+
+
 async def _handle_briefing_command(chat_id):
     """Zeigt naechsten anstehenden Termin mit Briefing.
 
@@ -2613,9 +2732,9 @@ async def _handle_briefing_command(chat_id):
         future = (await s.execute(stmt)).scalar_one_or_none()
 
         if future:
-            msg = "<b>🔔 Naechster Termin</b>\n\n"
-            msg += _format_kundengespraech_full(future)
-            return msg
+            return await _send_kundengespraech_with_drive(
+                chat_id, "<b>🔔 Naechster Termin</b>\n\n", future, tenant.id,
+            )
 
         # Kein zukuenftiger Termin -> juengstes Gespraech zeigen
         stmt2 = (
@@ -2637,10 +2756,11 @@ async def _handle_briefing_command(chat_id):
                 "Mit /aufnahme das erste anlegen."
             )
 
-        msg = "<b>📋 Letztes Gespraech</b>\n"
-        msg += "<i>(Kein anstehender Termin)</i>\n\n"
-        msg += _format_kundengespraech_full(latest)
-        return msg
+        return await _send_kundengespraech_with_drive(
+            chat_id,
+            "<b>📋 Letztes Gespraech</b>\n<i>(Kein anstehender Termin)</i>\n\n",
+            latest, tenant.id,
+        )
 
 
 async def _handle_kunde_command(chat_id, args):
@@ -2680,14 +2800,24 @@ async def _handle_kunde_command(chat_id, args):
         gespraeche = (await s.execute(stmt)).scalars().all()
 
     if not gespraeche:
-        return f"Keine Gespraeche zu <i>{suchbegriff}</i> gefunden."
+        # Auch ohne Gespraech: schauen ob ein Drive-Ordner existiert
+        # (z.B. Tenant hat /archiv ohne vorheriges Gespraech genutzt).
+        drive_block, _ = await _drive_link_section(tenant.id, suchbegriff)
+        if drive_block:
+            return (
+                f"Keine Gespraeche zu <i>{_h_safe(suchbegriff)}</i> gefunden."
+                f"{drive_block}"
+            )
+        return f"Keine Gespraeche zu <i>{_h_safe(suchbegriff)}</i> gefunden."
 
     if len(gespraeche) == 1:
-        # Nur eins -> volle Anzeige
-        return _format_kundengespraech_full(gespraeche[0])
+        # Nur eins -> volle Anzeige + Drive-Link-Block
+        return await _send_kundengespraech_with_drive(
+            chat_id, "", gespraeche[0], tenant.id,
+        )
 
     # Mehrere -> Liste mit Briefings
-    msg = f"<b>📋 Gespraeche zu '{suchbegriff}'</b> ({len(gespraeche)})\n\n"
+    msg = f"<b>📋 Gespraeche zu '{_h_safe(suchbegriff)}'</b> ({len(gespraeche)})\n\n"
     for i, g in enumerate(gespraeche[:5], 1):
         msg += f"<b>{i}. {_format_kundengespraech_short(g)}</b>\n"
         if g.briefing_kurz:
@@ -2697,6 +2827,28 @@ async def _handle_kunde_command(chat_id, args):
             msg += f"<i>{briefing}</i>\n\n"
     if len(gespraeche) > 5:
         msg += f"<i>... und {len(gespraeche) - 5} weitere</i>\n"
+
+    # Drive-Link nur wenn der Suchbegriff genau einem Kunden-Folder
+    # entspricht (alle 5 Treffer haben den gleichen normalisierten
+    # kunde_name). Sonst lassen wir's weg — Tenant kann mit /kunde <exakt>
+    # nochmal nachfragen.
+    distinct_names = {g.kunde_name for g in gespraeche}
+    if len(distinct_names) == 1:
+        kunde_name = next(iter(distinct_names))
+        drive_block, folder_url = await _drive_link_section(
+            tenant.id, kunde_name,
+        )
+        msg += drive_block
+        if folder_url:
+            sent = await _send_with_inline_buttons(
+                chat_id, msg,
+                [[{
+                    "text": f"📁 Drive-Ordner: {kunde_name}",
+                    "url": folder_url,
+                }]],
+            )
+            if sent:
+                return None  # type: ignore[return-value]
     return msg
 
 
@@ -6486,3 +6638,385 @@ def _h_safe(s) -> str:
     """HTML-escape einen String fuer Telegram-HTML-parse_mode."""
     import html as _html
     return _html.escape(str(s or ""))
+
+
+# =====================================================================
+# Google-Drive-Archiv (pro Kunde Ordner, Bilder/PDFs ueber Telegram)
+# =====================================================================
+# Workflow:
+#   /drive_verbinden      → einmaliger OAuth-Re-Auth (Drive-Scope)
+#   /drive_status         → Verbindung + Statistik
+#   /archiv               → Liste aller Kunden mit Drive-Ordner
+#   /archiv <name>        → Wizard-Start: Bot wartet auf Files
+#   <Photo/Document/PDF>  → Upload in Kunden-Ordner (lazy create)
+#   /fertig               → Wizard schliessen, Drive-Link zeigen
+#
+# Failsafe-Pattern: alle Drive-Errors fangen wir, schicken die Klartext-
+# Meldung im Telegram (statt Stacktraces) und brechen den Wizard nicht
+# ab — der User kann es nochmal versuchen.
+
+ARCHIV_MAX_FILE_SIZE = 25 * 1024 * 1024  # 25 MB Telegram-Bot-API-Limit
+
+
+async def _handle_drive_verbinden_command(chat_id) -> str:
+    """Schickt OAuth-Deeplink mit Drive-Scope.
+
+    Calendar-Token bleibt gueltig — der naechste OAuth-Roundtrip
+    ueberschreibt nur den Scope-Set des Tokens und behaelt den
+    Refresh-Token. Tenant kommt mit /archiv ohne weitere Schritte
+    direkt in den Upload-Wizard.
+    """
+    res = await _get_current_employee(chat_id)
+    if res is None:
+        return (
+            "Dieser Chat ist noch keinem Betrieb zugeordnet. "
+            "Bitte zuerst /start ausfuehren."
+        )
+    tenant, emp = res
+
+    # Wenn Default-Employee schon Drive-Scope hat: Bestaetigung statt Deeplink
+    from core.security.oauth_token_lookup import find_oauth_token
+    from core.integrations.google_drive import is_drive_configured
+    tok = await find_oauth_token(tenant.id, "google", emp.id)
+    if tok and is_drive_configured(tok):
+        return (
+            "✅ <b>Drive ist bereits verbunden.</b>\n\n"
+            "Du kannst direkt mit <b>/archiv &lt;kundenname&gt;</b> Bilder "
+            "und PDFs in Drive ablegen. Mit /drive_status checkst du "
+            "Statistik und Ordner-Anzahl."
+        )
+
+    # Deeplink generieren (provider=google, gleicher OAuth-Flow wie Calendar)
+    from config.settings import settings
+    from urllib.parse import urlencode
+    base = (settings.public_url or "").rstrip("/")
+    qs = urlencode({
+        "tenant": tenant.slug,
+        "provider": "google",
+        "employee": emp.slug,
+    })
+    oauth_url = f"{base}/oauth/start?{qs}"
+
+    return (
+        "<b>☁️ Google Drive verbinden</b>\n\n"
+        "Damit der Bot Kunden-Bilder und PDFs in deinem Drive ablegen "
+        "kann, brauche ich einmal Drive-Zugriff. Calendar bleibt "
+        "weiter verbunden — wir erweitern nur den Scope.\n\n"
+        f"<a href=\"{oauth_url}\">Jetzt einloggen und Drive freigeben</a>\n\n"
+        "<i>Tipp:</i> Q sieht <b>nur die Ordner die er selbst anlegt</b> "
+        "(Drive-Scope <code>drive.file</code>). Privat-Files in deinem "
+        "Drive bleiben fuer den Bot unsichtbar — Privacy-by-Design.\n\n"
+        "Nach dem Login: zurueck zum Bot und mit /archiv loslegen."
+    )
+
+
+async def _handle_drive_status_command(chat_id) -> str:
+    """Zeigt Drive-Verbindungs-Status + Statistik."""
+    from core.security.oauth_token_lookup import find_oauth_token
+    from core.integrations.google_drive import (
+        is_drive_configured, list_tenant_kunde_drives,
+    )
+
+    res = await _get_current_employee(chat_id)
+    if res is None:
+        return "Dieser Chat ist noch keinem Betrieb zugeordnet."
+    tenant, emp = res
+
+    tok = await find_oauth_token(tenant.id, "google", emp.id)
+    if not tok:
+        return (
+            "❌ <b>Drive nicht verbunden.</b>\n\n"
+            "Mit /drive_verbinden den OAuth-Flow starten."
+        )
+    if not is_drive_configured(tok):
+        return (
+            "⚠️ <b>Google ist verbunden, aber ohne Drive-Scope.</b>\n\n"
+            "Bitte einmal /drive_verbinden ausfuehren — Calendar bleibt "
+            "weiter verbunden."
+        )
+
+    folders = await list_tenant_kunde_drives(tenant.id, limit=100)
+    total_uploads = sum(int(f.upload_count or 0) for f in folders)
+    last_upload = None
+    for f in folders:
+        if f.last_upload_at and (
+            last_upload is None or f.last_upload_at > last_upload
+        ):
+            last_upload = f.last_upload_at
+    last_str = (
+        last_upload.strftime("%d.%m.%Y %H:%M") if last_upload else "-"
+    )
+
+    msg = "<b>☁️ Drive-Status</b>\n\n"
+    msg += "Verbindung: <b>✅ verbunden</b>\n"
+    msg += f"Kunden-Ordner: <b>{len(folders)}</b>\n"
+    msg += f"Hochgeladene Dateien: <b>{total_uploads}</b>\n"
+    msg += f"Letzter Upload: <b>{last_str}</b>\n\n"
+    if folders:
+        msg += "Mit /archiv siehst du die Liste, mit /archiv &lt;name&gt; "
+        msg += "laedst du neue Files in einen Kunden-Ordner."
+    else:
+        msg += (
+            "Noch kein Kunde mit Drive-Ordner. "
+            "Mit /archiv &lt;name&gt; den ersten anlegen."
+        )
+    return msg
+
+
+async def _handle_archiv_list_command(chat_id) -> str:
+    """Listet alle Kunden mit Drive-Ordner — sortiert nach last_upload."""
+    from core.integrations.google_drive import list_tenant_kunde_drives
+
+    tenant = await _get_tenant_by_chat(chat_id)
+    if not tenant:
+        return "Dieser Chat ist noch keinem Betrieb zugeordnet."
+
+    folders = await list_tenant_kunde_drives(tenant.id, limit=30)
+    if not folders:
+        return (
+            "<b>📁 Kunden-Archiv (Google Drive)</b>\n\n"
+            "Noch keine Kunden mit Drive-Ordner.\n\n"
+            "Lege den ersten an mit:\n"
+            "<b>/archiv &lt;Kundenname&gt;</b>\n\n"
+            "Beispiel: <code>/archiv Mueller</code>\n\n"
+            "Falls noch nicht passiert: einmal /drive_verbinden zur "
+            "OAuth-Freigabe."
+        )
+
+    lines = [
+        f"<b>📁 Kunden-Archiv</b> — {len(folders)} Kunden\n",
+    ]
+    for f in folders[:20]:
+        ts = (
+            f.last_upload_at.strftime("%d.%m.%y") if f.last_upload_at else "-"
+        )
+        lines.append(
+            f"• <b>{_h_safe(f.kunde_name)}</b> — "
+            f"{f.upload_count or 0} Files, letzter: {ts}"
+        )
+    if len(folders) > 20:
+        lines.append(f"\n<i>... und {len(folders) - 20} weitere</i>")
+    lines.append("")
+    lines.append(
+        "Neuen Upload starten: <b>/archiv &lt;name&gt;</b>"
+    )
+    return "\n".join(lines)
+
+
+async def _handle_archiv_command(chat_id, args: str) -> str:
+    """Wizard-Start: '/archiv Mueller' setzt State + erwartet Files."""
+    name = (args or "").strip()
+    if not name or len(name) < 2:
+        return (
+            "Bitte einen Kunden-Namen mitgeben.\n\n"
+            "Beispiel: <code>/archiv Mueller</code>"
+        )
+    if len(name) > 200:
+        return "Kunden-Name ist zu lang (max 200 Zeichen)."
+
+    res = await _get_current_employee(chat_id)
+    if res is None:
+        return (
+            "Dieser Chat ist noch keinem Betrieb zugeordnet. "
+            "Bitte zuerst /start ausfuehren."
+        )
+    tenant, emp = res
+
+    # Drive-Verbindung pruefen — sonst direkt freundlicher Hint statt
+    # 5-Sekunden-Wartezeit beim ersten Upload-Versuch.
+    from core.security.oauth_token_lookup import find_oauth_token
+    from core.integrations.google_drive import is_drive_configured
+    tok = await find_oauth_token(tenant.id, "google", emp.id)
+    if not tok or not is_drive_configured(tok):
+        return (
+            "⚠️ <b>Drive ist noch nicht verbunden.</b>\n\n"
+            "Bitte einmal /drive_verbinden ausfuehren — danach klappt "
+            "/archiv direkt."
+        )
+
+    # State setzen
+    await _save_state(
+        chat_id, STATE_ARCHIV_WAITING_FILES,
+        {
+            "kunde_name": name,
+            "employee_id": str(emp.id),
+            "tenant_id": str(tenant.id),
+            "uploaded": 0,
+        },
+    )
+
+    return (
+        f"<b>📁 Archiv: {_h_safe(name)}</b>\n\n"
+        "Schick mir jetzt <b>Bilder, PDFs oder andere Dokumente</b>. "
+        "Mehrere hintereinander sind OK — ich antworte nach jedem File.\n\n"
+        "Mit <b>/fertig</b> schliesst du den Upload ab und bekommst den "
+        "Drive-Link. Mit /abbrechen brichst du ohne Link ab "
+        "(bereits hochgeladene Files bleiben).\n\n"
+        "<i>Tipp:</i> max 25 MB pro Datei (Telegram-Limit)."
+    )
+
+
+async def _handle_archiv_file_received(
+    chat_id, photo_array, document, bot_token, state_data,
+) -> str:
+    """Verarbeitet ein Foto oder Dokument waehrend STATE_ARCHIV_WAITING_FILES.
+
+    Lade die Bytes von Telegram, schiebt sie via google_drive-Helper in
+    den Kunden-Ordner. Failsafe — bei Drive-Fehlern sehen wir Klartext
+    statt Stacktrace.
+    """
+    from core.integrations.google_drive import upload_file_to_kunde_folder
+
+    data = state_data or {}
+    kunde_name = data.get("kunde_name") or "Unbekannt"
+    tenant_id_str = data.get("tenant_id")
+    employee_id_str = data.get("employee_id")
+    if not tenant_id_str:
+        await _clear_state(chat_id)
+        return "Wizard-State korrupt. Bitte /archiv erneut starten."
+
+    try:
+        tenant_id = uuid.UUID(tenant_id_str)
+        employee_id = uuid.UUID(employee_id_str) if employee_id_str else None
+    except (ValueError, TypeError):
+        await _clear_state(chat_id)
+        return "Wizard-State korrupt. Bitte /archiv erneut starten."
+
+    # File-Identifikation: Photo (groesste Variante) oder Document
+    file_id = None
+    filename = None
+    mime_type = None
+    file_size = 0
+
+    if photo_array:
+        # Photo: nehme groesste Variante (telegram liefert mehrere Resolutions)
+        largest = max(
+            photo_array, key=lambda p: int(p.get("file_size") or 0),
+        )
+        file_id = largest.get("file_id")
+        file_size = int(largest.get("file_size") or 0)
+        # Telegram-Photos haben keinen Dateinamen — wir generieren einen
+        ts = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d_%H%M%S")
+        filename = f"foto_{ts}.jpg"
+        mime_type = "image/jpeg"
+    elif document:
+        file_id = document.get("file_id")
+        file_size = int(document.get("file_size") or 0)
+        filename = document.get("file_name") or f"datei_{file_id}"
+        mime_type = (
+            document.get("mime_type") or "application/octet-stream"
+        )
+    else:
+        return "Bitte ein Foto oder Dokument schicken (kein Text)."
+
+    if not file_id:
+        return "Datei konnte nicht identifiziert werden — nochmal versuchen."
+
+    if file_size > ARCHIV_MAX_FILE_SIZE:
+        return (
+            f"Datei zu gross ({file_size // 1024 // 1024} MB). "
+            f"Telegram erlaubt max 25 MB pro Datei. Bitte komprimieren "
+            f"oder in mehreren Schritten schicken."
+        )
+
+    # Telegram-Download
+    file_path = await _telegram_get_file_path(bot_token, file_id)
+    if not file_path:
+        return "Telegram-Download fehlgeschlagen — bitte erneut schicken."
+    file_bytes = await _telegram_download_file(bot_token, file_path)
+    if not file_bytes:
+        return "Telegram-Download fehlgeschlagen — bitte erneut schicken."
+
+    # Drive-Upload
+    try:
+        result = await upload_file_to_kunde_folder(
+            tenant_id=tenant_id,
+            kunde_name=kunde_name,
+            file_bytes=file_bytes,
+            filename=filename,
+            mime_type=mime_type,
+            employee_id=employee_id,
+        )
+    except ValueError as e:
+        # Token-/Scope-Fehler — sauberer Reset, User soll re-authen
+        msg = str(e)
+        logger.warning(f"Drive-Upload ValueError: {msg}")
+        return (
+            f"⚠️ <b>Drive-Upload fehlgeschlagen</b>\n\n"
+            f"{_h_safe(msg)}\n\n"
+            "Bitte einmal /drive_verbinden — danach /archiv erneut."
+        )
+    except Exception as e:
+        # Quota / Network / API-Error — Wizard NICHT abbrechen
+        # damit User naechste Datei probieren kann.
+        err = str(e)
+        logger.exception(f"Drive-Upload-Fehler: {err[:200]}")
+        if "quotaExceeded" in err or "storageQuotaExceeded" in err:
+            hint = (
+                "Drive-Speicher voll. In Drive aufraumen oder Workspace-"
+                "Plan upgraden, dann erneut versuchen."
+            )
+        elif "403" in err and "rateLimitExceeded" in err:
+            hint = "Drive-API-Rate-Limit. In ein paar Sekunden erneut versuchen."
+        else:
+            hint = (
+                "Unerwarteter Drive-Fehler. Bitte erneut versuchen oder "
+                "/drive_status pruefen."
+            )
+        return f"⚠️ <b>Upload fehlgeschlagen</b>\n\n{hint}"
+
+    # Counter im State hochzaehlen
+    new_data = dict(data)
+    new_data["uploaded"] = int(data.get("uploaded") or 0) + 1
+    new_data["folder_url"] = result.get("kunde_folder_url") or ""
+    new_data["folder_id"] = result.get("kunde_folder_id") or ""
+    await _save_state(chat_id, STATE_ARCHIV_WAITING_FILES, new_data)
+
+    return (
+        f"✅ <b>{_h_safe(filename)}</b> abgelegt "
+        f"({new_data['uploaded']} fuer {_h_safe(kunde_name)})\n\n"
+        "Naechste Datei schicken oder mit <b>/fertig</b> abschliessen."
+    )
+
+
+async def _handle_archiv_fertig_command(chat_id, state_data) -> str:
+    """Schliesst den /archiv-Wizard ab. Zeigt Anzahl + Drive-Link."""
+    data = state_data or {}
+    kunde_name = data.get("kunde_name") or "Unbekannt"
+    uploaded = int(data.get("uploaded") or 0)
+    folder_url = data.get("folder_url") or ""
+
+    await _clear_state(chat_id)
+
+    if uploaded == 0:
+        return (
+            f"Wizard fuer <b>{_h_safe(kunde_name)}</b> beendet — "
+            f"keine Dateien hochgeladen.\n\n"
+            "Mit /archiv erneut starten."
+        )
+
+    # Drive-Link via Lookup falls im State noch nicht vorhanden (sollte sein)
+    if not folder_url:
+        try:
+            from core.integrations.google_drive import get_kunde_folder_link
+            tenant = await _get_tenant_by_chat(chat_id)
+            if tenant:
+                folder_url = await get_kunde_folder_link(
+                    tenant.id, kunde_name,
+                ) or ""
+        except Exception as e:
+            logger.debug(f"folder_url-lookup im /fertig egal: {e}")
+
+    msg = (
+        f"<b>✅ {uploaded} Datei{'en' if uploaded != 1 else ''} archiviert</b>\n\n"
+        f"Kunde: <b>{_h_safe(kunde_name)}</b>\n"
+    )
+    if folder_url:
+        msg += f"\n<a href=\"{folder_url}\">📁 Drive-Ordner oeffnen</a>"
+        # Plus Inline-Button fuer einfachen Mobile-Klick
+        await _send_with_inline_buttons(
+            chat_id, msg,
+            [[{"text": f"📁 Ordner '{kunde_name}' oeffnen", "url": folder_url}]],
+        )
+        return None  # type: ignore[return-value]
+    return msg
