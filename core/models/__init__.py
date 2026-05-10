@@ -26,6 +26,8 @@ from core.models.telegram_state import (
     STATE_LEISTUNG_WAITING_PREIS,
     STATE_LEISTUNG_WAITING_BESCHREIBUNG,
     STATE_LEISTUNG_PREVIEWING,
+    STATE_WERKSTATT_WAITING_ADDRESS,
+    STATE_WERKSTATT_CONFIRMING,
     STATE_FORMULAR_TYP_WAEHLEN,
     STATE_FORMULAR_HAUPTMENU,
     STATE_FORMULAR_NEU_NAME,
@@ -152,6 +154,8 @@ __all__ = [
     "Kundengespraech",
     "STATE_AUFNAHME_WAITING_AUDIO",
     "STATE_AUFNAHME_PREVIEWING",
+    "STATE_WERKSTATT_WAITING_ADDRESS",
+    "STATE_WERKSTATT_CONFIRMING",
 ]
 from core.models.tenant_leistung import TenantLeistung
 from core.models.angebot import Angebot

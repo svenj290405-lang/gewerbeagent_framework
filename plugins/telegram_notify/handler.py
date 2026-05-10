@@ -33,6 +33,8 @@ from core.models import (
     STATE_LEISTUNG_WAITING_PREIS,
     STATE_LEISTUNG_WAITING_BESCHREIBUNG,
     STATE_LEISTUNG_PREVIEWING,
+    STATE_WERKSTATT_WAITING_ADDRESS,
+    STATE_WERKSTATT_CONFIRMING,
     STATE_FORMULAR_TYP_WAEHLEN,
     STATE_FORMULAR_HAUPTMENU,
     STATE_FORMULAR_NEU_NAME,
@@ -82,6 +84,10 @@ from core.ai import (
     analyse_kundengespraech_from_audio,
 )
 from core.integrations.lexware import LexwareProvider
+from core.integrations.openrouteservice import (
+    geocode_address as ors_geocode_address,
+    is_configured as ors_is_configured,
+)
 from core.integrations.accounting_base import (
     AccountingError,
     InvoiceLineItem,
@@ -289,6 +295,8 @@ async def _handle_help_command():
     msg += "<b>⚙️ SETUP</b>\n"
     msg += "/lexware_setup - Lexware verbinden\n"
     msg += "/lexware_status - Verbindung pruefen\n"
+    msg += "/werkstatt - Werkstatt-Adresse einrichten (fuer Smart-Termine)\n"
+    msg += "/werkstatt_status - aktuelle Heimat-Adresse anzeigen\n"
     msg += "/start - Bot mit Betrieb verbinden\n"
     msg += "/status - Agent-Status pruefen\n"
     msg += "/abbrechen - laufende Aktion abbrechen\n"
@@ -632,6 +640,10 @@ async def process_telegram_update(payload):
     elif text == "/rechnungen_anzeigen":
         await _clear_state(chat_id)
         reply = await _handle_rechnungen_anzeigen_command(chat_id)
+    elif text == "/werkstatt":
+        reply = await _handle_werkstatt_command(chat_id)
+    elif text == "/werkstatt_status":
+        reply = await _handle_werkstatt_status_command(chat_id)
     elif text.startswith("/"):
         reply = await _handle_unknown()
     else:
@@ -676,6 +688,12 @@ async def process_telegram_update(payload):
             reply = reply_or_none
         elif state.state_key == STATE_LEISTUNG_PREVIEWING:
             reply = "Bitte einen der Buttons oben antippen oder /abbrechen schicken."
+        elif state.state_key == STATE_WERKSTATT_WAITING_ADDRESS:
+            reply = await _handle_werkstatt_address_input(chat_id, text)
+        elif state.state_key == STATE_WERKSTATT_CONFIRMING:
+            reply = await _handle_werkstatt_confirm_input(
+                chat_id, text, state.state_data,
+            )
         elif state.state_key == STATE_RECHNUNG_AWAITING_MAIL:
             stage = (state.state_data or {}).get("stage")
             if stage == "awaiting_mail_address":
@@ -3252,6 +3270,280 @@ async def _handle_rechnungen_anzeigen_command(chat_id):
         else:
             lines.append(f'• {ts} {kunde} {betrag} Status: {rg.status}')
     return "\n".join(lines)
+
+
+
+
+# =====================================================================
+# Werkstatt-Setup-Wizard
+# (Heimat-Adresse fuer Smart-Termin-Routing — verwendet von Kalender-
+#  Plugin um Fahrtzeiten zwischen Terminen einzurechnen)
+# =====================================================================
+
+YES_TRIGGERS = ("ja", "j", "yes", "y", "ok", "speichern", "passt", "stimmt")
+NO_TRIGGERS = ("nein", "n", "no", "abbrechen", "nochmal", "neu", "falsch")
+
+
+def _format_werkstatt_status(tenant) -> str:
+    """Liefert Anzeige-Text der aktuellen Werkstatt-Daten."""
+    if not tenant.heimat_strasse and not tenant.heimat_ort:
+        return (
+            "<b>Werkstatt-Adresse</b>\n\n"
+            "Noch keine Heimat-Adresse hinterlegt.\n\n"
+            "Mit /werkstatt eintragen — wird gebraucht damit "
+            "Q bei Termin-Vorschlaegen die Fahrtzeiten zwischen "
+            "Kunden einrechnen kann."
+        )
+    addr_parts = []
+    if tenant.heimat_strasse:
+        addr_parts.append(tenant.heimat_strasse)
+    if tenant.heimat_plz or tenant.heimat_ort:
+        addr_parts.append(
+            f"{tenant.heimat_plz or ''} {tenant.heimat_ort or ''}".strip()
+        )
+    addr = ", ".join(addr_parts)
+    geo = ""
+    if tenant.heimat_lat is not None and tenant.heimat_lon is not None:
+        geo = (
+            f"\n📍 Geo: {tenant.heimat_lat}, {tenant.heimat_lon}"
+            f" (fuer Routing geocoded)"
+        )
+    msg = "<b>Werkstatt-Adresse</b>\n\n"
+    msg += f"📍 {addr}{geo}\n\n"
+    msg += f"⏱ Puffer pro Termin: {tenant.fahrtzeit_puffer_min} Min\n\n"
+    msg += "Mit /werkstatt aendern."
+    return msg
+
+
+async def _update_tenant_werkstatt(
+    tenant_id, *, strasse, plz, ort, lat, lon,
+):
+    """UPDATE auf tenants — heimat_*-Felder setzen."""
+    from sqlalchemy import update
+    from decimal import Decimal
+    async with AsyncSessionLocal() as s:
+        await s.execute(
+            update(Tenant).where(Tenant.id == tenant_id).values(
+                heimat_strasse=strasse,
+                heimat_plz=plz,
+                heimat_ort=ort,
+                heimat_lat=Decimal(str(round(lat, 6))) if lat is not None else None,
+                heimat_lon=Decimal(str(round(lon, 6))) if lon is not None else None,
+            )
+        )
+        await s.commit()
+
+
+async def _handle_werkstatt_command(chat_id):
+    """Startet den Werkstatt-Setup-Wizard.
+
+    Wenn schon Adresse hinterlegt: zeigt Status + bietet Aenderung an.
+    Sonst: fragt nach Adresse.
+    """
+    tenant = await _get_tenant_by_chat(chat_id)
+    if not tenant:
+        return (
+            "Dieser Chat ist noch keinem Betrieb zugeordnet.\n"
+            "Bitte zuerst den Aktivierungs-QR-Code scannen."
+        )
+
+    has_address = bool(tenant.heimat_strasse and tenant.heimat_ort)
+
+    await _save_state(chat_id, STATE_WERKSTATT_WAITING_ADDRESS, {})
+
+    if has_address:
+        msg = _format_werkstatt_status(tenant) + "\n\n"
+        msg += (
+            "<b>Neue Adresse?</b>\n"
+            "Schicke einfach die komplette Adresse, z.B.:\n"
+            "<code>Hauptstr. 5, 54290 Trier</code>\n\n"
+            "Oder /abbrechen wenn alles passt."
+        )
+        return msg
+
+    msg = "<b>Werkstatt einrichten</b>\n\n"
+    msg += (
+        "Q braucht deine Werkstatt-Adresse um bei Termin-Vorschlaegen "
+        "die Fahrtzeit von einem Kunden zum naechsten einzurechnen — "
+        "damit du nicht im Stress hetzen musst.\n\n"
+    )
+    if not ors_is_configured():
+        msg += (
+            "<i>⚠ Hinweis: Smart-Routing-API noch nicht aktiviert "
+            "(Betreiber muss OPENROUTESERVICE_API_KEY setzen). "
+            "Adresse wird trotzdem schon gespeichert, "
+            "Routing greift sobald der Key da ist.</i>\n\n"
+        )
+    msg += (
+        "<b>Schicke die komplette Adresse</b>, z.B.:\n"
+        "<code>Hauptstr. 5, 54290 Trier</code>\n\n"
+        "Oder /abbrechen."
+    )
+    return msg
+
+
+async def _handle_werkstatt_status_command(chat_id):
+    """/werkstatt_status — nur Anzeige, keinen Wizard starten."""
+    await _clear_state(chat_id)
+    tenant = await _get_tenant_by_chat(chat_id)
+    if not tenant:
+        return "Dieser Chat ist noch keinem Betrieb zugeordnet."
+    return _format_werkstatt_status(tenant)
+
+
+async def _handle_werkstatt_address_input(chat_id, text):
+    """User hat Adresse getippt. Geocoden + Bestaetigung anbieten."""
+    text = (text or "").strip()
+    if len(text) < 6:
+        return (
+            "Adresse zu kurz. Bitte schicke etwas wie:\n"
+            "<code>Hauptstr. 5, 54290 Trier</code>"
+        )
+
+    tenant = await _get_tenant_by_chat(chat_id)
+    if not tenant:
+        await _clear_state(chat_id)
+        return "Tenant nicht gefunden."
+
+    # 1. Versuche zu geocoden
+    point = await ors_geocode_address(text)
+    if point is None:
+        # Kein Geocoding moeglich (kein Key oder Adresse nicht gefunden).
+        # Wir lassen den Tenant trotzdem bestaetigen — die Adresse wird
+        # als Text gespeichert, Routing greift sobald Geo-Daten da sind.
+        # Adresse aufteilen mit grobem Heuristik-Parser.
+        parsed = _heuristic_parse_address(text)
+        await _save_state(
+            chat_id, STATE_WERKSTATT_CONFIRMING,
+            {
+                "raw": text,
+                "strasse": parsed["strasse"],
+                "plz": parsed["plz"],
+                "ort": parsed["ort"],
+                "lat": None, "lon": None,
+            },
+        )
+        msg = "<b>Adresse aufgenommen</b>\n\n"
+        if parsed["strasse"]:
+            msg += f"Strasse: {parsed['strasse']}\n"
+        if parsed["plz"] or parsed["ort"]:
+            msg += f"Ort: {parsed['plz']} {parsed['ort']}\n"
+        msg += (
+            "\n<i>⚠ Die Geo-Koordinaten konnten nicht ermittelt werden "
+            "(Routing-API nicht verfuegbar oder Adresse nicht eindeutig). "
+            "Wird nachgereicht sobald moeglich.</i>\n\n"
+        )
+        msg += "Mit <b>JA</b> speichern, mit <b>NEIN</b> nochmal eintippen."
+        return msg
+
+    # 2. Adresse aufteilen, Geo merken
+    parsed = _heuristic_parse_address(text)
+    await _save_state(
+        chat_id, STATE_WERKSTATT_CONFIRMING,
+        {
+            "raw": text,
+            "strasse": parsed["strasse"],
+            "plz": parsed["plz"],
+            "ort": parsed["ort"],
+            "lat": point.lat,
+            "lon": point.lon,
+        },
+    )
+    msg = "<b>Adresse gefunden</b>\n\n"
+    msg += f"📍 {text}\n"
+    if parsed["strasse"]:
+        msg += f"Strasse: {parsed['strasse']}\n"
+    if parsed["plz"] or parsed["ort"]:
+        msg += f"Ort: {parsed['plz']} {parsed['ort']}\n"
+    msg += f"\n📌 Geo: {point.lat:.5f}, {point.lon:.5f}\n"
+    msg += (
+        f"<a href=\"https://www.openstreetmap.org/?mlat={point.lat}"
+        f"&mlon={point.lon}#map=16/{point.lat}/{point.lon}\">"
+        f"Auf Karte ansehen</a>\n\n"
+    )
+    msg += "Mit <b>JA</b> speichern, mit <b>NEIN</b> nochmal eintippen."
+    return msg
+
+
+async def _handle_werkstatt_confirm_input(chat_id, text, state_data):
+    """Tenant tippt JA / NEIN."""
+    t = (text or "").strip().lower()
+    state_data = state_data or {}
+
+    if t in YES_TRIGGERS or t.startswith("ja"):
+        tenant = await _get_tenant_by_chat(chat_id)
+        if not tenant:
+            await _clear_state(chat_id)
+            return "Tenant nicht gefunden."
+        await _update_tenant_werkstatt(
+            tenant.id,
+            strasse=state_data.get("strasse"),
+            plz=state_data.get("plz"),
+            ort=state_data.get("ort"),
+            lat=state_data.get("lat"),
+            lon=state_data.get("lon"),
+        )
+        await _clear_state(chat_id)
+        msg = "✅ <b>Werkstatt gespeichert</b>\n\n"
+        if state_data.get("lat") is None:
+            msg += (
+                "<i>Hinweis: Geo-Koordinaten fehlen noch. "
+                "Sobald Routing-API verfuegbar ist, holen wir sie "
+                "automatisch nach.</i>\n\n"
+            )
+        msg += "Q rechnet ab jetzt bei Termin-Vorschlaegen die Fahrtzeit ein."
+        return msg
+
+    if t in NO_TRIGGERS or t.startswith("nein") or t == "/abbrechen":
+        await _save_state(chat_id, STATE_WERKSTATT_WAITING_ADDRESS, {})
+        return (
+            "OK — schicke die Adresse nochmal:\n"
+            "<code>Hauptstr. 5, 54290 Trier</code>\n\n"
+            "Oder /abbrechen ganz raus."
+        )
+
+    return (
+        "Bitte mit <b>JA</b> bestaetigen oder <b>NEIN</b> abbrechen.\n"
+        "Aktuell vorgemerkt: " + (state_data.get("raw") or "—")
+    )
+
+
+def _heuristic_parse_address(text: str) -> dict:
+    """Sehr grober DE-Adress-Parser. Gibt {strasse, plz, ort} zurueck.
+
+    Erwartet 'Strasse + Hausnr, [PLZ] Ort' im typischen Format. Wenn
+    das nicht klappt, packen wir alles in 'strasse' und lassen plz/ort
+    None — das ist OK fuer Anzeige + Routing geht via Geo, nicht via PLZ.
+    """
+    import re
+    s = (text or "").strip()
+    # Versuche "Strasse Hausnr, PLZ Ort" oder "Strasse Hausnr PLZ Ort"
+    parts = [p.strip() for p in s.split(",") if p.strip()]
+    plz = None
+    ort = None
+    strasse = None
+
+    if len(parts) >= 2:
+        strasse = parts[0]
+        # In den Rest: PLZ + Ort suchen
+        rest = " ".join(parts[1:])
+        m = re.match(r"^(\d{5})\s+(.+)$", rest)
+        if m:
+            plz = m.group(1)
+            ort = m.group(2).strip()
+        else:
+            ort = rest
+    else:
+        # 1-Teile: "Hauptstr 5 54290 Trier"
+        m = re.search(r"\b(\d{5})\s+([A-Za-zÄÖÜäöüß\s\-]+)$", s)
+        if m:
+            plz = m.group(1)
+            ort = m.group(2).strip()
+            strasse = s[: m.start()].strip().rstrip(",")
+        else:
+            strasse = s
+
+    return {"strasse": strasse, "plz": plz, "ort": ort}
 
 
 
