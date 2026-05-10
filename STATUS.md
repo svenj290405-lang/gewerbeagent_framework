@@ -34,30 +34,22 @@ cd05504 feat(admin-db): admin_users + api_pricing_config + api_usage_log + Seeds
 
 **URL:** https://www.gewerbeagent.de/
 
-**Features (Killian-Brain-Hologramm-Look — Iron Man 3, Fuel VFX reference):**
-- 3D-Hologramm via Three.js r128 (CDN, lazy geladen)
-- Warm-Amber/Orange-Palette (#ff5008 base, #ff8a3a mid, #fff4d8 peak) — KEIN Blau
-- 110 Faser-Pfade (Mobile 30) als CatmullRomCurve3 + TubeGeometry mit
-  6-10 Kontroll-Punkten, Center-Bias (Brain-Density)
-- Custom GLSL ShaderMaterial pro Faser: Licht wandert entlang Curve-UV.x
-  via wandernder Gauss-Peak (`exp(-d²·700)`) + exponentieller Trail nach
-  hinten + sanfte Grund-Glow auf der ganzen Faser. Individuelles uOffset
-  und uSpeed pro Curve (0.06-0.24 Hz) für asynchrone Pulse-Wellen.
-- 4000 Volume-Particles (Mobile 1500) mit power-2-Density-Bias (zentral
-  dichter, außen spärlicher), 220 Hot-Spot-Highlights als zweite Schicht,
-  300 davon mit Brownian-Motion (Performance-bewusst)
-- Outer Shell (SphereGeometry r=1.75) mit Custom Fresnel-Shader
-  (`pow(1-dot(N,V), 2.5)`), 3s Breath-Pulse, sehr niedrige Opacity → "Container"-Hint
-- UnrealBloomPass auf Desktop (strength 1.5, radius 0.8, threshold 0.4) —
-  Mobile fällt sauber zurück auf direkten renderer.render()
-- AdditiveBlending durchgehend, radial-gradient CanvasTexture für Particles
-- Pulse-Bursts alle 4-6s vom Zentrum (Wireframe-Icosahedrons, expanding)
-- Camera-Parallax zu Maus (subtil, ±0.3 units)
-- Klick spawnt 2 Pulse-Bursts (sichtbarer Trigger)
-- Sehr langsame Y-Rotation (0.0005 rad/frame ≈ 1 Umdrehung in 3.5min)
-- Build-up gestaffelt: Shell 0-0.5s → Particles 0.2-0.9s → Hot 0.4-1.1s → Faser-Licht 0.5-2.0s
-- prefers-reduced-motion: Rotation aus, Pulse aus, statisch
-- CSS Hero-Glow + SVG-Fallback auf Amber umgestellt (orange tint)
+**Features (JARVIS-Wireframe-Sphere, blau, Atem-Rhythmus):**
+- 3D-Wireframe-Sphere via Three.js r128 (CDN, lazy geladen)
+- IcosahedronGeometry (detail 3 Desktop / 2 Mobile) als WireframeGeometry
+- 280 Brownian-Motion-Partikel (Mobile 80) im Inneren der Sphere
+- 7 dynamische Energy-Linien (Mobile 5) als Bezier-Bahnen Pol-zu-Pol,
+  rotieren mit individuellen Speeds in zufälligen Achsen
+- Pulse-Animation: Scale 1.0 → 1.05 → 1.0 in **3.5s** (langsamer Atem-Rhythmus,
+  Sven-Wunsch — vorher 1.8s war zu hektisch). Linien-Opacity 0.6 → 1.0 → 0.6
+  simultan. (1-cos)/2-Kurve startet am Minimum.
+- Subtle blaue PointLight im Sphere-Zentrum pulsiert mit
+- Maus-Hover folgt sanft, Klick = Scale-Burst auf 1.15 mit Snap-back
+- Build-Up beim Page-Load: Sphere zeichnet sich in 1.6s mit setDrawRange auf
+- prefers-reduced-motion respektiert (kein Pulse, statisch)
+- Mobile <480 mit deviceMemory<4: SVG-Fallback (3 pulsierende Ringe)
+- Dezent-blau (#3b82f6) Linien, weiß-blaue Spitzlichter
+- CSS Hero-Glow: hellblauer radialer Halo (#dbeafe → transparent)
 - `prefers-reduced-motion` respektiert
 - Mobile <480px: vereinfachter SVG-Fallback (keine WebGL-Last)
 - Inter-Font, weiss-dominant, dezent-blau (#3b82f6)
