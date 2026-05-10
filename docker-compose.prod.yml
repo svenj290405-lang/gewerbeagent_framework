@@ -1,0 +1,95 @@
+# Prod-Stack: gewerbeagent.de + interne Postgres + Caddy
+# Verwendung:
+#   docker compose -p prod -f docker-compose.prod.yml up -d
+#
+# Bind-Mount: /opt/gewerbeagent/framework -> /app
+# DB-Name: gewerbeagent  (unveraendert vom Original)
+# Caddy routet sowohl gewerbeagent.de (prod) als auch dev.gewerbeagent.de
+# (dev-Stack joined die Caddy-Networks und wird per reverse_proxy erreicht).
+#
+# Init-Skript scripts/init-databases.sh wird beim ersten Start des Postgres-
+# Volumes ausgefuehrt und erstellt zusaetzlich die DB 'gewerbeagent_dev' fuer
+# den parallel laufenden Dev-Stack.
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: gewerbeagent_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: gewerbeagent
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: gewerbeagent
+      # init-databases.sh laeuft nur beim allerersten Start (leerer Volume).
+      # Wenn Volume schon existiert wird der Hook uebersprungen. In dem Fall
+      # muss 'gewerbeagent_dev' manuell via psql -c "CREATE DATABASE ..."
+      # angelegt werden — siehe INFRA-MANUAL-STEPS.md.
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init-databases.sh:/docker-entrypoint-initdb.d/init-databases.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gewerbeagent"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - internal
+
+  framework:
+    image: python:3.12-slim
+    container_name: gewerbeagent_framework
+    restart: unless-stopped
+    working_dir: /app
+    volumes:
+      - ./:/app
+    env_file:
+      - .env
+    command: >
+      bash -c "
+      apt-get update && apt-get install -y --no-install-recommends curl &&
+      pip install --no-cache-dir uv &&
+      uv sync --frozen &&
+      uv run alembic upgrade head &&
+      uv run uvicorn core.api.app:app --host 0.0.0.0 --port 8001
+      "
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - internal
+      - web
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: gewerbeagent_caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - /opt/gewerbeagent/website:/srv/website:ro
+      - caddy_data:/data
+      - caddy_config:/config
+      - caddy_logs:/var/log/caddy
+    depends_on:
+      - framework
+    networks:
+      - web
+
+networks:
+  internal:
+    name: gewerbeagent_internal
+  web:
+    name: gewerbeagent_web
+
+volumes:
+  postgres_data:
+    name: gewerbeagent_postgres_data
+  caddy_data:
+    name: gewerbeagent_caddy_data
+  caddy_config:
+    name: gewerbeagent_caddy_config
+  caddy_logs:
+    name: gewerbeagent_caddy_logs

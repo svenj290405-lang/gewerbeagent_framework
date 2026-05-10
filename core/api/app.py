@@ -47,23 +47,34 @@ async def lifespan(app: FastAPI):
     discover_plugins()
     logger.info(f"{len(PLUGIN_MANIFESTS)} Plugins geladen")
 
-    cron_task = asyncio.create_task(microsoft_cron_loop())
-    logger.info("Microsoft-Cron als Background-Task gestartet")
+    # Cron-Trennung Dev/Prod: im Dev-Stack mit DEV_CRON_DISABLED=true
+    # werden die Background-Loops uebersprungen → kein API-Quota-
+    # Verbrauch, keine Test-Mails, keine Bezahl-Polls fuer Prod-Tenants.
+    if settings.crons_enabled:
+        cron_task = asyncio.create_task(microsoft_cron_loop())
+        logger.info("Microsoft-Cron als Background-Task gestartet")
 
-    payment_task = asyncio.create_task(rechnung_payment_cron_loop())
-    logger.info("Bezahl-Polling-Cron (Lexware, alle 30 Min) gestartet")
+        payment_task = asyncio.create_task(rechnung_payment_cron_loop())
+        logger.info("Bezahl-Polling-Cron (Lexware, alle 30 Min) gestartet")
 
-    summary_task = asyncio.create_task(rechnung_paid_summary_cron_loop())
-    logger.info("Bezahl-Tages-Zusammenfassung-Cron (taegl. 18:00) gestartet")
+        summary_task = asyncio.create_task(rechnung_paid_summary_cron_loop())
+        logger.info("Bezahl-Tages-Zusammenfassung-Cron (taegl. 18:00) gestartet")
 
-    dsgvo_task = asyncio.create_task(dsgvo_cleanup_cron_loop())
-    logger.info("DSGVO-Cleanup-Cron (taegl. 03:00) gestartet")
+        dsgvo_task = asyncio.create_task(dsgvo_cleanup_cron_loop())
+        logger.info("DSGVO-Cleanup-Cron (taegl. 03:00) gestartet")
+        cron_tasks = (cron_task, payment_task, summary_task, dsgvo_task)
+    else:
+        logger.warning(
+            "Cron-Loops deaktiviert (environment=%s, dev_cron_disabled=%s)",
+            settings.environment, settings.dev_cron_disabled,
+        )
+        cron_tasks = ()
 
     yield
 
-    for t in (cron_task, payment_task, summary_task, dsgvo_task):
+    for t in cron_tasks:
         t.cancel()
-    for t in (cron_task, payment_task, summary_task, dsgvo_task):
+    for t in cron_tasks:
         try:
             await t
         except asyncio.CancelledError:

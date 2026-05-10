@@ -1,0 +1,53 @@
+# Dev-Stack: dev.gewerbeagent.de
+# Verwendung:
+#   cd /opt/gewerbeagent/framework-dev
+#   docker compose -p dev -f docker-compose.dev.yml up -d
+#
+# Voraussetzungen:
+#   1. Prod-Stack laeuft (docker compose -p prod up -d)
+#      → liefert Postgres + Caddy + Networks
+#   2. DB 'gewerbeagent_dev' existiert (siehe INFRA-MANUAL-STEPS.md)
+#   3. .env.dev ist konfiguriert (DATABASE_URL → gewerbeagent_dev)
+#   4. Bind-Mount-Pfad ist /opt/gewerbeagent/framework-dev (NICHT framework)
+#
+# Bind-Mount: /opt/gewerbeagent/framework-dev -> /app
+# DB-Name: gewerbeagent_dev
+# Networks: external — joined die Prod-Stack-Networks
+# Container-Name: gewerbeagent_framework_dev (anders als prod's
+#   gewerbeagent_framework — Caddy routet ueber Container-Name).
+#
+# Caddy-Routing: das dev-Framework wird als 'framework_dev:8001' von Caddy
+# erreicht — siehe Caddyfile-Block 'dev.gewerbeagent.de'.
+services:
+  framework_dev:
+    image: python:3.12-slim
+    container_name: gewerbeagent_framework_dev
+    hostname: framework_dev
+    restart: unless-stopped
+    working_dir: /app
+    volumes:
+      - ./:/app
+    env_file:
+      - .env.dev
+    command: >
+      bash -c "
+      apt-get update && apt-get install -y --no-install-recommends curl &&
+      pip install --no-cache-dir uv &&
+      uv sync --frozen &&
+      uv run alembic upgrade head &&
+      uv run uvicorn core.api.app:app --host 0.0.0.0 --port 8001
+      "
+    networks:
+      - internal
+      - web
+
+networks:
+  # External-Networks: muessen vorher vom Prod-Stack erstellt worden sein.
+  # 'name: gewerbeagent_internal' im Prod-Compose macht den Namen
+  # deterministisch — kein Project-Prefix.
+  internal:
+    external: true
+    name: gewerbeagent_internal
+  web:
+    external: true
+    name: gewerbeagent_web

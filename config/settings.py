@@ -60,9 +60,26 @@ class Settings(BaseSettings):
 
     public_url: str = "http://localhost:8000"
 
+    # Cron-Loops im Dev-Stack abschalten. Verhindert dass Dev-Stack echte
+    # API-Quoten verbraucht (Gemini, Vertex), Test-Mails verschickt
+    # (Brevo) oder Bezahl-Polls fuer Prod-Tenants ausloest. Standard:
+    # auto an wenn environment != 'production'. Mit DEV_CRON_DISABLED=true
+    # in .env.dev kann man auch im Dev explizit alle Crons abschalten.
+    dev_cron_disabled: bool = False
+
     @property
     def is_production(self) -> bool:
         return self.environment == "production"
+
+    @property
+    def crons_enabled(self) -> bool:
+        """True wenn Background-Cron-Loops gestartet werden sollen.
+
+        Prod: immer ja. Dev: nur wenn dev_cron_disabled=False explizit.
+        """
+        if self.is_production:
+            return True
+        return not self.dev_cron_disabled
 
     @property
     def project_root(self) -> Path:

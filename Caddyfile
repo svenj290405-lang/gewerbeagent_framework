@@ -60,3 +60,42 @@ www.gewerbeagent.de {
         format console
     }
 }
+
+# =====================================================================
+# Dev-Stack: dev.gewerbeagent.de
+# =====================================================================
+# AKTIVIERUNG erst nachdem (siehe INFRA-MANUAL-STEPS.md):
+#   1. DNS A-Record fuer dev.gewerbeagent.de auf Server-IP zeigt
+#   2. Dev-Framework-Container laeuft (gewerbeagent_framework_dev)
+#   3. basicauth-Hash unten gegen echten Wert ersetzt
+# Dann: docker compose -p prod restart caddy (laed Caddyfile neu)
+#
+# Vor Aktivierung bleibt der Block auskommentiert. Caddy ignoriert
+# die Lines mit '#' — keinerlei Wirkung auf Prod.
+#
+# basicauth-Hash erzeugen:
+#   docker exec gewerbeagent_caddy caddy hash-password --plaintext "<dein-passwort>"
+#
+# dev.gewerbeagent.de {
+#     encode gzip
+#     import security_headers
+#
+#     basicauth {
+#         sven $2a$14$REPLACE_WITH_BCRYPT_HASH_HIER
+#     }
+#
+#     reverse_proxy framework_dev:8001 {
+#         header_up Host {host}
+#         header_up X-Real-IP {remote}
+#         header_up X-Forwarded-For {remote}
+#         header_up X-Forwarded-Proto {scheme}
+#     }
+#
+#     log {
+#         output file /var/log/caddy/dev-access.log {
+#             roll_size 10mb
+#             roll_keep 3
+#         }
+#         format console
+#     }
+# }
