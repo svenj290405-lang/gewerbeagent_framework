@@ -84,6 +84,7 @@ from core.models.rechnung import (
 )
 from core.models.rechnung_position import RechnungPosition
 from core.models.tool_config import ToolConfig
+from core.models.geocode_cache import GeocodeCache
 
 __all__ = [
     "Tenant",
@@ -112,6 +113,7 @@ __all__ = [
     "RECHNUNG_INPUT_VOICE",
     "RechnungPosition",
     "ToolConfig",
+    "GeocodeCache",
     "OAuthToken",
     "OAuthState",
     "TelegramState",
