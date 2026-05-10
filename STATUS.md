@@ -1,15 +1,112 @@
-# Gewerbeagent — Nacht-Build Bericht
+# Gewerbeagent — Nacht-Build + Tag-Erweiterungen
 
 **Datum:** 10.05.2026
 **Branch:** `telegram-bot-onboarding`
-**Commits dieser Nacht:** 4 neue (siehe `git log`)
 
 ```
+914a845 feat(rechnung-bezahlt-ui): /rechnungen_anzeigen zeigt Bezahl-Status
+7482c2c feat(rechnung-bezahlt-cron): 30min Lexware-Polling + 18:00 Tages-Push
+e8b15b4 feat(rechnung-bezahlt-db): bezahlt_am + lexware_voucher_status + Indizes
+16e8082 docs: Sphere-Rollback zu JARVIS-Wireframe-Blau, Pulse 3.5s
+ac124cf docs: Sphere-Rebuild zum Killian-Brain-Hologramm-Look (verworfen)
+5b7e0fa docs: Sphere-Rebuild zu Iron-Man-Hologramm (Fragmented, verworfen)
+e028356 docs: STATUS.md - Sphere-Polish notiert (Pulse 5%, PointLight)
+00df4a5 docs: STATUS.md mit Nacht-Build-Bericht
 713cf89 fix(admin): unauthenticated /admin/* macht 303-Redirect zu /admin/login
 e7cb7f2 feat(admin-dashboard): /admin Backend mit Auth, Dashboard, Pricing-Editor
 48f53b4 feat(billing): track_api_usage + Provider-Instrumentierung
 cd05504 feat(admin-db): admin_users + api_pricing_config + api_usage_log + Seeds
 ```
+
+---
+
+## TEIL E — RECHNUNGS-BEZAHL-TRACKING (10.05.2026 vormittags)
+
+### Status: ✅ Fertig + Live
+
+Sven-Wunsch: Rechnungen die per Mail rausgehen sollen automatisch ueberwacht
+werden, ob sie bezahlt wurden. Tages-Zusammenfassung um 18:00 statt
+Sofort-Push (weniger Stoerung). Nur bezahlt-Tracking, kein Mahnen.
+
+### Neue DB-Felder (rechnungen-Tabelle)
+
+Migration `j2c8e5f1a4d6` (additiv, kein Drop):
+
+| Feld | Typ | Zweck |
+|---|---|---|
+| `bezahlt_am` | TimestampTZ | Wann Lexware "paid" gemeldet hat |
+| `lexware_voucher_status` | varchar(30) | Cache des zuletzt gemeldeten Status |
+| `last_paid_check_at` | TimestampTZ | Zuletzt gegen Lexware gepollt |
+| `paid_notification_sent` | bool default false | Verhindert Doppel-Push |
+
+Status-Konstante neu: `RECHNUNG_STATUS_BEZAHLT = "bezahlt"`.
+`LEXWARE_PAID_STATES = {"paid", "paidoff"}` als Toleranz-Set.
+
+Indizes:
+- `ix_rechnungen_status_bezahlt_am` — scaled das Polling-SELECT
+- `ix_rechnungen_paid_notify` — scaled die Tages-Zusammenfassung
+
+### Cron 1: Lexware-Polling alle 30 Minuten
+
+**Datei:** `core/integrations/rechnung_payment_monitor.py`
+
+- In `app.py` als `asyncio.create_task()` gestartet
+- Initial-Delay 90s nach App-Boot (entzerrt zu Microsoft-Cron)
+- Pro Tenant: SELECT mail_sent + bezahlt_am IS NULL + lexware_invoice_id
+- Pro Rechnung: `provider.get_invoice()` → `voucherStatus` pruefen
+- Race-Schutz: UPDATE nur wenn `bezahlt_am IS NULL` (paralleler manueller Check ist OK)
+- Failsafe: Lexware-Fehler pro Rechnung loggen, Lauf nicht abbrechen
+- Lexware-Rate-Limit (2 req/s) durch 0.3s zwischen Tenants
+- Real getestet: 1 Tenant, 4 offene Rechnungen, alle korrekt mit "open" markiert
+
+### Cron 2: Tages-Zusammenfassung um 18:00 Europe/Berlin
+
+**Datei:** `core/integrations/rechnung_paid_summary.py`
+
+- Tickt jede Minute, prueft ob heutige 18:00-Marke schon abgearbeitet
+- `last_run_date`-Memoiz im Prozess; bei Container-Restart vor 18:00
+  laeuft heute trotzdem nur einmal
+- Pro Tenant: SELECT bezahlt_am::date=heute AND paid_notification_sent=false
+- Telegram-Push (HTML-formatiert, deutsche EUR-Schreibweise via _format_eur):
+
+  ```
+  💰 Heute bezahlt: 3 Rechnungen
+  Gesamt: 2.523,66 €
+
+    • Müller GmbH — 500,00 €
+    • Schmidt & Co — 1.234,56 €
+    • Lange Heizungsbau — 789,10 €
+  ```
+
+  Ueber 10 Eintraege: "+ N weitere".
+- Bei Telegram-Fehler: paid_notification_sent NICHT gesetzt → naechster Tag retry
+- Lazy-Import von `_send_to_chat` aus telegram_notify-Plugin um Layering nicht zu verletzen
+
+### UI-Erweiterung in /rechnungen_anzeigen
+
+In `_handle_rechnungen_anzeigen_command` (handler.py:3195):
+
+- ✅ bezahlt 10.05. + Lexware-Link (wenn bezahlt)
+- ⏳ offen (geprueft 10.05. 07:17) + Lexware-Link (wenn mail_sent + voucher=open)
+- 🚫 storniert (wenn voucher=voided)
+- bestehende drafted/error/cancelled-Branches unveraendert
+
+### Bekannte Limitationen / Work-To-Do (optional)
+
+1. **Manueller "Jetzt pruefen"-Button** noch nicht gebaut. Im Listing
+   waere ein Inline-Button pro Rechnung schoen, der einen Sofort-Poll
+   triggert. Aktuell muss man bis zum naechsten Cron-Lauf warten (max 30 min).
+
+2. **Bezahl-Daten zur Web-Admin-Sicht** (/admin/) sind noch nicht
+   verlinkt. Im Dashboard koennten "Heute bezahlt" und "Diesen Monat
+   bezahlt" als zusaetzliche Stat-Cards laufen.
+
+3. **Tenant-Notification bei toten Lexware-API-Keys**: wenn `last_paid_check_at`
+   alt ist (z.B. > 24h fuer eine offene Rechnung), Telegram-Hinweis "Bitte
+   Lexware-Verbindung pruefen". Noch nicht eingebaut.
+
+4. **Webhooks** unterstuetzt Lexware-API nicht; Polling ist der einzige
+   Weg. 30 Min Latenz ist akzeptabel fuer Bezahl-Tracking.
 
 ---
 
