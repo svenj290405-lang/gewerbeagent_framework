@@ -416,72 +416,233 @@ async def _handle_start_command(text, chat_id, from_data):
         reply += "Mit /help sehen Sie alle verfuegbaren Befehle."
         return reply
 
-async def _handle_help_command():
+async def _handle_help_command(chat_id=None):
+    """Zeigt die Befehlsliste — gefiltert nach aktiven Features.
+
+    Wenn der Tenant z.B. das Drive-Feature nicht hat, blendet /help den
+    KUNDEN-ARCHIV-Block komplett aus. Tenants im Basis-Paket sehen
+    keinen Lexware-, Material- oder Visualisierungs-Block.
+
+    chat_id=None = Fallback (zeigt alles, fuer Test/Doku).
+    """
+    # Aktive Features fuer diesen Tenant ermitteln. Wenn der Chat noch
+    # keinem Tenant zugeordnet ist (z.B. Erstkontakt vor /start),
+    # zeigen wir nur die immer-verfuegbaren Befehle.
+    enabled_features: frozenset[str] | None = None
+    if chat_id is not None:
+        tenant = await _get_tenant_by_chat(chat_id)
+        if tenant is not None:
+            from core.features import enabled_features_for_tenant
+            try:
+                enabled_features = await enabled_features_for_tenant(tenant.id)
+            except Exception as e:
+                logger.warning(f"_handle_help_command: feature-load failed: {e}")
+                enabled_features = None
+
+    def _is_on(feature_key: str) -> bool:
+        # Bei fehlendem Tenant-Mapping -> alles anzeigen (Default-Hilfe)
+        if enabled_features is None:
+            return True
+        return feature_key in enabled_features
+
     msg = "<b>📋 Verfuegbare Befehle</b>\n\n"
 
-    msg += "<b>📷 BELEGE</b>\n"
-    msg += "/beleg - Foto/PDF an Lexware schicken\n"
-    msg += "/belege_anzeigen - letzte 10 hochgeladene\n\n"
+    if _is_on("lexware"):
+        msg += "<b>📷 BELEGE</b>\n"
+        msg += "/beleg - Foto/PDF an Lexware schicken\n"
+        msg += "/belege_anzeigen - letzte 10 hochgeladene\n\n"
 
-    msg += "<b>💰 RECHNUNGEN</b>\n"
-    msg += "/rechnung - neue anlegen (Text oder Sprache)\n"
-    msg += "/rechnungen_anzeigen - letzte 10\n"
-    msg += "/rechnung_pruefen - jetzt Bezahl-Status pollen (sonst alle 30min)\n\n"
-    msg += "<b>🛒 Material & Bestellungen</b>\n"
-    msg += "/material - Liste der Verbrauchsartikel\n"
-    msg += "/material neu - neuen Artikel anlegen\n"
-    msg += "/material &lt;slug&gt; - Details + Historie\n"
-    msg += "/bestellen - Liste mit Quick-Order\n"
-    msg += "/bestellen &lt;slug&gt; [menge] - jetzt bestellen\n"
-    msg += "/bestellungen - letzte 20 Bestellungen\n\n"
+        msg += "<b>💰 RECHNUNGEN</b>\n"
+        msg += "/rechnung - neue anlegen (Text oder Sprache)\n"
+        msg += "/rechnungen_anzeigen - letzte 10\n"
+        msg += "/rechnung_pruefen - jetzt Bezahl-Status pollen\n\n"
 
-    msg += "<b>📞 KUNDENGESPRAECHE</b>\n"
-    msg += "/aufnahme - Gespraech aufnehmen + Lexware-Angebot\n"
-    msg += "/briefing - naechster Termin mit Briefing\n"
-    msg += "/anrufe - letzte 10 Gespraeche\n"
-    msg += "/kunde [Name] - alle Gespraeche zu einem Kunden\n\n"
+    if _is_on("material"):
+        msg += "<b>🛒 MATERIAL &amp; BESTELLUNGEN</b>\n"
+        msg += "/material - Liste der Verbrauchsartikel\n"
+        msg += "/material neu - neuen Artikel anlegen\n"
+        msg += "/material &lt;slug&gt; - Details + Historie\n"
+        msg += "/bestellen - Liste mit Quick-Order\n"
+        msg += "/bestellen &lt;slug&gt; [menge] - jetzt bestellen\n"
+        msg += "/bestellungen - letzte 20 Bestellungen\n\n"
 
-    msg += "<b>📚 WISSENSBASIS</b>\n"
-    msg += "/wissen - neuen Eintrag anlegen\n"
-    msg += "/wissen_anzeigen - alle ansehen\n"
-    msg += "/wissen_loeschen - Eintrag entfernen\n\n"
+    if _is_on("voice_init") or _is_on("kalender"):
+        msg += "<b>📞 KUNDENGESPRAECHE</b>\n"
+        if _is_on("voice_init"):
+            msg += "/aufnahme - Gespraech aufnehmen + Lexware-Angebot\n"
+            msg += "/anrufe - letzte 10 Gespraeche\n"
+        if _is_on("kalender"):
+            msg += "/briefing - naechster Termin mit Briefing\n"
+        msg += "/kunde [Name] - alle Gespraeche zu einem Kunden\n\n"
 
-    msg += "<b>🧮 KALKULATION (Formeln fuers Angebot)</b>\n"
-    msg += "/kalkulation - neue Formel anlegen (Wizard)\n"
-    msg += "/kalkulation_excel - Excel-Datei mit Formeln hochladen\n"
-    msg += "/kalkulation_anzeigen - alle Regeln ansehen\n"
-    msg += "/kalkulation_loeschen - Regel entfernen\n\n"
+    if _is_on("wissensbasis"):
+        msg += "<b>📚 WISSENSBASIS</b>\n"
+        msg += "/wissen - neuen Eintrag anlegen\n"
+        msg += "/wissen_anzeigen - alle ansehen\n"
+        msg += "/wissen_loeschen - Eintrag entfernen\n\n"
 
-    msg += "<b>📋 ANFRAGE-FORMULAR</b>\n"
-    msg += "/formular - Felder bearbeiten (Wizard)\n"
-    msg += "/formular_anzeigen - aktuelle Felder ansehen\n"
-    msg += "/formular_zuruecksetzen - auf Standard zuruecksetzen\n\n"
+    if _is_on("kalkulation"):
+        msg += "<b>🧮 KALKULATION (Formeln fuers Angebot)</b>\n"
+        msg += "/kalkulation - neue Formel anlegen (Wizard)\n"
+        msg += "/kalkulation_excel - Excel-Datei mit Formeln hochladen\n"
+        msg += "/kalkulation_anzeigen - alle Regeln ansehen\n"
+        msg += "/kalkulation_loeschen - Regel entfernen\n\n"
 
-    msg += "<b>🎨 VISUALISIERUNG</b>\n"
-    msg += "/visualisierung - Foto + KI-Rendering\n\n"
+    if _is_on("anfrage_formular"):
+        msg += "<b>📋 ANFRAGE-FORMULAR</b>\n"
+        msg += "/formular - Felder bearbeiten (Wizard)\n"
+        msg += "/formular_anzeigen - aktuelle Felder ansehen\n"
+        msg += "/formular_zuruecksetzen - auf Standard zuruecksetzen\n\n"
 
-    msg += "<b>☁️ KUNDEN-ARCHIV (Google Drive)</b>\n"
-    msg += "/drive_verbinden - Drive-Zugriff erlauben (einmalig)\n"
-    msg += "/drive_status - Verbindung + Statistik pruefen\n"
-    msg += "/archiv - Liste der Kunden mit Drive-Ordner\n"
-    msg += "/archiv &lt;name&gt; - Bilder/PDFs hochladen (Wizard)\n"
-    msg += "/fertig - Upload-Wizard abschliessen\n\n"
+    if _is_on("visualisierung"):
+        msg += "<b>🎨 VISUALISIERUNG</b>\n"
+        msg += "/visualisierung - Foto + KI-Rendering\n\n"
+
+    if _is_on("drive_archiv"):
+        msg += "<b>☁️ KUNDEN-ARCHIV (Google Drive)</b>\n"
+        msg += "/drive_verbinden - Drive-Zugriff erlauben (einmalig)\n"
+        msg += "/drive_status - Verbindung + Statistik pruefen\n"
+        msg += "/archiv - Liste der Kunden mit Drive-Ordner\n"
+        msg += "/archiv &lt;name&gt; - Bilder/PDFs hochladen (Wizard)\n"
+        msg += "/fertig - Upload-Wizard abschliessen\n\n"
 
     msg += "<b>⚙️ SETUP</b>\n"
-    msg += "/lexware_setup - Lexware verbinden\n"
-    msg += "/lexware_status - Verbindung pruefen\n"
-    msg += "/werkstatt - Werkstatt-Adresse einrichten (fuer Smart-Termine)\n"
-    msg += "/werkstatt_status - aktuelle Heimat-Adresse anzeigen\n"
-    msg += "/kalender_verbinden - Google oder Outlook verknuepfen\n"
-    msg += "/kalender_status - aktuell verbundenen Kalender anzeigen\n"
-    msg += "/mitarbeiter - Mitarbeiter-Liste anzeigen\n"
-    msg += "/mitarbeiter neu - Mitarbeiter anlegen (nur Inhaber)\n"
+    if _is_on("lexware"):
+        msg += "/lexware_setup - Lexware verbinden\n"
+        msg += "/lexware_status - Verbindung pruefen\n"
+    if _is_on("werkstatt"):
+        msg += "/werkstatt - Werkstatt-Adresse einrichten\n"
+        msg += "/werkstatt_status - aktuelle Heimat-Adresse anzeigen\n"
+    if _is_on("kalender"):
+        msg += "/kalender_verbinden - Google oder Outlook verknuepfen\n"
+        msg += "/kalender_status - aktuell verbundenen Kalender anzeigen\n"
+    if _is_on("mitarbeiter"):
+        msg += "/mitarbeiter - Mitarbeiter-Liste anzeigen\n"
+        msg += "/mitarbeiter neu - Mitarbeiter anlegen (nur Inhaber)\n"
     msg += "/start - Bot mit Betrieb verbinden\n"
     msg += "/status - Agent-Status pruefen\n"
+    msg += "/paket - Mein Paket + aktive Features\n"
     msg += "/abbrechen - laufende Aktion abbrechen\n"
     msg += "/help - Diese Liste\n\n"
 
     msg += "<i>Bei Fragen: hallo@gewerbeagent.de</i>"
+    return msg
+
+
+# =====================================================================
+# Feature-Gate fuer Telegram-Befehle
+# =====================================================================
+# Vor jedem Command-Dispatch wird _check_feature_gate aufgerufen.
+# Liefert eine Lock-Message wenn das Feature im Paket nicht enthalten
+# ist; sonst None und der normale Dispatch laeuft.
+#
+# Always-on-Features (telegram_bot, kunde_lookup) passieren immer.
+# Befehle die in keiner Feature-Definition stehen (z.B. /status, /start
+# wenn nicht ueber telegram_bot.always_on abgedeckt) passieren auch —
+# Default-Allow fuer unbekannte Befehle (alte Befehle die noch nicht im
+# Catalog sind muessen weiter funktionieren).
+
+
+async def _check_feature_gate(text: str, chat_id) -> str | None:
+    """Returnt die Lock-Message wenn der Befehl ein deaktiviertes
+    Feature anspricht. Sonst None — Dispatch laeuft normal.
+    """
+    from core.features import is_feature_enabled, FEATURES
+    from core.features.catalog import COMMAND_TO_FEATURE
+
+    # Erstes Wort aus dem Text extrahieren ("/archiv Mueller" -> "/archiv")
+    cmd_word = text.split(maxsplit=1)[0]
+    feature_key = COMMAND_TO_FEATURE.get(cmd_word)
+    if feature_key is None:
+        # Befehl ist nicht im Catalog -> kein Gate (z.B. /status, /skip)
+        return None
+
+    feature = FEATURES.get(feature_key)
+    if feature is None or feature.always_on:
+        # always_on-Features sind immer offen
+        return None
+
+    # Tenant ermitteln. Wenn nicht zugeordnet (Erstkontakt), kein Gate —
+    # /start handled das.
+    tenant = await _get_tenant_by_chat(chat_id)
+    if tenant is None:
+        return None
+
+    if await is_feature_enabled(tenant.id, feature_key):
+        return None  # Feature aktiv → normaler Dispatch
+
+    # Feature gesperrt — Lock-Message
+    return _feature_locked_message(feature)
+
+
+def _feature_locked_message(feature) -> str:
+    """Klartext-Antwort wenn ein gesperrtes Feature angefragt wird."""
+    return (
+        f"🔒 <b>{_h_safe(feature.label)}</b> ist in deinem Paket nicht "
+        f"enthalten.\n\n"
+        f"Mit /paket siehst du dein aktuelles Paket und welche Features "
+        f"aktiv sind.\n\n"
+        f"Fuer Upgrade: hallo@gewerbeagent.de"
+    )
+
+
+async def _handle_paket_command(chat_id) -> str:
+    """Zeigt aktuelles Paket + aktive/inaktive Features."""
+    from core.features import enabled_features_for_tenant, FEATURES
+    from core.features.catalog import (
+        PACKAGES, PACKAGE_LABELS, PACKAGE_CUSTOM,
+    )
+
+    tenant = await _get_tenant_by_chat(chat_id)
+    if tenant is None:
+        return (
+            "Dieser Chat ist noch keinem Betrieb zugeordnet. "
+            "Bitte zuerst /start ausfuehren."
+        )
+
+    enabled = await enabled_features_for_tenant(tenant.id)
+
+    package_label = PACKAGE_LABELS.get(
+        tenant.package_tier, f"📦 {tenant.package_tier}"
+    )
+
+    msg = f"<b>{package_label}</b>\n"
+    msg += f"<i>{_h_safe(tenant.company_name)}</i>\n\n"
+
+    # Aktive Features (ohne always_on) anzeigen
+    active_features = sorted([
+        f for f in FEATURES.values()
+        if f.key in enabled and not f.always_on
+    ], key=lambda f: f.label)
+
+    if active_features:
+        msg += "<b>✅ Aktiviert:</b>\n"
+        for f in active_features:
+            msg += f"• {_h_safe(f.label)}\n"
+        msg += "\n"
+
+    # Verfuegbar aber nicht aktiviert
+    inactive_features = sorted([
+        f for f in FEATURES.values()
+        if f.key not in enabled and not f.always_on
+    ], key=lambda f: f.label)
+
+    if inactive_features:
+        msg += "<b>🔒 Nicht aktiviert:</b>\n"
+        for f in inactive_features:
+            msg += f"• {_h_safe(f.label)}\n"
+        msg += "\n"
+
+    if tenant.package_tier == PACKAGE_CUSTOM:
+        msg += (
+            "<i>Dein Paket ist 'Custom' — individuell zusammengestellt. "
+            "Aenderungen via Admin (Sven).</i>\n"
+        )
+    else:
+        msg += (
+            "<i>Fuer Paket-Upgrade oder einzelne Feature-Aktivierung: "
+            "hallo@gewerbeagent.de</i>"
+        )
     return msg
 
 async def _handle_status_command(chat_id):
@@ -1321,6 +1482,17 @@ async def process_telegram_update(payload):
         logger.info("Voice ohne passenden State ignoriert")
         return {"ok": True}
 
+    # ----- Feature-Gate -----
+    # Vor dem Befehls-Dispatch pruefen ob das angefragte Feature im
+    # Paket des Tenants ist. Always-on-Befehle (/help, /start, /paket)
+    # passieren unbedrueckt — sonst koennte ein Tenant ohne Paket nie
+    # /paket lesen.
+    if text.startswith("/"):
+        locked_msg = await _check_feature_gate(text, chat_id)
+        if locked_msg is not None:
+            await _send_to_chat(chat_id, locked_msg)
+            return {"ok": True}
+
     # ----- Text-Pfad -----
     if text == "/abbrechen":
         reply = await _handle_abbrechen(chat_id)
@@ -1328,7 +1500,9 @@ async def process_telegram_update(payload):
         await _clear_state(chat_id)
         reply = await _handle_start_command(text, chat_id, from_data)
     elif text == "/help":
-        reply = await _handle_help_command()
+        reply = await _handle_help_command(chat_id)
+    elif text == "/paket":
+        reply = await _handle_paket_command(chat_id)
     elif text == "/status":
         reply = await _handle_status_command(chat_id)
     elif text == "/wissen":
