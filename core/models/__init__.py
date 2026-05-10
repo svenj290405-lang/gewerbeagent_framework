@@ -30,6 +30,7 @@ from core.models.telegram_state import (
     STATE_WERKSTATT_CONFIRMING,
     STATE_MITARBEITER_NEU_NAME,
     STATE_MITARBEITER_NEU_SKILLS,
+    STATE_KALENDER_PROVIDER_CHOICE,
     STATE_FORMULAR_TYP_WAEHLEN,
     STATE_FORMULAR_HAUPTMENU,
     STATE_FORMULAR_NEU_NAME,
@@ -62,6 +63,9 @@ from core.models.oauth_token import OAuthToken
 from core.models.tenant import Tenant, TenantStatus
 from core.models.employee import (
     Employee,
+    CALENDAR_PROVIDER_GOOGLE,
+    CALENDAR_PROVIDER_MICROSOFT,
+    CALENDAR_PROVIDERS,
     SKILL_HEIZUNG,
     SKILL_SANITAER,
     SKILL_ELEKTRIK,
@@ -108,6 +112,9 @@ __all__ = [
     "Tenant",
     "TenantStatus",
     "Employee",
+    "CALENDAR_PROVIDER_GOOGLE",
+    "CALENDAR_PROVIDER_MICROSOFT",
+    "CALENDAR_PROVIDERS",
     "SKILL_HEIZUNG",
     "SKILL_SANITAER",
     "SKILL_ELEKTRIK",
@@ -186,6 +193,7 @@ __all__ = [
     "STATE_WERKSTATT_CONFIRMING",
     "STATE_MITARBEITER_NEU_NAME",
     "STATE_MITARBEITER_NEU_SKILLS",
+    "STATE_KALENDER_PROVIDER_CHOICE",
 ]
 from core.models.tenant_leistung import TenantLeistung
 from core.models.angebot import Angebot

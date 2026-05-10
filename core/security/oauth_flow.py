@@ -41,6 +41,9 @@ MICROSOFT_SCOPES = [
     "Mail.ReadWrite",
     "User.Read",
     "offline_access",
+    # Outlook-Calendar (analog Google Calendar): lesen+schreiben+loeschen
+    # plus FreeBusy-Check fuer Slot-Suche
+    "Calendars.ReadWrite",
 ]
 
 

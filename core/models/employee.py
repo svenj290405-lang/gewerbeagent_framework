@@ -51,6 +51,12 @@ if TYPE_CHECKING:
     from core.models.tenant import Tenant
 
 
+# --- Calendar-Provider-Konstanten ---
+CALENDAR_PROVIDER_GOOGLE = "google"
+CALENDAR_PROVIDER_MICROSOFT = "microsoft"
+CALENDAR_PROVIDERS = (CALENDAR_PROVIDER_GOOGLE, CALENDAR_PROVIDER_MICROSOFT)
+
+
 # --- Skill-Konstanten ---
 # Vordefinierte Skill-Strings die der Skill-Router (Phase 5) per
 # Keyword-Map auf Anliegen-Texte matcht. Tenants koennen freie Skill-
@@ -134,6 +140,16 @@ class Employee(Base):
     fahrtzeit_puffer_min: Mapped[int] = mapped_column(
         Integer, nullable=False, server_default="15", default=15,
     )
+
+    # Calendar-Provider — 'google' | 'microsoft' | None.
+    # NULL bedeutet "Kalender noch nicht verbunden" — Slot-Suche skippt
+    # diesen Mitarbeiter, Skill-Router faellt auf Default zurueck.
+    calendar_provider: Mapped[str | None] = mapped_column(
+        String(20), nullable=True, index=True,
+    )
+    # Calendar-ID innerhalb des Provider-Accounts (Google: 'primary',
+    # Microsoft: id-String). NULL = primaerer Default-Kalender.
+    calendar_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
     # Phase 4 — Skills + Arbeitszeiten
     # skills: ARRAY von Strings, frei gewaehlt aus ALLE_SKILLS oder

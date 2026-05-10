@@ -53,6 +53,9 @@ STATE_WERKSTATT_CONFIRMING = "werkstatt_confirming"
 STATE_MITARBEITER_NEU_NAME = "mitarbeiter_neu_name"
 STATE_MITARBEITER_NEU_SKILLS = "mitarbeiter_neu_skills"
 
+# Kalender-Verbinden-Wizard (Outlook-Calendar-Support)
+STATE_KALENDER_PROVIDER_CHOICE = "kalender_provider_choice"
+
 # Formular-Editor-Wizard
 STATE_FORMULAR_TYP_WAEHLEN = "formular_typ_waehlen"
 STATE_FORMULAR_HAUPTMENU = "formular_hauptmenu"

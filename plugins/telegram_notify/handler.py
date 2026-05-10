@@ -388,6 +388,12 @@ async def _handle_start_command(text, chat_id, from_data):
         reply += "- Push-Nachrichten zu Ihren Anrufen und Mails\n"
         reply += "- Bestaetigungen ueber gebuchte Termine\n"
         reply += "- Hinweise wenn Q nicht weiterkommt\n\n"
+        # Empfohlener naechster Schritt: Kalender + Heimat-Adresse einrichten
+        reply += (
+            "<b>Naechster Schritt:</b>\n"
+            "  • /kalender_verbinden — Google- oder Outlook-Kalender verknuepfen\n"
+            "  • /werkstatt — Heimat-Adresse fuer Smart-Termine setzen\n\n"
+        )
         reply += "Mit /help sehen Sie alle verfuegbaren Befehle."
         return reply
 
@@ -426,6 +432,8 @@ async def _handle_help_command():
     msg += "/lexware_status - Verbindung pruefen\n"
     msg += "/werkstatt - Werkstatt-Adresse einrichten (fuer Smart-Termine)\n"
     msg += "/werkstatt_status - aktuelle Heimat-Adresse anzeigen\n"
+    msg += "/kalender_verbinden - Google oder Outlook verknuepfen\n"
+    msg += "/kalender_status - aktuell verbundenen Kalender anzeigen\n"
     msg += "/mitarbeiter - Mitarbeiter-Liste anzeigen\n"
     msg += "/mitarbeiter neu - Mitarbeiter anlegen (nur Inhaber)\n"
     msg += "/start - Bot mit Betrieb verbinden\n"
@@ -602,6 +610,8 @@ async def process_telegram_update(payload):
             await _handle_leistung_callback(cq_chat_id, cq_data, cq_id, bot_token)
         elif cq_data and cq_data.startswith("formular:"):
             await _handle_formular_callback(cq_chat_id, cq_data, cq_id, bot_token)
+        elif cq_data and cq_data.startswith("kal:"):
+            await _handle_kalender_callback(cq_chat_id, cq_data, cq_id, bot_token)
         else:
             # Unbekannte Callback-Daten - nur bestätigen
             await _answer_callback_query(cq_id, "Unbekannte Aktion", bot_token)
@@ -778,6 +788,13 @@ async def process_telegram_update(payload):
     elif text == "/mitarbeiter" or text.startswith("/mitarbeiter "):
         await _clear_state(chat_id)
         reply = await _handle_mitarbeiter_command(chat_id, text)
+    elif text == "/kalender_verbinden" or text == "/kalender":
+        await _clear_state(chat_id)
+        # Send-and-return weil Wizard direkt per Inline-Buttons antwortet.
+        await _handle_kalender_verbinden_command(chat_id)
+        return {"ok": True}
+    elif text == "/kalender_status":
+        reply = await _handle_kalender_status_command(chat_id)
     elif text.startswith("/"):
         reply = await _handle_unknown()
     else:
@@ -5053,6 +5070,139 @@ async def _handle_mitarbeiter_neu_skills_input(chat_id, text, state_data):
         "Spaeter kann er optional <i>/werkstatt</i> ausfuehren um seine "
         "eigene Heimat-Adresse zu setzen (fuer Smart-Termin-Routing)."
     )
+
+
+# =====================================================================
+# Kalender-Verbinden-Wizard (Outlook + Google)
+# =====================================================================
+
+
+def _kalender_label(provider: str | None) -> str:
+    if provider == "google":
+        return "Google Calendar"
+    if provider == "microsoft":
+        return "Microsoft Outlook"
+    return "(noch nicht verbunden)"
+
+
+def _has_oauth_token(emps_provider_pairs, expected_provider: str) -> bool:
+    """Helper-Stub — nicht jetzt benutzt aber spaeter fuer Status-Anzeige."""
+    return False
+
+
+async def _handle_kalender_verbinden_command(chat_id) -> None:
+    """Wizard-Start: zeigt 2 Inline-Buttons (Google / Microsoft)."""
+    res = await _get_current_employee(chat_id)
+    if res is None:
+        await _send_to_chat(
+            chat_id,
+            "Dieser Chat ist noch keinem Betrieb zugeordnet. "
+            "Bitte zuerst /start ausfuehren.",
+        )
+        return
+    tenant, emp = res
+
+    # State setzen, damit Callback weiss zu welchem Mitarbeiter
+    await _save_state(
+        chat_id, STATE_KALENDER_PROVIDER_CHOICE,
+        {"employee_id": str(emp.id), "tenant_slug": tenant.slug},
+    )
+
+    aktuell = _kalender_label(emp.calendar_provider)
+    msg = (
+        f"<b>📅 Kalender verbinden — {emp.name}</b>\n\n"
+        f"Aktuell: {aktuell}\n\n"
+        "Welchen Kalender willst du verknuepfen?\n"
+        "Du wirst auf die Login-Seite des Anbieters weitergeleitet "
+        "und nach dem Login zurueck zum Bot."
+    )
+    buttons = [[
+        {"text": "📅 Google Calendar", "callback_data": f"kal:google:{emp.slug}"},
+        {"text": "📧 Microsoft Outlook", "callback_data": f"kal:microsoft:{emp.slug}"},
+    ]]
+    await _send_with_inline_buttons(chat_id, msg, buttons)
+
+
+async def _handle_kalender_status_command(chat_id) -> str:
+    """Zeigt Status der Kalender-Verbindung des aktuellen Mitarbeiters."""
+    res = await _get_current_employee(chat_id)
+    if res is None:
+        return "Dieser Chat ist noch keinem Betrieb zugeordnet."
+    _, emp = res
+    label = _kalender_label(emp.calendar_provider)
+    cal_id = emp.calendar_id or "(primaerer Kalender)"
+    msg = (
+        f"<b>📅 Kalender — {emp.name}</b>\n\n"
+        f"Provider: <b>{label}</b>\n"
+        f"Kalender-ID: <code>{cal_id}</code>\n\n"
+        "Mit /kalender_verbinden aendern."
+    )
+    return msg
+
+
+async def _handle_kalender_callback(chat_id, cq_data, cq_id, bot_token) -> None:
+    """Verarbeitet Klick auf Inline-Buttons aus /kalender_verbinden.
+
+    cq_data Format: 'kal:<provider>:<employee_slug>'
+    Aktion: setzt employee.calendar_provider, generiert OAuth-Deeplink,
+    schickt ihn als Folgenachricht.
+    """
+    parts = cq_data.split(":", 2)
+    if len(parts) != 3:
+        await _answer_callback_query(cq_id, "Falsches Format", bot_token)
+        return
+    _, provider, emp_slug = parts
+    if provider not in ("google", "microsoft"):
+        await _answer_callback_query(cq_id, "Unbekannter Provider", bot_token)
+        return
+
+    res = await _get_current_employee(chat_id)
+    if res is None:
+        await _answer_callback_query(cq_id, "Nicht zugeordnet", bot_token)
+        return
+    tenant, emp = res
+    if emp.slug != emp_slug:
+        # Sicherheits-Check: User darf nur seinen eigenen Provider setzen
+        await _answer_callback_query(
+            cq_id, "Slug-Mismatch — Wizard erneut starten", bot_token,
+        )
+        return
+
+    # Provider in DB speichern
+    from core.models.employee import Employee
+    async with AsyncSessionLocal() as s:
+        emp_db = (await s.execute(
+            select(Employee).where(Employee.id == emp.id)
+        )).scalar_one_or_none()
+        if emp_db is None:
+            await _answer_callback_query(cq_id, "Mitarbeiter weg", bot_token)
+            return
+        emp_db.calendar_provider = provider
+        # calendar_id zuruecksetzen → Default ('primary' bzw. /me/events)
+        emp_db.calendar_id = None
+        await s.commit()
+
+    await _clear_state(chat_id)
+    await _answer_callback_query(cq_id, f"{provider.capitalize()} gewaehlt", bot_token)
+
+    # OAuth-Deeplink generieren — public_url + /oauth/start
+    from config.settings import settings
+    base = (settings.public_url or "").rstrip("/")
+    oauth_url = f"{base}/oauth/start?tenant={tenant.slug}&provider={provider}"
+
+    label = _kalender_label(provider)
+    msg = (
+        f"✅ <b>{label}</b> als Provider gespeichert.\n\n"
+        f"<b>Jetzt einloggen:</b>\n"
+        f"<a href=\"{oauth_url}\">{oauth_url}</a>\n\n"
+        "Klick den Link, melde dich mit deinem "
+        f"{'Google' if provider == 'google' else 'Microsoft'}-Account an, "
+        "und erlaube Zugriff auf den Kalender. Danach landet das Token im "
+        "System und du kriegst Termine direkt in deinen Kalender.\n\n"
+        "<i>Tipp:</i> mit /kalender_status kannst du jederzeit pruefen "
+        "welcher Provider aktiv ist."
+    )
+    await _send_to_chat(chat_id, msg, bot_token=bot_token)
 
 
 # =====================================================================

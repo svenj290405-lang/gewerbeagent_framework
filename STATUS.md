@@ -808,6 +808,122 @@ $ curl -X POST .../telegram_notify/incoming
 $ curl ... -H "X-Telegram-Bot-Api-Secret-Token: <correct>" → HTTP 200
 ```
 
+---
+
+## TEIL I — OUTLOOK-CALENDAR-SUPPORT (10.05.2026 spaet abend)
+
+### Status: ✅ Code live, wartet auf Mitarbeiter-Wahl
+
+Sven-Wunsch: jeder Mitarbeiter kann beim Onboarding seinen Kalender
+verknuepfen — Google ODER Microsoft Outlook. Bisher war der ganze
+Stack Google-only. Jetzt: Provider-Adapter abstrahiert beide APIs,
+Mitarbeiter waehlt per Inline-Buttons im Telegram.
+
+### Was gebaut wurde
+
+**Schema (Migration p9k6g1i4f8h2):**
+- `employees.calendar_provider`: 'google' | 'microsoft' | NULL
+- `employees.calendar_id`: optionaler externer Identifier (NULL =
+  primaerer Default-Kalender des verbundenen Accounts)
+- Backfill: alle bestehenden Employees → 'google' (Status Quo)
+- Konstanten in employee.py: `CALENDAR_PROVIDER_GOOGLE`,
+  `CALENDAR_PROVIDER_MICROSOFT`, `CALENDAR_PROVIDERS`
+
+**Microsoft Calendar-Helper** (`core/integrations/microsoft_calendar.py`):
+- `get_free_busy(tenant_id, start, end)` → POST /me/calendar/getSchedule
+- `list_events_for_day(tenant_id, target_date)` → GET /me/calendarView
+- `create_event(tenant_id, summary, description, location, start, end)` → POST /me/events
+- `delete_event(tenant_id, event_id)` → DELETE /me/events/{id}
+- Nutzt bestehenden `get_microsoft_token()` aus microsoft.py mit
+  Auto-Refresh — kein Code-Duplikat
+- Calendars.ReadWrite Scope hinzugefuegt zu MICROSOFT_SCOPES (alte
+  Tokens muessen neu konsentiert werden!)
+
+**Provider-Adapter** (`plugins/kalender/adapters.py`):
+- `CalendarAdapter` Interface mit 5 Methoden:
+  is_slot_busy, get_busy_periods, list_events_for_day, create_event,
+  delete_event
+- `GoogleCalendarAdapter` wrappt bestehende google_auth + service-Calls
+- `MicrosoftCalendarAdapter` wrappt microsoft_calendar.py
+- `get_calendar_adapter(tenant_id, employee_id)` Factory liest
+  employee.calendar_provider und liefert passenden Adapter; Fallback
+  Google bei NULL
+
+**Refactor `plugins/kalender/handler.py`:**
+- Alle 4 Endpoints (`_check_availability`, `_book_appointment`,
+  `_find_free_slots`, `_cancel_appointment`) lesen jetzt
+  `payload.get("employee_id")` und routen via Adapter
+- `_suche_slots_am_tag` ist async geworden (Adapter-Calls)
+- `_smart_filter_slots` `service`-Param zu `adapter`-Param
+- Direkte googleapiclient-Calls aus dem Handler entfernt
+
+**Telegram-Wizard:**
+- `/kalender_verbinden` (oder `/kalender`): zeigt 2 Inline-Buttons
+  "📅 Google Calendar" und "📧 Microsoft Outlook"
+- `/kalender_status`: zeigt aktuell verbundenen Provider + Cal-ID
+- Callback `kal:<provider>:<emp_slug>` setzt
+  `employee.calendar_provider` + sendet OAuth-Deeplink
+  `https://gewerbeagent.de/oauth/start?tenant=<slug>&provider=google|microsoft`
+- /start-Welcome-Message bekommt einen "Naechster Schritt"-Hinweis
+  mit /kalender_verbinden + /werkstatt
+- /help erweitert um beide neuen Befehle
+
+### Live-Verifikation
+
+- Migration appliziert: 2 Employees mit `calendar_provider='google'`
+- Adapter-Factory liefert korrekt GoogleCalendarAdapter fuer Default-Emp
+- Webhook-Test: `/kalender_status` per echtem Telegram-Webhook → 200,
+  Plugin verarbeitet
+- Container restart sauber, alle 5 Plugins + 4 Crons gestartet
+
+### Bekannte Limitationen
+
+1. **Bestehende Microsoft-Tokens sind veraltet:** mit dem neuen
+   `Calendars.ReadWrite`-Scope muessen Mitarbeiter die schon Microsoft-
+   Mail haben den OAuth-Flow nochmal durchlaufen. Bestehende Mail-
+   Funktionalitaet laeuft weiter (alte Scopes), aber Calendar-Calls
+   wuerden 403 wegen fehlender Berechtigung ausloesen.
+2. **Microsoft-Sekundaer-Kalender** werden nicht unterstuetzt —
+   `MicrosoftCalendarAdapter` schreibt immer in `/me/events` (primaerer
+   Kalender). Sekundaere via `/me/calendars/{id}/events` waere
+   einfacher Patch wenn jemand das braucht.
+3. **Outlook Reminders** werden nicht gesetzt (Google bekommt
+   60min/24h Pop-up-Reminder; Outlook nutzt Default des Mailbox-Owners).
+4. **Microsoft FreeBusy `getSchedule`** brauct die Mail-Adresse, nicht
+   "me" — Adapter holt sie vorab via `/me`. Kostet 1 extra-Request,
+   wird in spaeterer Version cacheable gemacht.
+5. **Timezone**: Google-Adapter nutzt fest "+02:00" (TODO: dynamisch
+   aus Tenant-Config). Microsoft nutzt `Europe/Berlin` durch
+   `outlook.timezone`-Header. Sommer/Winter-Wechsel geht im
+   Microsoft-Pfad sauber, Google nicht — Bestand.
+
+### Was du jetzt machen kannst
+
+1. **Im Telegram:** `/kalender_verbinden` ausprobieren
+2. Du wirst die zwei Buttons sehen
+3. Klick auf "Google Calendar" oder "Microsoft Outlook"
+4. Bot postet einen Deeplink — folg dem
+5. OAuth-Flow → Token landet in DB (verschluesselt)
+6. Test: `/kalender_status` — zeigt jetzt deinen Provider
+
+Falls du Microsoft willst aber dein bestehender Mail-Token den
+neuen Scope nicht hat: Token einfach ueberschreiben durch erneuten
+OAuth-Flow.
+
+### Nicht-gemachte Folgeaufgaben
+
+- Voice-Pipeline (`voice_init`) ist noch nicht provider-aware. Dort
+  werden bisher keine Termine direkt angelegt — wenn das mal kommt,
+  muesste auch dort `employee_id` durchgereicht werden.
+- Anfrage-Formular ebenfalls nicht relevant aktuell.
+- Outlook-Mail-Polling und Calendar laufen mit dem **gleichen
+  OAuth-Token** (selbe `oauth_tokens.provider='microsoft'`-Zeile).
+  Sauber wegen Phase-1-OAuth-Constraint-Refactor (kommt spaeter).
+
+---
+
+## TL;DR (alt unten)
+
 ### Was bewusst NICHT gefixt wurde (Tier 2/3 fuer spaeter)
 
 | Befund | Risk | Begruendung Verschiebung |

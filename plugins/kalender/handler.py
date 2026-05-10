@@ -27,7 +27,7 @@ from core.integrations.openrouteservice import (
 )
 from core.models import Tenant
 from core.plugin_system import BasePlugin
-from plugins.kalender.google_auth import get_calendar_service
+from plugins.kalender.adapters import get_calendar_adapter
 from plugins.kalender.manifest import MANIFEST
 from plugins.telegram_notify.handler import TelegramNotifier
 
@@ -99,20 +99,15 @@ class Plugin(BasePlugin):
                     ),
                 }
 
-            # Google Calendar abfragen
-            service = await get_calendar_service(self.tenant_id)
-            tz_offset = "+02:00"  # TODO: dynamisch aus zeitzone
-            events_result = service.events().list(
-                calendarId=self.config["calendar_id"],
-                timeMin=start.isoformat() + tz_offset,
-                timeMax=ende.isoformat() + tz_offset,
-                singleEvents=True,
-                orderBy="startTime",
-            ).execute()
+            # Provider-agnostisch: Adapter holen (Google oder Outlook)
+            employee_id = payload.get("employee_id")
+            adapter = await get_calendar_adapter(
+                self.tenant_id, employee_id=employee_id,
+                fallback_calendar_id=self.config["calendar_id"],
+            )
+            busy = await adapter.is_slot_busy(start, ende)
 
-            events = events_result.get("items", [])
-
-            if not events:
+            if not busy:
                 return {
                     "verfuegbar": True,
                     "nachricht": (
@@ -151,43 +146,32 @@ class Plugin(BasePlugin):
             start = self._parse_datum_uhrzeit(datum, uhrzeit)
             ende = start + timedelta(minutes=dauer)
 
-            service = await get_calendar_service(self.tenant_id)
+            employee_id = payload.get("employee_id")
+            adapter = await get_calendar_adapter(
+                self.tenant_id, employee_id=employee_id,
+                fallback_calendar_id=self.config["calendar_id"],
+            )
 
             betrieb_name = self.config["betrieb_name"]
             telefon_text = f"\nTelefon: {telefon}" if telefon else ""
 
-            event = {
-                "summary": f"[{betrieb_name}] {anliegen} - {name}",
-                "description": (
-                    f"Betrieb: {betrieb_name}\n"
-                    f"Kunde: {name}\n"
-                    f"Anliegen: {anliegen}\n"
-                    f"Adresse: {adresse}"
-                    f"{telefon_text}\n\n"
-                    f"Eingetragen via KI-Agent Q (Gewerbeagent Framework)"
-                ),
-                "location": adresse,
-                "start": {
-                    "dateTime": start.isoformat(),
-                    "timeZone": self.config["zeitzone"],
-                },
-                "end": {
-                    "dateTime": ende.isoformat(),
-                    "timeZone": self.config["zeitzone"],
-                },
-                "reminders": {
-                    "useDefault": False,
-                    "overrides": [
-                        {"method": "popup", "minutes": 60},
-                        {"method": "popup", "minutes": 1440},
-                    ],
-                },
-            }
-
-            result = service.events().insert(
-                calendarId=self.config["calendar_id"],
-                body=event,
-            ).execute()
+            summary = f"[{betrieb_name}] {anliegen} - {name}"
+            description = (
+                f"Betrieb: {betrieb_name}\n"
+                f"Kunde: {name}\n"
+                f"Anliegen: {anliegen}\n"
+                f"Adresse: {adresse}"
+                f"{telefon_text}\n\n"
+                f"Eingetragen via KI-Agent Q (Gewerbeagent Framework)"
+            )
+            result = await adapter.create_event(
+                summary=summary,
+                description=description,
+                location=adresse,
+                start=start,
+                end=ende,
+                timezone=self.config["zeitzone"],
+            )
 
             # Telegram-Push (silent fail, blockiert nie den Termin)
             telefon_line = f"\n<b>Telefon:</b> {telefon}" if telefon else ""
@@ -212,7 +196,7 @@ class Plugin(BasePlugin):
                     f"um {start.strftime('%H:%M')} Uhr."
                 ),
                 "event_id": result.get("id"),
-                "link": result.get("htmlLink"),
+                "link": result.get("html_link") or result.get("htmlLink"),
             }
 
         except Exception as e:
@@ -247,30 +231,33 @@ class Plugin(BasePlugin):
             employee_id = payload.get("employee_id")
 
             wunsch = self._parse_datum_uhrzeit(wunsch_datum, wunsch_uhrzeit)
-            service = await get_calendar_service(self.tenant_id)
+            adapter = await get_calendar_adapter(
+                self.tenant_id, employee_id=employee_id,
+                fallback_calendar_id=self.config["calendar_id"],
+            )
 
             slots: list[dict] = []
 
             # Tag 0: selber Tag
-            slots.extend(self._suche_slots_am_tag(
-                service, wunsch.date(), wunsch_uhrzeit_anker=wunsch.time(), max_count=3, dauer=dauer
+            slots.extend(await self._suche_slots_am_tag(
+                adapter, wunsch.date(), wunsch_uhrzeit_anker=wunsch.time(), max_count=3, dauer=dauer
             ))
             # Tag 1: naechster Werktag
             naechster_tag = self._naechster_werktag(wunsch.date())
-            slots.extend(self._suche_slots_am_tag(
-                service, naechster_tag, wunsch_uhrzeit_anker=None, max_count=2, dauer=dauer
+            slots.extend(await self._suche_slots_am_tag(
+                adapter, naechster_tag, wunsch_uhrzeit_anker=None, max_count=2, dauer=dauer
             ))
             # Tag 2: uebernaechster Werktag
             uebernaechster_tag = self._naechster_werktag(naechster_tag)
-            slots.extend(self._suche_slots_am_tag(
-                service, uebernaechster_tag, wunsch_uhrzeit_anker=None, max_count=1, dauer=dauer
+            slots.extend(await self._suche_slots_am_tag(
+                adapter, uebernaechster_tag, wunsch_uhrzeit_anker=None, max_count=1, dauer=dauer
             ))
 
             # Smart-Filter (best-effort, schluckt eigene Fehler)
             smart_meta = {"applied": False, "reason": None, "removed": 0}
             try:
                 slots, smart_meta = await self._smart_filter_slots(
-                    slots, kunde_adresse, dauer, service,
+                    slots, kunde_adresse, dauer, adapter,
                     employee_id=employee_id,
                 )
             except Exception as exc:  # noqa: BLE001
@@ -345,7 +332,7 @@ class Plugin(BasePlugin):
         slots: list[dict],
         kunde_adresse: str,
         dauer_min: int,
-        service,
+        adapter,
         employee_id=None,
     ) -> tuple[list[dict], dict]:
         """Filtert Slots gegen Travel-Time-Constraints.
@@ -402,39 +389,16 @@ class Plugin(BasePlugin):
             meta["reason"] = "customer-not-geocodable"
             return slots, meta
 
-        # Cache fuer Tagespläne (1 GCal-Call pro Tag, nicht pro Slot)
+        # Cache fuer Tagespläne (1 API-Call pro Tag, nicht pro Slot).
+        # Provider-agnostisch ueber den Adapter — Google ODER Outlook.
         day_events_cache: dict[str, list[dict]] = {}
 
-        def _events_for_day(target_date) -> list[dict]:
+        async def _events_for_day(target_date) -> list[dict]:
             key = target_date.isoformat()
             if key in day_events_cache:
                 return day_events_cache[key]
             try:
-                from datetime import datetime as _dt, time as _time
-                day_start = _dt.combine(target_date, _time(0, 0)).isoformat() + "+02:00"
-                day_end = _dt.combine(target_date, _time(23, 59)).isoformat() + "+02:00"
-                resp = service.events().list(
-                    calendarId=self.config["calendar_id"],
-                    timeMin=day_start,
-                    timeMax=day_end,
-                    singleEvents=True,
-                    orderBy="startTime",
-                ).execute()
-                items = resp.get("items", [])
-                events = []
-                from dateutil import parser as _p  # type: ignore
-                for ev in items:
-                    s = ev.get("start", {})
-                    e = ev.get("end", {})
-                    s_iso = s.get("dateTime") or s.get("date")
-                    e_iso = e.get("dateTime") or e.get("date")
-                    if not s_iso or not e_iso:
-                        continue
-                    events.append({
-                        "start_dt": _p.isoparse(s_iso).replace(tzinfo=None),
-                        "end_dt": _p.isoparse(e_iso).replace(tzinfo=None),
-                        "location": (ev.get("location") or "").strip(),
-                    })
+                events = await adapter.list_events_for_day(target_date)
                 day_events_cache[key] = events
                 return events
             except Exception as exc:  # noqa: BLE001
@@ -463,7 +427,7 @@ class Plugin(BasePlugin):
                 enriched.append(slot)
                 continue
             slot_end = slot_dt + timedelta(minutes=dauer_min)
-            day_events = _events_for_day(slot_dt.date())
+            day_events = await _events_for_day(slot_dt.date())
 
             # Vor-Termin (letzter, der vor slot_dt endet)
             vor = max(
@@ -528,17 +492,20 @@ class Plugin(BasePlugin):
         return enriched, meta
 
     async def _cancel_appointment(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """Loescht einen Termin per Google-Calendar event_id."""
+        """Loescht einen Termin (provider-agnostisch via Adapter)."""
         try:
             event_id = payload.get("event_id")
             if not event_id:
                 return {"erfolg": False, "nachricht": "event_id fehlt"}
 
-            service = await get_calendar_service(self.tenant_id)
-            service.events().delete(
-                calendarId=self.config["calendar_id"],
-                eventId=event_id,
-            ).execute()
+            employee_id = payload.get("employee_id")
+            adapter = await get_calendar_adapter(
+                self.tenant_id, employee_id=employee_id,
+                fallback_calendar_id=self.config["calendar_id"],
+            )
+            ok = await adapter.delete_event(event_id)
+            if not ok:
+                return {"erfolg": False, "nachricht": "Loeschen fehlgeschlagen"}
 
             return {
                 "erfolg": True,
@@ -549,9 +516,9 @@ class Plugin(BasePlugin):
         except Exception as e:
             return {"erfolg": False, "nachricht": f"Fehler beim Loeschen: {str(e)}"}
 
-    def _suche_slots_am_tag(
+    async def _suche_slots_am_tag(
         self,
-        service,
+        adapter,
         target_date,
         wunsch_uhrzeit_anker,
         max_count: int,
@@ -561,7 +528,7 @@ class Plugin(BasePlugin):
         Sucht freie Slots an einem konkreten Tag.
 
         Geht in 30-Minuten-Schritten durch die Arbeitszeiten und prueft
-        Belegung gegen FreeBusy-API.
+        Belegung gegen die FreeBusy-API des jeweiligen Providers.
         """
         from datetime import datetime, time, timedelta
 
@@ -592,18 +559,13 @@ class Plugin(BasePlugin):
             anker_dt = datetime.combine(target_date, wunsch_uhrzeit_anker)
             kandidaten.sort(key=lambda c: abs((c - anker_dt).total_seconds()))
 
-        # FreeBusy-Range fuer den Tag holen (1 API-Call statt n)
-        zeitzone = self.config["zeitzone"]
-        fb_query = {
-            "timeMin": slot_start_dt.isoformat() + "+02:00",  # vereinfacht; TZ-mathematisch korrekt waere besser
-            "timeMax": tag_ende_dt.isoformat() + "+02:00",
-            "timeZone": zeitzone,
-            "items": [{"id": self.config["calendar_id"]}],
-        }
+        # FreeBusy-Range fuer den Tag holen (1 API-Call statt n).
+        # Provider-agnostisch via Adapter: Google nutzt freebusy().query(),
+        # Microsoft nutzt /me/calendar/getSchedule.
         try:
-            fb_result = service.freebusy().query(body=fb_query).execute()
-            busy = fb_result["calendars"][self.config["calendar_id"]]["busy"]
-        except Exception:
+            busy = await adapter.get_busy_periods(slot_start_dt, tag_ende_dt)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"FreeBusy-Query crashed ({adapter.provider_name}): {exc}")
             busy = []
 
         # Helper: ist das Intervall [start, start+dauer] frei?
