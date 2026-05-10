@@ -90,6 +90,18 @@ class Tenant(Base):
         Integer, nullable=False, server_default="15", default=15,
     )
 
+    # Paket-Tier — bestimmt welche Features per Default aktiv sind.
+    # Werte: 'basis' | 'pro' | 'enterprise' | 'custom'.
+    # 'custom' = Sven hat einzelne Features manuell getoggled, weicht
+    # vom vordefinierten Paket ab. ToolConfig.enabled bleibt die Quelle
+    # der Wahrheit fuer einzelne Features — package_tier ist nur die
+    # menschen-lesbare Zusammenfassung.
+    # Default 'pro' damit bestehende Tenants beim Backfill nicht
+    # versehentlich downgraded werden (siehe scripts/backfill_tenant_features).
+    package_tier: Mapped[str] = mapped_column(
+        String(20), nullable=False, server_default="pro", default="pro",
+    )
+
     # --- Relationships ---
 
     # Alle ToolConfigs dieses Tenants (automatisch geladen)

@@ -194,12 +194,19 @@ def detect_package_from_features(
     Admin-UI-Anzeige. Liefert PACKAGE_CUSTOM wenn die Menge mit keinem
     vordefinierten Paket exakt uebereinstimmt.
 
-    Always-on-Features werden ignoriert beim Vergleich.
+    Beim Vergleich:
+    - Always-on-Features werden ignoriert (sind per Definition immer aktiv)
+    - tool_configs.tool_name-Werte die NICHT im Catalog sind werden
+      ignoriert (z.B. legacy 'microsoft_oauth', 'telegram_bot' am
+      _global-Tenant — das sind Infra-Configs, keine Features).
     """
     always_on = frozenset(
         f.key for f in FEATURES.values() if f.always_on
     )
-    relevant = enabled - always_on
+    catalog_keys = frozenset(FEATURES.keys())
+    # Nur Catalog-Features minus always_on betrachten — alles andere
+    # ist legacy/infra und stoert das Mapping.
+    relevant = (enabled & catalog_keys) - always_on
 
     for pkg_name in (PACKAGE_BASIS, PACKAGE_PRO, PACKAGE_ENTERPRISE):
         pkg_features = PACKAGES[pkg_name]
