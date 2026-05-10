@@ -34,14 +34,21 @@ cd05504 feat(admin-db): admin_users + api_pricing_config + api_usage_log + Seeds
 
 **URL:** https://www.gewerbeagent.de/
 
-**Features:**
-- 3D-Wireframe-Sphere via Three.js r128 (CDN, lazy geladen)
-- IcosahedronGeometry mit 280 Brownian-Motion-Partikeln im Inneren
-- 7 dynamische Energy-Linien (Mobile 5) rotieren um die Sphere
-- Pulse-Animation: Scale 1.0 → 1.05 → 1.0, Linien-Opacity 0.6 → 1.0 → 0.6, exakt 1.8s
+**Features (Iron-Man-Hologramm-Look statt sauberer Wireframe):**
+- 3D-Hologramm via Three.js r128 (CDN, lazy geladen)
+- 4 überlagerte Particle-Layer mit unterschiedlichen Radien & Rotationen:
+  - Outer Shell (3500 Desktop / 1400 Mobile): cluster-bias zu 5 Centers + 40% Stragglers, ±15% Radius-Jitter → unregelmäßige Dichte
+  - Bright Highlights (180 / 70): sparse Spitzlichter, weiß, additive Glow
+  - Mid Shell (1400 / 500): kleinerer Radius, gegenläufige Rotation
+  - Inner Core (220 / 110): echte Brownian-Motion in r=0.55-Bereich
+- ~80 fragmentierte Linien-Stummel (statt durchgehender Wireframe), tangential auf Outer-Shell, asynchroner Flicker via 2 Sets mit Phasen-Offset
+- 3 konzentrische Ringe in zufälligen Achsen, eigene Rotation-Speeds
+- Energy-Pulses: expanding Wireframe-Shells alle 2-4s vom Zentrum, Lifetime 1.4s
+- AdditiveBlending + radial-gradient Texture (CanvasTexture, kein Bloom-Pass nötig) → Glow-Optik
+- Pulse-Animation: globale Group-Scale 1.0 → 1.05 → 1.0 in 1.8s (Spec-konform via (1-cos)/2)
 - Subtle blaue PointLight im Sphere-Zentrum pulsiert mit (Lebendigkeit)
-- Maus-Hover folgt sanft, Klick-Pulse-Burst
-- Build-Up-Animation: Sphere zeichnet sich beim Page-Load auf (1.6s)
+- Maus-Hover folgt sanft, Klick spawnt 2 Energy-Pulses (sichtbarer Burst)
+- Build-Up gestaffelt: Core 0-0.5s → Mid 0.3-0.9s → Outer 0.6-1.4s → Highlights/Fragments/Rings 1.0-1.8s
 - `prefers-reduced-motion` respektiert
 - Mobile <480px: vereinfachter SVG-Fallback (keine WebGL-Last)
 - Inter-Font, weiss-dominant, dezent-blau (#3b82f6)
