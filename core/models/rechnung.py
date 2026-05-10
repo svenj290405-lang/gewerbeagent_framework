@@ -43,6 +43,12 @@ RECHNUNG_STATUS_CANCELLED = "cancelled"        # User hat abgebrochen
 # alten Tenants vor. Beide Schreibweisen abdecken um robust zu sein.
 LEXWARE_PAID_STATES = frozenset({"paid", "paidoff"})
 
+# Lexware voucherStatus-Werte die "teilweise bezahlt" bedeuten.
+# Wird im /rechnungen_anzeigen mit eigenem Icon angezeigt aber nicht
+# als 'bezahlt' gewertet — der Tenant entscheidet ob er die Restzahlung
+# anmahnt oder den Restbetrag abschreibt.
+LEXWARE_PARTIAL_PAID_STATES = frozenset({"partiallypaid", "partly_paid"})
+
 # Eingabe-Typen
 RECHNUNG_INPUT_TEXT = "text"
 RECHNUNG_INPUT_VOICE = "voice"

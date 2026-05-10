@@ -29,9 +29,68 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
+# ----------------------------------------------------------------------
+# Brute-Force-Schutz fuer Anfrage-Endpoints
+# ----------------------------------------------------------------------
+# In-Memory Rate-Limit pro IP. Reicht fuer Single-Container-Setup.
+# Window 1h, ein Counter pro (ip, kind).
+import datetime as _dt
+from threading import Lock as _Lock
+_ANFRAGE_HITS: dict[tuple[str, str], list[_dt.datetime]] = {}
+_ANFRAGE_HITS_GUARD = _Lock()
+
+
+def _client_ip_anfrage(request: Request) -> str:
+    xri = request.headers.get("x-real-ip")
+    if xri:
+        return xri.split(",")[0].strip()[:64]
+    xff = request.headers.get("x-forwarded-for")
+    if xff:
+        return xff.split(",")[0].strip()[:64]
+    return (request.client.host if request.client else "unknown")[:64]
+
+
+def _check_anfrage_rate_limit(
+    request: Request, *, kind: str, max_per_hour: int,
+) -> bool:
+    """True wenn weiter erlaubt, False wenn Limit ueberschritten."""
+    ip = _client_ip_anfrage(request)
+    now = _dt.datetime.now(_dt.timezone.utc)
+    cutoff = now - _dt.timedelta(hours=1)
+    key = (ip, kind)
+    with _ANFRAGE_HITS_GUARD:
+        hits = _ANFRAGE_HITS.get(key, [])
+        # Alte Hits aussortieren
+        hits = [h for h in hits if h >= cutoff]
+        if len(hits) >= max_per_hour:
+            _ANFRAGE_HITS[key] = hits
+            logger.info(
+                f"anfrage rate-limit hit kind={kind} ip={ip} "
+                f"({len(hits)}/{max_per_hour}/h)"
+            )
+            return False
+        hits.append(now)
+        _ANFRAGE_HITS[key] = hits
+        # Garbage Collection bei zu vielen Keys
+        if len(_ANFRAGE_HITS) > 5000:
+            _ANFRAGE_HITS.clear()
+    return True
+
+
 @router.get("/anfrage/{token}", response_class=HTMLResponse)
-async def render_anfrage_form(token: str):
-    """Rendert das Anfrage-Formular fuer den gegebenen Token."""
+async def render_anfrage_form(token: str, request: Request):
+    """Rendert das Anfrage-Formular fuer den gegebenen Token.
+
+    Brute-Force-Schutz: max 60 GETs pro IP pro Stunde. Token-Bruteforce
+    waere sonst unbemerkt moeglich, weil GET ohne Auth erfolgt.
+    """
+    if not _check_anfrage_rate_limit(request, kind="get", max_per_hour=60):
+        return HTMLResponse(
+            content="<h1>Zu viele Versuche</h1>"
+                    "<p>Bitte einen Moment warten und dann erneut versuchen.</p>",
+            status_code=429,
+        )
+
     token_obj, tenant = await get_token_with_tenant(token)
 
     if token_obj is None:
@@ -61,7 +120,15 @@ async def submit_anfrage_form(token: str, request: Request):
     - max 5MB pro Datei, max 3 Dateien pro Anfrage
     - Files werden base64-encoded in antworten[<field>] = [{filename,
       content_type, size, base64}, ...] gespeichert
+
+    Brute-Force-Schutz: max 10 Submits pro IP pro Stunde.
     """
+    if not _check_anfrage_rate_limit(request, kind="submit", max_per_hour=10):
+        return HTMLResponse(
+            content="<h1>Zu viele Anfragen</h1>"
+                    "<p>Bitte einen Moment warten.</p>",
+            status_code=429,
+        )
     from starlette.datastructures import UploadFile as _UploadFile
     from core.integrations.anfrage_forms import (
         ANFRAGE_FILE_MAX_BYTES,

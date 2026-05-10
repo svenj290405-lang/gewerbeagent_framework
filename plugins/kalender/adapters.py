@@ -293,6 +293,26 @@ async def get_calendar_adapter(
     cal_id = (emp.calendar_id if emp else None) or fallback_calendar_id
 
     emp_id = emp.id if emp else None
+
+    # Wenn der gewaehlte Employee keinen OAuth-Token fuer den Provider
+    # hat, faellt der Lookup automatisch auf den Default-Employee zurueck
+    # (siehe core/security/oauth_token_lookup.py — 3-stufiger Fallback).
+    # Wir koennen das hier vorab pruefen und ggf. eine Info loggen damit
+    # der Owner spaeter im Audit-Log sieht warum ein Termin im falschen
+    # Kalender landet.
+    try:
+        from core.security.oauth_token_lookup import find_oauth_token
+        if emp_id is not None:
+            token = await find_oauth_token(tenant_id, provider, emp_id)
+            if token is not None and token.employee_id != emp_id:
+                logger.info(
+                    f"Adapter-Fallback: Employee {emp.slug if emp else '?'} hat "
+                    f"keinen eigenen {provider}-Token — nutzt Default-Token von "
+                    f"employee_id={token.employee_id}"
+                )
+    except Exception:
+        pass
+
     if provider == CALENDAR_PROVIDER_MICROSOFT:
         return MicrosoftCalendarAdapter(
             tenant_id=tenant_id, calendar_id=cal_id, employee_id=emp_id,

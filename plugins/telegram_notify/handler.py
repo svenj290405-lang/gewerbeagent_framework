@@ -4105,8 +4105,14 @@ async def _handle_rechnungen_anzeigen_command(chat_id):
                 lines.append(f'• {ts} {kunde} {betrag} ✅ bezahlt {paid_str}')
         elif rg.status == RECHNUNG_STATUS_MAIL_SENT:
             # Versendet, noch nicht bezahlt — zusaetzlich Lexware-Cache zeigen
-            if rg.lexware_voucher_status == "voided":
+            from core.models.rechnung import LEXWARE_PARTIAL_PAID_STATES
+            voucher_lc = (rg.lexware_voucher_status or "").lower()
+            if voucher_lc == "voided":
                 marker = "🚫 storniert"
+            elif voucher_lc == "cancelled":
+                marker = "❌ in Lexware geloescht"
+            elif voucher_lc in LEXWARE_PARTIAL_PAID_STATES:
+                marker = "🟡 teilweise bezahlt"
             elif rg.last_paid_check_at:
                 check_str = rg.last_paid_check_at.strftime("%d.%m. %H:%M")
                 marker = f"⏳ offen (geprueft {check_str})"
