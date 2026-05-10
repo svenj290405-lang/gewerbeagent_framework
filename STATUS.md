@@ -239,6 +239,80 @@ nicht spammig):
 
 ---
 
+## TEIL G — MULTI-MITARBEITER-FOUNDATION (10.05.2026 nachmittags)
+
+### Status: ✅ Phase 0 fertig + live (kein Verhaltenswechsel im Code)
+
+Sven-Wunsch: Handwerksbetriebe mit Angestellten sollen das System
+nutzen koennen — eigener Telegram-Chat, eigener Google-Kalender,
+eigene Heimat-Adresse, automatische Zuweisung passender Mitarbeiter
+fuer eingehende Anfragen. Plan in 6 Phasen geteilt
+(`das-machen-wir-gleich-foamy-frost.md`):
+0 Foundation → 2 Telegram → 4 Skills+Assignees → 1 Calendar-OAuth →
+3 Per-Emp-Heimat → 5 Skill-Router. Heute: Phase 0.
+
+### Neues Modell `employees`
+
+`core/models/employee.py` + Migration `l5g2c9e7b8d4`. Felder fuer
+ALLE 5 Phasen direkt vorgesehen — keine zweite Migration noetig:
+
+| Phase | Felder |
+|---|---|
+| 0 | id, tenant_id (FK CASCADE), slug, name, contact_email, is_default, is_active, notes |
+| 2 | telegram_chat_id BigInt UNIQUE NULL |
+| 3 | heimat_strasse/plz/ort/lat/lon, fahrtzeit_puffer_min |
+| 4 | skills ARRAY(String), arbeitszeiten JSONB, arbeitstage ARRAY(Int) |
+
+Constraints:
+- `uq_emp_tenant_slug` UNIQUE (tenant_id, slug)
+- `uq_emp_default_per_tenant` partial-unique-index (tenant_id) WHERE is_default
+  → exakt 1 Default-Employee pro Tenant, durch Postgres erzwungen
+- `uq_emp_telegram_chat_id` UNIQUE telegram_chat_id (eine Chat = 1 Mitarbeiter)
+- Indizes: tenant_id, (tenant_id, is_default), telegram_chat_id
+
+Skill-Konstanten in employee.py: SKILL_HEIZUNG, SKILL_SANITAER,
+SKILL_ELEKTRIK, SKILL_DACH, SKILL_TISCHLER, SKILL_MALER, SKILL_ALLGEMEIN.
+
+### Default-Employee-Backfill
+
+Migration legt automatisch fuer jeden bestehenden Tenant einen
+Default-Employee an (slug='default', is_default=true) und spiegelt
+heutige Tenant-Felder (contact_*, telegram_chat_id, heimat_*,
+fahrtzeit_puffer_min). Damit ist der Code ab sofort employee-zentrisch
+ohne `if employee else legacy`-Branches in den Folge-Phasen.
+
+Real verifiziert nach Migration:
+- 2 Tenants (`_global`, `demo`) → 2 Employees, beide is_default=true
+- demo-Tenant chat_id 8518191832 korrekt am Default-Employee
+- Helper get_default_employee, get_employees_for_tenant,
+  get_employee_by_telegram_chat alle gruen mit echten Daten
+
+### Backward-Compatibility
+
+`tenants.telegram_chat_id`, `tenants.heimat_*` werden NICHT gedroppt.
+Sie spiegeln den Default-Employee weiterhin — alte Code-Pfade lesen
+korrekt. Cleanup nach mehreren Wochen Mirror-Betrieb in einer
+separaten Migration. Ergo: heutiges Verhalten 100% identisch, kein
+Endpoint-Bruch, keine Notification verloren.
+
+### Naechste Schritte (kommende Sessions)
+
+| Phase | Was kommt | Aufwand |
+|---|---|---|
+| 2 | Telegram Multi-Chat + /start dietz__sven Format | ~3 PT |
+| 4 | /mitarbeiter-Wizard + Skill-Strings + assigned_employee_id auf email_conversations/kundengespraeche/rechnungen | ~2.5 PT |
+| 1 | Calendar Multi-OAuth (oauth_tokens.employee_id, partial-unique-Constraint-Refactor in 2 Schritten) | ~2.5 PT |
+| 3 | Smart-Filter nutzt Employee.heimat_* statt Tenant.heimat_* + ORS-LRU + Quota-Cap | ~1.5 PT |
+| 5 | core/routing/employee_router.py — Skill-Match + Distanz-Score + Conversation-Sticky | ~3 PT |
+
+### Aktivierung (heute nichts noetig)
+
+Phase 0 ist rein additiv. Live-Tenant laeuft unveraendert.
+Erste user-sichtbare Aenderung kommt in Phase 4 mit dem
+/mitarbeiter-Wizard.
+
+---
+
 ## TL;DR
 
 **Fertig und live:**

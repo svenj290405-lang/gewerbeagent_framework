@@ -58,6 +58,20 @@ from core.models.beleg import (
 )
 from core.models.oauth_token import OAuthToken
 from core.models.tenant import Tenant, TenantStatus
+from core.models.employee import (
+    Employee,
+    SKILL_HEIZUNG,
+    SKILL_SANITAER,
+    SKILL_ELEKTRIK,
+    SKILL_DACH,
+    SKILL_TISCHLER,
+    SKILL_MALER,
+    SKILL_ALLGEMEIN,
+    ALLE_SKILLS,
+    get_default_employee,
+    get_employees_for_tenant,
+    get_employee_by_telegram_chat,
+)
 from core.models.tenant_knowledge import (
     TenantKnowledge,
     KATEGORIE_LEISTUNGEN,
@@ -91,6 +105,18 @@ from core.models.geocode_cache import GeocodeCache
 __all__ = [
     "Tenant",
     "TenantStatus",
+    "Employee",
+    "SKILL_HEIZUNG",
+    "SKILL_SANITAER",
+    "SKILL_ELEKTRIK",
+    "SKILL_DACH",
+    "SKILL_TISCHLER",
+    "SKILL_MALER",
+    "SKILL_ALLGEMEIN",
+    "ALLE_SKILLS",
+    "get_default_employee",
+    "get_employees_for_tenant",
+    "get_employee_by_telegram_chat",
     "TenantKnowledge",
     "KATEGORIE_LEISTUNGEN",
     "KATEGORIE_MATERIALIEN",
