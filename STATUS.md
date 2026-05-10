@@ -34,21 +34,30 @@ cd05504 feat(admin-db): admin_users + api_pricing_config + api_usage_log + Seeds
 
 **URL:** https://www.gewerbeagent.de/
 
-**Features (Iron-Man-Hologramm-Look statt sauberer Wireframe):**
+**Features (Killian-Brain-Hologramm-Look — Iron Man 3, Fuel VFX reference):**
 - 3D-Hologramm via Three.js r128 (CDN, lazy geladen)
-- 4 überlagerte Particle-Layer mit unterschiedlichen Radien & Rotationen:
-  - Outer Shell (3500 Desktop / 1400 Mobile): cluster-bias zu 5 Centers + 40% Stragglers, ±15% Radius-Jitter → unregelmäßige Dichte
-  - Bright Highlights (180 / 70): sparse Spitzlichter, weiß, additive Glow
-  - Mid Shell (1400 / 500): kleinerer Radius, gegenläufige Rotation
-  - Inner Core (220 / 110): echte Brownian-Motion in r=0.55-Bereich
-- ~80 fragmentierte Linien-Stummel (statt durchgehender Wireframe), tangential auf Outer-Shell, asynchroner Flicker via 2 Sets mit Phasen-Offset
-- 3 konzentrische Ringe in zufälligen Achsen, eigene Rotation-Speeds
-- Energy-Pulses: expanding Wireframe-Shells alle 2-4s vom Zentrum, Lifetime 1.4s
-- AdditiveBlending + radial-gradient Texture (CanvasTexture, kein Bloom-Pass nötig) → Glow-Optik
-- Pulse-Animation: globale Group-Scale 1.0 → 1.05 → 1.0 in 1.8s (Spec-konform via (1-cos)/2)
-- Subtle blaue PointLight im Sphere-Zentrum pulsiert mit (Lebendigkeit)
-- Maus-Hover folgt sanft, Klick spawnt 2 Energy-Pulses (sichtbarer Burst)
-- Build-Up gestaffelt: Core 0-0.5s → Mid 0.3-0.9s → Outer 0.6-1.4s → Highlights/Fragments/Rings 1.0-1.8s
+- Warm-Amber/Orange-Palette (#ff5008 base, #ff8a3a mid, #fff4d8 peak) — KEIN Blau
+- 110 Faser-Pfade (Mobile 30) als CatmullRomCurve3 + TubeGeometry mit
+  6-10 Kontroll-Punkten, Center-Bias (Brain-Density)
+- Custom GLSL ShaderMaterial pro Faser: Licht wandert entlang Curve-UV.x
+  via wandernder Gauss-Peak (`exp(-d²·700)`) + exponentieller Trail nach
+  hinten + sanfte Grund-Glow auf der ganzen Faser. Individuelles uOffset
+  und uSpeed pro Curve (0.06-0.24 Hz) für asynchrone Pulse-Wellen.
+- 4000 Volume-Particles (Mobile 1500) mit power-2-Density-Bias (zentral
+  dichter, außen spärlicher), 220 Hot-Spot-Highlights als zweite Schicht,
+  300 davon mit Brownian-Motion (Performance-bewusst)
+- Outer Shell (SphereGeometry r=1.75) mit Custom Fresnel-Shader
+  (`pow(1-dot(N,V), 2.5)`), 3s Breath-Pulse, sehr niedrige Opacity → "Container"-Hint
+- UnrealBloomPass auf Desktop (strength 1.5, radius 0.8, threshold 0.4) —
+  Mobile fällt sauber zurück auf direkten renderer.render()
+- AdditiveBlending durchgehend, radial-gradient CanvasTexture für Particles
+- Pulse-Bursts alle 4-6s vom Zentrum (Wireframe-Icosahedrons, expanding)
+- Camera-Parallax zu Maus (subtil, ±0.3 units)
+- Klick spawnt 2 Pulse-Bursts (sichtbarer Trigger)
+- Sehr langsame Y-Rotation (0.0005 rad/frame ≈ 1 Umdrehung in 3.5min)
+- Build-up gestaffelt: Shell 0-0.5s → Particles 0.2-0.9s → Hot 0.4-1.1s → Faser-Licht 0.5-2.0s
+- prefers-reduced-motion: Rotation aus, Pulse aus, statisch
+- CSS Hero-Glow + SVG-Fallback auf Amber umgestellt (orange tint)
 - `prefers-reduced-motion` respektiert
 - Mobile <480px: vereinfachter SVG-Fallback (keine WebGL-Last)
 - Inter-Font, weiss-dominant, dezent-blau (#3b82f6)
