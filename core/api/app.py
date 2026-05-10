@@ -25,6 +25,12 @@ from core.plugin_system import (
 from core.api.anfrage_routes import router as anfrage_router
 from core.admin.routes import router as admin_router, mount_static as mount_admin_static
 from core.integrations.microsoft_cron import cron_loop as microsoft_cron_loop
+from core.integrations.rechnung_payment_monitor import (
+    cron_loop as rechnung_payment_cron_loop,
+)
+from core.integrations.rechnung_paid_summary import (
+    cron_loop as rechnung_paid_summary_cron_loop,
+)
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(
@@ -43,13 +49,21 @@ async def lifespan(app: FastAPI):
     cron_task = asyncio.create_task(microsoft_cron_loop())
     logger.info("Microsoft-Cron als Background-Task gestartet")
 
+    payment_task = asyncio.create_task(rechnung_payment_cron_loop())
+    logger.info("Bezahl-Polling-Cron (Lexware, alle 30 Min) gestartet")
+
+    summary_task = asyncio.create_task(rechnung_paid_summary_cron_loop())
+    logger.info("Bezahl-Tages-Zusammenfassung-Cron (taegl. 18:00) gestartet")
+
     yield
 
-    cron_task.cancel()
-    try:
-        await cron_task
-    except asyncio.CancelledError:
-        pass
+    for t in (cron_task, payment_task, summary_task):
+        t.cancel()
+    for t in (cron_task, payment_task, summary_task):
+        try:
+            await t
+        except asyncio.CancelledError:
+            pass
     logger.info("Framework faehrt runter.")
 
 
