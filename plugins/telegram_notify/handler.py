@@ -497,42 +497,64 @@ async def _handle_help_command(chat_id=None):
 
     lines: list[str] = ["<b>📋 Befehle</b>"]
 
-    def _block(emoji: str, title: str, items: list[tuple[str, str]]) -> None:
-        """items = [(cmd, kurzbeschreibung), ...]. Eine Zeile pro Eintrag."""
+    def _block(
+        emoji: str, title: str, items: list[tuple[str, str]],
+        *, locked: bool = False,
+    ) -> None:
+        """items = [(cmd, kurzbeschreibung), ...]. Eine Zeile pro Eintrag.
+
+        Wenn locked=True: Block-Header bekommt 🔒-Suffix, Befehle
+        bleiben aber sichtbar mit Beschreibung — der User soll wissen
+        was es gibt. Beim Tippen eines locked Befehls greift dann das
+        Feature-Gate mit Upgrade-Hinweis.
+        """
         if not items:
             return
         lines.append("")
-        lines.append(f"{emoji} <b>{title}</b>")
+        lock_marker = "  🔒" if locked else ""
+        lines.append(f"{emoji} <b>{title}</b>{lock_marker}")
         for cmd, desc in items:
             lines.append(f"<code>{cmd}</code> — {desc}")
 
     # --- Workflow: Kundengespraeche (voice + kalender + always-on kunde) ---
-    kunden_items: list[tuple[str, str]] = []
+    # Voice-Init-Befehle haben den expliziten Angebot-Hinweis — wir
+    # zeigen sie auch wenn das Feature nicht aktiv ist, damit der User
+    # sieht dass die Funktionalitaet existiert (mit 🔒-Marker).
+    kunden_items_active: list[tuple[str, str]] = []
+    kunden_items_locked: list[tuple[str, str]] = []
+
+    voice_items = [
+        ("/aufnahme",
+         "Sprachnachricht zum Kundengespraech schicken — Bot "
+         "transkribiert, extrahiert Kunde + Anliegen und legt "
+         "optional ein Lexware-Angebot mit Preisen direkt an."),
+        ("/anrufe",
+         "Letzte eingehende Anrufe mit KI-Zusammenfassung und "
+         "erkannten Kunden-Daten."),
+    ]
     if _is_on("voice_init"):
-        kunden_items.append((
-            "/aufnahme",
-            "Sprachnachricht zum Kundengespraech schicken — Bot "
-            "transkribiert, extrahiert Kunde + Anliegen und legt "
-            "optional ein Lexware-Angebot an.",
-        ))
-        kunden_items.append((
-            "/anrufe",
-            "Letzte eingehende Anrufe mit KI-Zusammenfassung und "
-            "erkannten Kunden-Daten.",
-        ))
+        kunden_items_active.extend(voice_items)
+    else:
+        kunden_items_locked.extend(voice_items)
+
     if _is_on("kalender"):
-        kunden_items.append((
+        kunden_items_active.append((
             "/briefing",
             "Briefing zum naechsten Termin: Kunde, relevantes "
             "Wissen, Anfahrtszeit.",
         ))
     # /kunde ist always_on (kunde_lookup-Feature)
-    kunden_items.append((
+    kunden_items_active.append((
         "/kunde [name]",
         "Kundenhistorie: alle Gespraeche, Termine und "
         "Drive-Ordner-Link.",
     ))
-    _block("📞", "Kundengespraeche", kunden_items)
+    _block("📞", "Kundengespraeche", kunden_items_active)
+    if kunden_items_locked:
+        _block(
+            "📞", "Kundengespraeche — Telefon-Annahme",
+            kunden_items_locked, locked=True,
+        )
 
     # --- Buchhaltung (lexware) ---
     if _is_on("lexware"):
@@ -622,29 +644,32 @@ async def _handle_help_command(chat_id=None):
              "Auf Tischler- oder Allgemein-Default zuruecksetzen."),
         ])
 
-    # --- Visualisierung ---
-    if _is_on("visualisierung"):
-        _block("🎨", "Visualisierung", [
-            ("/visualisierung",
-             "Foto + Text-Beschreibung schicken → photorealistisches "
-             "KI-Rendering. Danach an Kunden mailen, ins "
-             "Drive-Archiv legen oder verwerfen."),
-        ])
+    # --- Visualisierung (immer anzeigen, mit Lock wenn inaktiv) ---
+    viz_items = [
+        ("/visualisierung",
+         "Foto + Text-Beschreibung schicken → photorealistisches "
+         "KI-Rendering. Danach an Kunden mailen, ins "
+         "Drive-Archiv legen oder verwerfen."),
+    ]
+    _block("🎨", "Visualisierung", viz_items, locked=not _is_on("visualisierung"))
 
-    # --- Kunden-Archiv (Drive) ---
-    if _is_on("drive_archiv"):
-        _block("☁️", "Kunden-Archiv (Google Drive)", [
-            ("/drive_verbinden",
-             "Google-Drive mit dem Tenant verknuepfen (OAuth-Flow)."),
-            ("/drive_status",
-             "Drive-Verbindung + verknuepfter Account."),
-            ("/archiv [kunde]",
-             "Datei-Upload starten — Fotos und PDFs landen "
-             "automatisch im Kunden-Ordner."),
-            ("/fertig",
-             "Archiv-Upload abschliessen (nur im laufenden "
-             "/archiv-Wizard)."),
-        ])
+    # --- Kunden-Archiv (Drive, immer anzeigen mit Lock wenn inaktiv) ---
+    drive_items = [
+        ("/drive_verbinden",
+         "Google-Drive mit dem Tenant verknuepfen (OAuth-Flow)."),
+        ("/drive_status",
+         "Drive-Verbindung + verknuepfter Account."),
+        ("/archiv [kunde]",
+         "Datei-Upload starten — Fotos und PDFs landen "
+         "automatisch im Kunden-Ordner."),
+        ("/fertig",
+         "Archiv-Upload abschliessen (nur im laufenden "
+         "/archiv-Wizard)."),
+    ]
+    _block(
+        "☁️", "Kunden-Archiv (Google Drive)",
+        drive_items, locked=not _is_on("drive_archiv"),
+    )
 
     # --- Mail-Inbox (mail_intake) ---
     if _is_on("mail_intake"):
@@ -700,7 +725,8 @@ async def _handle_help_command(chat_id=None):
     ])
 
     lines.append("")
-    lines.append("<i>Hilfe: hallo@gewerbeagent.de</i>")
+    lines.append("<i>🔒 = nicht in deinem Paket — Upgrade via "
+                 "hallo@gewerbeagent.de. Aktuelle Features: /paket</i>")
     return "\n".join(lines)
 
 
