@@ -209,6 +209,66 @@ ANFRAGE_FILE_ALLOWED_MIME = (
 RESERVED_FIELD_NAMES = {"name", "email", "token"}
 
 
+# Phase B8: Magic-Bytes-Check. Verhindert dass ein Angreifer mit
+# umgebogenem content-type-Header eine .exe als "image/jpeg" hochlaedt.
+# Die Erkennung ist inline (kein python-magic-Dep — das brauchte
+# libmagic im Image und Rebuild). Bei mismatch: Caller verwirft den
+# Upload silent (kein Error-Detail an den Angreifer).
+_MAGIC_SIGNATURES: tuple[tuple[bytes, str], ...] = (
+    (b"\xff\xd8\xff", "image/jpeg"),
+    (b"\x89PNG\r\n\x1a\n", "image/png"),
+    # WebP: "RIFF" + 4 byte size + "WEBP" — wir pruefen den dritten Block
+    (b"RIFF", "image/webp"),       # 1. Plausi
+    (b"%PDF-", "application/pdf"),
+)
+
+
+def _looks_like_heic(raw: bytes) -> bool:
+    """HEIC/HEIF: 'ftyp'-Box bei offset 4 + brand ab offset 8."""
+    if len(raw) < 12:
+        return False
+    if raw[4:8] != b"ftyp":
+        return False
+    return raw[8:12] in (b"heic", b"heix", b"hevc", b"hevx", b"mif1", b"msf1")
+
+
+def verify_magic_bytes(
+    raw: bytes,
+    *,
+    claimed_content_type: str,
+) -> bool:
+    """True wenn die ersten Bytes zum behaupteten content-type passen.
+
+    Erlaubt nur Typen aus ANFRAGE_FILE_ALLOWED_MIME. Fuer alles andere:
+    False (selbst wenn die Magic-Bytes irgendwas erkennen).
+    """
+    if not raw or claimed_content_type not in ANFRAGE_FILE_ALLOWED_MIME:
+        return False
+
+    ct = claimed_content_type.lower()
+
+    if ct == "image/heic":
+        return _looks_like_heic(raw)
+
+    # JPEG: jpg/jpeg dedupliziert
+    if ct in ("image/jpeg", "image/jpg"):
+        return raw.startswith(b"\xff\xd8\xff")
+
+    if ct == "image/png":
+        return raw.startswith(b"\x89PNG\r\n\x1a\n")
+
+    if ct == "image/webp":
+        # RIFF...WEBP — 12 Byte Header
+        return (
+            len(raw) >= 12 and raw[0:4] == b"RIFF" and raw[8:12] == b"WEBP"
+        )
+
+    if ct == "application/pdf":
+        return raw.startswith(b"%PDF-")
+
+    return False
+
+
 def validate_schema_fields(fields: list[dict]) -> tuple[bool, str]:
     """Strukturpruefung. Returns (ok, error_msg). Fuer Telegram-Wizard + DB-Schreibweg."""
     if not isinstance(fields, list) or not fields:

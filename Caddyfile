@@ -18,6 +18,13 @@
         Cross-Origin-Opener-Policy "same-origin"
         # Permissions-Policy: keine sensiblen APIs ohne expliziten Bedarf
         Permissions-Policy "geolocation=(), camera=(), microphone=(), payment=()"
+        # Phase B8: CSP — verhindert XSS und drittpartei-Script-Injection.
+        # 'unsafe-inline' fuer scripts ist noetig fuer die Admin-Chart-
+        # Bloecke; fuer Style ebenfalls weil Anfrage-Formular generierte
+        # inline-Styles nutzt. Frame-ancestors 'none' ist Belt-and-
+        # Suspenders zu X-Frame-Options. img-src + connect-src bewusst
+        # eng gefasst.
+        Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: blob:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'; object-src 'none'"
         # Server-Header verstecken (verhindert Versions-Disclosure)
         -Server
     }
@@ -56,6 +63,44 @@ www.gewerbeagent.de {
         output file /var/log/caddy/website-access.log {
             roll_size 10mb
             roll_keep 5
+        }
+        format console
+    }
+}
+
+# =====================================================================
+# Phase B6: oeffentliche Status-Page (status.gewerbeagent.de)
+# =====================================================================
+# Aktivierung:
+#   1. DNS A-Record fuer status.gewerbeagent.de auf Server-IP zeigen
+#   2. caddy reload — Caddy holt automatisch ein Let's-Encrypt-Cert
+# Block proxied alles ans Framework, das nur die Status-Routes
+# beantwortet. Andere Endpoints (Webhook, /admin) bleiben auch hier
+# erreichbar — Caddy filtert nicht nach Path, das ist akzeptabel weil
+# alles ohne /admin-Auth eh limitiert ist. Cleaner waere ein Rewrite,
+# bringt aber kaum Sicherheitsgewinn.
+status.gewerbeagent.de {
+    encode gzip
+    import security_headers
+
+    # Default: zur Status-Page weiterleiten wenn nicht /api/status oder
+    # /status direkt angefragt wird.
+    @not_status {
+        not path /status /api/status
+    }
+    redir @not_status /status 302
+
+    reverse_proxy framework:8001 {
+        header_up Host {host}
+        header_up X-Real-IP {remote}
+        header_up X-Forwarded-For {remote}
+        header_up X-Forwarded-Proto {scheme}
+    }
+
+    log {
+        output file /var/log/caddy/status-access.log {
+            roll_size 10mb
+            roll_keep 3
         }
         format console
     }

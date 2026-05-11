@@ -134,6 +134,7 @@ async def submit_anfrage_form(token: str, request: Request):
         ANFRAGE_FILE_MAX_BYTES,
         ANFRAGE_FILE_MAX_COUNT,
         ANFRAGE_FILE_ALLOWED_MIME,
+        verify_magic_bytes,
     )
     import base64 as _b64
 
@@ -161,6 +162,15 @@ async def submit_anfrage_form(token: str, request: Request):
                 logger.info(
                     f"submit_anfrage: skip File {value.filename!r} - "
                     f"{len(raw)} bytes > {ANFRAGE_FILE_MAX_BYTES}"
+                )
+                continue
+            # Phase B8: Magic-Bytes-Check — Angreifer der content-type-
+            # Header faelscht (z.B. ".exe" mit content_type="image/jpeg")
+            # wird hier geblockt.
+            if not verify_magic_bytes(raw, claimed_content_type=ct):
+                logger.warning(
+                    f"submit_anfrage: magic-bytes mismatch fuer "
+                    f"{value.filename!r} (claimed={ct}) — verworfen"
                 )
                 continue
             file_obj = {
