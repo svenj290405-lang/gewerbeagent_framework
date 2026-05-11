@@ -64,6 +64,7 @@ from core.models.visualisierung import (
     VIZ_STATUS_GENERATING,
     VIZ_STATUS_DONE,
     VIZ_STATUS_FAILED,
+    VIZ_STATUS_MAIL_QUEUED,
     VIZ_STATUS_SENT,
 )
 from core.models.beleg import (
@@ -204,6 +205,7 @@ __all__ = [
     "VIZ_STATUS_GENERATING",
     "VIZ_STATUS_DONE",
     "VIZ_STATUS_FAILED",
+    "VIZ_STATUS_MAIL_QUEUED",
     "VIZ_STATUS_SENT",
     "Beleg",
     "BELEG_STATUS_PENDING",
@@ -231,7 +233,17 @@ __all__ = [
     "TenantKundeDrive",
 ]
 from core.models.tenant_leistung import TenantLeistung
-from core.models.angebot import Angebot
+from core.models.angebot import (
+    Angebot,
+    ANGEBOT_STATUS_ERSTELLT,
+    ANGEBOT_STATUS_IN_LEXWARE,
+    ANGEBOT_STATUS_MAIL_QUEUED,
+    ANGEBOT_STATUS_MAIL_SENT,
+    ANGEBOT_STATUS_MAIL_FAILED,
+    ANGEBOT_STATUS_ACCEPTED,
+    ANGEBOT_STATUS_REJECTED,
+    ANGEBOT_STATUS_RECHNUNG_ERSTELLT,
+)
 from core.models.angebot_position import AngebotPosition
 from core.models.kundengespraech import Kundengespraech
 from core.models.anfrage import (

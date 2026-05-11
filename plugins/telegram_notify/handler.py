@@ -86,6 +86,7 @@ from core.models import (
     RECHNUNG_STATUS_DRAFTED,
     RECHNUNG_STATUS_ERROR,
     RECHNUNG_STATUS_EXTRACTING,
+    RECHNUNG_STATUS_MAIL_QUEUED,
     RECHNUNG_STATUS_MAIL_SENT,
     RECHNUNG_STATUS_PREVIEWING,
     Tenant,
@@ -2119,6 +2120,66 @@ async def _load_viz_image(viz_id_str: str) -> tuple[bytes | None, str | None]:
         return viz.result_image_data, viz.prompt or ""
 
 
+async def _viz_queue_for_retry(
+    *,
+    tenant_id,
+    viz_id: str,
+    recipient_email: str,
+    subject: str,
+    html_body: str,
+    image_bytes: bytes,
+    from_name: str,
+    reply_to: str,
+    reply_to_name: str,
+    last_error: str,
+) -> None:
+    """Beta-1 B1-4: Visualisierungs-Mail in failed_mail_queue + Status.
+
+    Failsafe — Caller-Branch ist schon im Exception-Handler.
+    """
+    try:
+        from core.integrations.mail_retry_cron import enqueue_failed_mail
+        from core.models import (
+            MAIL_TYPE_VISUALISIERUNG, VIZ_STATUS_MAIL_QUEUED,
+        )
+        # Status auf 'mail_queued' setzen damit Tenant es in /briefing /
+        # Admin-UI sieht
+        try:
+            import uuid as _uuid_local
+            async with AsyncSessionLocal() as s:
+                viz = (await s.execute(
+                    select(Visualisierung)
+                    .where(Visualisierung.id == _uuid_local.UUID(viz_id))
+                )).scalar_one_or_none()
+                if viz:
+                    viz.status = VIZ_STATUS_MAIL_QUEUED
+                    viz.kunde_email = recipient_email
+                    await s.commit()
+        except Exception as exc:
+            logger.warning(f"viz-status auf MAIL_QUEUED setzen ignored: {exc}")
+
+        # Queue-Insert
+        await enqueue_failed_mail(
+            tenant_id=tenant_id,
+            mail_type=MAIL_TYPE_VISUALISIERUNG,
+            recipient_email=recipient_email,
+            subject=subject,
+            html_body=html_body,
+            attachments=[{
+                "filename": "visualisierung.jpg",
+                "mime_type": "image/jpeg",
+                "content_bytes": image_bytes,
+            }],
+            from_name=from_name,
+            reply_to=reply_to,
+            reply_to_name=reply_to_name,
+            viz_id=viz_id,
+            last_error=last_error[:500],
+        )
+    except Exception as exc:
+        logger.exception(f"_viz_queue_for_retry crashed: {exc}")
+
+
 async def _handle_viz_mail_email_input(chat_id, text, state_data):
     """User schickt Email-Adresse → wir mailen das Bild als Anhang."""
     email = (text or "").strip().lower()
@@ -2216,15 +2277,52 @@ async def _handle_viz_mail_email_input(chat_id, text, state_data):
         )
         msg_id = result.get("messageId", "?")
         logger.info(f"Visualisierung-Mail an {email} gesendet: {msg_id}")
+        # Status auf 'sent' setzen (war vorher implizit nirgendwo gesetzt
+        # — die Wizard-Logik hat die Viz nach Erfolg nie auf SENT
+        # gehoben. Beta-1 macht das jetzt explizit damit /briefing &
+        # Admin-UI konsistent sind).
+        try:
+            from core.models import VIZ_STATUS_SENT
+            async with AsyncSessionLocal() as s:
+                import uuid as _uuid_for_viz
+                viz = (await s.execute(
+                    select(Visualisierung).where(Visualisierung.id == _uuid_for_viz.UUID(viz_id))
+                )).scalar_one_or_none()
+                if viz:
+                    viz.status = VIZ_STATUS_SENT
+                    viz.kunde_email = email
+                    await s.commit()
+        except Exception as exc_status:
+            logger.exception(f"viz-status auf SENT setzen failed (egal): {exc_status}")
     except BrevoError as e:
-        logger.warning(f"Visualisierung-Mail fehlgeschlagen: {e}")
-        # Buttons wieder zeigen damit User es nochmal probieren kann
+        # Beta-1 B1-4: in Retry-Queue legen statt verlorengehen lassen
+        logger.exception(f"Visualisierung-Mail fehlgeschlagen — in Queue: {e}")
+        await _viz_queue_for_retry(
+            tenant_id=tenant.id, viz_id=viz_id, recipient_email=email,
+            subject=subject, html_body=intro, image_bytes=image_bytes,
+            from_name=sender_name, reply_to=tenant_contact_email,
+            reply_to_name=tenant_contact_name, last_error=str(e),
+        )
         await _show_viz_post_action_buttons(chat_id, viz_id, prompt or "")
-        return f"⚠️ Mailversand fehlgeschlagen (HTTP {e.status_code}). Du kannst es nochmal probieren."
+        return (
+            "⚠️ Mail-Versand verzoegert (HTTP "
+            f"{e.status_code or '?'}). Wird automatisch in 5 Min "
+            "wiederholt — kein erneutes Versenden noetig."
+        )
     except Exception as e:
         logger.exception(f"Visualisierung-Mail unbekannter Fehler: {e}")
+        # Auch hier in die Queue — bei unbekanntem Fehler genauso wert
+        # nachzuversuchen
+        await _viz_queue_for_retry(
+            tenant_id=tenant.id, viz_id=viz_id, recipient_email=email,
+            subject=subject, html_body=intro, image_bytes=image_bytes,
+            from_name=sender_name, reply_to=tenant_contact_email,
+            reply_to_name=tenant_contact_name, last_error=str(e),
+        )
         await _show_viz_post_action_buttons(chat_id, viz_id, prompt or "")
-        return "⚠️ Mailversand fehlgeschlagen. Du kannst es nochmal probieren."
+        return (
+            "⚠️ Mailversand fehlgeschlagen. Wird automatisch wiederholt."
+        )
 
     # Erfolgs-Bestaetigung + Buttons fuer naechste Aktion (Drive)
     await _send_to_chat(
@@ -4543,10 +4641,16 @@ async def _mark_rechnung_cancelled(rechnung_id):
 
 
 async def _create_rechnung_in_lexware(chat_id, rechnung_id, bot_token):
-    """Erstellt die Lexware-Rechnung (Draft) aus den extrahierten Daten."""
+    """Erstellt die Lexware-Rechnung (Draft) aus den extrahierten Daten.
+
+    Beta-1 B1-7: Race-Schutz mit SELECT FOR UPDATE — verhindert dass
+    zwei parallele Bestaetigungs-Klicks zwei Lexware-Vouchers erzeugen.
+    """
     async with AsyncSessionLocal() as s:
         rg = (await s.execute(
-            select(Rechnung).where(Rechnung.id == rechnung_id)
+            select(Rechnung)
+            .where(Rechnung.id == rechnung_id)
+            .with_for_update()
         )).scalar_one_or_none()
         if not rg:
             await _send_to_chat(chat_id, "Rechnung nicht mehr gefunden.")
@@ -4558,6 +4662,23 @@ async def _create_rechnung_in_lexware(chat_id, rechnung_id, bot_token):
             await _send_to_chat(
                 chat_id,
                 f"Rechnung wurde bereits in Lexware angelegt: <a href=\"{link}\">oeffnen</a>",
+            )
+            return
+
+        # Race-Schutz: anderer Klick hat die Rechnung schon im Verlauf
+        if rg.status == RECHNUNG_STATUS_CREATING:
+            await _send_to_chat(
+                chat_id,
+                "Rechnung wird gerade angelegt — bitte einen Moment warten.",
+            )
+            return
+        if rg.status in (
+            RECHNUNG_STATUS_MAIL_SENT, RECHNUNG_STATUS_MAIL_QUEUED,
+            RECHNUNG_STATUS_BEZAHLT,
+        ):
+            await _send_to_chat(
+                chat_id,
+                f"Rechnung ist schon im Status '{rg.status}' — nichts zu tun.",
             )
             return
 
@@ -5587,7 +5708,7 @@ async def _handle_rechnung_send_mail_now(chat_id, rechnung_id, bot_token):
             )
             logger.info(f"Rechnungs-Kopie an Tenant gesendet: {tenant_data['contact_email']}")
         except Exception as e:
-            logger.warning(f"Tenant-Kopie fehlgeschlagen (nicht kritisch): {e}")
+            logger.exception(f"Tenant-Kopie fehlgeschlagen (nicht kritisch): {e}")
 
     except BrevoError as e:
         # Phase A5: in Retry-Queue legen statt sofort auf ERROR.

@@ -120,30 +120,65 @@ async def _send_via_brevo(
     return result.get("messageId") or "?"
 
 
-async def _mark_sent(entry_id, message_id: str, mail_type: str,
-                    rechnung_id) -> None:
-    """Bei erfolgreichem Retry: queue=sent + ggf. Rechnung=mail_sent."""
+async def _mark_sent(
+    entry_id, message_id: str, mail_type: str,
+    rechnung_id, viz_id: str | None = None,
+    angebot_id: str | None = None,
+) -> None:
+    """Bei erfolgreichem Retry: queue=sent + Quell-Objekt-Status zurueck.
+
+    Generic ueber alle mail_types — siehe Beta-1 B1-5.
+    """
+    now = dt.datetime.now(dt.timezone.utc)
     async with AsyncSessionLocal() as s:
         await s.execute(
             update(FailedMailQueue)
             .where(FailedMailQueue.id == entry_id)
-            .values(
-                status=FAILED_MAIL_SENT,
-                last_error=None,
-                updated_at=dt.datetime.now(dt.timezone.utc),
-            )
+            .values(status=FAILED_MAIL_SENT, last_error=None, updated_at=now)
         )
+
         if mail_type == MAIL_TYPE_RECHNUNG and rechnung_id:
             await s.execute(
                 update(Rechnung)
                 .where(Rechnung.id == rechnung_id)
                 .values(
                     status=RECHNUNG_STATUS_MAIL_SENT,
-                    mail_sent_at=dt.datetime.now(dt.timezone.utc),
-                    updated_at=dt.datetime.now(dt.timezone.utc),
+                    mail_sent_at=now, updated_at=now,
                 )
             )
+
+        elif mail_type == "visualisierung" and viz_id:
+            # Lazy-import damit Top-Level-Imports leicht bleiben.
+            from core.models import Visualisierung, VIZ_STATUS_SENT
+            import uuid as _uuid
+            try:
+                vid = _uuid.UUID(viz_id)
+                await s.execute(
+                    update(Visualisierung)
+                    .where(Visualisierung.id == vid)
+                    .values(status=VIZ_STATUS_SENT, updated_at=now)
+                )
+            except (ValueError, TypeError):
+                logger.warning(f"viz_id invalid uuid: {viz_id!r}")
+
+        elif mail_type == "angebot" and angebot_id:
+            from core.models.angebot import Angebot
+            import uuid as _uuid
+            try:
+                aid = _uuid.UUID(angebot_id)
+                await s.execute(
+                    update(Angebot)
+                    .where(Angebot.id == aid)
+                    .values(
+                        status="mail_sent",
+                        mail_sent_at=now, updated_at=now,
+                    )
+                )
+            except (ValueError, TypeError):
+                logger.warning(f"angebot_id invalid uuid: {angebot_id!r}")
+
         await s.commit()
+
     logger.info(
         f"mail_retry: entry={entry_id} (type={mail_type}) zugestellt "
         f"messageId={message_id}"
@@ -173,9 +208,23 @@ async def _mark_failed_and_reschedule(
     return new_status == FAILED_MAIL_DEAD
 
 
-async def _on_dead_letter(entry: FailedMailQueue) -> None:
-    """Nach MAX_ATTEMPTS: Rechnung auf ERROR setzen + Alerts senden."""
-    # Rechnung auf ERROR
+async def _on_dead_letter(entry) -> None:
+    """Nach MAX_ATTEMPTS: Quell-Status auf ERROR/FAILED + Alerts senden.
+
+    `entry` ist entweder ein FailedMailQueue-ORM oder ein _E-Pseudo-Objekt
+    aus dem process-Loop. In beiden Fallen koennen wir auf payload-
+    Felder zugreifen (FailedMailQueue.payload, _E.payload).
+    """
+    now = dt.datetime.now(dt.timezone.utc)
+    payload = getattr(entry, "payload", None) or {}
+    viz_id = payload.get("viz_id") if isinstance(payload, dict) else None
+    angebot_id = payload.get("angebot_id") if isinstance(payload, dict) else None
+
+    error_suffix = (
+        f"Mail-Retry-Queue dead nach {entry.attempt_count} Versuchen: "
+        f"{(entry.last_error or '')[:300]}"
+    )[:1000]
+
     if entry.mail_type == MAIL_TYPE_RECHNUNG and entry.rechnung_id:
         async with AsyncSessionLocal() as s:
             await s.execute(
@@ -183,14 +232,50 @@ async def _on_dead_letter(entry: FailedMailQueue) -> None:
                 .where(Rechnung.id == entry.rechnung_id)
                 .values(
                     status=RECHNUNG_STATUS_ERROR,
-                    error_message=(
-                        f"Mail-Retry-Queue dead nach {entry.attempt_count} "
-                        f"Versuchen: {(entry.last_error or '')[:300]}"
-                    )[:1000],
-                    updated_at=dt.datetime.now(dt.timezone.utc),
+                    error_message=error_suffix,
+                    updated_at=now,
                 )
             )
             await s.commit()
+
+    elif entry.mail_type == "visualisierung" and viz_id:
+        from core.models import Visualisierung, VIZ_STATUS_FAILED
+        import uuid as _uuid
+        try:
+            vid = _uuid.UUID(viz_id)
+            async with AsyncSessionLocal() as s:
+                await s.execute(
+                    update(Visualisierung)
+                    .where(Visualisierung.id == vid)
+                    .values(
+                        status=VIZ_STATUS_FAILED,
+                        error_message=error_suffix,
+                        updated_at=now,
+                    )
+                )
+                await s.commit()
+        except (ValueError, TypeError):
+            pass
+        except Exception as exc:
+            # Visualisierung-Model hat ggf. kein error_message-Feld — defensiv
+            logger.warning(f"viz status=FAILED update ignored: {exc}")
+
+    elif entry.mail_type == "angebot" and angebot_id:
+        from core.models.angebot import Angebot
+        import uuid as _uuid
+        try:
+            aid = _uuid.UUID(angebot_id)
+            async with AsyncSessionLocal() as s:
+                await s.execute(
+                    update(Angebot)
+                    .where(Angebot.id == aid)
+                    .values(status="mail_failed", updated_at=now)
+                )
+                await s.commit()
+        except (ValueError, TypeError):
+            pass
+        except Exception as exc:
+            logger.warning(f"angebot status=mail_failed update ignored: {exc}")
 
     # Sven-Alert
     try:
@@ -213,7 +298,7 @@ async def _on_dead_letter(entry: FailedMailQueue) -> None:
             },
         )
     except Exception as e:
-        logger.warning(f"Sven-Alert (mail_retry_dead) failed: {e}")
+        logger.exception(f"Sven-Alert (mail_retry_dead) failed: {e}")
 
     # Tenant-Push
     try:
@@ -242,7 +327,76 @@ async def _on_dead_letter(entry: FailedMailQueue) -> None:
                 details={"mail_type": entry.mail_type},
             )
     except Exception as e:
-        logger.warning(f"Tenant-Alert (mail_retry_dead) failed: {e}")
+        logger.exception(f"Tenant-Alert (mail_retry_dead) failed: {e}")
+
+
+async def _dispatch_mail(
+    *, tenant_id, brevo_api_key: str, brevo_sender_email: str,
+    brevo_sender_name: str, recipient_email: str, payload: dict,
+) -> str:
+    """Hub: routet Resend an Brevo oder Microsoft Graph je nach payload.
+
+    Returns message_id. Wirft BrevoError-aequivalente Exception bei
+    Fehler — Caller fangt sie generisch.
+    """
+    backend = (payload.get("mail_backend") or "brevo").lower()
+
+    if backend == "microsoft_graph":
+        return await _send_via_microsoft_graph(
+            tenant_id=tenant_id,
+            recipient_email=recipient_email,
+            payload=payload,
+        )
+
+    # Default: Brevo
+    return await _send_via_brevo(
+        brevo_api_key=brevo_api_key,
+        sender_email=brevo_sender_email,
+        sender_name=brevo_sender_name,
+        recipient_email=recipient_email,
+        payload=payload,
+    )
+
+
+async def _send_via_microsoft_graph(
+    *, tenant_id, recipient_email: str, payload: dict,
+) -> str:
+    """Resend via Microsoft Graph (Angebot-Mails).
+
+    Macht aus dem send_tracked_mail-Dict-Result eine BrevoError-aehnliche
+    Exception falls success=False, damit der Caller generisch bleibt.
+    """
+    from core.integrations.microsoft import send_tracked_mail
+
+    # Attachments zurueck-base64-decoden + ins Microsoft-Graph-Schema mappen
+    attachments_payload = payload.get("attachments") or []
+    graph_attachments = []
+    for a in attachments_payload:
+        try:
+            graph_attachments.append({
+                "name": a.get("filename", "anhang"),
+                "contentType": a.get("mime_type", "application/octet-stream"),
+                "contentBytes": a.get("data_base64", ""),
+            })
+        except Exception as e:
+            logger.warning(f"graph-attachment skip (decode-fail): {e}")
+
+    result = await send_tracked_mail(
+        tenant_id=tenant_id,
+        to_email=recipient_email,
+        subject=payload.get("subject", "(ohne Betreff)"),
+        body_html=payload.get("html_body", ""),
+        attachments=graph_attachments or None,
+    )
+
+    if not result.get("success"):
+        # Erzeuge eine BrevoError-aequivalente Exception damit der Caller-
+        # Code unified bleibt.
+        raise BrevoError(
+            f"Microsoft Graph: {result.get('error', 'unknown')}",
+            status_code=None,
+        )
+    return result.get("message_id") or "?"
 
 
 async def process_one_pending_batch(batch_size: int = 20) -> dict:
@@ -253,11 +407,8 @@ async def process_one_pending_batch(batch_size: int = 20) -> dict:
     summary = {"claimed": 0, "sent": 0, "retried": 0, "dead": 0}
     now = dt.datetime.now(dt.timezone.utc)
 
-    # Atomar pending → in_flight markieren via UPDATE ... RETURNING.
-    # Wir benutzen kein temp-status; stattdessen attempt_count + status
-    # bleiben gleich, aber wir filtern auf next_attempt_at <= now.
-    # SKIP LOCKED via Index — fuer Parallel-Worker safe (auch wenn wir
-    # aktuell nur einen haben).
+    # Atomar pending holen via SELECT FOR UPDATE SKIP LOCKED — fuer
+    # Parallel-Worker safe (auch wenn wir aktuell nur einen haben).
     async with AsyncSessionLocal() as s:
         rows = (await s.execute(
             select(FailedMailQueue)
@@ -269,10 +420,7 @@ async def process_one_pending_batch(batch_size: int = 20) -> dict:
         )).scalars().all()
 
         # In-Place ableiten, NICHT in derselben Transaktion bearbeiten —
-        # Brevo-Call ist langsam und wir wollen den Row-Lock kurz halten.
-        # Wir lassen die Transaktion einfach mit commit() enden, ohne
-        # status zu aendern. Nachfolgende Updates passieren in eigenen
-        # Sessions pro Eintrag.
+        # Brevo/Graph-Call ist langsam, Row-Lock soll kurz bleiben.
         entries = [
             {
                 "id": r.id, "tenant_id": r.tenant_id,
@@ -290,22 +438,19 @@ async def process_one_pending_batch(batch_size: int = 20) -> dict:
     if not entries:
         return summary
 
-    # Brevo-Config einmal laden (alle Tenants teilen sich _global).
+    # Brevo-Config einmal laden (alle Brevo-Tenants teilen sich _global).
+    # Microsoft-Graph-Tenants nutzen Tenant-eigene OAuth-Token — kein
+    # cfg-Lookup hier noetig.
     cfg = await _load_brevo_config_for_tenant(entries[0]["tenant_id"])
-    if not cfg:
-        logger.warning("mail_retry: brevo-config nicht verfuegbar — alle pending bleiben pending")
-        return summary
-    brevo_api_key = cfg.get("brevo_api_key", "")
-    sender_email = cfg.get("sender_email", "")
-    sender_name_default = cfg.get("sender_name", "Gewerbeagent")
-    if not brevo_api_key or not sender_email:
-        logger.warning(
-            "mail_retry: brevo_api_key oder sender_email fehlt in _global config"
-        )
-        return summary
+    brevo_api_key = (cfg or {}).get("brevo_api_key", "")
+    brevo_sender_email = (cfg or {}).get("sender_email", "")
+    brevo_sender_name = (cfg or {}).get("sender_name", "Gewerbeagent")
 
     for entry_data in entries:
-        # Faux-dataclass fuer _on_dead_letter
+        payload = entry_data["payload"] or {}
+        backend = (payload.get("mail_backend") or "brevo").lower()
+
+        # Faux-Object — von _on_dead_letter genutzt fuer Status-Update
         class _E:
             id = entry_data["id"]
             tenant_id = entry_data["tenant_id"]
@@ -314,18 +459,30 @@ async def process_one_pending_batch(batch_size: int = 20) -> dict:
             recipient_email = entry_data["recipient_email"]
             attempt_count = entry_data["attempt_count"] + 1
             last_error = entry_data["last_error"]
+            payload = entry_data["payload"] or {}
+
+        # Pre-Check: bei Brevo brauchen wir die globale Config
+        if backend == "brevo" and (not brevo_api_key or not brevo_sender_email):
+            logger.warning(
+                "mail_retry: brevo cfg fehlt — entry %s bleibt pending",
+                entry_data["id"],
+            )
+            continue
 
         try:
-            msg_id = await _send_via_brevo(
+            msg_id = await _dispatch_mail(
+                tenant_id=entry_data["tenant_id"],
                 brevo_api_key=brevo_api_key,
-                sender_email=sender_email,
-                sender_name=sender_name_default,
+                brevo_sender_email=brevo_sender_email,
+                brevo_sender_name=brevo_sender_name,
                 recipient_email=entry_data["recipient_email"],
-                payload=entry_data["payload"] or {},
+                payload=payload,
             )
             await _mark_sent(
                 entry_data["id"], msg_id,
                 entry_data["mail_type"], entry_data["rechnung_id"],
+                viz_id=payload.get("viz_id"),
+                angebot_id=payload.get("angebot_id"),
             )
             summary["sent"] += 1
         except BrevoError as e:
@@ -403,12 +560,21 @@ async def enqueue_failed_mail(
     reply_to: str | None = None,
     reply_to_name: str | None = None,
     rechnung_id=None,
+    viz_id: str | None = None,
+    angebot_id: str | None = None,
+    mail_backend: str = "brevo",
     last_error: str = "",
 ) -> None:
     """Legt eine fehlgeschlagene Mail in der Retry-Queue ab.
 
     attachments: Liste von Dicts mit {filename, mime_type, content_bytes}
                  — content_bytes wird hier zu base64 codiert fuer JSONB.
+
+    Beta-1:
+      - viz_id / angebot_id: Cross-Reference im payload (DB hat nur
+        rechnung_id als FK; viz + angebot gehen ueber das payload-JSONB).
+      - mail_backend: "brevo" (default) oder "microsoft_graph" — der
+        Retry-Cron dispatched darauf basierend.
 
     Failsafe — keine Exception darf den Caller stoeren.
     """
@@ -432,6 +598,11 @@ async def enqueue_failed_mail(
             "reply_to": reply_to,
             "reply_to_name": reply_to_name,
             "attachments": enc_attachments,
+            "mail_backend": mail_backend,
+            # Cross-References fuer Visualisierung + Angebot (DB hat nur
+            # rechnung_id als FK)
+            "viz_id": str(viz_id) if viz_id else None,
+            "angebot_id": str(angebot_id) if angebot_id else None,
         }
 
         async with AsyncSessionLocal() as s:
@@ -453,7 +624,8 @@ async def enqueue_failed_mail(
             await s.commit()
         logger.info(
             f"mail_retry: enqueued {mail_type} fuer {recipient_email} "
-            f"(rechnung_id={rechnung_id})"
+            f"(rechnung_id={rechnung_id} viz_id={viz_id} angebot_id={angebot_id} "
+            f"backend={mail_backend})"
         )
     except Exception as e:
         # Letzte Verteidigungslinie: Logging, kein Crash.

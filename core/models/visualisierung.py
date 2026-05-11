@@ -28,6 +28,8 @@ VIZ_STATUS_PENDING = "pending"          # neu, noch keine Daten
 VIZ_STATUS_GENERATING = "generating"    # Gemini-Call laeuft
 VIZ_STATUS_DONE = "done"                # Bild fertig
 VIZ_STATUS_FAILED = "failed"            # Generierung gescheitert
+# Beta-1 B1-4: Brevo down → in failed_mail_queue. Cron retried.
+VIZ_STATUS_MAIL_QUEUED = "mail_queued"
 VIZ_STATUS_SENT = "sent"                # An Kunden gemailt
 
 

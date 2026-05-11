@@ -16,6 +16,18 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from core.database.base import Base
 
 
+# Beta-1 B1-6: Status-Konstanten als Modul-Exports (frueher nur im
+# Doc-String). Damit gibts grep-baren Code statt magic strings.
+ANGEBOT_STATUS_ERSTELLT = "erstellt"
+ANGEBOT_STATUS_IN_LEXWARE = "in_lexware"
+ANGEBOT_STATUS_MAIL_QUEUED = "mail_queued"     # NEU: Microsoft Graph down → Queue
+ANGEBOT_STATUS_MAIL_SENT = "mail_sent"
+ANGEBOT_STATUS_MAIL_FAILED = "mail_failed"     # NEU: 3 Retries durch, dead
+ANGEBOT_STATUS_ACCEPTED = "accepted"
+ANGEBOT_STATUS_REJECTED = "rejected"
+ANGEBOT_STATUS_RECHNUNG_ERSTELLT = "rechnung_erstellt"
+
+
 class Angebot(Base):
     __tablename__ = "angebote"
 

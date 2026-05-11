@@ -188,7 +188,47 @@ async def send_angebot_to_customer(
         }],
     )
     if not result.get("success"):
+        # Beta-1 B1-6: in failed_mail_queue legen statt verlieren.
+        # Microsoft-Graph kann auch wegen invalid-grant kurz down sein —
+        # der Retry-Cron probiert nach 5min, 30min, 2h erneut.
         out["error"] = result.get("error") or "Mail-Versand fehlgeschlagen"
+        try:
+            from core.integrations.mail_retry_cron import enqueue_failed_mail
+            from core.models import (
+                ANGEBOT_STATUS_MAIL_QUEUED, MAIL_TYPE_ANGEBOT,
+            )
+            async with AsyncSessionLocal() as session:
+                ang_db = (await session.execute(
+                    select(Angebot).where(Angebot.id == angebot_id)
+                )).scalar_one_or_none()
+                if ang_db is not None:
+                    ang_db.kunde_email = to_email
+                    ang_db.status = ANGEBOT_STATUS_MAIL_QUEUED
+                    await session.commit()
+
+            await enqueue_failed_mail(
+                tenant_id=tenant.id,
+                mail_type=MAIL_TYPE_ANGEBOT,
+                recipient_email=to_email,
+                subject=subject,
+                html_body=body_html,
+                attachments=[{
+                    "filename": filename,
+                    "mime_type": "application/pdf",
+                    "content_bytes": pdf_bytes,
+                }],
+                from_name=tenant.company_name,
+                angebot_id=str(angebot_id),
+                mail_backend="microsoft_graph",
+                last_error=out["error"],
+            )
+            out["queued"] = True
+            logger.info(
+                f"send_angebot_to_customer queued angebot={angebot_id} "
+                f"to={to_email} reason={out['error'][:120]}"
+            )
+        except Exception as exc:
+            logger.exception(f"enqueue_failed_mail (angebot) crashed: {exc}")
         return out
 
     # 6) Tracking-IDs am Angebot speichern
