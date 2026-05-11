@@ -24,6 +24,7 @@ import json
 import sys
 from pathlib import Path
 
+import httpx
 from sqlalchemy import select
 
 from core.database import AsyncSessionLocal
@@ -64,6 +65,77 @@ def _list_available_branches() -> list[str]:
         p.stem.removeprefix("branche_")
         for p in _TEMPLATES_DIR.glob("branche_*.json")
     )
+
+
+async def _load_global_bot_token() -> str | None:
+    """Holt den zentralen Telegram-Bot-Token aus _global ToolConfig.
+
+    Identisches Pattern wie scripts/generate_qr.py:60-75 und
+    plugins/telegram_notify/handler.py:_load_global_bot_token. Bewusst
+    dupliziert damit das Skript ohne Plugin-Imports auskommt.
+    """
+    from core.models import Tenant as _T, ToolConfig as _TC
+    async with AsyncSessionLocal() as s:
+        gt = (await s.execute(
+            select(_T).where(_T.slug == "_global")
+        )).scalar_one_or_none()
+        if not gt:
+            return None
+        tc = (await s.execute(
+            select(_TC).where(
+                _TC.tenant_id == gt.id, _TC.tool_name == "telegram_bot",
+            )
+        )).scalar_one_or_none()
+        if not tc or not tc.enabled:
+            return None
+        return (tc.config or {}).get("bot_token") or None
+
+
+async def _ensure_telegram_webhook() -> tuple[bool, str]:
+    """Stellt sicher dass der zentrale Telegram-Webhook auf _global zeigt.
+
+    Architektur: EIN Bot, EIN Webhook. Der Plugin-Handler dispatched
+    intern via chat_id-Lookup zum richtigen Tenant — der URL-Pfad
+    selber ist deshalb konstant `/webhook/_global/telegram_notify/incoming`.
+    Pro Onboarding rufen wir es idempotent auf — falls Sven mal den
+    Webhook anderswo hingebogen hatte (z.B. dev-Test).
+
+    Returns (success, info). Failsafe.
+    """
+    bot_token = await _load_global_bot_token()
+    if not bot_token:
+        return False, "Bot-Token in _global telegram_bot fehlt"
+
+    public_url = settings.public_url.rstrip("/")
+    webhook_url = f"{public_url}/webhook/_global/telegram_notify/incoming"
+    secret = settings.telegram_webhook_secret or ""
+
+    payload = {"url": webhook_url}
+    if secret:
+        payload["secret_token"] = secret
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            # Vorher pruefen ob der Webhook schon stimmt — vermeidet
+            # unnoetigen Telegram-API-Call bei jedem onboard-Lauf.
+            info_resp = await client.get(
+                f"https://api.telegram.org/bot{bot_token}/getWebhookInfo",
+            )
+            info_data = info_resp.json() if info_resp.content else {}
+            current_url = (info_data.get("result") or {}).get("url", "")
+            if current_url == webhook_url:
+                return True, f"{webhook_url} (schon korrekt)"
+
+            resp = await client.post(
+                f"https://api.telegram.org/bot{bot_token}/setWebhook",
+                json=payload,
+            )
+        data = resp.json() if resp.content else {}
+        if resp.status_code == 200 and data.get("ok"):
+            return True, webhook_url
+        return False, f"HTTP {resp.status_code}: {data.get('description', resp.text[:120])}"
+    except Exception as e:
+        return False, f"Exception: {e}"
 
 
 DEFAULT_KALENDER_CONFIG = {
@@ -212,6 +284,24 @@ async def onboard_tenant(
         except Exception as e:
             print(f"WARN: Template-Knowledge konnte nicht geladen werden: {e}")
 
+    # Beta-1 B1-2: Telegram-Webhook absichern. Architektur ist EIN
+    # zentraler Bot, EIN Webhook auf _global — der Handler dispatched
+    # via chat_id-Lookup. Failsafe — Skript laeuft weiter, Sven sieht
+    # im Output ob er manuell nachholen muss.
+    webhook_ok, webhook_info = await _ensure_telegram_webhook()
+
+    # Beta-1 B1-3: QR-Code direkt generieren. Failsafe — bei Fehler nur
+    # Hinweis, kein Abbruch.
+    qr_path: Path | None = None
+    qr_link: str | None = None
+    try:
+        from scripts.generate_qr import generate_for_slug
+        qr_result = await generate_for_slug(slug)
+        qr_path = qr_result.png_path
+        qr_link = qr_result.deep_link
+    except Exception as e:
+        print(f"WARN: QR-Code konnte nicht generiert werden: {e}")
+
     # OAuth-URL generieren (ausserhalb der Session, braucht keinen DB-Zugriff)
     oauth_url = await generate_auth_url(tenant_slug=slug, provider="google")
 
@@ -237,12 +327,24 @@ async def onboard_tenant(
             if knowledge_loaded else " (kein Template gefunden)"
         )
         print(f"  Branche:       {branche}{knowledge_msg}")
+    if webhook_ok:
+        print(f"  Telegram-Webhook: ✓ registriert")
+    else:
+        print(f"  Telegram-Webhook: ✗ {webhook_info}")
+    if qr_path:
+        print(f"  QR-Code:       {qr_path}")
+        print(f"  Deep-Link:     {qr_link}")
     print()
     print(f"  AKTIVIERTE FEATURES:")
     for label in feature_labels:
         print(f"    ✓ {label}")
     print()
     print("  NAECHSTE SCHRITTE:")
+    print()
+    print("  0. AVV-Template ausfuellen + per Mail an Kunde schicken")
+    print(f"     Template: LEGAL/AVV-Template.md  (Platzhalter wie")
+    print(f"     {{{{TENANT_COMPANY}}}} ersetzen)")
+    print(f"     Subprozessoren-Liste: LEGAL/Subprozessoren-Liste.md")
     print()
     print("  1. Google-Kalender verknuepfen")
     print("     Sende folgenden Link an den Kunden (oder klicke selbst,")

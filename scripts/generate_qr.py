@@ -1,16 +1,20 @@
 """
 Generiert einen QR-Code fuer Tenant-Onboarding via Telegram-Bot.
 
-Usage:
+CLI:
     docker compose exec framework uv run python -m scripts.generate_qr <tenant_slug>
+
+API (B1-3):
+    from scripts.generate_qr import generate_for_slug
+    pngpath = await generate_for_slug("dietz")
 
 Output:
     /tmp/qr_<slug>.png  -- der QR-Code zum Scannen oder Versenden
-    + Konsolen-Info (Tenant-Daten + Deep-Link)
+    + Konsolen-Info (Tenant-Daten + Deep-Link), wenn via CLI aufgerufen
 """
 import asyncio
-import os
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 import qrcode
@@ -21,7 +25,17 @@ from core.database import AsyncSessionLocal
 from core.models import Tenant, ToolConfig
 
 
-async def get_bot_username(bot_token: str) -> str | None:
+@dataclass
+class QRResult:
+    """Was generate_for_slug zurueckliefert."""
+    png_path: Path
+    deep_link: str
+    bot_username: str
+    tenant_slug: str
+    tenant_company: str
+
+
+async def _get_bot_username(bot_token: str) -> str | None:
     """Holt den Bot-Username via Telegram-API (fuer den Deep-Link)."""
     import httpx
     url = f"https://api.telegram.org/bot{bot_token}/getMe"
@@ -38,28 +52,32 @@ async def get_bot_username(bot_token: str) -> str | None:
         return None
 
 
-async def main():
-    if len(sys.argv) < 2:
-        print("ERROR: Tenant-Slug fehlt")
-        print("Usage: python -m scripts.generate_qr <tenant_slug>")
-        sys.exit(1)
+async def generate_for_slug(slug: str) -> QRResult:
+    """Hauptfunktion — wiederverwendbar aus onboard.py + CLI.
 
-    tenant_slug = sys.argv[1].strip().lower()
+    Wirft ValueError bei Fehlern (Tenant fehlt, Bot-Token fehlt,
+    Telegram-API gibt nix zurueck). CLI-Wrapper fangt die Errors
+    und mapped sie auf sys.exit-Codes.
+    """
+    tenant_slug = (slug or "").strip().lower()
+    if not tenant_slug:
+        raise ValueError("Tenant-Slug ist leer")
+    if tenant_slug == "_global":
+        raise ValueError("_global ist kein Endkunden-Tenant")
 
     async with AsyncSessionLocal() as s:
         tenant = (await s.execute(
             select(Tenant).where(Tenant.slug == tenant_slug)
         )).scalar_one_or_none()
         if not tenant:
-            print(f"ERROR: Tenant '{tenant_slug}' nicht gefunden")
-            sys.exit(1)
-        if tenant_slug == "_global":
-            print("ERROR: _global ist kein Endkunden-Tenant")
-            sys.exit(1)
+            raise ValueError(f"Tenant '{tenant_slug}' nicht gefunden")
 
         global_tenant = (await s.execute(
             select(Tenant).where(Tenant.slug == "_global")
-        )).scalar_one()
+        )).scalar_one_or_none()
+        if not global_tenant:
+            raise ValueError("_global-Tenant fehlt (Infra-Setup unvollstaendig)")
+
         tc = (await s.execute(
             select(ToolConfig).where(
                 ToolConfig.tenant_id == global_tenant.id,
@@ -67,17 +85,20 @@ async def main():
             )
         )).scalar_one_or_none()
         if not tc or not tc.enabled:
-            print("ERROR: telegram_bot ToolConfig in _global fehlt oder deaktiviert")
-            sys.exit(1)
+            raise ValueError(
+                "telegram_bot ToolConfig in _global fehlt oder deaktiviert"
+            )
         bot_token = (tc.config or {}).get("bot_token")
         if not bot_token:
-            print("ERROR: bot_token in _global telegram_bot ToolConfig leer")
-            sys.exit(1)
+            raise ValueError(
+                "bot_token in _global telegram_bot ToolConfig leer"
+            )
 
-    bot_username = await get_bot_username(bot_token)
+    bot_username = await _get_bot_username(bot_token)
     if not bot_username:
-        print("ERROR: Bot-Username konnte nicht via Telegram-API geholt werden")
-        sys.exit(1)
+        raise ValueError(
+            "Bot-Username konnte nicht via Telegram-API geholt werden"
+        )
 
     deep_link = f"https://t.me/{bot_username}?start={tenant_slug}"
 
@@ -94,16 +115,44 @@ async def main():
     out_path = Path(f"/tmp/qr_{tenant_slug}.png")
     img.save(out_path)
 
+    return QRResult(
+        png_path=out_path,
+        deep_link=deep_link,
+        bot_username=bot_username,
+        tenant_slug=tenant_slug,
+        tenant_company=tenant.company_name,
+    )
+
+
+async def main():
+    if len(sys.argv) < 2:
+        print("ERROR: Tenant-Slug fehlt")
+        print("Usage: python -m scripts.generate_qr <tenant_slug>")
+        sys.exit(1)
+
+    try:
+        result = await generate_for_slug(sys.argv[1])
+    except ValueError as e:
+        print(f"ERROR: {e}")
+        sys.exit(1)
+
+    # Tenant fuer chat-id-Anzeige nochmal laden (war im Helper nicht
+    # nach aussen propagiert)
+    async with AsyncSessionLocal() as s:
+        tenant = (await s.execute(
+            select(Tenant).where(Tenant.slug == result.tenant_slug)
+        )).scalar_one()
+
     print()
     print("=" * 60)
-    print(f"  QR-Code generiert fuer Tenant: {tenant_slug}")
+    print(f"  QR-Code generiert fuer Tenant: {result.tenant_slug}")
     print("=" * 60)
-    print(f"  Firma:       {tenant.company_name}")
+    print(f"  Firma:       {result.tenant_company}")
     print(f"  Status:      {tenant.status}")
-    print(f"  Bot:         @{bot_username}")
-    print(f"  Deep-Link:   {deep_link}")
+    print(f"  Bot:         @{result.bot_username}")
+    print(f"  Deep-Link:   {result.deep_link}")
     print(f"  Chat-ID:     {tenant.telegram_chat_id or '(noch nicht verbunden)'}")
-    print(f"  PNG-Datei:   {out_path}")
+    print(f"  PNG-Datei:   {result.png_path}")
     print("=" * 60)
     print()
     print("So gehts weiter:")
