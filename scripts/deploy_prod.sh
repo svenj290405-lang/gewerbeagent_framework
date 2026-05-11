@@ -61,6 +61,17 @@ tag="prod-$(date +%Y%m%d-%H%M)"
 git tag "$tag"
 echo "==> Tag gesetzt: $tag"
 
+# Phase B2: GIT_COMMIT_SHA fuer Sentry-Release-Tagging.
+# Wir hängen den Wert an die .env an (idempotent — wenn die Zeile schon
+# existiert, ersetzen wir sie statt zu duplizieren).
+commit_sha=$(git rev-parse --short=12 HEAD)
+if grep -q '^GIT_COMMIT_SHA=' .env 2>/dev/null; then
+    sed -i "s|^GIT_COMMIT_SHA=.*$|GIT_COMMIT_SHA=$commit_sha|" .env
+else
+    echo "GIT_COMMIT_SHA=$commit_sha" >> .env
+fi
+echo "==> Sentry release tag: $commit_sha"
+
 echo "==> Migrations ausfuehren..."
 docker compose -p prod -f docker-compose.prod.yml exec -T framework \
     uv run alembic upgrade head
