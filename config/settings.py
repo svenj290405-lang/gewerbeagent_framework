@@ -1,12 +1,21 @@
 ﻿"""
 Zentrale Konfiguration für das Gewerbeagent Framework.
 """
+import logging
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+logger = logging.getLogger(__name__)
+
+# Empfohlene Mindest-Laenge fuer SECRET_KEY/ENCRYPTION_KEY. Hart kann
+# der min_length=32 bleiben (Backward-Compat fuer Bestands-Deployments
+# mit 32-byte Keys = ~43 base64 chars). Aber wir warnen beim Boot wenn
+# weniger als 64 chars (= ~48 bytes) — `openssl rand -base64 48`.
+RECOMMENDED_KEY_LENGTH = 64
 
 
 class Settings(BaseSettings):
@@ -88,7 +97,23 @@ class Settings(BaseSettings):
 
 @lru_cache
 def get_settings() -> Settings:
-    return Settings()
+    s = Settings()
+    # Sicherheits-Warnungen — keine Hard-Fails damit Bestands-Deployments
+    # nicht beim Update brechen. Bei Phase-B Encryption-Key-Rotation wird
+    # darauf geachtet.
+    if len(s.encryption_key) < RECOMMENDED_KEY_LENGTH:
+        logger.warning(
+            "ENCRYPTION_KEY ist nur %d Zeichen lang. Empfohlen: %d+ "
+            "(generiere via `openssl rand -base64 48`). Rotation wird "
+            "in Phase B angegangen.",
+            len(s.encryption_key), RECOMMENDED_KEY_LENGTH,
+        )
+    if len(s.secret_key) < RECOMMENDED_KEY_LENGTH:
+        logger.warning(
+            "SECRET_KEY ist nur %d Zeichen lang. Empfohlen: %d+.",
+            len(s.secret_key), RECOMMENDED_KEY_LENGTH,
+        )
+    return s
 
 
 settings = get_settings()

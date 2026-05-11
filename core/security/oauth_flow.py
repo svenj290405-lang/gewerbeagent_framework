@@ -33,7 +33,12 @@ GOOGLE_SCOPES = [
     "openid",
 ]
 
-STATE_LIFETIME_MINUTES = 30
+# State-TTL: zwischen /oauth/start (Klick) und /oauth/callback (Login
+# zurück) liegen Sekunden bis maximal 1-2 Minuten. 10 Min ist großzügig
+# fuer langsame Logins ueber Recovery-Faktoren. Frueher waren es 30 Min
+# — runtergezogen damit gestohlene OAuth-Links nicht so lange gueltig
+# bleiben.
+STATE_LIFETIME_MINUTES = 10
 
 # =====================================================================
 # Microsoft OAuth Configuration (Azure App Registration)
@@ -166,12 +171,20 @@ async def generate_auth_url(
         redirect_uri=_get_redirect_uri(),
     )
 
+    # PKCE (RFC 7636) explizit fuer Google aktivieren — schuetzt vor
+    # Code-Interception-Attacks falls der state-Cookie irgendwie leakt.
+    # Microsoft macht's selber, Google's Library generiert das Challenge
+    # nur wenn flow.code_verifier vor authorization_url gesetzt ist.
+    code_verifier, _ = _generate_pkce_pair()
+    flow.code_verifier = code_verifier
+
     state = secrets.token_urlsafe(32)
     auth_url, _ = flow.authorization_url(
         access_type="offline",
         include_granted_scopes="true",
         prompt="consent",
         state=state,
+        code_challenge_method="S256",
     )
 
     async with AsyncSessionLocal() as session:
