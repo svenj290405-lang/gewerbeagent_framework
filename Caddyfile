@@ -69,6 +69,39 @@ www.gewerbeagent.de {
 }
 
 # =====================================================================
+# QuantPipeline (Schwester-Projekt, lebt in /opt/quantpipeline)
+# =====================================================================
+# Aktivierung:
+#   1. DNS A-Record fuer quant.gewerbeagent.de auf Server-IP zeigen
+#   2. docker compose -p quant -f /opt/quantpipeline/docker-compose.yml up -d
+#      (joined automatisch das gewerbeagent_web-Network)
+#   3. caddy reload — TLS-Cert wird automatisch geholt
+#
+# QuantPipeline ist privat (nur 10 Forscher per Telegram-Bot). Wir
+# erlauben hier deshalb keinen oeffentlichen Index — der Webhook-
+# Endpoint ist sowieso secret-protected, sonstige Paths gehen einfach
+# zur Status-Page wenn /status, sonst 404.
+quant.gewerbeagent.de {
+    encode gzip
+    import security_headers
+
+    reverse_proxy quantpipeline_framework:8002 {
+        header_up Host {host}
+        header_up X-Real-IP {remote}
+        header_up X-Forwarded-For {remote}
+        header_up X-Forwarded-Proto {scheme}
+    }
+
+    log {
+        output file /var/log/caddy/quantpipeline-access.log {
+            roll_size 10mb
+            roll_keep 3
+        }
+        format console
+    }
+}
+
+# =====================================================================
 # Phase B6: oeffentliche Status-Page (status.gewerbeagent.de)
 # =====================================================================
 # Aktivierung:

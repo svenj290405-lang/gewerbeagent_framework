@@ -424,6 +424,10 @@ async def _handle_start_command(text, chat_id, from_data):
 async def _handle_help_command(chat_id=None):
     """Zeigt die Befehlsliste — gefiltert nach aktiven Features.
 
+    Layout: pro Befehl eine Zeile mit Kurzbeschreibung. Vollstaendig
+    (alle dispatchbaren Commands sind drin) aber minimalistisch
+    (1 Satz pro Befehl, keine Wall-of-Text).
+
     Wenn der Tenant z.B. das Drive-Feature nicht hat, blendet /help den
     KUNDEN-ARCHIV-Block komplett aus. Tenants im Basis-Paket sehen
     keinen Lexware-, Material- oder Visualisierungs-Block.
@@ -450,66 +454,182 @@ async def _handle_help_command(chat_id=None):
             return True
         return feature_key in enabled_features
 
-    # Kompaktes Apple-Style-Layout: Kategorie-Zeile mit Befehlen
-    # kommagetrennt — keine Wall-of-Text mehr. Pro Befehl nur das was
-    # auf einer Zeile passt; Details kriegt der User wenn er den Befehl
-    # tippt.
     lines: list[str] = ["<b>📋 Befehle</b>"]
 
-    def _block(emoji: str, title: str, cmds: list[str]) -> None:
-        if cmds:
-            lines.append("")
-            lines.append(f"{emoji} <b>{title}</b>")
-            lines.append("  " + "  ·  ".join(cmds))
+    def _block(emoji: str, title: str, items: list[tuple[str, str]]) -> None:
+        """items = [(cmd, kurzbeschreibung), ...]. Eine Zeile pro Eintrag."""
+        if not items:
+            return
+        lines.append("")
+        lines.append(f"{emoji} <b>{title}</b>")
+        for cmd, desc in items:
+            lines.append(f"<code>{cmd}</code> — {desc}")
 
-    if _is_on("lexware"):
-        _block("📷", "Belege", ["/beleg", "/belege_anzeigen"])
-        _block("💰", "Rechnungen", [
-            "/rechnung", "/rechnungen_anzeigen", "/rechnung_pruefen",
-        ])
-    if _is_on("material"):
-        _block("🛒", "Material", [
-            "/material", "/material_neu", "/bestellen", "/bestellungen",
-        ])
-    voice_kal = []
+    # --- Workflow: Kundengespraeche (voice + kalender + always-on kunde) ---
+    kunden_items: list[tuple[str, str]] = []
     if _is_on("voice_init"):
-        voice_kal += ["/aufnahme", "/anrufe"]
+        kunden_items.append((
+            "/aufnahme",
+            "Sprach-Aufnahme analysieren. Optional Lexware-Angebot erstellen.",
+        ))
+        kunden_items.append((
+            "/anrufe",
+            "Letzte Anrufe + KI-Zusammenfassungen.",
+        ))
     if _is_on("kalender"):
-        voice_kal += ["/briefing"]
-    voice_kal += ["/kunde"]
-    if voice_kal:
-        _block("📞", "Kunden", voice_kal)
-    if _is_on("wissensbasis"):
-        _block("📚", "Wissen", [
-            "/wissen", "/wissen_anzeigen", "/wissen_loeschen",
-        ])
-    if _is_on("kalkulation"):
-        _block("🧮", "Kalkulation", [
-            "/kalkulation", "/kalkulation_anzeigen", "/kalkulation_excel",
-        ])
-    if _is_on("anfrage_formular"):
-        _block("📋", "Anfrage-Formular", [
-            "/formular", "/formular_anzeigen",
-        ])
-    if _is_on("visualisierung"):
-        _block("🎨", "Visualisierung", ["/visualisierung"])
-    if _is_on("drive_archiv"):
-        _block("☁️", "Kunden-Archiv", [
-            "/archiv", "/drive_status", "/drive_verbinden",
+        kunden_items.append((
+            "/briefing",
+            "Briefing zum naechsten Termin (Kontext + Anfahrt).",
+        ))
+    # /kunde ist always_on (kunde_lookup-Feature)
+    kunden_items.append((
+        "/kunde [name]",
+        "Kundenhistorie: Gespraeche, Termine, Drive-Link.",
+    ))
+    _block("📞", "Kundengespraeche", kunden_items)
+
+    # --- Buchhaltung (lexware) ---
+    if _is_on("lexware"):
+        _block("💰", "Buchhaltung — Belege & Rechnungen", [
+            ("/beleg",
+             "Foto/PDF vom Beleg schicken — geht an Lexware."),
+            ("/belege_anzeigen",
+             "Letzte 10 Belege + Status."),
+            ("/rechnung",
+             "Rechnung diktieren (Text/Sprache) → Lexware-Draft."),
+            ("/rechnungen_anzeigen",
+             "Offene + bezahlte Rechnungen mit Status."),
+            ("/rechnung_pruefen",
+             "Bezahl-Status sofort gegen Lexware abgleichen."),
+            ("/leistungen",
+             "Leistungskatalog (Stundensaetze, Pauschalen)."),
+            ("/leistung [name]",
+             "Detail einer Leistung."),
+            ("/leistung_neu",
+             "Neue Leistung anlegen (Wizard)."),
+            ("/leistung_loeschen [name]",
+             "Leistung entfernen."),
+            ("/lexware_setup",
+             "Lexware-API-Token hinterlegen (einmalig)."),
+            ("/lexware_status",
+             "Lexware-Verbindung pruefen."),
         ])
 
-    setup_cmds: list[str] = []
-    if _is_on("lexware"):
-        setup_cmds += ["/lexware_setup", "/lexware_status"]
+    # --- Material ---
+    if _is_on("material"):
+        _block("🛒", "Material-Bestellungen", [
+            ("/material",
+             "Verbrauchsmaterial-Katalog mit Schnell-Order-Buttons."),
+            ("/material [name]",
+             "Detail-Ansicht eines Artikels."),
+            ("/material_neu",
+             "Neuen Artikel anlegen (Wizard mit Lieferant + Link)."),
+            ("/bestellen [name]",
+             "Quick-Order mit Mengen-Eingabe."),
+            ("/bestellungen",
+             "Letzte Bestellungen + Status."),
+        ])
+
+    # --- Wissensbasis ---
+    if _is_on("wissensbasis"):
+        _block("📚", "Wissensbasis", [
+            ("/wissen",
+             "Neuen Eintrag (Anfahrt / Leistungen / FAQ / Allgemein)."),
+            ("/wissen_anzeigen",
+             "Alle Eintraege gruppiert."),
+            ("/wissen_loeschen",
+             "Eintrag entfernen."),
+        ])
+
+    # --- Kalkulations-Engine ---
+    if _is_on("kalkulation"):
+        _block("🧮", "Kalkulation (fuer Angebote)", [
+            ("/kalkulation",
+             "Neue Formel (z.B. m²-Preis, Pauschale + Aufschlag)."),
+            ("/kalkulation_anzeigen",
+             "Alle Formeln."),
+            ("/kalkulation_loeschen",
+             "Formel entfernen."),
+            ("/kalkulation_excel",
+             "Formel-Set aus .xlsx importieren."),
+        ])
+
+    # --- Anfrage-Formular ---
+    if _is_on("anfrage_formular"):
+        _block("📋", "Web-Anfrageformular", [
+            ("/formular",
+             "Felder bearbeiten + Vorschau."),
+            ("/formular_anzeigen",
+             "Aktuelles Schema."),
+            ("/formular_zuruecksetzen",
+             "Auf Tischler-/Allgemein-Default zuruecksetzen."),
+        ])
+
+    # --- Visualisierung ---
+    if _is_on("visualisierung"):
+        _block("🎨", "Visualisierung", [
+            ("/visualisierung",
+             "Foto + Beschreibung → KI-Rendering. "
+             "Optional an Kunden mailen oder ins Archiv legen."),
+        ])
+
+    # --- Kunden-Archiv (Drive) ---
+    if _is_on("drive_archiv"):
+        _block("☁️", "Kunden-Archiv (Google Drive)", [
+            ("/drive_verbinden",
+             "Google-Drive verknuepfen (OAuth)."),
+            ("/drive_status",
+             "Status der Drive-Verbindung."),
+            ("/archiv [kunde]",
+             "Datei-Upload starten — landet im Kunden-Ordner."),
+            ("/fertig",
+             "Archiv-Upload abschliessen (nur im Wizard)."),
+        ])
+
+    # --- Mail-Inbox (mail_intake) ---
+    if _is_on("mail_intake"):
+        _block("📨", "Mail-Inbox (Outlook)", [
+            ("/microsoft_setup",
+             "Outlook-Postfach verbinden (OAuth)."),
+            ("/microsoft_status",
+             "Konfiguration + letzter Polling-Zyklus."),
+            ("/microsoft_check",
+             "Inbox sofort einmalig abrufen."),
+        ])
+
+    # --- Setup (Kalender + Standort + Mitarbeiter) ---
+    setup_items: list[tuple[str, str]] = []
     if _is_on("kalender"):
-        setup_cmds += ["/kalender_verbinden", "/kalender_status"]
+        setup_items.append((
+            "/kalender_verbinden",
+            "Google- oder Outlook-Kalender verknuepfen (OAuth).",
+        ))
+        setup_items.append((
+            "/kalender_status",
+            "Welcher Kalender ist verknuepft.",
+        ))
     if _is_on("werkstatt"):
-        setup_cmds += ["/werkstatt"]
+        setup_items.append((
+            "/werkstatt",
+            "Heimat-Adresse fuer Smart-Termin-Routing.",
+        ))
+        setup_items.append((
+            "/werkstatt_status",
+            "Aktuelle Adresse anzeigen.",
+        ))
     if _is_on("mitarbeiter"):
-        setup_cmds += ["/mitarbeiter"]
-    _block("⚙️", "Setup", setup_cmds)
+        setup_items.append((
+            "/mitarbeiter",
+            "Mitarbeiter anlegen — eigener Chat, eigener Kalender.",
+        ))
+    _block("⚙️", "Setup", setup_items)
+
+    # --- Sonstiges (always-on) ---
     _block("ℹ️", "Sonstiges", [
-        "/paket", "/status", "/abbrechen",
+        ("/paket", "Aktuelles Paket + aktive Features."),
+        ("/status", "Tenant-Status (Slug, Aktivierung)."),
+        ("/abbrechen", "Laufenden Wizard sofort beenden."),
+        ("/help", "Diese Uebersicht."),
     ])
 
     lines.append("")
