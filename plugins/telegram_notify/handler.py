@@ -507,6 +507,13 @@ async def _handle_help_command(chat_id=None):
         bleiben aber sichtbar mit Beschreibung — der User soll wissen
         was es gibt. Beim Tippen eines locked Befehls greift dann das
         Feature-Gate mit Upgrade-Hinweis.
+
+        Wichtig: KEIN <code>-Wrap um den Befehl — Telegram macht
+        Slash-Commands sonst nicht klickbar. Wir nehmen <b> fuer
+        visuelle Unterscheidung. Argument-Hint (z.B. '[name]') steht
+        ausserhalb von <b>, sonst hebt der Bold-Block die Argumente
+        ein und Telegram interpretiert nur das erste Wort als Command
+        — wir wollen aber dass der Link das ganze '/cmd' umfasst.
         """
         if not items:
             return
@@ -514,7 +521,11 @@ async def _handle_help_command(chat_id=None):
         lock_marker = "  🔒" if locked else ""
         lines.append(f"{emoji} <b>{title}</b>{lock_marker}")
         for cmd, desc in items:
-            lines.append(f"<code>{cmd}</code> — {desc}")
+            # Command + Args trennen damit nur der echte Slash-Command
+            # in <b> steht und Telegram ihn als clickable parsed.
+            cmd_word, _, cmd_args = cmd.partition(" ")
+            cmd_args_html = f" {cmd_args}" if cmd_args else ""
+            lines.append(f"<b>{cmd_word}</b>{cmd_args_html} — {desc}")
 
     # --- Workflow: Kundengespraeche (voice + kalender + always-on kunde) ---
     # Voice-Init-Befehle haben den expliziten Angebot-Hinweis — wir
