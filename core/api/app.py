@@ -113,8 +113,10 @@ async def lifespan(app: FastAPI):
                 "Shutdown-Hook: %d 'creating'-Rechnungen auf 'error' "
                 "gesetzt (Container-Restart)", recovered,
             )
-    except Exception as e:
-        logger.warning("Shutdown-Hook (creating-Cleanup) fehler: %s", e)
+    except Exception:
+        # Beta-1 B1-8: Stack-Trace ist wertvoll bei Shutdown-Crashes
+        # weil schwer reproduzierbar — logger.exception statt warning.
+        logger.exception("Shutdown-Hook (creating-Cleanup) fehler")
 
     logger.info("Framework faehrt runter.")
 

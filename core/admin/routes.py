@@ -699,6 +699,26 @@ async def tenant_detail(
             for u in usage_rows
         ]
 
+        # Beta-1 B1-10: Mail-Queue-Health pro Tenant
+        from core.models import FailedMailQueue
+        day_ago = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=24)
+        mq_pending = (await s.execute(
+            select(func.count(FailedMailQueue.id))
+            .where(FailedMailQueue.tenant_id == tid)
+            .where(FailedMailQueue.status == "pending")
+        )).scalar() or 0
+        mq_sent_24h = (await s.execute(
+            select(func.count(FailedMailQueue.id))
+            .where(FailedMailQueue.tenant_id == tid)
+            .where(FailedMailQueue.status == "sent")
+            .where(FailedMailQueue.updated_at >= day_ago)
+        )).scalar() or 0
+        mq_dead = (await s.execute(
+            select(func.count(FailedMailQueue.id))
+            .where(FailedMailQueue.tenant_id == tid)
+            .where(FailedMailQueue.status == "dead")
+        )).scalar() or 0
+
         await audit(
             user_id=user.id, action="tenant.view",
             target=tenant.slug, request=request, session=s,
@@ -714,6 +734,9 @@ async def tenant_detail(
             "anfragen_total": int(anfragen_total),
             "cost_month": float(cost_month),
             "cost_total": float(cost_total),
+            "mq_pending": int(mq_pending),
+            "mq_sent_24h": int(mq_sent_24h),
+            "mq_dead": int(mq_dead),
         },
         "charts": {
             "timeline": {"labels": labels_30, "data": data_30},

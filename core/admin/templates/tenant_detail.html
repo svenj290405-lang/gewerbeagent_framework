@@ -66,6 +66,17 @@
         <div class="stat-value">{{ "%.4f €"|format(stats.cost_month) }}</div>
         <div class="stat-sub">{{ "%.4f €"|format(stats.cost_total) }} insgesamt</div>
     </div>
+    <div class="stat-card">
+        <div class="stat-label">Mail-Queue</div>
+        {% if stats.mq_pending > 0 or stats.mq_dead > 0 %}
+        <div class="stat-value" style="color:var(--yellow);">{{ stats.mq_pending }}</div>
+        {% else %}
+        <div class="stat-value" style="color:var(--green);">{{ stats.mq_pending }}</div>
+        {% endif %}
+        <div class="stat-sub">
+            pending · {{ stats.mq_sent_24h }} sent/24h · {{ stats.mq_dead }} dead
+        </div>
+    </div>
 </div>
 
 <div style="display:grid; grid-template-columns: 2fr 1fr; gap: 16px; margin-bottom: 24px;">

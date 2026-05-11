@@ -68,7 +68,7 @@ async def _fire_drive_upload_alert(
             },
         )
     except Exception as exc:
-        logger.warning(f"Sven-Alert (drive_upload_loop) failed: {exc}")
+        logger.exception(f"Sven-Alert (drive_upload_loop) failed: {exc}")
 
     # Tenant-Push: hat eigenes Cooldown via tenant_alert
     try:
@@ -91,7 +91,7 @@ async def _fire_drive_upload_alert(
             details={"failure_count": count},
         )
     except Exception as exc:
-        logger.warning(f"Tenant-Alert (drive_upload_loop) failed: {exc}")
+        logger.exception(f"Tenant-Alert (drive_upload_loop) failed: {exc}")
 
 
 def _slugify_kunde(name: str) -> str:
