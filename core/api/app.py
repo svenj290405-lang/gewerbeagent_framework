@@ -189,10 +189,13 @@ async def webhook_dispatch(
         raise HTTPException(status_code=401, detail="Unauthorized")
     except Exception as e:
         logger.exception(f"Plugin-Fehler in {plugin_name}/{endpoint}: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Fehler im Plugin {plugin_name}: {str(e)}",
-        )
+        # Production: keine Detail-Leaks an Caller (Stack-Trace bleibt im Log).
+        # Dev: voller Error-String fuer schnelleres Debugging.
+        if settings.is_production:
+            detail = "Plugin-Fehler. Details im Server-Log."
+        else:
+            detail = f"Fehler im Plugin {plugin_name}: {str(e)}"
+        raise HTTPException(status_code=500, detail=detail)
 
 # ============================================================
 # OAUTH ENDPOINTS

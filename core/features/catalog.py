@@ -58,7 +58,7 @@ FEATURES: dict[str, Feature] = {
     # --- Basis-Tier ---
     "kalender": Feature(
         key="kalender",
-        label="Kalender (Google/Outlook)",
+        label="Kalender",
         description="Termine planen, Slot-Suche, Smart-Routing.",
         telegram_commands=("/kalender_verbinden", "/kalender_status", "/briefing"),
     ),
@@ -72,7 +72,7 @@ FEATURES: dict[str, Feature] = {
     # --- Pro-Tier ---
     "mail_intake": Feature(
         key="mail_intake",
-        label="Mail-Inbox (Outlook/Brevo)",
+        label="Mail-Inbox",
         description="Eingehende Anfragen automatisch lesen + beantworten.",
         requires=("kalender",),
         telegram_commands=("/microsoft_setup", "/microsoft_status", "/microsoft_check"),
@@ -85,7 +85,7 @@ FEATURES: dict[str, Feature] = {
     ),
     "lexware": Feature(
         key="lexware",
-        label="Lexware-Buchhaltung",
+        label="Buchhaltung",
         description="Belege erfassen, Rechnungen schreiben, Bezahlung tracken.",
         telegram_commands=(
             "/lexware_setup", "/lexware_status",
@@ -117,21 +117,21 @@ FEATURES: dict[str, Feature] = {
     # voice_init bei ElevenLabs-Webhook).
     "voice_init": Feature(
         key="voice_init",
-        label="Voice-Telefonie (ElevenLabs)",
+        label="Telefon-Annahme",
         description="KI-Telefonbeantworter mit Termin-Buchung im Anruf.",
         requires=("kalender",),
         telegram_commands=("/aufnahme", "/anrufe"),
     ),
     "drive_archiv": Feature(
         key="drive_archiv",
-        label="Kunden-Archiv (Google Drive)",
+        label="Kunden-Archiv",
         description="Bilder/PDFs pro Kunde in Drive-Ordnern archivieren.",
         requires=("kalender",),  # braucht Google-OAuth (kommt aus Kalender)
         telegram_commands=("/drive_verbinden", "/drive_status", "/archiv", "/fertig"),
     ),
     "visualisierung": Feature(
         key="visualisierung",
-        label="KI-Visualisierung",
+        label="Visualisierung",
         description="Foto + Text-Beschreibung -> photorealistisches Rendering.",
         telegram_commands=("/visualisierung",),
     ),
@@ -144,14 +144,14 @@ FEATURES: dict[str, Feature] = {
     ),
     "mitarbeiter": Feature(
         key="mitarbeiter",
-        label="Mitarbeiter-Verwaltung",
+        label="Mitarbeiter",
         description="Multi-Mitarbeiter mit eigenem Kalender + Skills.",
         requires=("kalender",),
         telegram_commands=("/mitarbeiter",),
     ),
     "werkstatt": Feature(
         key="werkstatt",
-        label="Werkstatt-Adresse (Smart-Routing)",
+        label="Smart-Routing",
         description="Heimat-Adresse fuer Fahrtzeit-aware-Termin-Vorschlaege.",
         requires=("kalender",),
         telegram_commands=("/werkstatt", "/werkstatt_status"),

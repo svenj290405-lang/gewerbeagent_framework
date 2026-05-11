@@ -93,9 +93,15 @@ async def get_drive_service(
             "Bitte einmal /drive_verbinden im Telegram ausfuehren."
         )
 
+    # Race-Schutz: SELECT FOR UPDATE auf der Token-Zeile damit zwei
+    # parallele Drive-Uploads nicht beide gleichzeitig refresh() callen
+    # (Google revoked dann manchmal den alten Token sofort -> 401).
+    # Pattern identisch zu core/integrations/microsoft.py:50.
     async with AsyncSessionLocal() as session:
         result = await session.execute(
-            select(OAuthToken).where(OAuthToken.id == oauth_token.id)
+            select(OAuthToken)
+            .where(OAuthToken.id == oauth_token.id)
+            .with_for_update()
         )
         oauth_token = result.scalar_one()
 
@@ -108,7 +114,18 @@ async def get_drive_service(
             client_secret=client_secret,
             scopes=scopes,
         )
-        if not creds.valid and creds.refresh_token:
+
+        # Re-Check: Hat ein paralleler Request schon refreshed? Dann
+        # nutzen wir den frischen Token statt nochmal zu refreshen.
+        now = datetime.now(timezone.utc)
+        already_fresh = (
+            oauth_token.access_token_expires_at is not None
+            and oauth_token.access_token_expires_at > now
+            and oauth_token.access_token
+            and creds.token == oauth_token.access_token
+        )
+
+        if not creds.valid and creds.refresh_token and not already_fresh:
             creds.refresh(GRequest())
             oauth_token.access_token = creds.token
             if creds.expiry:
@@ -116,6 +133,17 @@ async def get_drive_service(
                     tzinfo=timezone.utc,
                 )
             await session.commit()
+        elif already_fresh:
+            # Der Token wurde von einem parallelen Request bereits erneuert.
+            # Wir bauen creds mit dem frischen access_token aus der DB neu.
+            creds = Credentials(
+                token=oauth_token.access_token,
+                refresh_token=oauth_token.refresh_token,
+                token_uri="https://oauth2.googleapis.com/token",
+                client_id=client_id,
+                client_secret=client_secret,
+                scopes=scopes,
+            )
 
     # Drive-Service synchron bauen (googleapiclient ist sync, also blockt
     # nicht — der Build-Call macht keinen Netzverkehr).

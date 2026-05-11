@@ -448,88 +448,71 @@ async def _handle_help_command(chat_id=None):
             return True
         return feature_key in enabled_features
 
-    msg = "<b>📋 Verfuegbare Befehle</b>\n\n"
+    # Kompaktes Apple-Style-Layout: Kategorie-Zeile mit Befehlen
+    # kommagetrennt — keine Wall-of-Text mehr. Pro Befehl nur das was
+    # auf einer Zeile passt; Details kriegt der User wenn er den Befehl
+    # tippt.
+    lines: list[str] = ["<b>📋 Befehle</b>"]
+
+    def _block(emoji: str, title: str, cmds: list[str]) -> None:
+        if cmds:
+            lines.append("")
+            lines.append(f"{emoji} <b>{title}</b>")
+            lines.append("  " + "  ·  ".join(cmds))
 
     if _is_on("lexware"):
-        msg += "<b>📷 BELEGE</b>\n"
-        msg += "/beleg - Foto/PDF an Lexware schicken\n"
-        msg += "/belege_anzeigen - letzte 10 hochgeladene\n\n"
-
-        msg += "<b>💰 RECHNUNGEN</b>\n"
-        msg += "/rechnung - neue anlegen (Text oder Sprache)\n"
-        msg += "/rechnungen_anzeigen - letzte 10\n"
-        msg += "/rechnung_pruefen - jetzt Bezahl-Status pollen\n\n"
-
+        _block("📷", "Belege", ["/beleg", "/belege_anzeigen"])
+        _block("💰", "Rechnungen", [
+            "/rechnung", "/rechnungen_anzeigen", "/rechnung_pruefen",
+        ])
     if _is_on("material"):
-        msg += "<b>🛒 MATERIAL &amp; BESTELLUNGEN</b>\n"
-        msg += "/material - Liste der Verbrauchsartikel\n"
-        msg += "/material neu - neuen Artikel anlegen\n"
-        msg += "/material &lt;slug&gt; - Details + Historie\n"
-        msg += "/bestellen - Liste mit Quick-Order\n"
-        msg += "/bestellen &lt;slug&gt; [menge] - jetzt bestellen\n"
-        msg += "/bestellungen - letzte 20 Bestellungen\n\n"
-
-    if _is_on("voice_init") or _is_on("kalender"):
-        msg += "<b>📞 KUNDENGESPRAECHE</b>\n"
-        if _is_on("voice_init"):
-            msg += "/aufnahme - Gespraech aufnehmen + Lexware-Angebot\n"
-            msg += "/anrufe - letzte 10 Gespraeche\n"
-        if _is_on("kalender"):
-            msg += "/briefing - naechster Termin mit Briefing\n"
-        msg += "/kunde [Name] - alle Gespraeche zu einem Kunden\n\n"
-
-    if _is_on("wissensbasis"):
-        msg += "<b>📚 WISSENSBASIS</b>\n"
-        msg += "/wissen - neuen Eintrag anlegen\n"
-        msg += "/wissen_anzeigen - alle ansehen\n"
-        msg += "/wissen_loeschen - Eintrag entfernen\n\n"
-
-    if _is_on("kalkulation"):
-        msg += "<b>🧮 KALKULATION (Formeln fuers Angebot)</b>\n"
-        msg += "/kalkulation - neue Formel anlegen (Wizard)\n"
-        msg += "/kalkulation_excel - Excel-Datei mit Formeln hochladen\n"
-        msg += "/kalkulation_anzeigen - alle Regeln ansehen\n"
-        msg += "/kalkulation_loeschen - Regel entfernen\n\n"
-
-    if _is_on("anfrage_formular"):
-        msg += "<b>📋 ANFRAGE-FORMULAR</b>\n"
-        msg += "/formular - Felder bearbeiten (Wizard)\n"
-        msg += "/formular_anzeigen - aktuelle Felder ansehen\n"
-        msg += "/formular_zuruecksetzen - auf Standard zuruecksetzen\n\n"
-
-    if _is_on("visualisierung"):
-        msg += "<b>🎨 VISUALISIERUNG</b>\n"
-        msg += "/visualisierung - Foto + KI-Rendering\n\n"
-
-    if _is_on("drive_archiv"):
-        msg += "<b>☁️ KUNDEN-ARCHIV (Google Drive)</b>\n"
-        msg += "/drive_verbinden - Drive-Zugriff erlauben (einmalig)\n"
-        msg += "/drive_status - Verbindung + Statistik pruefen\n"
-        msg += "/archiv - Liste der Kunden mit Drive-Ordner\n"
-        msg += "/archiv &lt;name&gt; - Bilder/PDFs hochladen (Wizard)\n"
-        msg += "/fertig - Upload-Wizard abschliessen\n\n"
-
-    msg += "<b>⚙️ SETUP</b>\n"
-    if _is_on("lexware"):
-        msg += "/lexware_setup - Lexware verbinden\n"
-        msg += "/lexware_status - Verbindung pruefen\n"
-    if _is_on("werkstatt"):
-        msg += "/werkstatt - Werkstatt-Adresse einrichten\n"
-        msg += "/werkstatt_status - aktuelle Heimat-Adresse anzeigen\n"
+        _block("🛒", "Material", [
+            "/material", "/material_neu", "/bestellen", "/bestellungen",
+        ])
+    voice_kal = []
+    if _is_on("voice_init"):
+        voice_kal += ["/aufnahme", "/anrufe"]
     if _is_on("kalender"):
-        msg += "/kalender_verbinden - Google oder Outlook verknuepfen\n"
-        msg += "/kalender_status - aktuell verbundenen Kalender anzeigen\n"
-    if _is_on("mitarbeiter"):
-        msg += "/mitarbeiter - Mitarbeiter-Liste anzeigen\n"
-        msg += "/mitarbeiter neu - Mitarbeiter anlegen (nur Inhaber)\n"
-    msg += "/start - Bot mit Betrieb verbinden\n"
-    msg += "/status - Agent-Status pruefen\n"
-    msg += "/paket - Mein Paket + aktive Features\n"
-    msg += "/abbrechen - laufende Aktion abbrechen\n"
-    msg += "/help - Diese Liste\n\n"
+        voice_kal += ["/briefing"]
+    voice_kal += ["/kunde"]
+    if voice_kal:
+        _block("📞", "Kunden", voice_kal)
+    if _is_on("wissensbasis"):
+        _block("📚", "Wissen", [
+            "/wissen", "/wissen_anzeigen", "/wissen_loeschen",
+        ])
+    if _is_on("kalkulation"):
+        _block("🧮", "Kalkulation", [
+            "/kalkulation", "/kalkulation_anzeigen", "/kalkulation_excel",
+        ])
+    if _is_on("anfrage_formular"):
+        _block("📋", "Anfrage-Formular", [
+            "/formular", "/formular_anzeigen",
+        ])
+    if _is_on("visualisierung"):
+        _block("🎨", "Visualisierung", ["/visualisierung"])
+    if _is_on("drive_archiv"):
+        _block("☁️", "Kunden-Archiv", [
+            "/archiv", "/drive_status", "/drive_verbinden",
+        ])
 
-    msg += "<i>Bei Fragen: hallo@gewerbeagent.de</i>"
-    return msg
+    setup_cmds: list[str] = []
+    if _is_on("lexware"):
+        setup_cmds += ["/lexware_setup", "/lexware_status"]
+    if _is_on("kalender"):
+        setup_cmds += ["/kalender_verbinden", "/kalender_status"]
+    if _is_on("werkstatt"):
+        setup_cmds += ["/werkstatt"]
+    if _is_on("mitarbeiter"):
+        setup_cmds += ["/mitarbeiter"]
+    _block("⚙️", "Setup", setup_cmds)
+    _block("ℹ️", "Sonstiges", [
+        "/paket", "/status", "/abbrechen",
+    ])
+
+    lines.append("")
+    lines.append("<i>Hilfe: hallo@gewerbeagent.de</i>")
+    return "\n".join(lines)
 
 
 # =====================================================================
@@ -581,11 +564,8 @@ async def _check_feature_gate(text: str, chat_id) -> str | None:
 def _feature_locked_message(feature) -> str:
     """Klartext-Antwort wenn ein gesperrtes Feature angefragt wird."""
     return (
-        f"🔒 <b>{_h_safe(feature.label)}</b> ist in deinem Paket nicht "
-        f"enthalten.\n\n"
-        f"Mit /paket siehst du dein aktuelles Paket und welche Features "
-        f"aktiv sind.\n\n"
-        f"Fuer Upgrade: hallo@gewerbeagent.de"
+        f"🔒 <b>{_h_safe(feature.label)}</b> ist nicht in deinem Paket.\n"
+        f"Übersicht: /paket  ·  Upgrade: hallo@gewerbeagent.de"
     )
 
 
@@ -604,55 +584,47 @@ async def _handle_paket_command(chat_id) -> str:
         )
 
     enabled = await enabled_features_for_tenant(tenant.id)
-
     package_label = PACKAGE_LABELS.get(
         tenant.package_tier, f"📦 {tenant.package_tier}"
     )
 
-    msg = f"<b>{package_label}</b>\n"
-    msg += f"<i>{_h_safe(tenant.company_name)}</i>\n\n"
+    # Apple-Style: kompakte zweispaltige Liste — ein Symbol + Name pro
+    # Zeile, sortiert nach Label. Aktiv und Inaktiv direkt in einer
+    # Übersicht ohne Block-Header.
+    feature_lines: list[str] = []
+    sorted_features = sorted(
+        (f for f in FEATURES.values() if not f.always_on),
+        key=lambda f: f.label,
+    )
+    for f in sorted_features:
+        icon = "✅" if f.key in enabled else "·"
+        feature_lines.append(f"{icon}  {_h_safe(f.label)}")
 
-    # Aktive Features (ohne always_on) anzeigen
-    active_features = sorted([
-        f for f in FEATURES.values()
-        if f.key in enabled and not f.always_on
-    ], key=lambda f: f.label)
+    n_on = sum(1 for f in sorted_features if f.key in enabled)
+    n_total = len(sorted_features)
 
-    if active_features:
-        msg += "<b>✅ Aktiviert:</b>\n"
-        for f in active_features:
-            msg += f"• {_h_safe(f.label)}\n"
-        msg += "\n"
-
-    # Verfuegbar aber nicht aktiviert
-    inactive_features = sorted([
-        f for f in FEATURES.values()
-        if f.key not in enabled and not f.always_on
-    ], key=lambda f: f.label)
-
-    if inactive_features:
-        msg += "<b>🔒 Nicht aktiviert:</b>\n"
-        for f in inactive_features:
-            msg += f"• {_h_safe(f.label)}\n"
-        msg += "\n"
-
+    msg_parts = [
+        f"<b>{package_label}</b>",
+        f"<i>{_h_safe(tenant.company_name)}</i>",
+        f"<i>{n_on} von {n_total} Features aktiv</i>",
+        "",
+        "\n".join(feature_lines),
+        "",
+    ]
     if tenant.package_tier == PACKAGE_CUSTOM:
-        msg += (
-            "<i>Dein Paket ist 'Custom' — individuell zusammengestellt. "
-            "Aenderungen via Admin (Sven).</i>\n"
-        )
+        msg_parts.append("<i>Custom-Paket. Aenderungen via Admin.</i>")
     else:
-        msg += (
-            "<i>Fuer Paket-Upgrade oder einzelne Feature-Aktivierung: "
-            "hallo@gewerbeagent.de</i>"
-        )
-    return msg
+        msg_parts.append("<i>Upgrade: hallo@gewerbeagent.de</i>")
+    return "\n".join(msg_parts)
 
 async def _handle_status_command(chat_id):
     tenant = await _get_tenant_by_chat(chat_id)
     if not tenant:
-        return "Dieser Chat ist noch <b>keinem Betrieb zugeordnet</b>.\n\nBitte scannen Sie den Aktivierungs-QR-Code."
-    return f"<b>{tenant.company_name}</b>\nStatus: {tenant.status}\nSlug: {tenant.slug}"
+        return "Chat nicht zugeordnet. QR-Code scannen oder /start."
+    return (
+        f"<b>{_h_safe(tenant.company_name)}</b>\n"
+        f"{tenant.status}  ·  <code>{tenant.slug}</code>"
+    )
 
 async def _handle_unknown():
     return "Diesen Befehl kenne ich noch nicht.\n\nMit /help sehen Sie was ich kann."
@@ -1628,7 +1600,10 @@ async def process_telegram_update(payload):
         reply = await _handle_kalender_status_command(chat_id)
     elif text == "/drive_verbinden":
         await _clear_state(chat_id)
-        reply = await _handle_drive_verbinden_command(chat_id)
+        reply_or_none = await _handle_drive_verbinden_command(chat_id)
+        if reply_or_none is None:
+            return {"ok": True}
+        reply = reply_or_none
     elif text == "/drive_status":
         reply = await _handle_drive_status_command(chat_id)
     elif text == "/archiv":
@@ -1873,17 +1848,12 @@ async def _handle_visualisierung_command(chat_id):
     """Startet den Visualisierungs-Wizard."""
     tenant = await _get_tenant_by_chat(chat_id)
     if not tenant:
-        return (
-            "Dieser Chat ist noch keinem Betrieb zugeordnet.\n"
-            "Bitte zuerst den Aktivierungs-QR-Code scannen."
-        )
+        return "Erst /start ausfuehren — Chat ist keinem Betrieb zugeordnet."
     await _save_state(chat_id, STATE_VIZ_WAITING_PHOTO, {})
-    msg = "<b>Visualisierung erstellen</b>\n\n"
-    msg += "Schicken Sie mir bitte das <b>Foto</b> der Stelle, "
-    msg += "wo z.B. eine Treppe, ein Moebel oder eine Kueche hinkommen soll.\n\n"
-    msg += "<i>Tipp: Foto direkt aus der Telegram-Kamera oder aus der Galerie.</i>\n\n"
-    msg += "/abbrechen um abzubrechen."
-    return msg
+    return (
+        "<b>🎨 Visualisierung</b>\n"
+        "Schick ein Foto der Stelle (Treppe, Bad, Wand, ...)."
+    )
 
 
 async def _handle_viz_photo_received(chat_id, photo_array, bot_token):
@@ -1929,14 +1899,11 @@ async def _handle_viz_photo_received(chat_id, photo_array, bot_token):
         {"viz_id": viz_id},
     )
 
-    msg = f"Foto erhalten ({len(image_bytes) // 1024} KB).\n\n"
-    msg += "<b>Was soll dort hin?</b> Beschreiben Sie es kurz:\n"
-    msg += "- Material (z.B. Eiche, Buche, Edelstahl)\n"
-    msg += "- Stil (z.B. modern, klassisch)\n"
-    msg += "- Details (z.B. 14 Stufen, Glasgelaender)\n\n"
-    msg += "<i>Beispiel: Helle Eichentreppe geradlaeufig mit Edelstahl-Gelaender.</i>\n\n"
-    msg += "/abbrechen um abzubrechen."
-    return msg
+    return (
+        f"Foto erhalten ({len(image_bytes) // 1024} KB).\n\n"
+        "<b>Was soll dort hin?</b>\n"
+        "<i>z.B. Helle Eichentreppe mit Edelstahl-Gelaender</i>"
+    )
 
 
 async def _handle_viz_description_input(chat_id, text, state_data):
@@ -6686,14 +6653,24 @@ class Plugin(BasePlugin):
         # Mitarbeiter anlegen, Termine buchen).
         from config.settings import settings
         expected = (settings.telegram_webhook_secret or "").strip()
-        if expected:
+        if not expected:
+            # Production: hartes Veto — kein Webhook ohne Secret.
+            # Dev: nur Warning, damit lokales Probieren ohne Setup geht.
+            if settings.is_production:
+                logger.error(
+                    "Telegram-Webhook ABGELEHNT: TELEGRAM_WEBHOOK_SECRET ist "
+                    "in Production zwingend erforderlich",
+                )
+                raise PermissionError("webhook-secret-missing-in-production")
+            logger.warning(
+                "Telegram-Webhook ohne Secret (dev) — Production wuerde dies blockieren",
+            )
+        else:
             got = (headers or {}).get("x-telegram-bot-api-secret-token", "")
             # Constant-Time-Vergleich gegen Timing-Attacks
             import hmac
             if not hmac.compare_digest(got, expected):
                 raise PermissionError("invalid-telegram-secret")
-        # Wenn KEIN Secret gesetzt ist: Webhook ist offen (Backward-Compat).
-        # Das wird in STATUS.md/Doku als deployment-blocker markiert.
         logger.info(f"Telegram-Webhook empfangen: endpoint={endpoint}")
         if endpoint == "incoming":
             return await process_telegram_update(payload)
@@ -7202,35 +7179,26 @@ def _h_safe(s) -> str:
 ARCHIV_MAX_FILE_SIZE = 25 * 1024 * 1024  # 25 MB Telegram-Bot-API-Limit
 
 
-async def _handle_drive_verbinden_command(chat_id) -> str:
+async def _handle_drive_verbinden_command(chat_id):
     """Schickt OAuth-Deeplink mit Drive-Scope.
 
     Calendar-Token bleibt gueltig — der naechste OAuth-Roundtrip
-    ueberschreibt nur den Scope-Set des Tokens und behaelt den
-    Refresh-Token. Tenant kommt mit /archiv ohne weitere Schritte
-    direkt in den Upload-Wizard.
+    erweitert nur den Scope-Set des Tokens und behaelt den Refresh-Token.
     """
     res = await _get_current_employee(chat_id)
     if res is None:
-        return (
-            "Dieser Chat ist noch keinem Betrieb zugeordnet. "
-            "Bitte zuerst /start ausfuehren."
-        )
+        return "Erst /start ausfuehren — Chat ist keinem Betrieb zugeordnet."
     tenant, emp = res
 
-    # Wenn Default-Employee schon Drive-Scope hat: Bestaetigung statt Deeplink
     from core.security.oauth_token_lookup import find_oauth_token
     from core.integrations.google_drive import is_drive_configured
     tok = await find_oauth_token(tenant.id, "google", emp.id)
     if tok and is_drive_configured(tok):
         return (
-            "✅ <b>Drive ist bereits verbunden.</b>\n\n"
-            "Du kannst direkt mit <b>/archiv &lt;kundenname&gt;</b> Bilder "
-            "und PDFs in Drive ablegen. Mit /drive_status checkst du "
-            "Statistik und Ordner-Anzahl."
+            "✅ <b>Drive ist verbunden.</b>\n"
+            "Mit <b>/archiv &lt;kundenname&gt;</b> kannst du loslegen."
         )
 
-    # Deeplink generieren (provider=google, gleicher OAuth-Flow wie Calendar)
     from config.settings import settings
     from urllib.parse import urlencode
     base = (settings.public_url or "").rstrip("/")
@@ -7241,17 +7209,21 @@ async def _handle_drive_verbinden_command(chat_id) -> str:
     })
     oauth_url = f"{base}/oauth/start?{qs}"
 
-    return (
-        "<b>☁️ Google Drive verbinden</b>\n\n"
-        "Damit der Bot Kunden-Bilder und PDFs in deinem Drive ablegen "
-        "kann, brauche ich einmal Drive-Zugriff. Calendar bleibt "
-        "weiter verbunden — wir erweitern nur den Scope.\n\n"
-        f"<a href=\"{oauth_url}\">Jetzt einloggen und Drive freigeben</a>\n\n"
-        "<i>Tipp:</i> Q sieht <b>nur die Ordner die er selbst anlegt</b> "
-        "(Drive-Scope <code>drive.file</code>). Privat-Files in deinem "
-        "Drive bleiben fuer den Bot unsichtbar — Privacy-by-Design.\n\n"
-        "Nach dem Login: zurueck zum Bot und mit /archiv loslegen."
+    msg = (
+        "<b>☁️ Drive verbinden</b>\n"
+        "Einmal-Login. Calendar bleibt verbunden — wir erweitern nur "
+        "den Scope.\n\n"
+        "<i>Q sieht nur die Ordner die er selbst anlegt. "
+        "Private Files bleiben unsichtbar.</i>"
     )
+    sent = await _send_with_inline_buttons(
+        chat_id, msg,
+        [[{"text": "Drive freigeben", "url": oauth_url}]],
+    )
+    if sent:
+        return None  # type: ignore[return-value]
+    # Fallback ohne Buttons
+    return msg + f"\n\nLink: {oauth_url}"
 
 
 async def _handle_drive_status_command(chat_id) -> str:
@@ -7288,20 +7260,15 @@ async def _handle_drive_status_command(chat_id) -> str:
         ):
             last_upload = f.last_upload_at
     last_str = (
-        last_upload.strftime("%d.%m.%Y %H:%M") if last_upload else "-"
+        last_upload.strftime("%d.%m.%Y %H:%M") if last_upload else "—"
     )
 
-    msg = "<b>☁️ Drive-Status</b>\n\n"
-    msg += "Verbindung: <b>✅ verbunden</b>\n"
-    msg += f"Kunden-Ordner: <b>{len(folders)}</b>\n"
-    msg += f"Hochgeladene Dateien: <b>{total_uploads}</b>\n"
-    msg += f"Letzter Upload: <b>{last_str}</b>\n\n"
-    if folders:
-        msg += "Mit /archiv siehst du die Liste, mit /archiv &lt;name&gt; "
-        msg += "laedst du neue Files in einen Kunden-Ordner."
-    else:
+    msg = (
+        "<b>☁️ Drive</b>  ✅\n"
+        f"{len(folders)} Ordner  ·  {total_uploads} Dateien  ·  letzter {last_str}\n"
+    )
+    if not folders:
         msg += (
-            "Noch kein Kunde mit Drive-Ordner. "
             "Mit /archiv &lt;name&gt; den ersten anlegen."
         )
     return msg
@@ -7390,13 +7357,9 @@ async def _handle_archiv_command(chat_id, args: str) -> str:
     )
 
     return (
-        f"<b>📁 Archiv: {_h_safe(name)}</b>\n\n"
-        "Schick mir jetzt <b>Bilder, PDFs oder andere Dokumente</b>. "
-        "Mehrere hintereinander sind OK — ich antworte nach jedem File.\n\n"
-        "Mit <b>/fertig</b> schliesst du den Upload ab und bekommst den "
-        "Drive-Link. Mit /abbrechen brichst du ohne Link ab "
-        "(bereits hochgeladene Files bleiben).\n\n"
-        "<i>Tipp:</i> max 25 MB pro Datei (Telegram-Limit)."
+        f"<b>📁 {_h_safe(name)}</b>\n"
+        "Schick Bilder/PDFs. Mehrere OK.\n"
+        "<b>/fertig</b> zum Abschliessen."
     )
 
 
