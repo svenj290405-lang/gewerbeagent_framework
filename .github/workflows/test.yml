@@ -1,0 +1,74 @@
+name: Tests
+
+# Laeuft auf jedem Push + PR. Quick-Smoke-Test damit man nicht
+# versehentlich kaputten Code nach develop pusht.
+
+on:
+  push:
+    branches: [develop, main]
+  pull_request:
+    branches: [develop, main]
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: gewerbeagent
+          POSTGRES_PASSWORD: ci-test
+          POSTGRES_DB: gewerbeagent_ci
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U gewerbeagent"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up uv
+        # uv ist schneller als pip und matched dem Container-Setup
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "latest"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps
+        run: uv sync --frozen
+
+      - name: Smoke-Imports (Boot-Order-Check)
+        # Falls eine Migration oder ein Model kaputt ist, scheitert
+        # der Import schon hier — schneller Feedback-Loop ohne DB.
+        env:
+          DATABASE_URL: postgresql+asyncpg://gewerbeagent:ci-test@localhost:5432/gewerbeagent_ci
+          SECRET_KEY: ${{ secrets.CI_SECRET_KEY || 'ci-secret-key-min-32-chars-padding-padding' }}
+          ENCRYPTION_KEY: ${{ secrets.CI_ENCRYPTION_KEY || 'ci-encryption-key-min-32-chars-padding' }}
+          ENVIRONMENT: development
+        run: |
+          uv run python -c "import core.api.app; print('app imports ok')"
+          uv run python -c "from core.models import *; print('models import ok')"
+
+      - name: Alembic upgrade head
+        env:
+          DATABASE_URL: postgresql+asyncpg://gewerbeagent:ci-test@localhost:5432/gewerbeagent_ci
+          SECRET_KEY: ${{ secrets.CI_SECRET_KEY || 'ci-secret-key-min-32-chars-padding-padding' }}
+          ENCRYPTION_KEY: ${{ secrets.CI_ENCRYPTION_KEY || 'ci-encryption-key-min-32-chars-padding' }}
+          ENVIRONMENT: development
+        run: uv run alembic upgrade head
+
+      - name: Pytest
+        env:
+          DATABASE_URL: postgresql+asyncpg://gewerbeagent:ci-test@localhost:5432/gewerbeagent_ci
+          SECRET_KEY: ${{ secrets.CI_SECRET_KEY || 'ci-secret-key-min-32-chars-padding-padding' }}
+          ENCRYPTION_KEY: ${{ secrets.CI_ENCRYPTION_KEY || 'ci-encryption-key-min-32-chars-padding' }}
+          ENVIRONMENT: development
+        run: uv run pytest tests/ -q

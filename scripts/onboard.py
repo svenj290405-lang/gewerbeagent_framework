@@ -20,7 +20,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import sys
+from pathlib import Path
 
 from sqlalchemy import select
 
@@ -30,9 +32,38 @@ from core.features.catalog import (
     PACKAGE_BASIS, PACKAGE_PRO, PACKAGE_ENTERPRISE, ALL_PACKAGES,
     PACKAGE_LABELS, PACKAGES, FEATURES,
 )
-from core.models import Tenant, TenantStatus, ToolConfig
+from core.models import (
+    Tenant, TenantKnowledge, TenantStatus, ToolConfig,
+    ALLE_KATEGORIEN,
+)
 from core.security.oauth_flow import generate_auth_url
 from config.settings import settings
+
+
+# Branchen-Templates Phase B10
+_TEMPLATES_DIR = Path(__file__).parent / "templates"
+
+
+def _load_branche_template(branche: str | None) -> dict | None:
+    """Liest scripts/templates/branche_<key>.json. None wenn nicht vorhanden."""
+    if not branche:
+        return None
+    path = _TEMPLATES_DIR / f"branche_{branche}.json"
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception as e:
+        print(f"WARN: branche-Template {path.name} unleserlich: {e}")
+        return None
+
+
+def _list_available_branches() -> list[str]:
+    """Liefert alle vorhandenen Branche-Keys."""
+    return sorted(
+        p.stem.removeprefix("branche_")
+        for p in _TEMPLATES_DIR.glob("branche_*.json")
+    )
 
 
 DEFAULT_KALENDER_CONFIG = {
@@ -81,8 +112,16 @@ async def onboard_tenant(
     tier: str,
     phone: str | None = None,
     notes: str | None = None,
+    branche: str | None = None,
 ) -> None:
-    """Legt einen neuen Tenant an und konfiguriert ihn."""
+    """Legt einen neuen Tenant an und konfiguriert ihn.
+
+    branche (Phase B10): wenn gesetzt, wird das passende Template aus
+    scripts/templates/branche_<branche>.json geladen und als
+    TenantKnowledge-Eintraege geschrieben. Tenant kann sie nachher
+    via /wissen anpassen. Wenn das Template nicht existiert, wird die
+    Wissensbasis leer angelegt (heute-Default).
+    """
 
     # Validierung: Slug-Format
     if not slug.isalnum() and not all(c.isalnum() or c in "-_" for c in slug):
@@ -124,6 +163,7 @@ async def onboard_tenant(
             status=TenantStatus.ONBOARDING,
             notes=notes,
             package_tier=tier,
+            branche=branche,
         )
         session.add(tenant)
         await session.flush()  # damit tenant.id verfuegbar ist
@@ -152,6 +192,26 @@ async def onboard_tenant(
     # enabled-Flag.
     await apply_package(tenant_id, tier)
 
+    # Phase B10: Branchen-Template laden + als TenantKnowledge schreiben
+    knowledge_loaded = 0
+    template = _load_branche_template(branche)
+    if template is not None:
+        try:
+            async with AsyncSessionLocal() as session:
+                for entry in template.get("knowledge", []):
+                    kat = entry.get("kategorie", "")
+                    text = entry.get("text", "")
+                    if kat in ALLE_KATEGORIEN and text:
+                        session.add(TenantKnowledge(
+                            tenant_id=tenant_id,
+                            kategorie=kat,
+                            text=text[:2000],
+                        ))
+                        knowledge_loaded += 1
+                await session.commit()
+        except Exception as e:
+            print(f"WARN: Template-Knowledge konnte nicht geladen werden: {e}")
+
     # OAuth-URL generieren (ausserhalb der Session, braucht keinen DB-Zugriff)
     oauth_url = await generate_auth_url(tenant_slug=slug, provider="google")
 
@@ -171,6 +231,12 @@ async def onboard_tenant(
     print(f"  Status:        ONBOARDING")
     print(f"  Paket:         {PACKAGE_LABELS.get(tier, tier)} ({len(enabled_in_tier)} Features)")
     print(f"  Kalender:      Mo-Fr 08:00-17:00, 90 Min Standard")
+    if branche:
+        knowledge_msg = (
+            f" + {knowledge_loaded} Wissens-Eintraege"
+            if knowledge_loaded else " (kein Template gefunden)"
+        )
+        print(f"  Branche:       {branche}{knowledge_msg}")
     print()
     print(f"  AKTIVIERTE FEATURES:")
     for label in feature_labels:
@@ -224,6 +290,16 @@ def main() -> None:
         choices=[PACKAGE_BASIS, PACKAGE_PRO, PACKAGE_ENTERPRISE],
         help="Paket-Tier (basis/pro/enterprise). Wenn nicht gesetzt, wird interaktiv gefragt.",
     )
+    available_branches = _list_available_branches()
+    parser.add_argument(
+        "--branche", default=None,
+        choices=available_branches if available_branches else None,
+        help=(
+            f"Branchen-Template fuer Wissensbasis-Defaults. "
+            f"Verfuegbar: {', '.join(available_branches) or '(keine Templates)'}. "
+            f"Ohne dieses Flag startet der Tenant mit leerer Wissensbasis."
+        ),
+    )
     args = parser.parse_args()
 
     tier = args.tier
@@ -239,6 +315,7 @@ def main() -> None:
             phone=args.phone,
             notes=args.notes,
             tier=tier,
+            branche=args.branche,
         )
     )
 

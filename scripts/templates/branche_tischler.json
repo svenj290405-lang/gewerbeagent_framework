@@ -1,0 +1,34 @@
+{
+  "key": "tischler",
+  "label": "Tischlerei / Schreinerei",
+  "knowledge": [
+    {
+      "kategorie": "leistungen",
+      "text": "Wir fertigen Massmoebel nach Kundenwunsch: Schraenke, Regale, Tische, Betten, Kuechen-Einbauten. Daneben Reparaturen + Aufarbeitung von Massivholzmoebeln, Tueren- und Fenster-Service, Bodenverlegung (Parkett, Dielen)."
+    },
+    {
+      "kategorie": "materialien",
+      "text": "Wir arbeiten mit Massivholz (Eiche, Esche, Buche, Nussbaum), Multiplex, Spanplatte beschichtet, MDF. Furniere auf Wunsch. Beschlaege Blum/Hettich."
+    },
+    {
+      "kategorie": "preise",
+      "text": "Stundensatz Tischler: 65 EUR netto. Stundensatz Geselle: 55 EUR netto. Vor-Ort-Termin Beratung: 1. halbe Stunde kostenlos, danach 30 EUR. Anfahrt im Umkreis 30km pauschal 35 EUR."
+    },
+    {
+      "kategorie": "anfahrt",
+      "text": "Einzugsgebiet 50km um die Werkstatt. Daruber hinaus nur bei groesseren Auftraegen (>3000 EUR) auf Anfrage."
+    },
+    {
+      "kategorie": "oeffnungszeiten",
+      "text": "Werkstatt: Mo-Fr 07:30 - 17:00. Termine vor Ort nach Vereinbarung. Samstag/Sonntag geschlossen."
+    },
+    {
+      "kategorie": "notfall",
+      "text": "Akute Wasserschaeden mit Holzboeden: bitte Kunde sofort an Trocknung verweisen und uns zur Begutachtung holen. Keine 24h-Bereitschaft."
+    },
+    {
+      "kategorie": "besonderheiten",
+      "text": "5 Jahre Garantie auf alle Massmoebel. Wir sind Innungs-Mitglied. Auftraege ab 500 EUR erst nach Anzahlung 30 Prozent."
+    }
+  ]
+}

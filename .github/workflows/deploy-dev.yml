@@ -1,0 +1,48 @@
+name: Deploy Dev
+
+# Bei jedem Push auf develop wird der Dev-Stack automatisch
+# aktualisiert. Prod bleibt unberuehrt — fuer Prod gibt's einen
+# separaten manuellen Workflow (deploy-prod.yml).
+
+on:
+  push:
+    branches: [develop]
+  workflow_dispatch:    # zusaetzlich: manueller Trigger fuer Force-Deploy
+
+concurrency:
+  group: deploy-dev
+  cancel-in-progress: false  # keine Race zwischen zwei Deploys
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    # Tests muessen davor gruen sein (separater workflow). Wenn man
+    # dependent-on-success ohne Action-Reuse will: `needs: test` setzen
+    # und die test-Workflow als reusable_workflow umbauen.
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup SSH
+        # SSH-Key zum Hetzner-Server. In GitHub-Repo-Secrets ablegen:
+        #   DEPLOY_SSH_KEY    private key (ed25519, 4096-rsa)
+        #   DEPLOY_HOST       z.B. gewerbeagent.de
+        #   DEPLOY_USER       z.B. sven (Sudo nicht noetig)
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H ${{ secrets.DEPLOY_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Deploy Dev-Stack
+        run: |
+          ssh ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }} \
+            'cd /opt/gewerbeagent/framework-dev && ./scripts/deploy_dev.sh'
+
+      - name: Health-Check
+        # 10s warten + curl gegen Dev-Subdomain
+        run: |
+          sleep 10
+          curl -fsSL https://dev.gewerbeagent.de/health \
+            -u "${{ secrets.DEV_BASICAUTH }}" || exit 1

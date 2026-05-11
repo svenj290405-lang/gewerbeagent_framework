@@ -1,0 +1,60 @@
+name: Deploy Prod (manual)
+
+# NUR manuell triggerbar — workflow_dispatch erfordert Klick im
+# GitHub-UI. Verhindert dass ein versehentlicher Push auf main
+# direkt nach Prod deployed.
+#
+# Vorgehen:
+#   1. develop muss alle Tests durchhaben
+#   2. develop → main lokal merged (oder per PR mit Branch-Protection)
+#   3. Im GitHub-UI: Actions → Deploy Prod → Run workflow → Branch=main
+#   4. Skript laeuft ./scripts/deploy_prod.sh auf dem Server
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Tippe "deploy prod" zum Bestaetigen'
+        required: true
+        default: ''
+
+concurrency:
+  group: deploy-prod
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    if: github.event.inputs.confirm == 'deploy prod'
+
+    steps:
+      - name: Sanity-Check
+        run: |
+          if [ "${{ github.event.inputs.confirm }}" != "deploy prod" ]; then
+            echo "Confirm-String stimmt nicht — Abbruch."
+            exit 1
+          fi
+          if [ "${{ github.ref }}" != "refs/heads/main" ]; then
+            echo "Deploy Prod nur von main-Branch erlaubt. Aktuell: ${{ github.ref }}"
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H ${{ secrets.DEPLOY_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Deploy Prod-Stack
+        run: |
+          ssh ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }} \
+            'cd /opt/gewerbeagent/framework && ./scripts/deploy_prod.sh'
+
+      - name: Health-Check
+        run: |
+          sleep 10
+          curl -fsSL https://gewerbeagent.de/health || exit 1

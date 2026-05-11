@@ -1,0 +1,34 @@
+{
+  "key": "elektrik",
+  "label": "Elektroinstallation",
+  "knowledge": [
+    {
+      "kategorie": "leistungen",
+      "text": "Elektroinstallation Neubau + Sanierung, Smart-Home (KNX, Loxone), PV-Anlagen mit Speicher, Wallbox-Installation (Mennekes, ABL), Sicherungskasten-Tausch, Beleuchtung, Brandschutz-Sicherheitsbeleuchtung, E-Check (DIN VDE 0701/0702)."
+    },
+    {
+      "kategorie": "materialien",
+      "text": "Hager Sicherungsschraenke, Gira/Busch-Jaeger Schalter, ABL/Mennekes Wallboxen, Fronius/SMA Wechselrichter, BYD/Senec Speicher, Loxone/KNX Smart-Home."
+    },
+    {
+      "kategorie": "preise",
+      "text": "Stundensatz Elektromeister: 80 EUR netto. Stundensatz Geselle: 60 EUR netto. Anfahrt pauschal 40 EUR im Umkreis 30km. E-Check pauschal 45 EUR pro Wohneinheit. Wallbox-Installation Standard 1100 EUR + Material."
+    },
+    {
+      "kategorie": "anfahrt",
+      "text": "Einzugsgebiet 40km. PV/Wallbox-Anfragen auch ueberregional bei groesseren Projekten."
+    },
+    {
+      "kategorie": "oeffnungszeiten",
+      "text": "Buero: Mo-Fr 08:00 - 16:30. Stromausfall-Notdienst 24/7 in Wartungsvertraegen."
+    },
+    {
+      "kategorie": "notfall",
+      "text": "Totalausfall / Funkenflug / Steckdose qualmt = SOFORT. Stromabsicherung erstmal Hausanschluss kappen lassen + uns rufen."
+    },
+    {
+      "kategorie": "besonderheiten",
+      "text": "Eingetragener Installateur bei allen oertlichen Netzbetreibern. PV-Foerderberatung mit KFW + BAFA. Wallbox-Anmeldung beim Netzbetreiber uebernehmen wir komplett."
+    }
+  ]
+}

@@ -1,0 +1,34 @@
+{
+  "key": "dach",
+  "label": "Dachdeckerei",
+  "knowledge": [
+    {
+      "kategorie": "leistungen",
+      "text": "Dachsanierung + Neueindeckung, Flachdach (EPDM, Bitumen, Foliendach), Daemmung (Aufsparren, Zwischensparren), Dachfenster (Velux, Roto), Solar-Vorbereitung, Spenglerei (Dachrinnen, Verblechungen), Sturmschaden-Soforthilfe."
+    },
+    {
+      "kategorie": "materialien",
+      "text": "Dachziegel: Erlus, Braas, Creaton. Daemmung: Isover, Rockwool, Steico. Dachfenster: Velux, Roto. Foliendach: Sika Sarnafil, Soprema."
+    },
+    {
+      "kategorie": "preise",
+      "text": "Stundensatz Dachdeckermeister: 75 EUR netto. Stundensatz Geselle: 60 EUR netto. Geruest-Anteil wird separat berechnet. Vor-Ort-Begutachtung 1h kostenlos bei Beauftragung."
+    },
+    {
+      "kategorie": "anfahrt",
+      "text": "Einzugsgebiet 50km. Sturmschaden-Notdienst nur im 25km-Radius."
+    },
+    {
+      "kategorie": "oeffnungszeiten",
+      "text": "Buero: Mo-Fr 07:00 - 16:00. Bei Sturm-/Hagelschaden direkter Telegram-Kontakt 24/7."
+    },
+    {
+      "kategorie": "notfall",
+      "text": "Wassereinbruch durchs Dach = SOFORT. Wir kommen mit Plane + Notabdeckung. Endgueltige Sanierung im Anschluss terminiert."
+    },
+    {
+      "kategorie": "besonderheiten",
+      "text": "Dachdecker-Innung Mitglied. 10 Jahre Garantie auf Eindeckungen, 5 Jahre auf Reparaturen. Versicherungsabwicklung machen wir mit (Sturmschaden + Hagelschaden)."
+    }
+  ]
+}

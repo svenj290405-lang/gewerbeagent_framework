@@ -1,0 +1,34 @@
+{
+  "key": "shk",
+  "label": "Sanitaer / Heizung / Klima (SHK)",
+  "knowledge": [
+    {
+      "kategorie": "leistungen",
+      "text": "Sanitaer-Installationen (WC, Waschbecken, Dusche, Badewanne), Heizungs-Wartung + Austausch (Gas-Brennwert, Waermepumpe, Holzpellets), Klima-Anlagen + Lueftung, Rohrbruch-Reparatur, Verstopfungen, Trinkwasser-Installation. KFW-Foerderberatung."
+    },
+    {
+      "kategorie": "materialien",
+      "text": "Heizung: Viessmann, Vaillant, Buderus, Wolf. Sanitaer: Geberit, Grohe, Hansgrohe, Villeroy & Boch. Waermepumpen: Stiebel Eltron, NIBE. Pellet-Heizung: Hargassner, Hapero."
+    },
+    {
+      "kategorie": "preise",
+      "text": "Stundensatz Heizung+Sanitaer-Meister: 75 EUR netto. Stundensatz Geselle: 60 EUR netto. Anfahrt im Umkreis 25km pauschal 35 EUR. Notdienst-Aufschlag 100 Prozent (Wochenende/Nacht)."
+    },
+    {
+      "kategorie": "anfahrt",
+      "text": "Einzugsgebiet 40km. Notdienst-Gebiet 25km (Wartung-Vertraege priorisiert)."
+    },
+    {
+      "kategorie": "oeffnungszeiten",
+      "text": "Werkstatt: Mo-Fr 07:00 - 17:00, Samstag 08:00 - 12:00. Notdienst rund um die Uhr fuer Wartungs-Vertrags-Kunden."
+    },
+    {
+      "kategorie": "notfall",
+      "text": "Wasserschaden / Rohrbruch / Heizungsausfall im Winter = SOFORT. Notdienst-Nummer ist 24/7. Andere 'Notfaelle' (verstopfter Abfluss) bitte werktags."
+    },
+    {
+      "kategorie": "besonderheiten",
+      "text": "Wir sind eingetragener Foerderberater (BAFA + KFW). Heizungstausch mit bis zu 70 Prozent Foerderung moeglich. Beratungstermin vor Ort kostenlos bei Beauftragung."
+    }
+  ]
+}
