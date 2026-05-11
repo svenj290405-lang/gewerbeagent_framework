@@ -314,3 +314,106 @@ Edit code in /opt/gewerbeagent/framework-dev → ./deploy_dev.sh → testen auf 
 Sven hat jetzt jederzeit einen sicheren Sandbox, in dem Drive,
 Material, neue Features ausprobiert werden können ohne dass Kunden-Bots
 Schaden nehmen.
+
+---
+
+## 11. DB-Backup-Cron einrichten (Phase A2)
+
+Tägliches `pg_dump` auf dem Host (nicht im Container — überlebt
+Container-Restart):
+
+```bash
+# Backup-Verzeichnis anlegen
+sudo mkdir -p /var/backups/gewerbeagent
+sudo chown $(whoami):$(whoami) /var/backups/gewerbeagent
+
+# Host-Cron (crontab -e)
+30 3 * * * /opt/gewerbeagent/framework/scripts/backup_db.sh \
+    >> /var/log/gewerbeagent-backup.log 2>&1
+```
+
+Off-Site (Hetzner Storage-Box):
+```bash
+# SSH-Key auf Storage-Box installieren (einmalig)
+ssh-copy-id -p 23 u123456@u123456.your-storagebox.de
+
+# Cron um Off-Site-Sync erweitern
+30 3 * * * BACKUP_OFFSITE=u123456@u123456.your-storagebox.de:/home/backups/prod \
+    /opt/gewerbeagent/framework/scripts/backup_db.sh \
+    >> /var/log/gewerbeagent-backup.log 2>&1
+```
+
+Restore-Test (einmal manuell durchspielen):
+```bash
+# Test-DB anlegen
+docker exec gewerbeagent_postgres psql -U gewerbeagent \
+    -c "CREATE DATABASE gewerbeagent_restoretest"
+
+# Letztes Backup einspielen
+/opt/gewerbeagent/framework/scripts/restore_db.sh \
+    --file=$(ls -1t /var/backups/gewerbeagent/dump-*.sql.gz | head -1) \
+    --db=gewerbeagent_restoretest
+
+# Test-DB wieder löschen
+docker exec gewerbeagent_postgres psql -U gewerbeagent \
+    -c "DROP DATABASE gewerbeagent_restoretest"
+```
+
+---
+
+## 12a. Admin-Telegram-Bot einrichten (Phase A3)
+
+`.env` enthält schon die zwei Felder, aktuell beide leer:
+```
+ADMIN_TELEGRAM_BOT_TOKEN=
+ADMIN_TELEGRAM_CHAT_ID=
+```
+
+Setup:
+1. Bei [@BotFather](https://t.me/BotFather): `/newbot` → "Q Admin"
+2. Token notieren → in `.env` als `ADMIN_TELEGRAM_BOT_TOKEN` eintragen
+3. Bot anschreiben (irgendwas, z.B. /start). Dann:
+   ```bash
+   curl -s "https://api.telegram.org/bot<TOKEN>/getUpdates" | jq '.result[].message.chat.id' | head -1
+   ```
+   Liefert eine numerische ID → als `ADMIN_TELEGRAM_CHAT_ID` in `.env`
+4. Framework restart damit Settings neu gelesen werden:
+   ```bash
+   docker compose -p prod -f docker-compose.prod.yml restart framework
+   ```
+5. Test:
+   ```bash
+   docker exec gewerbeagent_framework /app/.venv/bin/python -c "
+   import asyncio
+   from core.integrations.admin_alerts import notify_sven_admin_alert
+   asyncio.run(notify_sven_admin_alert(
+       kind='setup_test',
+       message='✅ Admin-Bot funktioniert',
+       bypass_cooldown=True,
+   ))
+   "
+   ```
+   → Push muss in Telegram ankommen.
+
+Bevor diese 2 Werte gesetzt sind, geht KEIN A3/A4/A5-Alert raus — die
+Funktionen sind failsafe und loggen nur einen `WARN` ins Container-Log.
+
+---
+
+## 12. External-Liveness-Cron einrichten (Phase A3)
+
+Cron alle 5 min — sitzt auf dem Host, nicht im Framework-Container
+(sonst Henne-Ei wenn Framework crasht):
+
+```bash
+*/5 * * * * /opt/gewerbeagent/framework/scripts/external_liveness_check.py \
+    >> /var/log/gewerbeagent-liveness.log 2>&1
+```
+
+Test:
+```bash
+docker stop gewerbeagent_framework
+# 5-10 min warten → Sven bekommt Telegram-Push "framework down"
+docker start gewerbeagent_framework
+# nächster Check → "wieder online"
+```
