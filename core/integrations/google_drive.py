@@ -38,6 +38,62 @@ logger = logging.getLogger(__name__)
 DRIVE_FOLDER_MIME = "application/vnd.google-apps.folder"
 
 
+async def _fire_drive_upload_alert(
+    *,
+    tenant_id: uuid.UUID,
+    count: int,
+    last_reason: str,
+    kunde_name: str,
+) -> None:
+    """Schickt Drive-Upload-Loop-Alert an Sven UND Tenant.
+
+    Failsafe — keine Exception darf den Upload-Caller stoeren.
+    """
+    # Sven-Alert (admin)
+    try:
+        from core.integrations.admin_alerts import notify_sven_admin_alert
+        await notify_sven_admin_alert(
+            kind=f"drive_upload_loop.{tenant_id}",
+            message=(
+                f"⚠️ <b>Drive-Uploads schlagen fehl</b>\n\n"
+                f"Tenant: <code>{tenant_id}</code>\n"
+                f"Failures in 1h: <b>{count}</b>\n"
+                f"Letzter Fehler: <code>{last_reason[:200]}</code>\n"
+                f"Letzter Kunde: <code>{kunde_name[:80]}</code>"
+            ),
+            details={
+                "tenant_id": str(tenant_id),
+                "failure_count": count,
+                "last_reason": last_reason[:500],
+            },
+        )
+    except Exception as exc:
+        logger.warning(f"Sven-Alert (drive_upload_loop) failed: {exc}")
+
+    # Tenant-Push: hat eigenes Cooldown via tenant_alert
+    try:
+        from core.integrations.tenant_alert import (
+            _send_alert, _record_alert, _was_recently_alerted,
+        )
+        kind = "drive_upload_loop"
+        if await _was_recently_alerted(tenant_id=tenant_id, alert_kind=kind):
+            return
+        msg = (
+            "⚠️ <b>Drive-Uploads gehen nicht durch</b>\n\n"
+            "Die letzten 5 Datei-Uploads sind fehlgeschlagen. Bitte einmal "
+            "den Drive-Status pruefen und bei Bedarf neu verbinden:\n\n"
+            "<code>/drive_status</code>\n"
+            "<code>/drive_verbinden</code>"
+        )
+        sent = await _send_alert(tenant_id=tenant_id, message=msg)
+        await _record_alert(
+            tenant_id=tenant_id, alert_kind=kind, success=sent,
+            details={"failure_count": count},
+        )
+    except Exception as exc:
+        logger.warning(f"Tenant-Alert (drive_upload_loop) failed: {exc}")
+
+
 def _slugify_kunde(name: str) -> str:
     """'Müller-Bauunternehmen GmbH' -> 'mueller-bauunternehmen-gmbh'."""
     s = (name or "").strip().lower()
@@ -329,26 +385,47 @@ async def upload_file_to_kunde_folder(
             'upload_count': int,  # neu nach Inkrement
         }
     Raises bei Fehlern (Caller fängt + meldet im Telegram).
+
+    Failure-Counter (Phase-A A4): wenn 5 Uploads pro Tenant in einer
+    Stunde fehlschlagen, geht ein Sven-Alert UND eine Tenant-Push-
+    Notification raus. Bei Erfolg wird der Counter zurueckgesetzt.
     """
-    folder_id, folder_url = await get_or_create_kunde_folder(
-        tenant_id, kunde_name, employee_id=employee_id,
-    )
+    from core.integrations.failure_counter import DRIVE_UPLOAD_FAILURES
 
-    service = await get_drive_service(tenant_id, employee_id)
-
-    from googleapiclient.http import MediaIoBaseUpload
-
-    def _sync_upload():
-        media = MediaIoBaseUpload(
-            io.BytesIO(file_bytes), mimetype=mime_type, resumable=False,
+    try:
+        folder_id, folder_url = await get_or_create_kunde_folder(
+            tenant_id, kunde_name, employee_id=employee_id,
         )
-        meta = {"name": filename[:200], "parents": [folder_id]}
-        return service.files().create(
-            body=meta, media_body=media,
-            fields="id, webViewLink, name",
-        ).execute()
 
-    uploaded = await asyncio.to_thread(_sync_upload)
+        service = await get_drive_service(tenant_id, employee_id)
+
+        from googleapiclient.http import MediaIoBaseUpload
+
+        def _sync_upload():
+            media = MediaIoBaseUpload(
+                io.BytesIO(file_bytes), mimetype=mime_type, resumable=False,
+            )
+            meta = {"name": filename[:200], "parents": [folder_id]}
+            return service.files().create(
+                body=meta, media_body=media,
+                fields="id, webViewLink, name",
+            ).execute()
+
+        uploaded = await asyncio.to_thread(_sync_upload)
+        # Erfolg — Failure-Window fuer diesen Tenant zuruecksetzen.
+        DRIVE_UPLOAD_FAILURES.reset(key=str(tenant_id))
+    except Exception as exc:
+        # Failure-Counter aktualisieren + ggf. Alert ausloesen.
+        should_alert, count = DRIVE_UPLOAD_FAILURES.record_failure(
+            key=str(tenant_id), reason=f"{type(exc).__name__}: {exc}",
+        )
+        if should_alert:
+            await _fire_drive_upload_alert(
+                tenant_id=tenant_id, count=count, last_reason=str(exc)[:200],
+                kunde_name=kunde_name,
+            )
+        # Original-Exception weitergeben — Caller meldet im Telegram.
+        raise
 
     # upload_count + last_upload_at hochzaehlen
     new_count = 0

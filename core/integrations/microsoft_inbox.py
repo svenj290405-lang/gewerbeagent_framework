@@ -265,11 +265,47 @@ async def poll_microsoft_inbox(
             classification = cls_result.get("classification") or "UNSICHER"
             confidence = cls_result.get("confidence") or "low"
             reason = cls_result.get("reason") or ""
+            # Erfolg — Failure-Window fuer diesen Tenant zuruecksetzen.
+            try:
+                from core.integrations.failure_counter import (
+                    MAIL_CLASSIFY_FAILURES,
+                )
+                MAIL_CLASSIFY_FAILURES.reset(key=str(tenant_id))
+            except Exception:
+                pass
         except Exception as e:
             logger.warning(f"Klassifikation fehler fuer msg {msg.get('id')}: {e}")
             classification = "UNSICHER"
             confidence = "low"
             reason = f"Fehler: {e}"
+            # Failure-Counter: nach 3 Fehlern pro 24h → Sven-Alert.
+            try:
+                from core.integrations.failure_counter import (
+                    MAIL_CLASSIFY_FAILURES,
+                )
+                should_alert, count = MAIL_CLASSIFY_FAILURES.record_failure(
+                    key=str(tenant_id),
+                    reason=f"{type(e).__name__}: {e}",
+                )
+                if should_alert:
+                    from core.integrations.admin_alerts import (
+                        notify_sven_admin_alert,
+                    )
+                    await notify_sven_admin_alert(
+                        kind=f"mail_classify_dead.{tenant_id}",
+                        message=(
+                            f"⚠️ <b>Mail-Klassifikation faellt aus</b>\n\n"
+                            f"Tenant: <code>{tenant.slug}</code>\n"
+                            f"Failures in 24h: <b>{count}</b>\n"
+                            f"Letzter Fehler: <code>{str(e)[:200]}</code>"
+                        ),
+                        details={
+                            "tenant_id": str(tenant_id),
+                            "failure_count": count,
+                        },
+                    )
+            except Exception as exc:
+                logger.debug(f"mail_classify_failure_counter ignored: {exc}")
 
         classified_counts[classification] = classified_counts.get(classification, 0) + 1
 

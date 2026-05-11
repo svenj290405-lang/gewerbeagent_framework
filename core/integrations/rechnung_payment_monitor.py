@@ -207,7 +207,7 @@ async def check_pending_invoices_for_tenant(
     return summary
 
 
-async def cleanup_stale_creating_rechnungen(stale_minutes: int = 5) -> int:
+async def cleanup_stale_creating_rechnungen(stale_minutes: int = 3) -> int:
     """Findet Rechnungen die seit > stale_minutes auf Status 'creating'
     haengen — Container-Restart oder unbeantworteter Lexware-Call hat
     sie verwaist. Setzt sie auf 'error' damit der Tenant den Wizard

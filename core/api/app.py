@@ -32,6 +32,7 @@ from core.integrations.rechnung_paid_summary import (
     cron_loop as rechnung_paid_summary_cron_loop,
 )
 from core.integrations.dsgvo_cleanup_cron import cron_loop as dsgvo_cleanup_cron_loop
+from core.integrations.mail_retry_cron import cron_loop as mail_retry_cron_loop
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(
@@ -62,7 +63,11 @@ async def lifespan(app: FastAPI):
 
         dsgvo_task = asyncio.create_task(dsgvo_cleanup_cron_loop())
         logger.info("DSGVO-Cleanup-Cron (taegl. 03:00) gestartet")
-        cron_tasks = (cron_task, payment_task, summary_task, dsgvo_task)
+
+        mail_retry_task = asyncio.create_task(mail_retry_cron_loop())
+        logger.info("Mail-Retry-Cron (alle 5 Min) gestartet")
+
+        cron_tasks = (cron_task, payment_task, summary_task, dsgvo_task, mail_retry_task)
     else:
         logger.warning(
             "Cron-Loops deaktiviert (environment=%s, dev_cron_disabled=%s)",
@@ -79,6 +84,25 @@ async def lifespan(app: FastAPI):
             await t
         except asyncio.CancelledError:
             pass
+
+    # Shutdown-Hook: alle Rechnungen die noch in Status 'creating' haengen
+    # auf 'error' setzen. Sonst kann der Tenant beim naechsten Restart
+    # ewig auf die "wird erstellt..."-Meldung warten. Failsafe — keine
+    # Exception darf den Shutdown stoeren.
+    try:
+        from core.integrations.rechnung_payment_monitor import (
+            cleanup_stale_creating_rechnungen,
+        )
+        # stale_minutes=0 = ALLE creating-Rechnungen sofort auf error.
+        recovered = await cleanup_stale_creating_rechnungen(stale_minutes=0)
+        if recovered > 0:
+            logger.warning(
+                "Shutdown-Hook: %d 'creating'-Rechnungen auf 'error' "
+                "gesetzt (Container-Restart)", recovered,
+            )
+    except Exception as e:
+        logger.warning("Shutdown-Hook (creating-Cleanup) fehler: %s", e)
+
     logger.info("Framework faehrt runter.")
 
 
