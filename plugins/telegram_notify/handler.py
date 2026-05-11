@@ -335,12 +335,53 @@ async def _load_global_bot_token():
             return None
         return (tc.config or {}).get("bot_token") or None
 
+# Telegram limitiert eine Bot-Message auf 4096 Zeichen. Wir nehmen 3900
+# als sichere Schwelle (Reserve fuer Markup-Overhead).
+TELEGRAM_MAX_MESSAGE_LEN = 3900
+
+
+def _split_message_safely(text: str, max_len: int = TELEGRAM_MAX_MESSAGE_LEN) -> list[str]:
+    """Teilt eine zu lange Message in mehrere Stuecke.
+
+    Splittet bevorzugt an Block-Grenzen (\\n\\n), Fallback auf Zeilen-
+    Grenzen, Worst-Case auf max_len-Bytes. Bewusst NICHT mitten in
+    HTML-Tags — wir splitten nur an Whitespace damit `<b>...</b>`
+    geschlossen bleiben (wir haengen Tags nicht ueber Splits).
+    """
+    if len(text) <= max_len:
+        return [text]
+    chunks: list[str] = []
+    remaining = text
+    while len(remaining) > max_len:
+        cut = remaining.rfind("\n\n", 0, max_len)
+        if cut == -1:
+            cut = remaining.rfind("\n", 0, max_len)
+        if cut == -1:
+            cut = max_len  # hart abschneiden — sollte praktisch nie passieren
+        chunks.append(remaining[:cut].rstrip())
+        remaining = remaining[cut:].lstrip()
+    if remaining:
+        chunks.append(remaining)
+    return chunks
+
+
 async def _send_to_chat(chat_id, text, bot_token=None):
+    """Sendet Text an einen Telegram-Chat. Bei > 3900 Zeichen wird
+    automatisch in mehrere Messages aufgeteilt — sonst antwortet die
+    Bot-API mit HTTP 400 "message is too long"."""
     if bot_token is None:
         bot_token = await _load_global_bot_token()
         if bot_token is None:
             return False
-    return await TelegramNotifier._send_raw(bot_token, str(chat_id), text)
+    text_str = str(text)
+    chunks = _split_message_safely(text_str)
+    if len(chunks) == 1:
+        return await TelegramNotifier._send_raw(bot_token, str(chat_id), chunks[0])
+    ok_all = True
+    for chunk in chunks:
+        ok = await TelegramNotifier._send_raw(bot_token, str(chat_id), chunk)
+        ok_all = ok_all and bool(ok)
+    return ok_all
 
 async def _handle_start_command(text, chat_id, from_data):
     parts = text.split(maxsplit=1)
@@ -470,21 +511,26 @@ async def _handle_help_command(chat_id=None):
     if _is_on("voice_init"):
         kunden_items.append((
             "/aufnahme",
-            "Sprach-Aufnahme analysieren. Optional Lexware-Angebot erstellen.",
+            "Sprachnachricht zum Kundengespraech schicken — Bot "
+            "transkribiert, extrahiert Kunde + Anliegen und legt "
+            "optional ein Lexware-Angebot an.",
         ))
         kunden_items.append((
             "/anrufe",
-            "Letzte Anrufe + KI-Zusammenfassungen.",
+            "Letzte eingehende Anrufe mit KI-Zusammenfassung und "
+            "erkannten Kunden-Daten.",
         ))
     if _is_on("kalender"):
         kunden_items.append((
             "/briefing",
-            "Briefing zum naechsten Termin (Kontext + Anfahrt).",
+            "Briefing zum naechsten Termin: Kunde, relevantes "
+            "Wissen, Anfahrtszeit.",
         ))
     # /kunde ist always_on (kunde_lookup-Feature)
     kunden_items.append((
         "/kunde [name]",
-        "Kundenhistorie: Gespraeche, Termine, Drive-Link.",
+        "Kundenhistorie: alle Gespraeche, Termine und "
+        "Drive-Ordner-Link.",
     ))
     _block("📞", "Kundengespraeche", kunden_items)
 
@@ -492,109 +538,124 @@ async def _handle_help_command(chat_id=None):
     if _is_on("lexware"):
         _block("💰", "Buchhaltung — Belege & Rechnungen", [
             ("/beleg",
-             "Foto/PDF vom Beleg schicken — geht an Lexware."),
+             "Beleg-Foto oder PDF schicken — wird als Buchungsbeleg "
+             "in Lexware angelegt."),
             ("/belege_anzeigen",
-             "Letzte 10 Belege + Status."),
+             "Letzte 10 Belege mit Datum, Betrag und Sync-Status."),
             ("/rechnung",
-             "Rechnung diktieren (Text/Sprache) → Lexware-Draft."),
+             "Rechnung per Text oder Sprache diktieren — Bot baut "
+             "einen Lexware-Draft zum Abnicken."),
             ("/rechnungen_anzeigen",
-             "Offene + bezahlte Rechnungen mit Status."),
+             "Offene + bezahlte Rechnungen mit Bezahl-Status."),
             ("/rechnung_pruefen",
-             "Bezahl-Status sofort gegen Lexware abgleichen."),
+             "Bezahl-Status der offenen Rechnungen sofort gegen "
+             "Lexware abgleichen."),
             ("/leistungen",
-             "Leistungskatalog (Stundensaetze, Pauschalen)."),
+             "Leistungskatalog (Stundensaetze, Pauschalen, Pakete) "
+             "anzeigen."),
             ("/leistung [name]",
-             "Detail einer Leistung."),
+             "Detail einer Leistung: Preis, Einheit, Beschreibung."),
             ("/leistung_neu",
-             "Neue Leistung anlegen (Wizard)."),
+             "Neue Leistung anlegen (Wizard: Name → Preis → "
+             "Beschreibung)."),
             ("/leistung_loeschen [name]",
-             "Leistung entfernen."),
+             "Leistung aus dem Katalog entfernen."),
             ("/lexware_setup",
-             "Lexware-API-Token hinterlegen (einmalig)."),
+             "Lexware-API-Token hinterlegen (einmalig pro Tenant)."),
             ("/lexware_status",
-             "Lexware-Verbindung pruefen."),
+             "Lexware-Verbindung + letzte Sync-Zeit pruefen."),
         ])
 
     # --- Material ---
     if _is_on("material"):
         _block("🛒", "Material-Bestellungen", [
             ("/material",
-             "Verbrauchsmaterial-Katalog mit Schnell-Order-Buttons."),
+             "Verbrauchsmaterial-Katalog mit Inline-Buttons fuer "
+             "Schnellbestellung."),
             ("/material [name]",
-             "Detail-Ansicht eines Artikels."),
+             "Artikel-Detail: Lieferant, Preis, Bestell-Link."),
             ("/material_neu",
-             "Neuen Artikel anlegen (Wizard mit Lieferant + Link)."),
+             "Neuen Artikel anlegen (Wizard: Name → Lieferant → "
+             "Link)."),
             ("/bestellen [name]",
-             "Quick-Order mit Mengen-Eingabe."),
+             "Quick-Order mit Mengen-Eingabe; Bestellung wird "
+             "gespeichert."),
             ("/bestellungen",
-             "Letzte Bestellungen + Status."),
+             "Letzte Bestellungen mit Datum und Status."),
         ])
 
     # --- Wissensbasis ---
     if _is_on("wissensbasis"):
         _block("📚", "Wissensbasis", [
             ("/wissen",
-             "Neuen Eintrag (Anfahrt / Leistungen / FAQ / Allgemein)."),
+             "Eintrag anlegen — Kategorien: Anfahrt, Leistungen, "
+             "FAQ, Allgemein."),
             ("/wissen_anzeigen",
-             "Alle Eintraege gruppiert."),
+             "Alle Eintraege gruppiert nach Kategorie."),
             ("/wissen_loeschen",
-             "Eintrag entfernen."),
+             "Einen Eintrag entfernen."),
         ])
 
     # --- Kalkulations-Engine ---
     if _is_on("kalkulation"):
         _block("🧮", "Kalkulation (fuer Angebote)", [
             ("/kalkulation",
-             "Neue Formel (z.B. m²-Preis, Pauschale + Aufschlag)."),
+             "Neue Formel anlegen — z.B. m²-Preis, Pauschale, "
+             "Aufschlag-%."),
             ("/kalkulation_anzeigen",
-             "Alle Formeln."),
+             "Alle Formeln gruppiert nach Kategorie."),
             ("/kalkulation_loeschen",
-             "Formel entfernen."),
+             "Eine Formel entfernen."),
             ("/kalkulation_excel",
-             "Formel-Set aus .xlsx importieren."),
+             "Formel-Set aus .xlsx-Datei importieren."),
         ])
 
     # --- Anfrage-Formular ---
     if _is_on("anfrage_formular"):
         _block("📋", "Web-Anfrageformular", [
             ("/formular",
-             "Felder bearbeiten + Vorschau."),
+             "Felder bearbeiten — hinzufuegen, loeschen, "
+             "Live-Vorschau."),
             ("/formular_anzeigen",
-             "Aktuelles Schema."),
+             "Aktuelles Schema mit allen Feldern + Pflichtangaben."),
             ("/formular_zuruecksetzen",
-             "Auf Tischler-/Allgemein-Default zuruecksetzen."),
+             "Auf Tischler- oder Allgemein-Default zuruecksetzen."),
         ])
 
     # --- Visualisierung ---
     if _is_on("visualisierung"):
         _block("🎨", "Visualisierung", [
             ("/visualisierung",
-             "Foto + Beschreibung → KI-Rendering. "
-             "Optional an Kunden mailen oder ins Archiv legen."),
+             "Foto + Text-Beschreibung schicken → photorealistisches "
+             "KI-Rendering. Danach an Kunden mailen, ins "
+             "Drive-Archiv legen oder verwerfen."),
         ])
 
     # --- Kunden-Archiv (Drive) ---
     if _is_on("drive_archiv"):
         _block("☁️", "Kunden-Archiv (Google Drive)", [
             ("/drive_verbinden",
-             "Google-Drive verknuepfen (OAuth)."),
+             "Google-Drive mit dem Tenant verknuepfen (OAuth-Flow)."),
             ("/drive_status",
-             "Status der Drive-Verbindung."),
+             "Drive-Verbindung + verknuepfter Account."),
             ("/archiv [kunde]",
-             "Datei-Upload starten — landet im Kunden-Ordner."),
+             "Datei-Upload starten — Fotos und PDFs landen "
+             "automatisch im Kunden-Ordner."),
             ("/fertig",
-             "Archiv-Upload abschliessen (nur im Wizard)."),
+             "Archiv-Upload abschliessen (nur im laufenden "
+             "/archiv-Wizard)."),
         ])
 
     # --- Mail-Inbox (mail_intake) ---
     if _is_on("mail_intake"):
         _block("📨", "Mail-Inbox (Outlook)", [
             ("/microsoft_setup",
-             "Outlook-Postfach verbinden (OAuth)."),
+             "Outlook-Postfach via Microsoft-OAuth verbinden."),
             ("/microsoft_status",
-             "Konfiguration + letzter Polling-Zyklus."),
+             "Konfigurierter Account + letzter Polling-Zyklus."),
             ("/microsoft_check",
-             "Inbox sofort einmalig abrufen."),
+             "Inbox sofort einmal abrufen (statt 2-min-Cron zu "
+             "warten)."),
         ])
 
     # --- Setup (Kalender + Standort + Mitarbeiter) ---
@@ -602,34 +663,40 @@ async def _handle_help_command(chat_id=None):
     if _is_on("kalender"):
         setup_items.append((
             "/kalender_verbinden",
-            "Google- oder Outlook-Kalender verknuepfen (OAuth).",
+            "Google- oder Outlook-Kalender via OAuth verknuepfen.",
         ))
         setup_items.append((
             "/kalender_status",
-            "Welcher Kalender ist verknuepft.",
+            "Welcher Kalender ist mit welchem Account verknuepft.",
         ))
     if _is_on("werkstatt"):
         setup_items.append((
             "/werkstatt",
-            "Heimat-Adresse fuer Smart-Termin-Routing.",
+            "Heimat-Adresse setzen — Basis fuer Fahrtzeit-aware "
+            "Termin-Vorschlaege.",
         ))
         setup_items.append((
             "/werkstatt_status",
-            "Aktuelle Adresse anzeigen.",
+            "Aktuell hinterlegte Adresse + Koordinaten.",
         ))
     if _is_on("mitarbeiter"):
         setup_items.append((
             "/mitarbeiter",
-            "Mitarbeiter anlegen — eigener Chat, eigener Kalender.",
+            "Mitarbeiter anlegen — eigener Telegram-Chat, eigener "
+            "Kalender, eigene Skills.",
         ))
     _block("⚙️", "Setup", setup_items)
 
     # --- Sonstiges (always-on) ---
     _block("ℹ️", "Sonstiges", [
-        ("/paket", "Aktuelles Paket + aktive Features."),
-        ("/status", "Tenant-Status (Slug, Aktivierung)."),
-        ("/abbrechen", "Laufenden Wizard sofort beenden."),
-        ("/help", "Diese Uebersicht."),
+        ("/paket",
+         "Aktuelles Paket + Liste der aktivierten Features."),
+        ("/status",
+         "Tenant-Slug und Aktivierungs-Status."),
+        ("/abbrechen",
+         "Laufenden Wizard oder State sofort beenden."),
+        ("/help",
+         "Diese Befehlsuebersicht."),
     ])
 
     lines.append("")
