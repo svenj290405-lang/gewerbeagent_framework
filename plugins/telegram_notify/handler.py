@@ -496,6 +496,7 @@ async def _handle_help_command(chat_id=None):
         return feature_key in enabled_features
 
     lines: list[str] = ["<b>📋 Befehle</b>"]
+    locked_block_count = 0  # fuer kontext-sensitiven Footer-Hinweis
 
     def _block(
         emoji: str, title: str, items: list[tuple[str, str]],
@@ -515,10 +516,13 @@ async def _handle_help_command(chat_id=None):
         ein und Telegram interpretiert nur das erste Wort als Command
         — wir wollen aber dass der Link das ganze '/cmd' umfasst.
         """
+        nonlocal locked_block_count
         if not items:
             return
         lines.append("")
         lock_marker = "  🔒" if locked else ""
+        if locked:
+            locked_block_count += 1
         lines.append(f"{emoji} <b>{title}</b>{lock_marker}")
         for cmd, desc in items:
             # Command + Args trennen damit nur der echte Slash-Command
@@ -736,8 +740,13 @@ async def _handle_help_command(chat_id=None):
     ])
 
     lines.append("")
-    lines.append("<i>🔒 = nicht in deinem Paket — Upgrade via "
-                 "hallo@gewerbeagent.de. Aktuelle Features: /paket</i>")
+    if locked_block_count > 0:
+        # Footer mit Lock-Erklaerung nur wenn auch wirklich Locks gerendert
+        # wurden — sonst verwirrt's mehr als es hilft.
+        lines.append("<i>🔒 = nicht in deinem Paket — Upgrade via "
+                     "hallo@gewerbeagent.de. Aktuelle Features: /paket</i>")
+    else:
+        lines.append("<i>Alle Features aktiv. Hilfe: hallo@gewerbeagent.de</i>")
     return "\n".join(lines)
 
 
