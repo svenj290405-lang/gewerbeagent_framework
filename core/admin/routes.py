@@ -824,6 +824,45 @@ async def tenant_features_page(
     })
 
 
+@router.post("/tenants/{tenant_id}/retention")
+async def tenant_set_retention(
+    request: Request,
+    tenant_id: str,
+    data_retention_days: int = Form(...),
+    csrf_token: str = Form(...),
+    user: AdminUser = Depends(require_admin),
+):
+    """Phase B4: data_retention_days fuer Tenant aendern.
+
+    Range 7-365. dsgvo_cleanup_cron nimmt den Wert beim naechsten 03:00-
+    Tick auf — kein Restart noetig.
+    """
+    require_csrf(request, csrf_token)
+    if data_retention_days < 7 or data_retention_days > 365:
+        raise HTTPException(400, "Retention muss zwischen 7 und 365 Tagen liegen")
+    try:
+        tid = uuid.UUID(tenant_id)
+    except ValueError:
+        raise HTTPException(404, "Tenant nicht gefunden")
+    async with get_session() as s:
+        tenant = (await s.execute(
+            select(Tenant).where(Tenant.id == tid)
+        )).scalar_one_or_none()
+        if not tenant:
+            raise HTTPException(404, "Tenant nicht gefunden")
+        old = tenant.data_retention_days
+        tenant.data_retention_days = data_retention_days
+        await audit(
+            user_id=user.id, action="tenant.retention.update",
+            target=tenant.slug, request=request, session=s,
+            details={"old": old, "new": data_retention_days},
+        )
+        await s.commit()
+    return RedirectResponse(
+        f"/admin/tenants/{tenant_id}", status_code=303,
+    )
+
+
 @router.post("/tenants/{tenant_id}/features/package")
 async def tenant_features_apply_package(
     request: Request,

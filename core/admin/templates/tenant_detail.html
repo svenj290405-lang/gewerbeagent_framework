@@ -26,6 +26,25 @@
     </div>
 </div>
 
+<div class="section-title">DSGVO-Retention</div>
+<form method="post"
+      action="/admin/tenants/{{ tenant.id }}/retention"
+      style="display:flex; gap:8px; align-items:center; margin-bottom:24px;">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <label style="font-size:13px;color:var(--ink-muted);">
+        Mail-Konversationen loeschen nach
+    </label>
+    <input type="number" name="data_retention_days"
+           value="{{ tenant.data_retention_days }}"
+           min="7" max="365"
+           style="width:80px; padding:6px 8px; border:1px solid var(--border); border-radius:6px;">
+    <span style="font-size:13px;color:var(--ink-muted);">Tagen</span>
+    <button type="submit" class="btn">Speichern</button>
+    <small style="margin-left:auto;color:var(--ink-muted);">
+        Range 7–365. Default 90.
+    </small>
+</form>
+
 <div class="stats-grid">
     <div class="stat-card">
         <div class="stat-label">Kontakt</div>

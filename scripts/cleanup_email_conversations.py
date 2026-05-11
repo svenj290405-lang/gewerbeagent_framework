@@ -31,33 +31,46 @@ logger = logging.getLogger("cleanup")
 DEFAULT_RETENTION_DAYS = 14
 
 
-async def cleanup(retention_days: int, execute: bool) -> int:
+async def cleanup(
+    retention_days: int, execute: bool,
+    *,
+    tenant_id=None,
+) -> int:
+    """Loescht Konversationen.
+
+    Phase B4: optional tenant_id, dann nur Konversationen DIESES Tenants.
+    Default (None) = alle Tenants (Cli-Kompatibilitaet, Backfill-Lauf).
+    """
     cutoff = dt.date.today() - dt.timedelta(days=retention_days)
     cutoff_dt = dt.datetime.combine(cutoff, dt.time.min, tzinfo=dt.timezone.utc)
 
     async with AsyncSessionLocal() as s:
-        result = await s.execute(
-            select(EmailConversation).where(
-                (EmailConversation.termin_datum != None)  # noqa: E711
-                & (EmailConversation.termin_datum < cutoff)
-            )
+        stmt = select(EmailConversation).where(
+            (EmailConversation.termin_datum != None)  # noqa: E711
+            & (EmailConversation.termin_datum < cutoff)
         )
+        if tenant_id is not None:
+            stmt = stmt.where(EmailConversation.tenant_id == tenant_id)
+        result = await s.execute(stmt)
         per_termin = list(result.scalars())
 
-        result = await s.execute(
-            select(EmailConversation).where(
-                (EmailConversation.termin_datum.is_(None))
-                & (EmailConversation.state == STATE_CLOSED)
-                & (EmailConversation.updated_at < cutoff_dt)
-            )
+        stmt = select(EmailConversation).where(
+            (EmailConversation.termin_datum.is_(None))
+            & (EmailConversation.state == STATE_CLOSED)
+            & (EmailConversation.updated_at < cutoff_dt)
         )
+        if tenant_id is not None:
+            stmt = stmt.where(EmailConversation.tenant_id == tenant_id)
+        result = await s.execute(stmt)
         per_updated = list(result.scalars())
 
         candidates = {c.id: c for c in per_termin}
         candidates.update({c.id: c for c in per_updated})
 
+        scope = f" tenant={tenant_id}" if tenant_id else ""
         logger.info(
-            f"Cutoff-Datum: {cutoff.isoformat()} (heute - {retention_days} Tage)"
+            f"Cutoff-Datum: {cutoff.isoformat()} "
+            f"(heute - {retention_days} Tage){scope}"
         )
         logger.info(f"Kandidaten zum Loeschen: {len(candidates)}")
 

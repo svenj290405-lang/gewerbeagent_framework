@@ -33,12 +33,19 @@ from core.integrations.rechnung_paid_summary import (
 )
 from core.integrations.dsgvo_cleanup_cron import cron_loop as dsgvo_cleanup_cron_loop
 from core.integrations.mail_retry_cron import cron_loop as mail_retry_cron_loop
+from core.integrations.db_maintenance_cron import cron_loop as db_maintenance_cron_loop
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(
-    level=settings.log_level,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
+# Phase B1: strukturiertes Logging mit Tenant-/Employee-Context.
+# Ersetzt das frueher genutzte basicConfig — der Filter haengt automatisch
+# tenant + employee an jede Zeile, gefuettert via core.logging_context.
+from core.logging_context import configure_structured_logging
+configure_structured_logging(level=settings.log_level)
+
+# Phase B2: Sentry init (opt-in via SENTRY_DSN env). No-op wenn nicht
+# konfiguriert — kein Boot-Fail moeglich.
+from core.integrations.error_tracking import init_sentry
+init_sentry()
 
 
 @asynccontextmanager
@@ -67,7 +74,13 @@ async def lifespan(app: FastAPI):
         mail_retry_task = asyncio.create_task(mail_retry_cron_loop())
         logger.info("Mail-Retry-Cron (alle 5 Min) gestartet")
 
-        cron_tasks = (cron_task, payment_task, summary_task, dsgvo_task, mail_retry_task)
+        db_maintenance_task = asyncio.create_task(db_maintenance_cron_loop())
+        logger.info("DB-Maintenance-Cron (taegl. 02:00) gestartet")
+
+        cron_tasks = (
+            cron_task, payment_task, summary_task, dsgvo_task,
+            mail_retry_task, db_maintenance_task,
+        )
     else:
         logger.warning(
             "Cron-Loops deaktiviert (environment=%s, dev_cron_disabled=%s)",
@@ -121,6 +134,11 @@ app = FastAPI(
 app.include_router(anfrage_router)
 app.include_router(admin_router)
 mount_admin_static(app)
+
+# Phase B6: Status-Page Routes (/status + /api/status). Oeffentlich
+# erreichbar — Caddy proxy auch von status.gewerbeagent.de hierher.
+from core.api.status_routes import router as status_router
+app.include_router(status_router)
 
 
 # Admin-Redirect-Exception in echten 303-Redirect umwandeln
@@ -179,6 +197,10 @@ async def webhook_dispatch(
     logger.info(
         f"Webhook: tenant={tenant_slug} plugin={plugin_name} endpoint={endpoint}"
     )
+
+    # B1: Tenant-Context fuer alle nachfolgenden Logs in diesem Request
+    from core.logging_context import set_log_tenant
+    set_log_tenant(tenant_slug)  # slug ist genauso gut wie UUID hier
 
     # Plugin fuer diesen Tenant holen
     plugin = await get_plugin_for_tenant(tenant_slug, plugin_name)

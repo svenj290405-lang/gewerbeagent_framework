@@ -83,6 +83,40 @@ def _has_api_key() -> bool:
     return bool((settings.openrouteservice_api_key or "").strip())
 
 
+# 1-pro-Tag-Cooldown fuer den ORS-Quota-Alert (Phase B9). In-Memory
+# reicht — bei Container-Restart wuerde der Alert moeglicherweise ein
+# zweites Mal kommen, das ist akzeptabel.
+_ORS_LAST_QUOTA_ALERT: datetime | None = None
+
+
+async def _maybe_alert_quota_exhausted() -> None:
+    """Sven warnen wenn ORS-Free-Tier (2000/Tag) erschoepft ist.
+
+    Cooldown 24h — der Alert braucht keine 5-Sekunden-Praezision, einmal
+    pro Tag reicht (Quota resettet auch nur einmal/Tag).
+    """
+    global _ORS_LAST_QUOTA_ALERT
+    now = datetime.now(timezone.utc)
+    if _ORS_LAST_QUOTA_ALERT and (now - _ORS_LAST_QUOTA_ALERT).total_seconds() < 24 * 3600:
+        return
+    _ORS_LAST_QUOTA_ALERT = now
+    try:
+        from core.integrations.admin_alerts import notify_sven_admin_alert
+        await notify_sven_admin_alert(
+            kind="ors_quota_exhausted",
+            message=(
+                "⚠️ <b>OpenRouteService Quota erschoepft</b>\n\n"
+                "ORS antwortet mit HTTP 429 (Free-Tier 2000/Tag).\n"
+                "Smart-Routing pausiert bis morgen — Slot-Vorschlaege "
+                "kommen weiterhin, aber ohne Fahrtzeit.\n\n"
+                "Upgrade: <code>openrouteservice.org/plans</code>"
+            ),
+            cooldown_hours=24,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"ORS-Quota-Alert ignored: {exc}")
+
+
 # ---------------------------------------------------------------------------
 # Geocoding
 # ---------------------------------------------------------------------------
@@ -146,6 +180,10 @@ async def geocode_address(
             f"ORS-Geocode HTTP {exc.response.status_code}: "
             f"{exc.response.text[:200]}"
         )
+        # 429 = Free-Tier-Quota erschoepft (2000/Tag). Sven warnen,
+        # damit er entweder den Tag aussitzen oder upgraden kann.
+        if exc.response.status_code == 429:
+            await _maybe_alert_quota_exhausted()
         return None
     except Exception as exc:  # noqa: BLE001
         logger.warning(f"ORS-Geocode crash: {exc}")
@@ -227,6 +265,8 @@ async def travel_time_minutes(
             f"ORS-Matrix HTTP {exc.response.status_code}: "
             f"{exc.response.text[:200]}"
         )
+        if exc.response.status_code == 429:
+            await _maybe_alert_quota_exhausted()
         return None
     except Exception as exc:  # noqa: BLE001
         logger.warning(f"ORS-Matrix crash: {exc}")
@@ -275,6 +315,8 @@ async def travel_time_matrix(
             f"ORS-Matrix HTTP {exc.response.status_code}: "
             f"{exc.response.text[:200]}"
         )
+        if exc.response.status_code == 429:
+            await _maybe_alert_quota_exhausted()
         return None
     except Exception as exc:  # noqa: BLE001
         logger.warning(f"ORS-Matrix crash: {exc}")

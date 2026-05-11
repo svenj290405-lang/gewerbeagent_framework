@@ -102,6 +102,13 @@ class Tenant(Base):
         String(20), nullable=False, server_default="pro", default="pro",
     )
 
+    # DSGVO-Retention in Tagen. Steuert dsgvo_cleanup_cron.
+    # Range: 7-365 (sanftes Limit im Admin-Form). Default 90.
+    # Phase B4: bisher globaler RETENTION_DAYS=14 — jetzt pro Tenant.
+    data_retention_days: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="90", default=90,
+    )
+
     # --- Relationships ---
 
     # Alle ToolConfigs dieses Tenants (automatisch geladen)

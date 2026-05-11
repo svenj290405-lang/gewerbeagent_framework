@@ -30,6 +30,7 @@ EXPECTED_CRONS = {
     "rechnung_paid_summary": 5,    # Tick jede Minute, Toleranz 5
     "dsgvo_cleanup": 5,            # Tick jede Minute (wartet bis 03:00)
     "mail_retry_cron": 10,         # Tick alle 5min, Toleranz 10
+    "db_maintenance_cron": 5,      # Tick jede Minute (wartet bis 02:00)
 }
 
 
