@@ -33,6 +33,7 @@ RECHNUNG_STATUS_EXTRACTING = "extracting"      # Gemini-Call laeuft
 RECHNUNG_STATUS_PREVIEWING = "previewing"      # Vorschau angezeigt, wartet auf Best.
 RECHNUNG_STATUS_CREATING = "creating"          # Lexware-Call laeuft
 RECHNUNG_STATUS_DRAFTED = "drafted"            # Draft in Lexware fertig
+RECHNUNG_STATUS_MAIL_QUEUED = "mail_queued"    # Brevo failed → Retry-Queue
 RECHNUNG_STATUS_MAIL_SENT = "mail_sent"        # PDF per Mail an Kunde verschickt
 RECHNUNG_STATUS_BEZAHLT = "bezahlt"            # Lexware hat voucherStatus=paid gemeldet
 RECHNUNG_STATUS_ERROR = "error"

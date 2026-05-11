@@ -59,6 +59,7 @@ from core.models import (
     STATE_WERKSTATT_CONFIRMING,
     STATE_MITARBEITER_NEU_NAME,
     STATE_MITARBEITER_NEU_SKILLS,
+    STATE_KALENDER_PROVIDER_CHOICE,
     STATE_FORMULAR_TYP_WAEHLEN,
     STATE_FORMULAR_HAUPTMENU,
     STATE_FORMULAR_NEU_NAME,
@@ -4841,6 +4842,12 @@ async def _handle_rechnungen_anzeigen_command(chat_id):
         elif rg.status == RECHNUNG_STATUS_DRAFTED and rg.lexware_invoice_id:
             link = LexwareProvider.invoice_deeplink_view(rg.lexware_invoice_id)
             lines.append(f'• {ts} {kunde} {betrag} <a href="{link}">in Lexware</a>')
+        elif rg.status == "mail_queued":
+            # Phase A5: Mail in Retry-Queue, Cron versucht's noch.
+            lines.append(
+                f'• {ts} {kunde} {betrag} ⏳ Mailversand verzoegert '
+                f'(automatischer Retry)'
+            )
         elif rg.status == RECHNUNG_STATUS_ERROR:
             err = (rg.error_message or "?")[:50]
             lines.append(f'• {ts} {kunde} {betrag} <i>Fehler: {err}</i>')
@@ -5583,21 +5590,92 @@ async def _handle_rechnung_send_mail_now(chat_id, rechnung_id, bot_token):
             logger.warning(f"Tenant-Kopie fehlgeschlagen (nicht kritisch): {e}")
 
     except BrevoError as e:
+        # Phase A5: in Retry-Queue legen statt sofort auf ERROR.
+        # Status='mail_queued' signalisiert dem Tenant "wir versuchen
+        # es im Hintergrund weiter". Cron erledigt 3 Retries; bei
+        # endgueltigem Fehler setzt _on_dead_letter dann den Status
+        # auf ERROR und schickt Push.
+        from core.integrations.mail_retry_cron import enqueue_failed_mail
+        from core.models import (
+            MAIL_TYPE_RECHNUNG, RECHNUNG_STATUS_MAIL_QUEUED,
+        )
         async with AsyncSessionLocal() as s:
             rg = (await s.execute(
                 select(Rechnung).where(Rechnung.id == rechnung_id)
             )).scalar_one_or_none()
             if rg:
-                rg.status = RECHNUNG_STATUS_ERROR
-                rg.error_message = f"Brevo: {str(e)[:400]}"
+                rg.status = RECHNUNG_STATUS_MAIL_QUEUED
+                rg.error_message = f"Brevo (queued): {str(e)[:300]}"
                 await s.commit()
+        await enqueue_failed_mail(
+            tenant_id=tenant.id,
+            mail_type=MAIL_TYPE_RECHNUNG,
+            recipient_email=rg_data["kunde_email"],
+            subject=subject,
+            html_body=html_body,
+            attachments=[{
+                "filename": pdf_filename,
+                "mime_type": "application/pdf",
+                "content_bytes": pdf_bytes,
+            }],
+            from_name=tenant_data["company_name"],
+            to_name=rg_data["kunde_name"],
+            reply_to=tenant_data["contact_email"],
+            reply_to_name=tenant_data["contact_name"],
+            rechnung_id=rechnung_id,
+            last_error=str(e),
+        )
         await _clear_state(chat_id)
-        await _send_to_chat(chat_id, f"Mailversand fehlgeschlagen (HTTP {e.status_code}). Bitte spaeter erneut.")
+        await _send_to_chat(
+            chat_id,
+            f"⚠️ Mail-Versand verzoegert (HTTP {e.status_code}). "
+            f"Wird automatisch in 5 Min nochmal versucht. "
+            f"Status: /rechnungen_anzeigen",
+        )
         return
     except Exception as e:
         logger.exception(f"Mailversand unerwartet fehlgeschlagen: {e}")
+        # Auch hier in die Retry-Queue — bei unbekanntem Fehler ist es
+        # genauso wert nachzuversuchen.
+        try:
+            from core.integrations.mail_retry_cron import enqueue_failed_mail
+            from core.models import (
+                MAIL_TYPE_RECHNUNG, RECHNUNG_STATUS_MAIL_QUEUED,
+            )
+            async with AsyncSessionLocal() as s:
+                rg = (await s.execute(
+                    select(Rechnung).where(Rechnung.id == rechnung_id)
+                )).scalar_one_or_none()
+                if rg:
+                    rg.status = RECHNUNG_STATUS_MAIL_QUEUED
+                    rg.error_message = f"Unbekannt (queued): {str(e)[:300]}"
+                    await s.commit()
+            await enqueue_failed_mail(
+                tenant_id=tenant.id,
+                mail_type=MAIL_TYPE_RECHNUNG,
+                recipient_email=rg_data["kunde_email"],
+                subject=subject,
+                html_body=html_body,
+                attachments=[{
+                    "filename": pdf_filename,
+                    "mime_type": "application/pdf",
+                    "content_bytes": pdf_bytes,
+                }],
+                from_name=tenant_data["company_name"],
+                to_name=rg_data["kunde_name"],
+                reply_to=tenant_data["contact_email"],
+                reply_to_name=tenant_data["contact_name"],
+                rechnung_id=rechnung_id,
+                last_error=str(e),
+            )
+        except Exception as inner:
+            logger.warning(f"enqueue_failed_mail crashed too: {inner}")
         await _clear_state(chat_id)
-        await _send_to_chat(chat_id, "Mailversand fehlgeschlagen. Bitte spaeter erneut.")
+        await _send_to_chat(
+            chat_id,
+            "⚠️ Mailversand fehlgeschlagen. Wird automatisch wiederholt. "
+            "Status: /rechnungen_anzeigen",
+        )
         return
 
     # Status auf mail_sent
