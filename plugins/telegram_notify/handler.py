@@ -887,38 +887,36 @@ async def _collect_setup_status(tenant, employee) -> list[tuple[str, str, str | 
     enabled = await enabled_features_for_tenant(tenant.id)
     items: list[tuple[str, str, str | None]] = []
 
-    # Kalender
+    # Kalender — Provider absichtlich nicht im Label (Google/Microsoft
+    # beide moeglich, Sven will keinen Tech-Namen wo's mehrere gibt).
     if "kalender" in enabled:
         if employee.calendar_provider:
-            label_prov = {"google": "Google", "microsoft": "Outlook"}.get(
-                employee.calendar_provider, employee.calendar_provider,
-            )
-            items.append(("✅", f"Kalender ({label_prov})", None))
+            items.append(("✅", "Kalender", None))
         else:
             items.append(("❌", "Kalender", "/kalender_verbinden"))
 
-    # Mail-Inbox (Outlook) — Token via OAuth
+    # Mail-Postfach — bisher nur Outlook, kuenftig vllt. Gmail.
     if "mail_intake" in enabled:
         ms = await find_oauth_token(tenant.id, "microsoft")
         items.append(
-            ("✅", "Outlook-Postfach", None) if ms
-            else ("❌", "Outlook-Postfach", "/microsoft_setup")
+            ("✅", "Mail-Postfach", None) if ms
+            else ("❌", "Mail-Postfach", "/microsoft_setup")
         )
 
-    # Drive — Google-OAuth-Token muss Drive-Scope haben
+    # Kunden-Archiv (Cloud-Speicher) — bisher Google Drive.
     if "drive_archiv" in enabled:
         try:
             from core.integrations.google_drive import is_drive_configured
             tok = await find_oauth_token(tenant.id, "google", employee.id)
             if tok and is_drive_configured(tok):
-                items.append(("✅", "Kunden-Archiv (Drive)", None))
+                items.append(("✅", "Kunden-Archiv", None))
             elif tok:
-                items.append(("⚠️", "Drive ohne Scope", "/drive_verbinden"))
+                items.append(("⚠️", "Kunden-Archiv (Scope fehlt)", "/drive_verbinden"))
             else:
-                items.append(("❌", "Kunden-Archiv (Drive)", "/drive_verbinden"))
+                items.append(("❌", "Kunden-Archiv", "/drive_verbinden"))
         except Exception:
             logger.exception("drive_archiv-Status-Check fehlgeschlagen")
-            items.append(("•", "Drive (Status unklar)", None))
+            items.append(("•", "Kunden-Archiv (Status unklar)", None))
 
     # Lexware — Token in ToolConfig
     if "lexware" in enabled:
@@ -934,12 +932,12 @@ async def _collect_setup_status(tenant, employee) -> list[tuple[str, str, str | 
                 row and row.enabled and (row.config or {}).get("encrypted_token")
             )
             items.append(
-                ("✅", "Lexware-Buchhaltung", None) if has_token
-                else ("❌", "Lexware-Buchhaltung", "/lexware_setup")
+                ("✅", "Buchhaltung", None) if has_token
+                else ("❌", "Buchhaltung", "/lexware_setup")
             )
         except Exception:
             logger.exception("lexware-Status-Check fehlgeschlagen")
-            items.append(("•", "Lexware (Status unklar)", None))
+            items.append(("•", "Buchhaltung (Status unklar)", None))
 
     # Werkstatt-/Heimat-Adresse
     if "werkstatt" in enabled:
