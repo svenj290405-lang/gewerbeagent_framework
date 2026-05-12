@@ -114,7 +114,14 @@ from core.models.angebot import (
     ANGEBOT_STATUS_IN_LEXWARE,
     ANGEBOT_STATUS_MAIL_SENT,
     ANGEBOT_STATUS_MAIL_QUEUED,
+    ANGEBOT_STATUS_ACCEPTED,
     ANGEBOT_STATUS_RECHNUNG_ERSTELLT,
+    ANGEBOT_STATUS_WORK_IN_PROGRESS,
+    ANGEBOT_STATUS_WORK_DONE,
+    ANGEBOT_STATUS_RECHNUNG_GESENDET,
+    ANGEBOT_STATUS_ABGEBROCHEN,
+    AUFTRAG_LIFECYCLE,
+    AUFTRAG_LIFECYCLE_LABELS,
 )
 from core.models.angebot_position import AngebotPosition
 from core.security import decrypt, encrypt
@@ -622,6 +629,11 @@ async def _handle_help_command(chat_id=None):
              "deine /kalkulation-Formeln an, legt das Angebot in Lexware "
              "an, schickt PDF per Mail an den Kunden und bereitet eine "
              "passende Rechnung als Lexware-Draft vor."),
+            ("/auftraege",
+             "Uebersicht laufender Projekte — pro Auftrag siehst du den "
+             "Lifecycle (Angenommen, Arbeit laeuft, Fertig). Bei 🏁 Fertig "
+             "wird die Rechnung automatisch finalisiert und per Mail "
+             "rausgeschickt."),
             ("/beleg",
              "Beleg-Foto oder PDF schicken — wird als Buchungsbeleg "
              "in Lexware angelegt."),
@@ -1895,6 +1907,8 @@ async def _dispatch_update(payload):
             await _handle_aufnahme_callback(cq_chat_id, cq_data, cq_id, bot_token)
         elif cq_data and cq_data.startswith("angebot:"):
             await _handle_angebot_callback(cq_chat_id, cq_data, cq_id, bot_token)
+        elif cq_data and cq_data.startswith("auftrag:"):
+            await _handle_auftrag_callback(cq_chat_id, cq_data, cq_id, bot_token)
         elif cq_data and cq_data.startswith("leistung:"):
             await _handle_leistung_callback(cq_chat_id, cq_data, cq_id, bot_token)
         elif cq_data and cq_data.startswith("formular:"):
@@ -2145,6 +2159,17 @@ async def _dispatch_update(payload):
         reply = await _handle_aufnahme_command(chat_id)
     elif text == "/angebot":
         reply = await _handle_angebot_command(chat_id)
+    elif text == "/auftraege":
+        await _clear_state(chat_id)
+        reply = await _handle_auftraege_command(chat_id)
+    elif text.startswith("/auftrag_"):
+        # Detail-Ansicht: /auftrag_<8-hex> — sendet Buttons direkt, returnt None
+        await _clear_state(chat_id)
+        id_prefix = text[len("/auftrag_"):].strip().lower()
+        reply_or_none = await _handle_auftrag_show_command(chat_id, id_prefix)
+        if reply_or_none is None:
+            return {"ok": True}
+        reply = reply_or_none
     elif text == "/formular":
         reply = await _handle_formular_command(chat_id)
     elif text == "/formular_anzeigen":
@@ -5886,7 +5911,9 @@ async def _run_angebot_pipeline(angebot_id) -> str:
             "Du kannst das Angebot manuell aus Lexware verschicken."
         )
 
-    # Stufe 3: Auto-Rechnung als Lexware-Draft mit den gleichen Positionen
+    # Stufe 3: Auto-Rechnung als Lexware-Draft mit den gleichen Positionen.
+    # Bleibt bewusst im Draft-Status — wird erst beim /auftraege-Schritt
+    # "Fertig" finalisiert + per Mail an den Kunden geschickt.
     try:
         invoice = await provider.create_invoice_draft(
             line_items=line_items,
@@ -5898,6 +5925,7 @@ async def _run_angebot_pipeline(angebot_id) -> str:
             ),
             remark="Bitte begleichen Sie den Rechnungsbetrag innerhalb von 14 Tagen.",
             tax_type="gross",
+            finalize=False,
         )
     except Exception as exc:
         logger.exception(f"Auto-Rechnung-Draft gescheitert: {exc}")
@@ -5910,11 +5938,426 @@ async def _run_angebot_pipeline(angebot_id) -> str:
             ang = (await s.execute(
                 select(Angebot).where(Angebot.id == angebot_id)
             )).scalar_one()
+            ang.lexware_invoice_id = invoice.invoice_id
             ang.status = ANGEBOT_STATUS_RECHNUNG_ERSTELLT
             await s.commit()
         report.append(
             f"✅ Rechnungs-Draft in Lexware bereit — "
-            f"<a href=\"{invoice.deeplink_edit}\">finalisieren + versenden</a>"
+            f"<a href=\"{invoice.deeplink_edit}\">in Lexware oeffnen</a>"
+        )
+        report.append(
+            "\n<i>Naechste Schritte siehst du in /auftraege — "
+            "dort kannst du den Status setzen und am Ende mit einem Tap "
+            "die Rechnung rausschicken.</i>"
+        )
+
+    return "\n".join(report)
+
+
+# =====================================================================
+# /auftraege — Uebersicht laufender Projekte, Status-Setzen, Rechnungs-
+# Versand bei "Fertig"
+# =====================================================================
+
+# Stati die als "laufende Auftraege" angezeigt werden — alles ab
+# rechnung_erstellt (Angebot raus + Invoice-Draft bereit) bis
+# rechnung_gesendet (Rechnung beim Kunden).
+_AUFTRAG_ACTIVE_STATI = {
+    ANGEBOT_STATUS_RECHNUNG_ERSTELLT,
+    ANGEBOT_STATUS_ACCEPTED,
+    ANGEBOT_STATUS_WORK_IN_PROGRESS,
+    ANGEBOT_STATUS_WORK_DONE,
+    ANGEBOT_STATUS_RECHNUNG_GESENDET,
+}
+
+
+def _auftrag_progress_line(status: str) -> str:
+    """Visuelle Fortschritts-Anzeige — ✓ fuer erledigte Schritte, ▸ fuer
+    den aktuellen, ─ fuer noch offene."""
+    if status not in AUFTRAG_LIFECYCLE:
+        return AUFTRAG_LIFECYCLE_LABELS.get(status, status)
+    current_idx = AUFTRAG_LIFECYCLE.index(status)
+    parts = []
+    for i, s in enumerate(AUFTRAG_LIFECYCLE):
+        label = AUFTRAG_LIFECYCLE_LABELS.get(s, s).split(" ", 1)
+        symbol = label[0]  # nur das Emoji als Schritt-Symbol
+        if i < current_idx:
+            parts.append(f"<s>{symbol}</s>")
+        elif i == current_idx:
+            parts.append(f"<b>{symbol}</b>")
+        else:
+            parts.append(f"<i>{symbol}</i>")
+    return " → ".join(parts)
+
+
+async def _handle_auftraege_command(chat_id):
+    """Listet laufende Auftraege des Tenants mit aktuellem Lifecycle-Schritt."""
+    tenant = await _get_tenant_by_chat(chat_id)
+    if not tenant:
+        return (
+            "Dieser Chat ist noch keinem Betrieb zugeordnet.\n"
+            "Bitte zuerst /start ausfuehren."
+        )
+
+    async with AsyncSessionLocal() as s:
+        rows = (await s.execute(
+            select(Angebot)
+            .where(Angebot.tenant_id == tenant.id)
+            .where(Angebot.status.in_(list(_AUFTRAG_ACTIVE_STATI)))
+            .order_by(Angebot.created_at.desc())
+            .limit(20)
+        )).scalars().all()
+
+    if not rows:
+        return (
+            "📂 <b>Keine laufenden Auftraege</b>\n\n"
+            "Mit /angebot eins anlegen — sobald das Angebot in Lexware "
+            "ist, taucht der Auftrag hier auf."
+        )
+
+    lines = ["📂 <b>Laufende Auftraege</b>\n"]
+    for ang in rows:
+        progress = _auftrag_progress_line(ang.status)
+        gesamt = float(ang.gesamtbetrag_brutto_eur or 0)
+        created = ang.created_at.strftime("%d.%m.%Y") if ang.created_at else "?"
+        lines.append(
+            f"<b>{_h_safe(ang.kunde_name)}</b>  ·  "
+            f"{gesamt:.2f}€  ·  {created}"
+        )
+        lines.append(f"  {progress}")
+        lines.append(
+            f"  <b>Status setzen:</b> /auftrag_{str(ang.id)[:8]}"
+        )
+        lines.append("")
+    lines.append(
+        "<i>Tap auf /auftrag_xxxxxxxx fuer Details + Buttons zum "
+        "Status-Wechseln. Bei 🏁 Fertig wird die Rechnung automatisch "
+        "rausgeschickt.</i>"
+    )
+    return "\n".join(lines)
+
+
+async def _handle_auftrag_show_command(chat_id, id_prefix: str):
+    """Zeigt einen einzelnen Auftrag (per 8-Char-ID-Prefix) mit Buttons
+    zum Status-Setzen."""
+    tenant = await _get_tenant_by_chat(chat_id)
+    if not tenant:
+        return "Tenant nicht gefunden. /start ausfuehren."
+
+    # Suche per Prefix — wir nehmen exakt 8 Hex-Chars
+    async with AsyncSessionLocal() as s:
+        # Cast id-Spalte zu Text fuer Prefix-Match, ist sauberer als
+        # alle Rows zu laden + Python-Filter.
+        from sqlalchemy import cast, String as SAString
+        rows = (await s.execute(
+            select(Angebot)
+            .where(Angebot.tenant_id == tenant.id)
+            .where(cast(Angebot.id, SAString).like(f"{id_prefix}%"))
+            .limit(2)
+        )).scalars().all()
+
+    if not rows:
+        return f"Kein Auftrag mit ID-Prefix <code>{_h_safe(id_prefix)}</code> gefunden."
+    if len(rows) > 1:
+        return "Mehrdeutiger Prefix — bitte mehr Zeichen. /auftraege fuer Uebersicht."
+
+    ang = rows[0]
+    progress = _auftrag_progress_line(ang.status)
+    label_now = AUFTRAG_LIFECYCLE_LABELS.get(ang.status, ang.status)
+    gesamt = float(ang.gesamtbetrag_brutto_eur or 0)
+
+    lines = [
+        f"📂 <b>{_h_safe(ang.kunde_name)}</b>",
+        f"💶 {gesamt:.2f} € brutto",
+        f"📅 angelegt {ang.created_at.strftime('%d.%m.%Y') if ang.created_at else '?'}",
+        "",
+        f"<b>Aktueller Stand:</b> {label_now}",
+        progress,
+    ]
+    if ang.kunde_email:
+        lines.append(f"📧 {_h_safe(ang.kunde_email)}")
+    if ang.lexware_quotation_id:
+        deeplink_q = LexwareProvider.quotation_deeplink_view(ang.lexware_quotation_id)
+        lines.append(f"📋 <a href=\"{deeplink_q}\">Angebot in Lexware</a>")
+    if ang.lexware_invoice_id:
+        deeplink_i = LexwareProvider.invoice_deeplink_view(ang.lexware_invoice_id)
+        lines.append(f"🧾 <a href=\"{deeplink_i}\">Rechnung in Lexware</a>")
+
+    # Buttons je nach aktuellem Status: nur sinnvolle Folge-Schritte zeigen
+    aid = str(ang.id)
+    btns: list[list[dict]] = []
+    if ang.status == ANGEBOT_STATUS_RECHNUNG_ERSTELLT:
+        btns.append([
+            {"text": "✅ Angenommen",
+             "callback_data": f"auftrag:set:{aid}:{ANGEBOT_STATUS_ACCEPTED}"},
+            {"text": "❌ Abgebrochen",
+             "callback_data": f"auftrag:set:{aid}:{ANGEBOT_STATUS_ABGEBROCHEN}"},
+        ])
+    if ang.status in (ANGEBOT_STATUS_RECHNUNG_ERSTELLT, ANGEBOT_STATUS_ACCEPTED):
+        btns.append([
+            {"text": "🔨 Arbeit laeuft",
+             "callback_data": f"auftrag:set:{aid}:{ANGEBOT_STATUS_WORK_IN_PROGRESS}"},
+        ])
+    if ang.status in (
+        ANGEBOT_STATUS_ACCEPTED,
+        ANGEBOT_STATUS_WORK_IN_PROGRESS,
+    ):
+        btns.append([
+            {"text": "🏁 Fertig — Rechnung raus",
+             "callback_data": f"auftrag:fertig:{aid}"},
+        ])
+    if ang.status == ANGEBOT_STATUS_WORK_DONE:
+        # Edge: wenn der vorherige Rechnungs-Versand crashte, nochmal versuchen
+        btns.append([
+            {"text": "🔄 Rechnung jetzt rausschicken",
+             "callback_data": f"auftrag:fertig:{aid}"},
+        ])
+    if ang.status == ANGEBOT_STATUS_RECHNUNG_GESENDET:
+        lines.append("")
+        lines.append("✅ <i>Auftrag abgeschlossen. Rechnung ist beim Kunden.</i>")
+
+    msg = "\n".join(lines)
+    if btns:
+        await _send_with_keyboard(chat_id, msg, {"inline_keyboard": btns})
+        return None
+    return msg
+
+
+async def _handle_auftrag_callback(chat_id, callback_data, callback_query_id, bot_token):
+    """auftrag:set:<id>:<status>  oder  auftrag:fertig:<id>"""
+    import uuid as _uuid
+    parts = callback_data.split(":")
+    if len(parts) < 3:
+        await _answer_callback_query(callback_query_id, "Format-Fehler", bot_token)
+        return
+    action = parts[1]
+    try:
+        aid = _uuid.UUID(parts[2])
+    except (ValueError, IndexError):
+        await _answer_callback_query(callback_query_id, "Ungueltige ID", bot_token)
+        return
+
+    if action == "set":
+        if len(parts) < 4:
+            await _answer_callback_query(callback_query_id, "Status fehlt", bot_token)
+            return
+        new_status = parts[3]
+        if new_status not in AUFTRAG_LIFECYCLE_LABELS:
+            await _answer_callback_query(callback_query_id, "Unbekannt", bot_token)
+            return
+        async with AsyncSessionLocal() as s:
+            ang = (await s.execute(
+                select(Angebot).where(Angebot.id == aid)
+            )).scalar_one_or_none()
+            if ang is None:
+                await _answer_callback_query(callback_query_id, "Weg", bot_token)
+                return
+            ang.status = new_status
+            if new_status == ANGEBOT_STATUS_ACCEPTED:
+                import datetime as _dt
+                ang.accepted_at = _dt.datetime.now(_dt.timezone.utc)
+            await s.commit()
+            kunde_name = ang.kunde_name
+        await _answer_callback_query(
+            callback_query_id,
+            f"Status: {AUFTRAG_LIFECYCLE_LABELS.get(new_status, new_status)}",
+            bot_token,
+        )
+        await _send_to_chat(
+            chat_id,
+            f"📂 <b>{_h_safe(kunde_name)}</b>: Status gesetzt auf "
+            f"{AUFTRAG_LIFECYCLE_LABELS.get(new_status, new_status)}.\n\n"
+            f"Mit /auftraege siehst du alle, mit /auftrag_{str(aid)[:8]} "
+            f"die naechsten Schritte."
+        )
+        return
+
+    if action == "fertig":
+        # User bestaetigt: Arbeit fertig — Rechnung finalisieren + versenden
+        await _answer_callback_query(
+            callback_query_id, "Schicke Rechnung raus…", bot_token,
+        )
+        await _send_to_chat(
+            chat_id,
+            "🏁 <b>Auftrag fertig</b> — finalisiere Rechnung in Lexware "
+            "und sende sie mit Anschreiben an den Kunden…",
+        )
+        result = await _run_rechnung_versand_pipeline(aid)
+        await _send_to_chat(chat_id, result)
+        return
+
+    await _answer_callback_query(callback_query_id, "Unbekannt", bot_token)
+
+
+async def _run_rechnung_versand_pipeline(angebot_id) -> str:
+    """Bei 🏁 Fertig: Rechnung in Lexware finalisieren + Mail mit PDF an
+    den Kunden. Setzt Status auf rechnung_gesendet wenn alles klappt.
+
+    Strategie: wir legen die Invoice NEU als finalized an (Lexware bietet
+    keine 'draft -> open'-Konvertierung an). Der alte Draft kann manuell
+    in Lexware geloescht werden — er stoert nicht.
+    """
+    from core.integrations.angebot_mail import (
+        send_rechnung_to_customer,
+    )
+
+    async with AsyncSessionLocal() as s:
+        ang = (await s.execute(
+            select(Angebot).where(Angebot.id == angebot_id)
+        )).scalar_one_or_none()
+        if ang is None:
+            return "❌ Auftrag nicht gefunden."
+        positions = (await s.execute(
+            select(AngebotPosition).where(AngebotPosition.angebot_id == angebot_id)
+            .order_by(AngebotPosition.position_nr)
+        )).scalars().all()
+        tenant = (await s.execute(
+            select(Tenant).where(Tenant.id == ang.tenant_id)
+        )).scalar_one()
+        kunde_name = ang.kunde_name
+        kunde_email = ang.kunde_email
+        kunde_strasse = ang.kunde_strasse
+        kunde_plz = ang.kunde_plz
+        kunde_ort = ang.kunde_ort
+        custom_intro = ang.introduction_text
+
+    provider = await _get_lexware_provider_for_tenant(tenant)
+    if provider is None:
+        return "❌ Lexware ist nicht eingerichtet."
+
+    line_items = [
+        InvoiceLineItem(
+            name=p.name,
+            quantity=float(p.menge),
+            unit_name=p.einheit or "Stueck",
+            unit_price_gross=float(p.preis_brutto_eur),
+            description=p.beschreibung,
+            tax_rate_percent=int(p.mwst_prozent or 19),
+        )
+        for p in positions
+    ]
+    one_time_address = {"name": kunde_name, "countryCode": "DE"}
+    if kunde_strasse:
+        one_time_address["street"] = kunde_strasse
+    if kunde_plz:
+        one_time_address["zip"] = kunde_plz
+    if kunde_ort:
+        one_time_address["city"] = kunde_ort
+
+    report = [f"🧾 <b>Rechnung: {_h_safe(kunde_name)}</b>", ""]
+
+    # Stufe 1: Finalisierte Rechnung in Lexware anlegen
+    intro_text = (
+        f"Sehr geehrte Damen und Herren,\n\nvielen Dank fuer den "
+        f"Auftrag. Nachstehend unsere Rechnung."
+    )
+    if custom_intro:
+        # Wir nutzen das gleiche personalisierte Anschreiben wie im
+        # Angebot — passt meist auch zur Rechnung ("danke fuer den
+        # Auftrag, hier die Abrechnung").
+        intro_text = custom_intro
+    try:
+        invoice = await provider.create_invoice_draft(
+            line_items=line_items,
+            one_time_address=one_time_address,
+            title=f"Rechnung {kunde_name}",
+            introduction=intro_text,
+            remark="Bitte begleichen Sie den Rechnungsbetrag innerhalb von 14 Tagen.",
+            tax_type="gross",
+            finalize=True,
+        )
+    except Exception as exc:
+        logger.exception(f"Rechnungs-Finalisierung gescheitert: {exc}")
+        async with AsyncSessionLocal() as s:
+            ang = (await s.execute(
+                select(Angebot).where(Angebot.id == angebot_id)
+            )).scalar_one()
+            ang.status = ANGEBOT_STATUS_WORK_DONE  # bleibt im "Fertig"-Status
+            await s.commit()
+        return (
+            f"❌ Rechnung konnte nicht angelegt werden: "
+            f"<code>{_h_safe(str(exc)[:200])}</code>\n\n"
+            "Status bleibt 'Fertig' — du kannst es nochmal versuchen."
+        )
+
+    # IDs persistieren — alte lexware_invoice_id (Draft) wird ueberschrieben.
+    async with AsyncSessionLocal() as s:
+        ang = (await s.execute(
+            select(Angebot).where(Angebot.id == angebot_id)
+        )).scalar_one()
+        ang.lexware_invoice_id = invoice.invoice_id
+        ang.status = ANGEBOT_STATUS_WORK_DONE
+        await s.commit()
+
+    report.append(
+        f"✅ Rechnung in Lexware angelegt — "
+        f"<a href=\"{invoice.deeplink_view}\">oeffnen</a>"
+    )
+
+    # Stufe 2: Email-Fallback aus Lexware-Kontakten
+    if not kunde_email and kunde_name and len(kunde_name.strip()) >= 3:
+        try:
+            contacts = await provider.search_contacts(
+                kunde_name, customer_only=True, limit=5,
+            )
+        except Exception:
+            contacts = []
+        chosen = None
+        kn_low = kunde_name.lower()
+        for c in contacts:
+            if c.email and any(tok in (c.name or "").lower() for tok in kn_low.split()):
+                chosen = c.email
+                break
+        if not chosen:
+            for c in contacts:
+                if c.email:
+                    chosen = c.email
+                    break
+        if chosen:
+            kunde_email = chosen
+            report.append(
+                f"🔎 Mail-Adresse aus Lexware-Kontakten: <code>{_h_safe(chosen)}</code>"
+            )
+            async with AsyncSessionLocal() as s:
+                ang2 = (await s.execute(
+                    select(Angebot).where(Angebot.id == angebot_id)
+                )).scalar_one()
+                ang2.kunde_email = chosen
+                await s.commit()
+
+    # Stufe 3: Mail an Kunden mit Rechnungs-PDF
+    if not kunde_email:
+        report.append(
+            "⚠️ Keine Kunden-Mail vorhanden — Rechnung manuell aus "
+            "Lexware versenden. Status bleibt auf 'Fertig'."
+        )
+        return "\n".join(report)
+
+    try:
+        mail_result = await send_rechnung_to_customer(
+            angebot_id=angebot_id, to_email=kunde_email,
+        )
+    except Exception as exc:
+        logger.exception(f"Rechnungs-Mail-Versand crashed: {exc}")
+        mail_result = {"success": False, "error": str(exc)}
+
+    if mail_result.get("success"):
+        async with AsyncSessionLocal() as s:
+            ang = (await s.execute(
+                select(Angebot).where(Angebot.id == angebot_id)
+            )).scalar_one()
+            ang.status = ANGEBOT_STATUS_RECHNUNG_GESENDET
+            await s.commit()
+        report.append(
+            f"✅ Rechnung per Mail an <b>{_h_safe(kunde_email)}</b> versendet"
+        )
+        report.append("")
+        report.append("🎉 <b>Auftrag abgeschlossen.</b>")
+    else:
+        err = mail_result.get("error", "unbekannt")
+        report.append(
+            f"⚠️ Mail-Versand fehlgeschlagen — <i>{_h_safe(err[:160])}</i>\n"
+            "Status bleibt auf 'Fertig'. Im /auftraege erneut anstossen."
         )
 
     return "\n".join(report)

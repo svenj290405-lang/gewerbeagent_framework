@@ -26,6 +26,31 @@ ANGEBOT_STATUS_MAIL_FAILED = "mail_failed"     # NEU: 3 Retries durch, dead
 ANGEBOT_STATUS_ACCEPTED = "accepted"
 ANGEBOT_STATUS_REJECTED = "rejected"
 ANGEBOT_STATUS_RECHNUNG_ERSTELLT = "rechnung_erstellt"
+# Lifecycle nach Angebots-Versand (manuelle Schritte des Handwerkers
+# ueber /auftraege). work_done loest den Rechnungs-Versand aus.
+ANGEBOT_STATUS_WORK_IN_PROGRESS = "arbeit_laeuft"
+ANGEBOT_STATUS_WORK_DONE = "arbeit_fertig"
+ANGEBOT_STATUS_RECHNUNG_GESENDET = "rechnung_gesendet"
+ANGEBOT_STATUS_ABGEBROCHEN = "abgebrochen"
+
+# Auftrags-Lifecycle in lesbarer Reihenfolge — Reihenfolge der Schritte
+# in der /auftraege-UI. Status >= rechnung_erstellt zaehlt als
+# "laufender Auftrag".
+AUFTRAG_LIFECYCLE = [
+    ANGEBOT_STATUS_RECHNUNG_ERSTELLT,    # Angebot in Lexware, Rechnung als Draft bereit
+    ANGEBOT_STATUS_ACCEPTED,             # Kunde hat zugesagt (manuell oder per Mail-Reply)
+    ANGEBOT_STATUS_WORK_IN_PROGRESS,     # Handwerker arbeitet
+    ANGEBOT_STATUS_WORK_DONE,            # Handwerker fertig → Rechnung wird versendet
+    ANGEBOT_STATUS_RECHNUNG_GESENDET,    # Rechnung beim Kunden
+]
+AUFTRAG_LIFECYCLE_LABELS = {
+    ANGEBOT_STATUS_RECHNUNG_ERSTELLT: "📋 Angebot raus",
+    ANGEBOT_STATUS_ACCEPTED: "✅ Angenommen",
+    ANGEBOT_STATUS_WORK_IN_PROGRESS: "🔨 Arbeit laeuft",
+    ANGEBOT_STATUS_WORK_DONE: "🏁 Fertig",
+    ANGEBOT_STATUS_RECHNUNG_GESENDET: "📨 Rechnung raus",
+    ANGEBOT_STATUS_ABGEBROCHEN: "❌ Abgebrochen",
+}
 
 
 class Angebot(Base):
@@ -61,6 +86,12 @@ class Angebot(Base):
     )
     lexware_voucher_number: Mapped[str | None] = mapped_column(String(50), nullable=True)
     lexware_status: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    # Lexware-Invoice (Rechnungs-Draft, wird in der /angebot-Pipeline
+    # mit-angelegt und spaeter beim /auftraege-Schritt "fertig"
+    # finalisiert + per Mail an den Kunden geschickt).
+    lexware_invoice_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True
+    )
 
     # AI-generierte Texte
     introduction_text: Mapped[str | None] = mapped_column(Text, nullable=True)

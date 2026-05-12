@@ -654,6 +654,7 @@ class LexwareProvider(AccountingProvider):
         introduction: str | None = None,
         remark: str | None = None,
         tax_type: str = "gross",
+        finalize: bool = False,
     ) -> InvoiceDraft:
         """
         POST /v1/invoices  (ohne ?finalize=true -> bleibt 'draft')
@@ -721,10 +722,18 @@ class LexwareProvider(AccountingProvider):
         if remark:
             body["remark"] = remark
 
+        # finalize=true: Rechnung wird direkt als "open" angelegt statt als
+        # Draft — nur dann ist PDF-Download verfuegbar, was wir fuer die
+        # Rechnungs-Mail an den Kunden brauchen (Lifecycle-Schritt "Fertig"
+        # im /auftraege-Flow).
+        url = f"{LEXWARE_API_BASE}/v1/invoices"
+        if finalize:
+            url += "?finalize=true"
+
         await self._rate_limit()
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             r = await client.post(
-                f"{LEXWARE_API_BASE}/v1/invoices",
+                url,
                 headers={**self._headers, "Content-Type": "application/json"},
                 json=body,
             )
@@ -733,8 +742,8 @@ class LexwareProvider(AccountingProvider):
 
         invoice_id = UUID(data["id"])
         logger.info(
-            "Lexware create_invoice_draft OK: id=%s items=%d tax=%s",
-            invoice_id, len(line_items), tax_type,
+            "Lexware create_invoice_draft OK: id=%s items=%d tax=%s finalize=%s",
+            invoice_id, len(line_items), tax_type, finalize,
         )
         return InvoiceDraft(
             invoice_id=invoice_id,
