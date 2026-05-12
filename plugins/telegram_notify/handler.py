@@ -5291,7 +5291,7 @@ async def _handle_angebot_command(chat_id):
             "Dieser Chat ist noch keinem Betrieb zugeordnet.\n"
             "Bitte zuerst /start ausfuehren."
         )
-    provider = LexwareProvider.from_global_config()
+    provider = await _get_lexware_provider_for_tenant(tenant)
     if provider is None:
         return (
             "🔒 <b>Lexware ist nicht eingerichtet.</b>\n"
@@ -5531,11 +5531,7 @@ async def _run_angebot_pipeline(angebot_id) -> str:
     """
     from core.integrations.angebot_mail import send_angebot_to_customer
 
-    provider = LexwareProvider.from_global_config()
-    if provider is None:
-        return "❌ Lexware ist nicht eingerichtet. /lexware_setup ausfuehren."
-
-    # Angebot laden inkl. Positionen
+    # Angebot laden inkl. Positionen + Tenant (brauchen wir fuer Provider)
     async with AsyncSessionLocal() as s:
         ang = (await s.execute(
             select(Angebot).where(Angebot.id == angebot_id)
@@ -5554,6 +5550,10 @@ async def _run_angebot_pipeline(angebot_id) -> str:
         kunde_strasse = ang.kunde_strasse
         kunde_plz = ang.kunde_plz
         kunde_ort = ang.kunde_ort
+
+    provider = await _get_lexware_provider_for_tenant(tenant)
+    if provider is None:
+        return "❌ Lexware ist nicht eingerichtet. /lexware_setup ausfuehren."
 
     # Lexware-LineItems vorbereiten (einmal — fuer Quotation + Invoice)
     line_items = [

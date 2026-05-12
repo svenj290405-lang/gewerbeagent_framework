@@ -25,7 +25,8 @@ from core.database import AsyncSessionLocal
 from core.integrations.accounting_base import AccountingError
 from core.integrations.lexware import LexwareProvider
 from core.integrations.microsoft import send_tracked_mail
-from core.models import Angebot, Tenant
+from core.models import Angebot, Tenant, ToolConfig
+from core.security import decrypt
 
 logger = logging.getLogger(__name__)
 
@@ -125,8 +126,28 @@ async def send_angebot_to_customer(
         out["error"] = "Angebot hat keine Lexware-Quotation-ID"
         return out
 
-    # 2) Lexware-Status pruefen
-    provider = LexwareProvider.from_global_config()
+    # 2) Lexware-Provider aus der Tenant-ToolConfig laden (analog
+    # _get_lexware_provider_for_tenant im telegram_notify-Handler — eine
+    # frühere from_global_config()-Factory existierte nie wirklich, der
+    # ursprüngliche Stub crashte beim ersten echten Aufruf 2026-05-12).
+    provider = None
+    async with AsyncSessionLocal() as session:
+        tc = (await session.execute(
+            select(ToolConfig).where(
+                ToolConfig.tenant_id == tenant.id,
+                ToolConfig.tool_name == "lexware",
+            )
+        )).scalar_one_or_none()
+    if tc and tc.enabled:
+        cfg = tc.config or {}
+        encrypted = cfg.get("encrypted_api_key")
+        if encrypted:
+            try:
+                api_key = decrypt(encrypted)
+                if api_key:
+                    provider = LexwareProvider(api_key=api_key)
+            except Exception as exc:
+                logger.warning(f"Lexware-Key Entschluesselung gescheitert: {exc}")
     if provider is None:
         out["error"] = "Lexware ist nicht konfiguriert (siehe /lexware_setup)"
         return out
