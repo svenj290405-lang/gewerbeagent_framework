@@ -432,6 +432,29 @@ async def _handle_start_command(text, chat_id, from_data):
                 f"Mitarbeiter {tenant_slug}/{employee_slug}: "
                 f"Chat-ID-Wechsel von {emp.telegram_chat_id} zu {chat_id}"
             )
+        # Bug 2026-05-12: ein Inhaber kann sich mit derselben Telegram-App
+        # erst als Default-Employee aktivieren und danach als neu angelegter
+        # Mitarbeiter — `uq_emp_telegram_chat_id` knallt sonst beim Commit.
+        # Loesung: alle FREMDEN Employees mit dieser chat_id (im selben oder
+        # einem anderen Tenant) entkoppeln, bevor wir uns selbst zuweisen.
+        if emp.telegram_chat_id != chat_id:
+            stale = (await s.execute(
+                select(Employee).where(
+                    Employee.telegram_chat_id == chat_id,
+                    Employee.id != emp.id,
+                )
+            )).scalars().all()
+            for old in stale:
+                logger.info(
+                    f"Loese alte chat_id-Bindung an Employee {old.id} "
+                    f"(slug={old.slug}, tenant={old.tenant_id}) bevor "
+                    f"sie an {emp.slug} uebergeht"
+                )
+                old.telegram_chat_id = None
+            if stale:
+                # Vor dem Reassign muss die NULL-Zuweisung in der DB
+                # ankommen, sonst greift uq_emp_telegram_chat_id immer noch.
+                await s.flush()
         # Chat-ID auf Mitarbeiter setzen
         emp.telegram_chat_id = chat_id
         # Fuer Default-Employee zusaetzlich tenant.telegram_chat_id mitspiegeln
@@ -1552,7 +1575,111 @@ async def _handle_kalk_excel_confirm_input(chat_id, text, state_data):
 # ===========================================================================
 
 
+# Befehle, die ein laufender Wizard nicht abschalten darf — sonst
+# kann der User aus dem Wizard nicht antworten. Alles ANDERE wird beim
+# naechsten Slash-Befehl als impliziter Reset behandelt.
+_WIZARD_SAFE_COMMANDS = frozenset({
+    "/abbrechen", "/cancel", "/reset", "/skip", "/fertig", "/ja", "/nein",
+})
+
+
+async def _safe_clear_state(chat_id):
+    """State loeschen, aber niemals selbst crashen — fuer Recovery-Paths.
+
+    Wenn die DB streikt, soll der Recovery-Handler trotzdem zu Ende
+    kommen und dem User eine Antwort schicken. Nur loggen, nicht rethrow.
+    """
+    try:
+        await _clear_state(chat_id)
+    except Exception:
+        logger.exception(f"State-Clear fuer chat_id={chat_id} fehlgeschlagen")
+
+
+async def _send_safe(chat_id, text):
+    """Send mit Try/Except — fuer Recovery-Paths, nie rethrow."""
+    try:
+        await _send_to_chat(chat_id, text)
+    except Exception:
+        logger.exception(f"Recovery-Send an chat_id={chat_id} fehlgeschlagen")
+
+
+def _extract_chat_id(payload) -> int | None:
+    """Versucht aus einem beliebigen Telegram-Update die chat_id zu holen.
+
+    Wird vom outer try/except benutzt — wenn der Hauptcode crasht,
+    muessen wir trotzdem wissen WEM wir die Recovery-Antwort schicken.
+    """
+    try:
+        msg = payload.get("message") or payload.get("edited_message")
+        if msg:
+            return (msg.get("chat") or {}).get("id")
+        cq = payload.get("callback_query") or {}
+        return ((cq.get("message") or {}).get("chat") or {}).get("id")
+    except Exception:
+        return None
+
+
 async def process_telegram_update(payload):
+    """Top-Level-Webhook-Dispatcher mit Recovery-Guarantees.
+
+    Drei Defensive-Layer fuer den Sven-Stuck-Case (siehe Bug 2026-05-12,
+    /werkstatt -> /Werkstatt -> /start demo__marco-jantos -> 500):
+
+    1) Universal `/abbrechen` (auch /cancel, /reset) wird VOR allem
+       anderen abgefangen — auch wenn ein Photo/Voice oder Feature-Gate
+       sonst dazwischen kaeme. Liefert garantiert eine Antwort.
+    2) Outer try/except: jeder Crash im Dispatch fuehrt zu State-Clear
+       + freundlicher Recovery-Message statt 500. So bleibt der Bot
+       benutzbar selbst wenn ein einzelner Handler buggy ist.
+    3) Slash-Befehle werden case-insensitiv normalisiert (kein 'War
+       das jetzt /Werkstatt oder /werkstatt'-Hänger mehr).
+    """
+    chat_id_for_recovery = _extract_chat_id(payload)
+
+    # Layer 1: Universal /abbrechen — vor Photo/Feature-Gate/Allem.
+    try:
+        msg = payload.get("message") or payload.get("edited_message") or {}
+        text_raw = (msg.get("text") or "").strip().lower()
+        if text_raw in ("/abbrechen", "/cancel", "/reset"):
+            chat_id = (msg.get("chat") or {}).get("id")
+            if chat_id:
+                state_existed = False
+                try:
+                    state_existed = (await _load_state(chat_id)) is not None
+                except Exception:
+                    logger.exception("State-Load im /abbrechen-Pfad fehlgeschlagen")
+                await _safe_clear_state(chat_id)
+                if state_existed:
+                    msg_out = "Abgebrochen. Mit /help sehen Sie alle Befehle."
+                else:
+                    msg_out = "Es laeuft gerade keine Aktion. /help zeigt was ich kann."
+                await _send_safe(chat_id, msg_out)
+                return {"ok": True}
+    except Exception:
+        logger.exception("Fehler im /abbrechen-Early-Path — eskalier zum Recovery")
+
+    # Layer 2 + 3: Inner-Dispatch mit Crash-Recovery.
+    try:
+        return await _dispatch_update(payload)
+    except Exception:
+        logger.exception(
+            f"Telegram-Handler-Crash (chat_id={chat_id_for_recovery}); "
+            "State wird zurueckgesetzt und User benachrichtigt."
+        )
+        if chat_id_for_recovery:
+            await _safe_clear_state(chat_id_for_recovery)
+            await _send_safe(
+                chat_id_for_recovery,
+                "⚠️ Da ist intern etwas schiefgelaufen. "
+                "Ich habe den Vorgang zurueckgesetzt — bitte erneut versuchen.\n\n"
+                "Mit /help siehst du alle Befehle. "
+                "Falls es wieder passiert, bitte beim Betreiber melden.",
+            )
+        # Webhook NIE 500 zurueckgeben — Telegram retried sonst endlos.
+        return {"ok": True}
+
+
+async def _dispatch_update(payload):
     # Callback-Query (Button-Klick) hat eigene Top-Level-Struktur
     callback_query = payload.get("callback_query")
     if callback_query:
@@ -1585,6 +1712,13 @@ async def process_telegram_update(payload):
     if not msg:
         return {"ok": True}
     text = (msg.get("text") or "").strip()
+    # Slash-Befehle case-insensitiv: /Werkstatt = /werkstatt = /WERKSTATT.
+    # Argumente bleiben unveraendert — "/kunde Müller" wird "/kunde Müller",
+    # nicht "/kunde müller". Sonst zerstoeren wir Adress- und Namens-Inputs.
+    if text.startswith("/"):
+        parts = text.split(maxsplit=1)
+        parts[0] = parts[0].lower()
+        text = " ".join(parts) if len(parts) > 1 else parts[0]
     photo_array = msg.get("photo") or []
     document = msg.get("document") or None
     voice = msg.get("voice") or None
@@ -1693,6 +1827,27 @@ async def process_telegram_update(payload):
         # Voice-Note ohne aktiven Wizard - ignorieren
         logger.info("Voice ohne passenden State ignoriert")
         return {"ok": True}
+
+    # ----- Auto-Reset alter Wizard-States bei neuem Slash-Befehl -----
+    # Wenn der User mitten im Wizard einen ANDEREN Slash-Befehl tippt,
+    # ist seine Absicht klar: alten Vorgang aufgeben, neuen anfangen.
+    # Sonst staut sich der State zu (Sven-Hänger 2026-05-12).
+    # Ausnahmen: /abbrechen wird oben schon abgefangen; /skip /fertig
+    # /ja /nein /cancel /reset koennen Wizard-Antworten sein.
+    if text.startswith("/"):
+        first_token = text.split(maxsplit=1)[0]
+        if first_token not in _WIZARD_SAFE_COMMANDS:
+            try:
+                existing_state = await _load_state(chat_id)
+                if existing_state is not None:
+                    logger.info(
+                        f"Auto-Reset: chat_id={chat_id} hatte State "
+                        f"{existing_state.state_key}, wird durch Slash-"
+                        f"Befehl {first_token!r} zurueckgesetzt"
+                    )
+                    await _clear_state(chat_id)
+            except Exception:
+                logger.exception("Auto-Reset-Check fehlgeschlagen — ignoriert")
 
     # ----- Feature-Gate -----
     # Vor dem Befehls-Dispatch pruefen ob das angefragte Feature im
