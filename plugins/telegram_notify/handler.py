@@ -1637,26 +1637,66 @@ async def process_telegram_update(payload):
     chat_id_for_recovery = _extract_chat_id(payload)
 
     # Layer 1: Universal /abbrechen — vor Photo/Feature-Gate/Allem.
+    # Match auf den ersten Token, damit auch "/abbrechen jetzt", "/cancel
+    # bitte" o.ae. durchgehen. Aliase: /cancel /reset /stop. Auch via
+    # Callback-Query: ein Inline-Button mit data="/abbrechen" greift.
     try:
+        # Text aus Message ODER Callback-Query holen.
         msg = payload.get("message") or payload.get("edited_message") or {}
         text_raw = (msg.get("text") or "").strip().lower()
-        if text_raw in ("/abbrechen", "/cancel", "/reset"):
-            chat_id = (msg.get("chat") or {}).get("id")
+        cq_text = (payload.get("callback_query") or {}).get("data") or ""
+        cancel_token = (text_raw or cq_text.strip().lower()).split(maxsplit=1)
+        first = cancel_token[0] if cancel_token else ""
+        if first in ("/abbrechen", "/cancel", "/reset", "/stop"):
+            chat_id = (
+                (msg.get("chat") or {}).get("id")
+                or (((payload.get("callback_query") or {}).get("message") or {})
+                    .get("chat") or {}).get("id")
+            )
             if chat_id:
-                state_existed = False
+                # State-Existenz ist nur fuer Wording — wenn der Check
+                # crasht, gehen wir defensiv von "lief was" aus und
+                # senden trotzdem die Abbrechen-Bestaetigung.
+                state_existed = True
                 try:
                     state_existed = (await _load_state(chat_id)) is not None
                 except Exception:
-                    logger.exception("State-Load im /abbrechen-Pfad fehlgeschlagen")
+                    logger.exception(
+                        "State-Load im /abbrechen-Pfad fehlgeschlagen — "
+                        "ignoriere und sende Abbrechen-Bestaetigung trotzdem"
+                    )
                 await _safe_clear_state(chat_id)
                 if state_existed:
-                    msg_out = "Abgebrochen. Mit /help sehen Sie alle Befehle."
+                    msg_out = (
+                        "✅ <b>Abgebrochen.</b> Alle offenen Vorgaenge "
+                        "zurueckgesetzt.\n\nMit /help sehen Sie alle Befehle."
+                    )
                 else:
                     msg_out = "Es laeuft gerade keine Aktion. /help zeigt was ich kann."
                 await _send_safe(chat_id, msg_out)
+                logger.info(
+                    f"/abbrechen erfolgreich (chat_id={chat_id}, "
+                    f"state_existed={state_existed})"
+                )
                 return {"ok": True}
     except Exception:
-        logger.exception("Fehler im /abbrechen-Early-Path — eskalier zum Recovery")
+        logger.exception(
+            "Fehler im /abbrechen-Early-Path — eskalier zum Recovery"
+        )
+        # Letzter Notnagel: ChatID retten und Abbrechen-Antwort senden,
+        # auch wenn die Logik oben crashte. /abbrechen MUSS durchgehen.
+        try:
+            recov_chat = _extract_chat_id(payload)
+            if recov_chat:
+                await _safe_clear_state(recov_chat)
+                await _send_safe(
+                    recov_chat,
+                    "✅ <b>Abgebrochen.</b> (Notfall-Reset) Mit /help "
+                    "sehen Sie alle Befehle.",
+                )
+                return {"ok": True}
+        except Exception:
+            logger.exception("Auch der Notfall-Abbrechen-Pfad ist gescheitert")
 
     # Layer 2 + 3: Inner-Dispatch mit Crash-Recovery.
     try:
