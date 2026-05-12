@@ -875,14 +875,149 @@ async def _handle_paket_command(chat_id) -> str:
         msg_parts.append("<i>Upgrade: svenj05@gmx.de</i>")
     return "\n".join(msg_parts)
 
+async def _collect_setup_status(tenant, employee) -> list[tuple[str, str, str | None]]:
+    """Pro relevantem Feature: ist die Verbindung konfiguriert?
+
+    Zeigt nur Features die im Paket aktiv sind — sonst wuerde ein
+    Basis-Paket-User ueber fehlendes Drive meckern obwohl er es gar
+    nicht hat. Returns Liste von (icon, label, hint_command_or_None).
+    """
+    from core.features import enabled_features_for_tenant
+    from core.security.oauth_token_lookup import find_oauth_token
+    enabled = await enabled_features_for_tenant(tenant.id)
+    items: list[tuple[str, str, str | None]] = []
+
+    # Kalender
+    if "kalender" in enabled:
+        if employee.calendar_provider:
+            label_prov = {"google": "Google", "microsoft": "Outlook"}.get(
+                employee.calendar_provider, employee.calendar_provider,
+            )
+            items.append(("✅", f"Kalender ({label_prov})", None))
+        else:
+            items.append(("❌", "Kalender", "/kalender_verbinden"))
+
+    # Mail-Inbox (Outlook) — Token via OAuth
+    if "mail_intake" in enabled:
+        ms = await find_oauth_token(tenant.id, "microsoft")
+        items.append(
+            ("✅", "Outlook-Postfach", None) if ms
+            else ("❌", "Outlook-Postfach", "/microsoft_setup")
+        )
+
+    # Drive — Google-OAuth-Token muss Drive-Scope haben
+    if "drive_archiv" in enabled:
+        try:
+            from core.integrations.google_drive import is_drive_configured
+            tok = await find_oauth_token(tenant.id, "google", employee.id)
+            if tok and is_drive_configured(tok):
+                items.append(("✅", "Kunden-Archiv (Drive)", None))
+            elif tok:
+                items.append(("⚠️", "Drive ohne Scope", "/drive_verbinden"))
+            else:
+                items.append(("❌", "Kunden-Archiv (Drive)", "/drive_verbinden"))
+        except Exception:
+            logger.exception("drive_archiv-Status-Check fehlgeschlagen")
+            items.append(("•", "Drive (Status unklar)", None))
+
+    # Lexware — Token in ToolConfig
+    if "lexware" in enabled:
+        try:
+            async with AsyncSessionLocal() as s:
+                row = (await s.execute(
+                    select(ToolConfig).where(
+                        ToolConfig.tenant_id == tenant.id,
+                        ToolConfig.tool_name == LEXWARE_TOOL_NAME,
+                    )
+                )).scalar_one_or_none()
+            has_token = bool(
+                row and row.enabled and (row.config or {}).get("encrypted_token")
+            )
+            items.append(
+                ("✅", "Lexware-Buchhaltung", None) if has_token
+                else ("❌", "Lexware-Buchhaltung", "/lexware_setup")
+            )
+        except Exception:
+            logger.exception("lexware-Status-Check fehlgeschlagen")
+            items.append(("•", "Lexware (Status unklar)", None))
+
+    # Werkstatt-/Heimat-Adresse
+    if "werkstatt" in enabled:
+        label = "Werkstatt-Adresse" if employee.is_default else "Heimat-Adresse"
+        if employee.heimat_strasse and employee.heimat_ort:
+            items.append(("✅", label, None))
+        else:
+            items.append(("❌", label, "/werkstatt"))
+
+    return items
+
+
 async def _handle_status_command(chat_id):
-    tenant = await _get_tenant_by_chat(chat_id)
-    if not tenant:
-        return "Chat nicht zugeordnet. QR-Code scannen oder /start."
-    return (
-        f"<b>{_h_safe(tenant.company_name)}</b>\n"
-        f"{tenant.status}  ·  <code>{tenant.slug}</code>"
-    )
+    """Persoenliche Statusuebersicht — wer bin ich, was ist verbunden,
+    laeuft gerade ein Wizard.
+
+    Soll auf den ersten Blick zeigen: 'wo stehe ich, wo muss ich noch
+    klicken'. Bisher war der Output kryptisch ('demo · onboarding') —
+    jetzt: Identitaet, Paket, Setup-Check, Wizard-Zustand.
+    """
+    from core.features.catalog import PACKAGE_LABELS
+
+    res = await _get_current_employee(chat_id)
+    if res is None:
+        return (
+            "Dieser Chat ist noch keinem Betrieb zugeordnet.\n"
+            "Bitte zuerst /start ausfuehren oder QR-Code scannen."
+        )
+    tenant, employee = res
+
+    # Paket-Label aus catalog (faellt auf raw-Wert zurueck).
+    package_label = PACKAGE_LABELS.get(tenant.package_tier, tenant.package_tier)
+    # Tenant-Status menschen-lesbar.
+    status_icon = {
+        "active": "✅",
+        "onboarding": "🕒",
+        "suspended": "⏸",
+        "cancelled": "🚫",
+    }.get(tenant.status, "•")
+    role_label = "Inhaber" if employee.is_default else "Mitarbeiter"
+
+    lines: list[str] = [
+        f"👤 <b>{_h_safe(employee.name)}</b>  ·  {role_label}",
+        f"🏢 <b>{_h_safe(tenant.company_name)}</b>",
+        f"Slug: <code>{_h_safe(tenant.slug)}</code>  ·  "
+        f"Paket: <b>{_h_safe(package_label)}</b>  ·  "
+        f"Status: {status_icon} {_h_safe(tenant.status)}",
+        "",
+    ]
+
+    setup = await _collect_setup_status(tenant, employee)
+    if setup:
+        lines.append("<b>🔌 Verbindungen</b>")
+        for icon, label, hint in setup:
+            line = f"{icon}  {label}"
+            if hint:
+                line += f" — {hint}"
+            lines.append(line)
+        lines.append("")
+
+    # Aktiver Wizard?
+    state = None
+    try:
+        state = await _load_state(chat_id)
+    except Exception:
+        logger.exception("State-Check fuer /status fehlgeschlagen")
+
+    lines.append("<b>📋 Bot-Zustand</b>")
+    lines.append(f"Telegram-Chat: <code>{chat_id}</code>")
+    if state:
+        lines.append(
+            f"⏳ Aktiver Vorgang: <code>{_h_safe(state.state_key)}</code> "
+            "— mit /abbrechen beenden"
+        )
+    else:
+        lines.append("<i>Kein laufender Wizard.</i>")
+
+    return "\n".join(lines)
 
 async def _handle_unknown():
     return "Diesen Befehl kenne ich noch nicht.\n\nMit /help sehen Sie was ich kann."
