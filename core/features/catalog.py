@@ -153,7 +153,6 @@ FEATURES: dict[str, Feature] = {
             "/team",
             "/krank",
             "/urlaub",
-            "/abwesend",
             "/zurueck",
         ),
     ),

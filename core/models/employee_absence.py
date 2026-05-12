@@ -151,9 +151,11 @@ async def get_active_absences(
         result: list[tuple[Employee, EmployeeAbsence]] = []
         for emp, absence in rows:
             if absence.covers(target_date):
-                session.expunge(emp)
-                session.expunge(absence)
                 result.append((emp, absence))
+        # Alle in einem Rutsch detachen — robuster als pro-Instance-expunge,
+        # weil lazy='joined' auf Absence.employee zu doppelten Identity-Map-
+        # Eintraegen fuehren kann.
+        session.expunge_all()
         return result
 
 
@@ -180,11 +182,10 @@ async def get_upcoming_absences(
             .order_by(EmployeeAbsence.start_date.asc(), Employee.slug.asc())
         )
         rows = (await session.execute(stmt)).all()
-        out: list[tuple[Employee, EmployeeAbsence]] = []
-        for emp, ab in rows:
-            session.expunge(emp)
-            session.expunge(ab)
-            out.append((emp, ab))
+        out: list[tuple[Employee, EmployeeAbsence]] = [
+            (emp, ab) for emp, ab in rows
+        ]
+        session.expunge_all()
         return out
 
 

@@ -796,8 +796,8 @@ async def _handle_help_command(chat_id=None):
         ))
         setup_items.append((
             "/team",
-            "Team-Status-Uebersicht: wer ist heute da, wer krank, wer "
-            "Urlaub, mit Skills + Job-Titel.",
+            "Team-Status: wer ist heute da, wer krank, wer Urlaub — "
+            "inkl. Vorausschau der naechsten 7 Tage.",
         ))
         setup_items.append((
             "/krank",
@@ -808,10 +808,6 @@ async def _handle_help_command(chat_id=None):
             "/urlaub",
             "Urlaub planen (Start-/End-Datum). Blockt Slot-Vorschlaege "
             "in dem Zeitraum, bestehende Termine bleiben.",
-        ))
-        setup_items.append((
-            "/abwesend",
-            "Aktuelle + naechste 7 Tage Abwesenheiten als Liste.",
         ))
         setup_items.append((
             "/zurueck [slug]",
@@ -2326,9 +2322,6 @@ async def _dispatch_update(payload):
         reply = await _handle_urlaub_command(chat_id)
         if reply is None:
             return {"ok": True}
-    elif text == "/abwesend":
-        await _clear_state(chat_id)
-        reply = await _handle_abwesend_command(chat_id)
     elif text == "/zurueck" or text.startswith("/zurueck "):
         await _clear_state(chat_id)
         reply = await _handle_zurueck_command(chat_id, text)
@@ -9290,7 +9283,8 @@ async def _handle_zurueck_command(chat_id, text):
 # ----- /team Status-Uebersicht -----
 
 async def _handle_team_command(chat_id):
-    """Status-Liste mit Symbolen pro Mitarbeiter."""
+    """Status-Liste mit Symbolen pro Mitarbeiter + Vorausschau auf
+    geplante Abwesenheiten der naechsten 7 Tage."""
     import datetime as _dt
     res = await _get_current_employee(chat_id)
     if res is None:
@@ -9298,7 +9292,9 @@ async def _handle_team_command(chat_id):
     tenant, _ = res
 
     from core.models.employee import get_employees_for_tenant
-    from core.models.employee_absence import get_active_absences
+    from core.models.employee_absence import (
+        get_active_absences, get_upcoming_absences,
+    )
     employees = await get_employees_for_tenant(tenant.id, active_only=False)
     today = _dt.date.today()
     active_absences = await get_active_absences(tenant.id, today)
@@ -9332,6 +9328,22 @@ async def _handle_team_command(chat_id):
         shown += 1
     if extra > 0:
         lines.append(f"<i>… und {extra} weitere</i>")
+
+    # Vorausschau auf die naechsten 7 Tage — geplante Urlaube etc.
+    upcoming = await get_upcoming_absences(tenant.id, days_ahead=7)
+    if upcoming:
+        lines.append("")
+        lines.append("<b>📅 Naechste 7 Tage:</b>")
+        for emp, ab in upcoming:
+            icon = {"krank": "🤒", "urlaub": "🏖", "sonstiges": "🚫"}.get(
+                ab.absence_type, "❌"
+            )
+            start_str = ab.start_date.strftime("%d.%m.")
+            end_str = ab.end_date.strftime("%d.%m.") if ab.end_date else "open"
+            lines.append(
+                f"  {icon} {emp.name} {start_str}–{end_str} ({ab.absence_type})"
+            )
+
     return "\n".join(lines)
 
 
