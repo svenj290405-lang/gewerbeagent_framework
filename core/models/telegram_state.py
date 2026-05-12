@@ -59,6 +59,7 @@ STATE_AUFNAHME_PREVIEWING = "aufnahme_previewing"
 # /angebot-Wizard: Text/Voice → Gemini → Kalkulation → Lexware-Angebot → Mail → Auto-Rechnung
 STATE_ANGEBOT_WAITING_INPUT = "angebot_waiting_input"
 STATE_ANGEBOT_PREVIEWING = "angebot_previewing"
+STATE_ANGEBOT_AWAITING_INSTRUCTIONS = "angebot_awaiting_instructions"
 STATE_ANGEBOT_AWAITING_MAIL = "angebot_awaiting_mail"
 
 STATE_LEISTUNG_WAITING_NAME = "leistung_waiting_name"

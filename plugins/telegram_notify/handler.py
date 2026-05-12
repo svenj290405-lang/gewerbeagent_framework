@@ -48,6 +48,7 @@ from core.models import (
     STATE_AUFNAHME_PREVIEWING,
     STATE_ANGEBOT_WAITING_INPUT,
     STATE_ANGEBOT_PREVIEWING,
+    STATE_ANGEBOT_AWAITING_INSTRUCTIONS,
     STATE_ANGEBOT_AWAITING_MAIL,
     STATE_MATERIAL_NEU_NAME,
     STATE_MATERIAL_NEU_LINK,
@@ -125,6 +126,8 @@ from core.ai import (
 from core.ai.gemini import (
     extract_angebot_from_text,
     extract_angebot_from_audio,
+    generate_angebot_anschreiben,
+    generate_angebot_anschreiben_from_audio,
 )
 from core.integrations.lexware import LexwareProvider
 from core.integrations.openrouteservice import (
@@ -2037,6 +2040,22 @@ async def _dispatch_update(payload):
             if reply:
                 await _send_to_chat(chat_id, reply)
             return {"ok": True}
+        # ----- Angebot-Wizard: Voice-Anweisungen fuers Anschreiben -----
+        if state and state.state_key == STATE_ANGEBOT_AWAITING_INSTRUCTIONS:
+            bot_token = await _load_global_bot_token()
+            if not bot_token:
+                await _send_to_chat(
+                    chat_id,
+                    "Bot-Konfiguration fehlt - bitte beim Betreiber melden.",
+                )
+                return {"ok": True}
+            await _send_to_chat(chat_id, "⏳ Schreibe das Anschreiben…")
+            reply = await _handle_angebot_instructions_received(
+                chat_id, voice_dict=voice, bot_token=bot_token,
+            )
+            if reply:
+                await _send_to_chat(chat_id, reply)
+            return {"ok": True}
         # Voice-Note ohne aktiven Wizard - ignorieren
         logger.info("Voice ohne passenden State ignoriert")
         return {"ok": True}
@@ -2318,6 +2337,15 @@ async def _dispatch_update(payload):
             reply = reply_or_none
         elif state.state_key == STATE_ANGEBOT_PREVIEWING:
             reply = "Bitte einen der Buttons oben antippen oder /abbrechen schicken."
+        elif state.state_key == STATE_ANGEBOT_AWAITING_INSTRUCTIONS:
+            # Text-Anweisungen fuers Anschreiben (Voice oben)
+            await _send_to_chat(chat_id, "⏳ Schreibe das Anschreiben…")
+            reply_or_none = await _handle_angebot_instructions_received(
+                chat_id, text=text,
+            )
+            if reply_or_none is None:
+                return {"ok": True}
+            reply = reply_or_none
         elif state.state_key == STATE_LEISTUNG_WAITING_NAME:
             reply = await _handle_leistung_name_input(chat_id, text)
         elif state.state_key == STATE_LEISTUNG_WAITING_PREIS:
@@ -5310,8 +5338,12 @@ async def _handle_angebot_command(chat_id):
     )
 
 
-def _format_angebot_preview(extracted: dict) -> str:
-    """Markdown-Vorschau fuer den Confirm-Step."""
+def _format_angebot_preview(extracted: dict, *, anschreiben: str | None = None) -> str:
+    """Markdown-Vorschau fuer den Confirm-Step.
+
+    Wenn `anschreiben` gesetzt ist, wird es in einem eigenen Block oben
+    angezeigt — sonst Hinweis dass das Default-Anschreiben genutzt wird.
+    """
     kunde = extracted.get("kunde_name") or "(unbekannt)"
     email = extracted.get("kunde_email")
     strasse = extracted.get("kunde_strasse")
@@ -5321,6 +5353,10 @@ def _format_angebot_preview(extracted: dict) -> str:
     lines = [f"📋 <b>Angebot fuer {_h_safe(kunde)}</b>"]
     if email:
         lines.append(f"📧 {_h_safe(email)}")
+    else:
+        lines.append(
+            "📧 <i>(keine Mail erkannt — wird in Lexware-Kontakten gesucht)</i>"
+        )
     addr_parts = [p for p in [strasse, f"{plz or ''} {ort or ''}".strip()] if p]
     if addr_parts:
         lines.append("📍 " + ", ".join(_h_safe(p) for p in addr_parts))
@@ -5349,6 +5385,17 @@ def _format_angebot_preview(extracted: dict) -> str:
     lines.append("")
     lines.append(f"<b>Gesamt brutto: {float(gesamt):.2f} €</b>")
 
+    if anschreiben:
+        lines.append("")
+        lines.append("✏️ <b>Anschreiben (personalisiert)</b>")
+        lines.append(f"<i>{_h_safe(anschreiben)}</i>")
+    else:
+        lines.append("")
+        lines.append(
+            "<i>Anschreiben: Standard. Mit ✏️ Anschreiben anpassen "
+            "personalisieren (Tonangabe, was rein soll, ...).</i>"
+        )
+
     missing = extracted.get("missing_fields") or []
     if missing:
         lines.append("")
@@ -5357,6 +5404,60 @@ def _format_angebot_preview(extracted: dict) -> str:
         )
 
     return "\n".join(lines)
+
+
+def _angebot_keyboard(angebot_id: str) -> dict:
+    """Inline-Keyboard fuer die Preview — drei Buttons in 2 Reihen.
+
+    Reihe 1: Erstellen + Versenden (Hauptaktion, prominent oben)
+    Reihe 2: Anschreiben personalisieren | Verwerfen
+    """
+    return {
+        "inline_keyboard": [
+            [{"text": "✅ Erstellen + Versenden",
+              "callback_data": f"angebot:confirm:{angebot_id}"}],
+            [
+                {"text": "✏️ Anschreiben anpassen",
+                 "callback_data": f"angebot:anschreiben:{angebot_id}"},
+                {"text": "❌ Verwerfen",
+                 "callback_data": f"angebot:cancel:{angebot_id}"},
+            ],
+        ]
+    }
+
+
+async def _resend_angebot_preview(chat_id, angebot_id_str: str):
+    """Sendet die aktuelle Preview erneut — mit Anschreiben falls in DB."""
+    state = await _load_state(chat_id)
+    extracted = (state.state_data or {}).get("extracted") if state else None
+    if not extracted:
+        await _send_to_chat(
+            chat_id,
+            "Angebots-Daten nicht mehr im Speicher. Bitte /angebot neu starten."
+        )
+        return
+    # Anschreiben aus DB nachladen
+    anschreiben = None
+    try:
+        import uuid as _uuid
+        async with AsyncSessionLocal() as s:
+            ang = (await s.execute(
+                select(Angebot).where(Angebot.id == _uuid.UUID(angebot_id_str))
+            )).scalar_one_or_none()
+            if ang and ang.introduction_text:
+                anschreiben = ang.introduction_text
+    except Exception:
+        logger.exception("Anschreiben-Reload fehlgeschlagen — egal, weiter")
+
+    preview = _format_angebot_preview(extracted, anschreiben=anschreiben)
+    keyboard = _angebot_keyboard(angebot_id_str)
+    msg = (
+        preview
+        + "\n\n<i>Bestaetigen erstellt das Angebot in Lexware, schickt das "
+        "PDF per Mail an den Kunden und legt eine passende Rechnung als "
+        "Lexware-Draft an.</i>"
+    )
+    await _send_with_keyboard(chat_id, msg, keyboard)
 
 
 async def _handle_angebot_input_received(
@@ -5455,15 +5556,7 @@ async def _handle_angebot_input_received(
 
     # 5) Preview + State setzen
     preview = _format_angebot_preview(extracted)
-    # Inline-Buttons fuer Confirm/Cancel
-    keyboard = {
-        "inline_keyboard": [[
-            {"text": "✅ Erstellen + Versenden",
-             "callback_data": f"angebot:confirm:{angebot_id}"},
-            {"text": "❌ Verwerfen",
-             "callback_data": f"angebot:cancel:{angebot_id}"},
-        ]]
-    }
+    keyboard = _angebot_keyboard(angebot_id)
     await _save_state(chat_id, STATE_ANGEBOT_PREVIEWING, {
         "angebot_id": angebot_id,
         "extracted": extracted,
@@ -5480,7 +5573,7 @@ async def _handle_angebot_input_received(
 
 
 async def _handle_angebot_callback(chat_id, callback_data, callback_query_id, bot_token):
-    """Verarbeitet angebot:<action>:<id>-Callbacks."""
+    """Verarbeitet angebot:<action>:<id>-Callbacks (confirm/cancel/anschreiben)."""
     import uuid as _uuid
     parts = callback_data.split(":", 2)
     if len(parts) != 3:
@@ -5519,7 +5612,112 @@ async def _handle_angebot_callback(chat_id, callback_data, callback_query_id, bo
         await _send_to_chat(chat_id, result)
         return
 
+    if action == "anschreiben":
+        # State auf "warte auf Anweisungen" setzen — angebot_id mitnehmen
+        # damit wir das richtige Angebot im naechsten Step finden.
+        # Preview-State bleibt in der DB als Backup falls User abbricht.
+        await _answer_callback_query(
+            callback_query_id, "Anschreiben anpassen…", bot_token,
+        )
+        # Aktuellen Preview-State erhalten und die extracted-Daten weitergeben
+        prev = await _load_state(chat_id)
+        extracted = (prev.state_data or {}).get("extracted") if prev else {}
+        await _save_state(chat_id, STATE_ANGEBOT_AWAITING_INSTRUCTIONS, {
+            "angebot_id": angebot_id_str,
+            "extracted": extracted,
+        })
+        await _send_to_chat(
+            chat_id,
+            "✏️ <b>Anschreiben personalisieren</b>\n\n"
+            "Schreib oder diktier deine Anweisungen — z.B.:\n"
+            "<i>«freundlich und kurz, erwaehne dass wir naechste Woche "
+            "Donnerstag Zeit haetten»</i>\n\n"
+            "Oder direkt deinen Wunsch-Text — ich baue daraus einen sauberen "
+            "Brief-Anfang fuer das Lexware-PDF.\n\n"
+            "Mit /abbrechen verwerfen und zur Standard-Variante zurueck.",
+        )
+        return
+
     await _answer_callback_query(callback_query_id, "Unbekannte Aktion", bot_token)
+
+
+async def _handle_angebot_instructions_received(
+    chat_id, *, text: str | None = None, voice_dict: dict | None = None,
+    bot_token: str | None = None,
+):
+    """Gemini generiert ein personalisiertes Anschreiben aus den
+    Handwerker-Anweisungen, speichert in angebot.introduction_text,
+    zeigt aktualisierte Preview."""
+    state = await _load_state(chat_id)
+    if not state or state.state_key != STATE_ANGEBOT_AWAITING_INSTRUCTIONS:
+        return "Status verloren — bitte /angebot neu starten."
+    data = state.state_data or {}
+    angebot_id_str = data.get("angebot_id")
+    extracted = data.get("extracted") or {}
+    if not angebot_id_str:
+        await _clear_state(chat_id)
+        return "Angebots-ID fehlt — bitte /angebot neu starten."
+
+    tenant = await _get_tenant_by_chat(chat_id)
+
+    # Gemini-Generation — Text oder Audio
+    try:
+        if voice_dict is not None:
+            if not bot_token:
+                bot_token = await _load_global_bot_token()
+            file_id = voice_dict.get("file_id")
+            file_path = await _telegram_get_file_path(bot_token, file_id)
+            audio_bytes = await _telegram_download_file(bot_token, file_path)
+            mime = voice_dict.get("mime_type") or "audio/ogg"
+            anschreiben = await generate_angebot_anschreiben_from_audio(
+                extracted, audio_bytes, mime_type=mime,
+                tenant_id=tenant.id if tenant else None,
+            )
+        else:
+            anschreiben = await generate_angebot_anschreiben(
+                extracted, text or "",
+                tenant_id=tenant.id if tenant else None,
+            )
+    except Exception as exc:
+        logger.exception(f"Anschreiben-Generation crashed: {exc}")
+        anschreiben = ""
+
+    if not anschreiben:
+        # Zurueck zur Preview ohne Anschreiben
+        await _save_state(chat_id, STATE_ANGEBOT_PREVIEWING, {
+            "angebot_id": angebot_id_str,
+            "extracted": extracted,
+        })
+        await _send_to_chat(
+            chat_id,
+            "⚠️ Konnte kein Anschreiben generieren. Bitte konkreter formulieren "
+            "(z.B. <i>«kurz und sachlich, Hinweis dass wir nach Ostern kommen»</i>).\n\n"
+            "Du kannst es nochmal versuchen oder direkt Erstellen + Versenden.",
+        )
+        await _resend_angebot_preview(chat_id, angebot_id_str)
+        return None
+
+    # Anschreiben in DB persistieren
+    import uuid as _uuid
+    try:
+        async with AsyncSessionLocal() as s:
+            ang = (await s.execute(
+                select(Angebot).where(Angebot.id == _uuid.UUID(angebot_id_str))
+            )).scalar_one_or_none()
+            if ang is not None:
+                ang.introduction_text = anschreiben
+                await s.commit()
+    except Exception:
+        logger.exception("Anschreiben-DB-Save fehlgeschlagen")
+
+    # Zurueck zur Preview mit dem neuen Anschreiben sichtbar
+    await _save_state(chat_id, STATE_ANGEBOT_PREVIEWING, {
+        "angebot_id": angebot_id_str,
+        "extracted": extracted,
+    })
+    await _send_to_chat(chat_id, "✅ Anschreiben angepasst. Hier die Vorschau:")
+    await _resend_angebot_preview(chat_id, angebot_id_str)
+    return None
 
 
 async def _run_angebot_pipeline(angebot_id) -> str:
@@ -5550,6 +5748,8 @@ async def _run_angebot_pipeline(angebot_id) -> str:
         kunde_strasse = ang.kunde_strasse
         kunde_plz = ang.kunde_plz
         kunde_ort = ang.kunde_ort
+        # Personalisiertes Anschreiben falls vorher gesetzt — sonst Default
+        custom_intro = ang.introduction_text
 
     provider = await _get_lexware_provider_for_tenant(tenant)
     if provider is None:
@@ -5582,15 +5782,16 @@ async def _run_angebot_pipeline(angebot_id) -> str:
 
     # Stufe 1: Lexware-Quotation FINALISIERT anlegen (Pflicht — sonst
     # kein PDF-Download moeglich, also keine Mail an Kunde).
+    intro_text = custom_intro or (
+        "Sehr geehrte Damen und Herren,\n\nvielen Dank fuer Ihre Anfrage. "
+        "Anbei unser Angebot."
+    )
     try:
         quotation = await provider.create_quotation_draft(
             line_items=line_items,
             one_time_address=one_time_address,
             title=f"Angebot {kunde_name}",
-            introduction=(
-                f"Sehr geehrte Damen und Herren,\n\nvielen Dank fuer Ihre "
-                f"Anfrage. Anbei unser Angebot."
-            ),
+            introduction=intro_text,
             remark="Preise inkl. MwSt. Angebot gueltig 30 Tage.",
             tax_type="gross",
             finalize=True,
@@ -5617,7 +5818,46 @@ async def _run_angebot_pipeline(angebot_id) -> str:
         f"<a href=\"{quotation.deeplink_view}\">in Lexware oeffnen</a>"
     )
 
-    # Stufe 2: Mail an Kunden (nur wenn Mail-Adresse erkannt wurde)
+    # Stufe 2a: Email-Fallback aus Lexware-Kontakten wenn nicht
+    # im Input erkannt. search_contacts macht Pattern-Match auf den
+    # Namen — beste Trefferquote bei min 3 Zeichen.
+    if not kunde_email and kunde_name and len(kunde_name.strip()) >= 3:
+        try:
+            contacts = await provider.search_contacts(
+                kunde_name, customer_only=True, limit=5,
+            )
+        except Exception as exc:
+            logger.exception(f"Lexware-Contact-Lookup gescheitert: {exc}")
+            contacts = []
+        # Erste Mail-Adresse aus den Treffern uebernehmen — bevorzugt
+        # Match wo der Name zumindest teilweise im Treffer-Display steht.
+        chosen_email = None
+        kunde_lower = kunde_name.lower()
+        for c in contacts:
+            if c.email:
+                if any(tok in (c.name or "").lower() for tok in kunde_lower.split()):
+                    chosen_email = c.email
+                    break
+        if not chosen_email:
+            for c in contacts:
+                if c.email:
+                    chosen_email = c.email
+                    break
+        if chosen_email:
+            kunde_email = chosen_email
+            report.append(
+                f"🔎 Mail-Adresse aus Lexware-Kontakten: <code>{_h_safe(chosen_email)}</code>"
+            )
+            # In DB persistieren — beim naechsten Mal sofort dabei
+            async with AsyncSessionLocal() as s:
+                ang2 = (await s.execute(
+                    select(Angebot).where(Angebot.id == angebot_id)
+                )).scalar_one_or_none()
+                if ang2 is not None:
+                    ang2.kunde_email = chosen_email
+                    await s.commit()
+
+    # Stufe 2b: Mail an Kunden (nur wenn jetzt eine Adresse da ist)
     if kunde_email:
         try:
             mail_result = await send_angebot_to_customer(

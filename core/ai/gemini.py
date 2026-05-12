@@ -560,12 +560,14 @@ async def _gemini_extract_rechnung(parts: list, mode: str) -> dict:
     client = _get_genai_client(location=GENAI_TEXT_LOCATION)
     model = "gemini-2.5-flash"
 
-    # Gemini 2.5 verbraucht intern Thinking-Tokens — bei nur 2048 kann es
-    # passieren dass die Response leer kommt (finish_reason=MAX_TOKENS),
-    # speziell wenn der Prompt um den Kalkulationsblock erweitert ist.
+    # Gemini 2.5 verbraucht intern Thinking-Tokens — bei nur 2048-4096
+    # kann es passieren dass die Response leer kommt (finish_reason=
+    # MAX_TOKENS), speziell wenn der Prompt um den Kalkulationsblock
+    # erweitert ist. 8192 ist defensiv genug fuer komplette Angebote
+    # mit 5+ Positionen + Thinking-Budget.
     config = GenerateContentConfig(
         temperature=0.1,
-        max_output_tokens=4096,
+        max_output_tokens=8192,
         response_mime_type="application/json",
         response_schema=RECHNUNG_RESPONSE_SCHEMA,
     )
@@ -1286,6 +1288,181 @@ async def update_angebot_from_audio(
         [audio_part, prompt],
         mode=f"angebot/update_audio/{mime_type}",
     )
+
+
+# =====================================================================
+# Personalisiertes Anschreiben fuer ein Angebot
+# =====================================================================
+# Sven sagt: "schreib freundlich, erwaehne dass wir am Donnerstag Zeit
+# haetten" — wir schicken die Anweisungen + Angebots-Snapshot an Gemini
+# und bekommen einen kompletten Anschreibe-Text (Briefform, geht im
+# Lexware-PDF in den `introduction`-Block).
+
+ANSCHREIBEN_PROMPT_TEMPLATE = """Du bist Assistent fuer einen deutschen Handwerksbetrieb \
+und schreibst das Anschreiben (Einleitungstext) zu einem Angebot.
+
+ANGEBOTS-KONTEXT:
+- Kunde: {kunde_name}
+- Adresse: {kunde_adresse}
+- Positionen:
+{positionen_summary}
+- Gesamtbetrag brutto: {gesamt:.2f} EUR
+
+ANWEISUNGEN VOM HANDWERKER:
+{instructions}
+
+AUFGABE:
+Schreibe einen kurzen, freundlichen Einleitungstext (max. 5 Saetze, max. 600 Zeichen) \
+fuer das Lexware-Angebot. Der Text steht spaeter im Angebots-PDF \
+direkt unter "Sehr geehrte..." und vor der Positionsliste.
+
+REGELN:
+- Beginne mit "Sehr geehrte Damen und Herren" oder mit der personalisierten \
+  Anrede falls aus dem Kunden-Namen erkennbar (z.B. "Sehr geehrte Frau Mueller").
+- Beziehe dich kurz auf das angefragte Gewerk (aus den Positionen).
+- Setze den vom Handwerker gewuenschten Ton um (sachlich/herzlich/kurz/ausfuehrlich).
+- Erwaehne explizit was der Handwerker erwaehnt haben will, falls genannt.
+- KEINE Floskeln wie "es freut uns sehr". Klar und respektvoll.
+- KEIN Schlusssatz wie "mit freundlichen Gruessen" — das macht Lexware.
+- KEINE Markdown-Symbole, keine HTML-Tags, reines Plaintext.
+
+Antworte AUSSCHLIESSLICH mit dem Anschreibe-Text. Keine Erlaeuterung davor oder danach.
+"""
+
+
+def _format_positionen_summary(positionen: list) -> str:
+    """Kompakte Zeilenliste der Positionen fuer den Prompt."""
+    lines = []
+    for i, p in enumerate(positionen or [], 1):
+        name = p.get("name") or "Position"
+        menge = p.get("menge") or 1
+        einheit = p.get("einheit") or "Stueck"
+        preis = p.get("preis_brutto_eur") or 0
+        lines.append(f"  {i}. {name} ({menge} {einheit}, {float(preis):.2f} EUR)")
+    return "\n".join(lines) if lines else "  (keine Positionen)"
+
+
+async def generate_angebot_anschreiben(
+    extracted: dict,
+    instructions: str,
+    *,
+    tenant_id=None,
+) -> str:
+    """Generiert ein personalisiertes Anschreiben fuer ein Angebot.
+
+    extracted: das Gemini-Extraction-dict (kunde_name, positionen, gesamt…).
+    instructions: was der Handwerker geschrieben/diktiert hat — Tonangabe,
+                  Hinweise, was rein soll.
+    Returns: Plaintext-Anschreiben (max ~600 Zeichen).
+    """
+    if not instructions or not instructions.strip():
+        return ""
+
+    kunde_name = extracted.get("kunde_name") or "(Kunde)"
+    addr_bits = [
+        extracted.get("kunde_strasse"),
+        " ".join(b for b in [extracted.get("kunde_plz"),
+                              extracted.get("kunde_ort")] if b).strip(),
+    ]
+    kunde_adresse = ", ".join(a for a in addr_bits if a) or "(keine Adresse)"
+    positionen = extracted.get("positionen") or []
+    gesamt = extracted.get("gesamtbetrag_brutto_eur") or sum(
+        float(p.get("menge") or 1) * float(p.get("preis_brutto_eur") or 0)
+        for p in positionen
+    )
+
+    prompt = ANSCHREIBEN_PROMPT_TEMPLATE.format(
+        kunde_name=kunde_name,
+        kunde_adresse=kunde_adresse,
+        positionen_summary=_format_positionen_summary(positionen),
+        gesamt=float(gesamt or 0),
+        instructions=instructions.strip(),
+    )
+    try:
+        text = await call_gemini(
+            prompt,
+            temperature=0.4,
+            max_output_tokens=2048,
+            tenant_id=tenant_id,
+            operation_kind="angebot/anschreiben",
+        )
+    except Exception as exc:
+        logger.exception(f"Anschreiben-Generation gescheitert: {exc}")
+        return ""
+    # Defensive: harten Cutoff bei 800 Zeichen — Lexware respektiert das
+    # Feld zwar, aber zu lange Anschreiben sehen im PDF unschoen aus.
+    text = (text or "").strip()
+    if len(text) > 800:
+        text = text[:797] + "..."
+    return text
+
+
+async def generate_angebot_anschreiben_from_audio(
+    extracted: dict,
+    audio_bytes: bytes,
+    mime_type: str = "audio/ogg",
+    *,
+    tenant_id=None,
+) -> str:
+    """Wie generate_angebot_anschreiben, aber mit Voice-Anweisungen.
+
+    Schickt die Audio + den Angebots-Kontext-Prompt an Gemini.
+    """
+    if not audio_bytes:
+        return ""
+
+    from google.genai.types import Part
+    from google.genai.types import GenerateContentConfig
+
+    # Wir bauen den Prompt OHNE die Anweisungen — die kommen aus dem Audio.
+    kunde_name = extracted.get("kunde_name") or "(Kunde)"
+    addr_bits = [
+        extracted.get("kunde_strasse"),
+        " ".join(b for b in [extracted.get("kunde_plz"),
+                              extracted.get("kunde_ort")] if b).strip(),
+    ]
+    kunde_adresse = ", ".join(a for a in addr_bits if a) or "(keine Adresse)"
+    positionen = extracted.get("positionen") or []
+    gesamt = extracted.get("gesamtbetrag_brutto_eur") or sum(
+        float(p.get("menge") or 1) * float(p.get("preis_brutto_eur") or 0)
+        for p in positionen
+    )
+    prompt = ANSCHREIBEN_PROMPT_TEMPLATE.format(
+        kunde_name=kunde_name,
+        kunde_adresse=kunde_adresse,
+        positionen_summary=_format_positionen_summary(positionen),
+        gesamt=float(gesamt or 0),
+        instructions="(siehe angehaengte Sprachnachricht des Handwerkers)",
+    )
+
+    try:
+        client = _get_genai_client(location=GENAI_TEXT_LOCATION)
+        config = GenerateContentConfig(
+            temperature=0.4,
+            max_output_tokens=2048,
+        )
+        audio_part = Part.from_bytes(data=audio_bytes, mime_type=mime_type)
+        def _sync_call():
+            return client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=[audio_part, prompt],
+                config=config,
+            )
+        loop = asyncio.get_event_loop()
+        response = await loop.run_in_executor(None, _sync_call)
+        if not response.candidates or not response.candidates[0].content:
+            return ""
+        text = ""
+        for p in response.candidates[0].content.parts or []:
+            if getattr(p, "text", None):
+                text += p.text
+        text = text.strip()
+        if len(text) > 800:
+            text = text[:797] + "..."
+        return text
+    except Exception as exc:
+        logger.exception(f"Anschreiben-Audio-Generation gescheitert: {exc}")
+        return ""
 
 
 # Antwort-Klassifikation: ist die eingehende Mail eine Annahme/Ablehnung
