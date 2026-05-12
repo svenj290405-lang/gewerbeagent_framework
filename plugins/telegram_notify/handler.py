@@ -3197,37 +3197,64 @@ async def _handle_lexware_setup_command(chat_id):
     bereits_eingerichtet = ""
     if existing and (existing.config or {}).get("encrypted_api_key"):
         bereits_eingerichtet = (
-            "\n\n<i>Hinweis: Lexware ist schon verbunden. "
-            "Wenn Sie einen neuen Schluessel eingeben, ueberschreibt das den alten.</i>"
+            "\n\n<i>ℹ️ Lexware ist schon verbunden — ein neuer Schluessel "
+            "ueberschreibt den alten.</i>"
         )
 
     await _save_state(chat_id, STATE_LEXWARE_SETUP_TOKEN, {})
-    msg = "<b>Lexware verbinden</b>\n\n"
-    msg += "So gehts:\n"
-    msg += "1. Im Browser <b>app.lexware.de</b> oeffnen und einloggen\n"
-    msg += "2. <b>Erweiterungen / Apps -> Public API</b> oeffnen\n"
-    msg += "3. Auf <b>API-Schluessel erstellen</b> klicken\n"
-    msg += "4. Schluessel kopieren und mir hier einfuegen\n\n"
-    msg += "<i>Der Schluessel wird verschluesselt gespeichert.</i>\n\n"
-    msg += f"/abbrechen um abzubrechen.{bereits_eingerichtet}"
+    msg = (
+        "🧾 <b>Lexware verbinden</b>\n\n"
+        "Damit ich Angebote und Rechnungen fuer dich in Lexware "
+        "anlegen kann, brauche ich einmal deinen API-Schluessel.\n\n"
+        "<b>So bekommst du ihn — 3 Schritte:</b>\n\n"
+        "1️⃣ Diesen Link in deinem Browser oeffnen:\n"
+        "👉 <a href=\"https://app.lexware.de/permalink/profile/api-keys\">"
+        "app.lexware.de/permalink/profile/api-keys</a>\n"
+        "<i>(Falls dein Lexware-Login fragt: einloggen wie immer.)</i>\n\n"
+        "2️⃣ Auf den blauen Button "
+        "<b>«Neuen API-Schluessel erstellen»</b> klicken.\n"
+        "<i>Bei Bezeichnung kannst du <b>Gewerbeagent</b> eintragen.</i>\n\n"
+        "3️⃣ Der Schluessel erscheint einmalig — auf <b>«Kopieren»</b> "
+        "tippen und hier in den Chat einfuegen ✏️\n\n"
+        "<i>⚠️ Den Schluessel siehst du nur einmal — also direkt hier "
+        "einkleben oder kurz notieren.</i>\n\n"
+        "<i>🔒 Bei mir wird der Schluessel verschluesselt gespeichert. "
+        "Du kannst ihn jederzeit in Lexware widerrufen.</i>\n\n"
+        f"Mit /abbrechen verwirfst du den Vorgang.{bereits_eingerichtet}"
+    )
     return msg
 
 
 async def _handle_lexware_setup_token_input(chat_id, text):
-    """User schickt den API-Key als Text."""
+    """User schickt den API-Schluessel als Text."""
     api_key = (text or "").strip()
-    # Plausibilisierung: Lexware-Keys sind ~48 Zeichen, alphanumerisch
+    # Plausi: Lexware-Keys sind alphanumerische Strings (~48+ Zeichen).
+    # Sven-feedback-freundliche Fehler statt technischer Zahlen.
     if len(api_key) < 20:
-        return "Das sieht nicht wie ein API-Schluessel aus. Bitte den vollstaendigen Schluessel einfuegen oder /abbrechen."
+        return (
+            "🤔 Das sieht zu kurz aus fuer einen Lexware-Schluessel.\n\n"
+            "Hast du den ganzen Schluessel kopiert? Er ist normalerweise "
+            "ein langer Buchstaben-Zahlen-Mix.\n\n"
+            "Nochmal probieren oder /abbrechen."
+        )
     if len(api_key) > 200:
-        return "Das ist zu lang fuer einen API-Schluessel. Bitte nochmal pruefen oder /abbrechen."
+        return (
+            "🤔 Das ist viel zu lang fuer einen API-Schluessel.\n\n"
+            "Bitte nur den Schluessel einfuegen — keinen Begleittext.\n\n"
+            "Nochmal probieren oder /abbrechen."
+        )
     if " " in api_key or "\n" in api_key:
-        return "Der Schluessel enthaelt Leerzeichen oder Zeilenumbrueche. Bitte sauber kopieren oder /abbrechen."
+        return (
+            "🤔 Da sind Leerzeichen oder Zeilenumbrueche drin.\n\n"
+            "Bitte den Schluessel <b>am Stueck</b> kopieren und einfuegen — "
+            "manche Browser haengen Whitespace mit dran.\n\n"
+            "Nochmal probieren oder /abbrechen."
+        )
 
     tenant = await _get_tenant_by_chat(chat_id)
     if not tenant:
         await _clear_state(chat_id)
-        return "Tenant nicht gefunden - bitte /start ausfuehren."
+        return "Chat ist keinem Betrieb zugeordnet — erst /start ausfuehren."
 
     # Live-Test: Health-Check gegen Lexware
     try:
@@ -3237,18 +3264,28 @@ async def _handle_lexware_setup_token_input(chat_id, text):
         await _clear_state(chat_id)
         if e.status_code == 401:
             return (
-                "Der Schluessel wurde von Lexware abgelehnt (401).\n"
-                "Bitte einen neuen Schluessel im Lexware-Profil erstellen "
-                "und mit /lexware_setup nochmal versuchen."
+                "🔒 <b>Lexware sagt: Schluessel ungueltig.</b>\n\n"
+                "Moegliche Gruende:\n"
+                "  • Schluessel ist abgelaufen oder wurde geloescht\n"
+                "  • Beim Kopieren ist ein Zeichen verlorengegangen\n\n"
+                "Loesung: einen neuen Schluessel erstellen unter\n"
+                "👉 <a href=\"https://app.lexware.de/permalink/profile/api-keys\">"
+                "app.lexware.de/permalink/profile/api-keys</a>\n\n"
+                "Dann nochmal /lexware_setup."
             )
         return (
-            f"Lexware antwortet mit Fehler (HTTP {e.status_code}).\n"
-            "Bitte spaeter erneut /lexware_setup versuchen."
+            f"⚠️ Lexware antwortet gerade nicht (Fehler {e.status_code}).\n\n"
+            "Vielleicht eine kurze Stoerung — in ein paar Minuten "
+            "nochmal /lexware_setup probieren."
         )
     except Exception as e:
         logger.exception(f"Lexware-Setup unerwarteter Fehler: {e}")
         await _clear_state(chat_id)
-        return "Verbindung zu Lexware fehlgeschlagen. Bitte spaeter erneut versuchen."
+        return (
+            "⚠️ Verbindung zu Lexware hat nicht geklappt.\n\n"
+            "Internet kurz pruefen und nochmal /lexware_setup probieren. "
+            "Falls es immer wieder schiefgeht: bei svenj05@gmx.de melden."
+        )
 
     # Verschluesselt speichern
     encrypted = encrypt(api_key)
@@ -3256,11 +3293,19 @@ async def _handle_lexware_setup_token_input(chat_id, text):
     await _save_lexware_config(tenant.id, encrypted, organization_id)
     await _clear_state(chat_id)
 
-    features = ", ".join(profile.get("businessFeatures") or []) if isinstance(profile, dict) else "-"
-    msg = "<b>Lexware verbunden.</b>\n\n"
-    msg += f"Org-ID: <code>{organization_id or '-'}</code>\n"
-    msg += f"Features: {features}\n\n"
-    msg += "Jetzt koennen Sie mit /beleg Belege hochladen."
+    msg = (
+        "✅ <b>Lexware ist verbunden!</b>\n\n"
+        "Du kannst jetzt:\n"
+        "  • <b>/angebot</b> — Angebot diktieren, automatisch in Lexware "
+        "anlegen + per Mail an den Kunden\n"
+        "  • <b>/beleg</b> — Foto eines Belegs schicken, kommt direkt "
+        "in Lexware\n"
+        "  • <b>/rechnung</b> — Rechnung diktieren, Lexware-Draft zum "
+        "Abnicken\n"
+        "  • <b>/auftraege</b> — laufende Projekte mit Status + "
+        "Auto-Rechnungs-Versand bei Beendet\n\n"
+        "Status spaeter pruefen mit <b>/lexware_status</b>."
+    )
     return msg
 
 
