@@ -87,6 +87,19 @@ class Kundengespraech(Base):
         nullable=True, index=True,
     )
 
+    # Phase-6-Reschedule-Mail-Tracking: wenn ein Kundengespraech-Termin
+    # wegen Krankheit auf einen Kollegen umgebucht wird, schicken wir
+    # dem Kunden eine "neuer Termin/anderer Mitarbeiter"-Mail. Die
+    # message_id + conversation_id merken wir hier um (a) doppelten
+    # Versand zu vermeiden und (b) Replies im Mail-Intake-Sticky-
+    # Routing auf den neuen Mitarbeiter zuzuordnen.
+    reschedule_mail_message_id: Mapped[str | None] = mapped_column(
+        String(500), nullable=True,
+    )
+    reschedule_mail_conversation_id: Mapped[str | None] = mapped_column(
+        String(500), nullable=True,
+    )
+
     # created_at + updated_at aus Base
 
     def __repr__(self) -> str:

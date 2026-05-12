@@ -82,6 +82,19 @@ STATE_WERKSTATT_CONFIRMING = "werkstatt_confirming"
 # Mitarbeiter-Wizard (Phase 4 Multi-Mitarbeiter)
 STATE_MITARBEITER_NEU_NAME = "mitarbeiter_neu_name"
 STATE_MITARBEITER_NEU_SKILLS = "mitarbeiter_neu_skills"
+# Phase 6: Job-Titel + Arbeitszeit
+STATE_MITARBEITER_JOB_TITLE_INPUT = "mitarbeiter_job_title_input"
+STATE_MITARBEITER_ARBEITSZEIT_PRESET = "mitarbeiter_arbeitszeit_preset"
+STATE_MITARBEITER_ARBEITSZEIT_CUSTOM_DAYS = "mitarbeiter_arbeitszeit_custom_days"
+STATE_MITARBEITER_ARBEITSZEIT_CUSTOM_HOURS = "mitarbeiter_arbeitszeit_custom_hours"
+
+# Phase 6: Krank/Urlaub
+STATE_KRANK_AWAIT_EMPLOYEE = "krank_await_employee"
+STATE_KRANK_AWAIT_DURATION = "krank_await_duration"
+STATE_KRANK_AWAIT_CUSTOM_DATE = "krank_await_custom_date"
+STATE_URLAUB_AWAIT_EMPLOYEE = "urlaub_await_employee"
+STATE_URLAUB_AWAIT_START = "urlaub_await_start"
+STATE_URLAUB_AWAIT_END = "urlaub_await_end"
 
 # Kalender-Verbinden-Wizard (Outlook-Calendar-Support)
 STATE_KALENDER_PROVIDER_CHOICE = "kalender_provider_choice"

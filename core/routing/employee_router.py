@@ -29,6 +29,7 @@ defensiv programmieren.
 """
 from __future__ import annotations
 
+import datetime as dt
 import logging
 import uuid
 from dataclasses import dataclass
@@ -83,8 +84,12 @@ class RoutingDecision:
     debug: dict[str, Any]
 
 
-def _extract_skills_from_text(text: str) -> list[str]:
-    """Findet Skills im freien Text (Substring-Match, lowercase)."""
+def extract_skills_from_text(text: str) -> list[str]:
+    """Findet Skills im freien Text (Substring-Match, lowercase).
+
+    Public Helper — auch von core.integrations.absence_redistribution
+    benutzt um aus Kalender-Event-Subjects Skills zu extrahieren.
+    """
     if not text:
         return []
     t = text.lower()
@@ -95,12 +100,18 @@ def _extract_skills_from_text(text: str) -> list[str]:
     return hits
 
 
+# Backward-Compat: alter privater Name bleibt als Alias bestehen.
+_extract_skills_from_text = extract_skills_from_text
+
+
 async def choose_employee(
     tenant_id: uuid.UUID,
     *,
     anliegen_text: str = "",
     kunde_adresse: str | None = None,
     existing_conversation=None,
+    target_datetime: dt.datetime | None = None,
+    exclude_employee_ids: list[uuid.UUID] | None = None,
 ) -> RoutingDecision | None:
     """Waehlt den passendsten Mitarbeiter fuer eine eingehende Anfrage.
 
@@ -113,6 +124,15 @@ async def choose_employee(
         existing_conversation: optional EmailConversation. Wenn deren
             assigned_employee_id schon gesetzt ist, wird der Router NICHT
             neu entscheiden (Sticky-Routing).
+        target_datetime: optional Termin-Zeitpunkt. Wenn gesetzt, werden
+            nur Mitarbeiter beruecksichtigt die zu dieser Zeit arbeiten
+            (is_employee_working_at — checkt Absence, Arbeitstag,
+            Arbeitszeit). Wenn nach Filter 0 Kandidaten: Default-Employee
+            als Fallback mit reason='no-coverage' (Signal an Cron/Bot
+            zur Eskalation an den Inhaber).
+        exclude_employee_ids: Liste der Mitarbeiter die ausgeschlossen
+            werden sollen — typisch bei Umverteilung der Krank-Termine
+            (der Erkrankte selbst soll nicht wieder gewaehlt werden).
 
     Returns:
         RoutingDecision oder None wenn der Tenant keine aktiven Employees
@@ -165,6 +185,46 @@ async def choose_employee(
     if not emps:
         logger.warning(f"choose_employee: tenant {tenant_id} hat keine aktiven Employees")
         return None
+
+    # 2a) Verfuegbarkeits-Filter (Phase 6): nur Mitarbeiter die zur
+    # `target_datetime` arbeiten (kein Absence, richtiger Arbeitstag,
+    # innerhalb Arbeitszeit) + nicht im exclude-Set.
+    excluded = set(exclude_employee_ids or [])
+    candidates_after_filter = emps
+    if target_datetime is not None or excluded:
+        from core.models.employee_absence import is_employee_working_at
+        filtered = []
+        for e in emps:
+            if e.id in excluded:
+                continue
+            if target_datetime is not None:
+                if not await is_employee_working_at(e.id, target_datetime):
+                    continue
+            filtered.append(e)
+        candidates_after_filter = filtered
+
+    # Wenn der Verfuegbarkeits-Filter ALLES rauswirft: Eskalation
+    # signalisieren via reason='no-coverage'. Wir liefern den
+    # Default-Employee mit dem Signal — der Cron / Bot kann dann
+    # eine "kein-Mitarbeiter-verfuegbar"-Nachricht an den Inhaber
+    # schicken.
+    if not candidates_after_filter:
+        default_emp = await get_default_employee(tenant_id)
+        if default_emp is None:
+            return None
+        return RoutingDecision(
+            employee_id=default_emp.id,
+            employee_name=default_emp.name,
+            employee_slug=default_emp.slug,
+            reason="no-coverage", score=0.0,
+            debug={
+                "target_datetime": target_datetime.isoformat() if target_datetime else None,
+                "excluded_count": len(excluded),
+                "all_emps": [e.slug for e in emps],
+            },
+        )
+    # Ab hier arbeiten wir nur noch auf der gefilterten Liste.
+    emps = candidates_after_filter
 
     # 3) Trivial-Fall: nur 1 Employee
     if len(emps) == 1:

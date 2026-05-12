@@ -122,6 +122,12 @@ class Employee(Base):
     )
     notes: Mapped[str | None] = mapped_column(String(2000), nullable=True)
 
+    # Phase 6 — Freitext-Rolle (z.B. "Inhaber", "Geselle", "Lehrling",
+    # "Subunternehmer"). Reiner Anzeige-Wert in /team + /mitarbeiter-
+    # Detail. KEIN Permission-Effekt; Permissions laufen weiter nur
+    # ueber is_default. Setzen via /mitarbeiter <slug> job_title <text>.
+    job_title: Mapped[str | None] = mapped_column(String(100), nullable=True)
+
     # Phase 2 — Telegram-Identitaet
     telegram_chat_id: Mapped[int | None] = mapped_column(
         BigInteger, nullable=True, unique=True,

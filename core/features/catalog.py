@@ -148,7 +148,14 @@ FEATURES: dict[str, Feature] = {
         label="Mitarbeiter",
         description="Multi-Mitarbeiter mit eigenem Kalender + Skills.",
         requires=("kalender",),
-        telegram_commands=("/mitarbeiter",),
+        telegram_commands=(
+            "/mitarbeiter",
+            "/team",
+            "/krank",
+            "/urlaub",
+            "/abwesend",
+            "/zurueck",
+        ),
     ),
     "werkstatt": Feature(
         key="werkstatt",

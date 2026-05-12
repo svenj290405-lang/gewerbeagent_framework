@@ -61,6 +61,16 @@ from core.models import (
     STATE_WERKSTATT_CONFIRMING,
     STATE_MITARBEITER_NEU_NAME,
     STATE_MITARBEITER_NEU_SKILLS,
+    STATE_MITARBEITER_JOB_TITLE_INPUT,
+    STATE_MITARBEITER_ARBEITSZEIT_PRESET,
+    STATE_MITARBEITER_ARBEITSZEIT_CUSTOM_DAYS,
+    STATE_MITARBEITER_ARBEITSZEIT_CUSTOM_HOURS,
+    STATE_KRANK_AWAIT_EMPLOYEE,
+    STATE_KRANK_AWAIT_DURATION,
+    STATE_KRANK_AWAIT_CUSTOM_DATE,
+    STATE_URLAUB_AWAIT_EMPLOYEE,
+    STATE_URLAUB_AWAIT_START,
+    STATE_URLAUB_AWAIT_END,
     STATE_KALENDER_PROVIDER_CHOICE,
     STATE_FORMULAR_TYP_WAEHLEN,
     STATE_FORMULAR_HAUPTMENU,
@@ -778,7 +788,33 @@ async def _handle_help_command(chat_id=None):
         setup_items.append((
             "/mitarbeiter",
             "Mitarbeiter anlegen — eigener Telegram-Chat, eigener "
-            "Kalender, eigene Skills.",
+            "Kalender, eigene Skills. Sub-Befehle: <b>aktivieren</b>, "
+            "<b>deaktivieren</b>, <b>skills</b>, <b>job_title</b>, "
+            "<b>arbeitszeit</b>.",
+        ))
+        setup_items.append((
+            "/team",
+            "Team-Status-Uebersicht: wer ist heute da, wer krank, wer "
+            "Urlaub, mit Skills + Job-Titel.",
+        ))
+        setup_items.append((
+            "/krank",
+            "Mitarbeiter krankmelden — Bot verteilt Tagestermine "
+            "automatisch auf passende Kollegen um (Skill+Distanz+Verfuegbarkeit).",
+        ))
+        setup_items.append((
+            "/urlaub",
+            "Urlaub planen (Start-/End-Datum). Blockt Slot-Vorschlaege "
+            "in dem Zeitraum, bestehende Termine bleiben.",
+        ))
+        setup_items.append((
+            "/abwesend",
+            "Aktuelle + naechste 7 Tage Abwesenheiten als Liste.",
+        ))
+        setup_items.append((
+            "/zurueck [slug]",
+            "Mitarbeiter ist wieder gesund/zurueck — beendet die "
+            "aktive Abwesenheit.",
         ))
     _block("⚙️", "Setup", setup_items)
 
@@ -1910,6 +1946,12 @@ async def _dispatch_update(payload):
             await _handle_auftrag_callback(cq_chat_id, cq_data, cq_id, bot_token)
         elif cq_data and cq_data.startswith("ob:"):
             await _handle_onboarding_callback(cq_chat_id, cq_data, cq_id, bot_token)
+        elif cq_data and cq_data.startswith("krank:"):
+            await _handle_krank_callback(cq_chat_id, cq_data, cq_id, bot_token)
+        elif cq_data and cq_data.startswith("urlaub:"):
+            await _handle_urlaub_callback(cq_chat_id, cq_data, cq_id, bot_token)
+        elif cq_data and cq_data.startswith("az:"):
+            await _handle_arbeitszeit_callback(cq_chat_id, cq_data, cq_id, bot_token)
         elif cq_data and cq_data.startswith("formular:"):
             await _handle_formular_callback(cq_chat_id, cq_data, cq_id, bot_token)
         elif cq_data and cq_data.startswith("kal:"):
@@ -2273,6 +2315,28 @@ async def _dispatch_update(payload):
     elif text == "/mitarbeiter" or text.startswith("/mitarbeiter "):
         await _clear_state(chat_id)
         reply = await _handle_mitarbeiter_command(chat_id, text)
+        if reply is None:
+            # Wizard hat schon per _send_with_keyboard geantwortet
+            return {"ok": True}
+    elif text == "/krank":
+        await _clear_state(chat_id)
+        reply = await _handle_krank_command(chat_id)
+        if reply is None:
+            return {"ok": True}
+    elif text == "/urlaub":
+        await _clear_state(chat_id)
+        reply = await _handle_urlaub_command(chat_id)
+        if reply is None:
+            return {"ok": True}
+    elif text == "/abwesend":
+        await _clear_state(chat_id)
+        reply = await _handle_abwesend_command(chat_id)
+    elif text == "/zurueck" or text.startswith("/zurueck "):
+        await _clear_state(chat_id)
+        reply = await _handle_zurueck_command(chat_id, text)
+    elif text == "/team":
+        await _clear_state(chat_id)
+        reply = await _handle_team_command(chat_id)
     elif text == "/kalender_verbinden" or text == "/kalender":
         await _clear_state(chat_id)
         # Send-and-return weil Wizard direkt per Inline-Buttons antwortet.
@@ -2446,6 +2510,29 @@ async def _dispatch_update(payload):
             reply = await _handle_mitarbeiter_neu_name_input(chat_id, text)
         elif state.state_key == STATE_MITARBEITER_NEU_SKILLS:
             reply = await _handle_mitarbeiter_neu_skills_input(
+                chat_id, text, state.state_data,
+            )
+        elif state.state_key == STATE_KRANK_AWAIT_CUSTOM_DATE:
+            reply_or_none = await _handle_krank_custom_date_input(
+                chat_id, text, state.state_data,
+            )
+            if reply_or_none is None:
+                return {"ok": True}
+            reply = reply_or_none
+        elif state.state_key == STATE_URLAUB_AWAIT_START:
+            reply = await _handle_urlaub_start_input(
+                chat_id, text, state.state_data,
+            )
+        elif state.state_key == STATE_URLAUB_AWAIT_END:
+            reply = await _handle_urlaub_end_input(
+                chat_id, text, state.state_data,
+            )
+        elif state.state_key == STATE_MITARBEITER_ARBEITSZEIT_CUSTOM_DAYS:
+            reply = await _handle_arbeitszeit_custom_days_input(
+                chat_id, text, state.state_data,
+            )
+        elif state.state_key == STATE_MITARBEITER_ARBEITSZEIT_CUSTOM_HOURS:
+            reply = await _handle_arbeitszeit_custom_hours_input(
                 chat_id, text, state.state_data,
             )
         elif state.state_key == STATE_MATERIAL_NEU_NAME:
@@ -4247,9 +4334,30 @@ async def _handle_briefing_command(chat_id):
     if provider_label and cal_events:
         cal_source_label = f" <i>(aus {provider_label}-Kalender)</i>"
 
+    # Abwesenheits-Header (Phase 6) — zeigt heute Abwesende
+    abwesenheit_header = ""
+    try:
+        from core.models.employee_absence import get_active_absences
+        active = await get_active_absences(tenant.id, today_date)
+        if active:
+            krank_list = [emp.name for emp, ab in active if ab.absence_type == "krank"]
+            urlaub_list = [emp.name for emp, ab in active if ab.absence_type == "urlaub"]
+            sonst_list = [emp.name for emp, ab in active if ab.absence_type == "sonstiges"]
+            parts_h = []
+            if krank_list:
+                parts_h.append(f"🤒 Heute krank: <b>{', '.join(krank_list)}</b>")
+            if urlaub_list:
+                parts_h.append(f"🏖 Heute Urlaub: <b>{', '.join(urlaub_list)}</b>")
+            if sonst_list:
+                parts_h.append(f"🚫 Heute abwesend: <b>{', '.join(sonst_list)}</b>")
+            if parts_h:
+                abwesenheit_header = "\n".join(parts_h) + "\n\n"
+    except Exception as _e:  # noqa: BLE001
+        logger.warning(f"briefing absence header failed: {_e}")
+
     if eintraege:
         datum_str = today_start.strftime("%A, %d.%m.%Y")
-        lines = [f"🔔 <b>Termine heute</b> — {datum_str}{cal_source_label}\n"]
+        lines = [abwesenheit_header + f"🔔 <b>Termine heute</b> — {datum_str}{cal_source_label}\n"]
         for e in eintraege:
             ort_suffix = f"  ·  {_h_safe(e['ort'])}" if e["ort"] else ""
             lines.append(
@@ -4288,7 +4396,10 @@ async def _handle_briefing_command(chat_id):
         return "\n".join(lines)
 
     # Kein Termin heute — Hinweis-Block
-    lines = ["📅 <b>Heute kein Termin.</b>"]
+    lines = []
+    if abwesenheit_header:
+        lines.append(abwesenheit_header.rstrip())
+    lines.append("📅 <b>Heute kein Termin.</b>")
     if provider_label:
         lines.append(
             f"<i>(Geprueft: {provider_label}-Kalender — keine Events heute)</i>\n"
@@ -8251,6 +8362,26 @@ def _format_skills(skills: list[str] | None) -> str:
     return ", ".join(skills)
 
 
+_WOCHENTAGE = ["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"]
+
+
+def _format_arbeitstage(tage: list[int] | None) -> str:
+    """[0,1,2,3,4] → 'Mo–Fr', [0,2,4] → 'Mo, Mi, Fr'.
+    Erkennt nur sortierte konsekutive Bloecke als Range."""
+    if not tage:
+        return "Mo–Fr"
+    sorted_tage = sorted(set(t for t in tage if 0 <= t <= 6))
+    if not sorted_tage:
+        return "—"
+    # Konsekutive Range?
+    if (
+        len(sorted_tage) >= 2
+        and sorted_tage == list(range(sorted_tage[0], sorted_tage[-1] + 1))
+    ):
+        return f"{_WOCHENTAGE[sorted_tage[0]]}–{_WOCHENTAGE[sorted_tage[-1]]}"
+    return ", ".join(_WOCHENTAGE[t] for t in sorted_tage)
+
+
 async def _format_mitarbeiter_list(tenant_id) -> str:
     """Liste aller Mitarbeiter eines Tenants."""
     from core.models import get_employees_for_tenant
@@ -8328,14 +8459,40 @@ async def _format_mitarbeiter_detail(tenant_id, slug) -> str:
         if (emp.heimat_strasse or emp.heimat_ort) else "—"
     )
     cal_label = _kalender_label(emp.calendar_provider)
+
+    # Arbeitszeit + Job-Titel + aktuelle Abwesenheit
+    job_title = emp.job_title or ("Inhaber" if emp.is_default else "—")
+    if emp.arbeitstage and emp.arbeitszeiten:
+        tage_label = _format_arbeitstage(emp.arbeitstage)
+        az = emp.arbeitszeiten
+        zeit_label = f"{az.get('start','08:00')}–{az.get('end','17:00')}"
+        arbeitszeit_label = f"{tage_label} {zeit_label}"
+    else:
+        arbeitszeit_label = "Mo–Fr 8–17 (Default)"
+
+    # Heute aktive Absence?
+    import datetime as _dt
+    from core.models.employee_absence import get_active_absences
+    today_active = await get_active_absences(tenant_id, _dt.date.today())
+    abwesend_label = "—"
+    for _emp, _abs in today_active:
+        if _emp.id == emp.id:
+            icon = {"krank": "🤒", "urlaub": "🏖", "sonstiges": "🚫"}.get(_abs.absence_type, "❌")
+            end_str = _abs.end_date.strftime("%d.%m.") if _abs.end_date else "open-ended"
+            abwesend_label = f"{icon} {_abs.absence_type} bis {end_str}"
+            break
+
     parts = [
         f"<b>{emp.name}</b>{flag}{active}",
         f"Slug: <code>{emp.slug}</code>",
+        f"Rolle: {job_title}",
         f"E-Mail: {emp.contact_email or '—'}",
         f"Telegram: {chat_str}",
         f"Heimat: {heimat}",
         f"Kalender: {cal_label}",
         f"Skills: {_format_skills(emp.skills)}",
+        f"Arbeitszeit: {arbeitszeit_label}",
+        f"Heute abwesend: {abwesend_label}",
         "",
         f"<b>Telegram-Onboarding:</b>\n<code>{tg_deeplink}</code>",
     ]
@@ -8459,6 +8616,40 @@ async def _handle_mitarbeiter_command(chat_id, text):
                 f"✅ Skills fuer <b>{emp.name}</b> gesetzt: "
                 f"{_format_skills(emp.skills)}"
             )
+        # /mitarbeiter <slug> job_title <freitext>
+        if sub_args.startswith("job_title ") or sub_args.startswith("rolle "):
+            prefix_len = len("job_title ") if sub_args.startswith("job_title ") else len("rolle ")
+            # Wir nutzen den Original-Text (mit Case) — slug-Args lag in
+            # rest (vor lowercase). Re-extract aus args:
+            raw_args = rest.strip()
+            # Trenne wieder
+            sp = raw_args.split(maxsplit=1)
+            new_title = sp[1].strip() if len(sp) > 1 else ""
+            if not new_title or len(new_title) > 100:
+                return "Job-Titel: 1-100 Zeichen. Beispiel: <i>/mitarbeiter max job_title Geselle</i>"
+            emp.job_title = new_title
+            await s.commit()
+            return f"✅ Job-Titel fuer <b>{emp.name}</b> gesetzt: <i>{new_title}</i>"
+        # /mitarbeiter <slug> arbeitszeit → Wizard
+        if sub_args == "arbeitszeit":
+            await _save_state(
+                chat_id, STATE_MITARBEITER_ARBEITSZEIT_PRESET,
+                {"employee_id": str(emp.id), "employee_name": emp.name},
+            )
+            keyboard = {"inline_keyboard": [
+                [{"text": "Mo–Fr 8–17 (Standard)", "callback_data": "az:p:mofr_8_17"}],
+                [{"text": "Mo–Fr 7–16",            "callback_data": "az:p:mofr_7_16"}],
+                [{"text": "Teilzeit (Mo–Mi 9–14)", "callback_data": "az:p:tz_mowed"}],
+                [{"text": "Custom",                "callback_data": "az:p:custom"}],
+                [{"text": "Zuruecksetzen (=Tenant-Default)", "callback_data": "az:p:reset"}],
+            ]}
+            await _send_with_keyboard(
+                chat_id,
+                f"<b>Arbeitszeit fuer {emp.name}</b>\n\n"
+                "Wann arbeitet er normalerweise? Waehle ein Preset oder Custom:",
+                keyboard,
+            )
+            return None
 
     return (
         f"Unbekannter Befehl: <code>/mitarbeiter {args}</code>\n\n"
@@ -8467,7 +8658,9 @@ async def _handle_mitarbeiter_command(chat_id, text):
         "• /mitarbeiter neu — anlegen\n"
         "• /mitarbeiter &lt;slug&gt; — Details\n"
         "• /mitarbeiter &lt;slug&gt; aktivieren / deaktivieren\n"
-        "• /mitarbeiter &lt;slug&gt; skills heizung,sanitaer"
+        "• /mitarbeiter &lt;slug&gt; skills heizung,sanitaer\n"
+        "• /mitarbeiter &lt;slug&gt; job_title Geselle\n"
+        "• /mitarbeiter &lt;slug&gt; arbeitszeit"
     )
 
 
@@ -8575,6 +8768,619 @@ async def _handle_mitarbeiter_neu_skills_input(chat_id, text, state_data):
         f"<b>{name}</b> mit dem Bot verbunden.\n\n"
         "Spaeter kann er optional <i>/werkstatt</i> ausfuehren um seine "
         "eigene Heimat-Adresse zu setzen (fuer Smart-Termin-Routing)."
+    )
+
+
+# =====================================================================
+# Krank / Urlaub / Abwesend / Zurueck / Team-Status (Phase 6)
+# =====================================================================
+
+async def _handle_krank_command(chat_id):
+    """/krank — Wizard: Mitarbeiter auswaehlen → Dauer → Insert + Auto-Umverteilung.
+
+    Inhaber-only. Bei Nicht-Inhaber: nur sich selbst krankmelden.
+    """
+    res = await _get_current_employee(chat_id)
+    if res is None:
+        return "Dieser Chat ist noch keinem Betrieb zugeordnet."
+    tenant, current_emp = res
+
+    from core.models.employee import get_employees_for_tenant
+    employees = await get_employees_for_tenant(tenant.id, active_only=True)
+    if not employees:
+        return "Keine aktiven Mitarbeiter."
+
+    # Nicht-Inhaber: nur sich selbst (Sicherheits-Schutz)
+    if not current_emp.is_default:
+        await _save_state(
+            chat_id, STATE_KRANK_AWAIT_DURATION,
+            {"employee_id": str(current_emp.id), "employee_name": current_emp.name},
+        )
+        keyboard = _krank_duration_keyboard()
+        await _send_with_keyboard(
+            chat_id,
+            f"<b>🤒 Du meldest dich krank.</b>\n\n"
+            f"Wie lange?",
+            keyboard,
+        )
+        return None
+
+    # Inhaber: alle aktiven Mitarbeiter zur Auswahl
+    await _save_state(chat_id, STATE_KRANK_AWAIT_EMPLOYEE, {})
+    rows = []
+    for e in employees:
+        label = e.name
+        if e.is_default:
+            label += " (Inhaber)"
+        rows.append([{"text": label, "callback_data": f"krank:emp:{e.id}"}])
+    rows.append([{"text": "Abbrechen", "callback_data": "krank:cancel"}])
+    await _send_with_keyboard(
+        chat_id,
+        "<b>🤒 Wer ist krank?</b>\n\n"
+        "Tap auf den Mitarbeiter:",
+        {"inline_keyboard": rows},
+    )
+    return None
+
+
+def _krank_duration_keyboard() -> dict:
+    return {"inline_keyboard": [
+        [{"text": "Nur heute",   "callback_data": "krank:dur:today"}],
+        [{"text": "3 Tage",      "callback_data": "krank:dur:3"}],
+        [{"text": "1 Woche",     "callback_data": "krank:dur:7"}],
+        [{"text": "Bis Datum",   "callback_data": "krank:dur:custom"}],
+        [{"text": "Open-ended (offen)", "callback_data": "krank:dur:open"}],
+        [{"text": "Abbrechen",   "callback_data": "krank:cancel"}],
+    ]}
+
+
+async def _handle_krank_callback(chat_id, callback_data, callback_query_id, bot_token):
+    """krank:emp:<id> | krank:dur:<today|3|7|custom|open> | krank:cancel"""
+    import datetime as _dt
+    parts = callback_data.split(":")
+    action = parts[1] if len(parts) > 1 else ""
+    await _answer_callback_query(callback_query_id, "OK", bot_token)
+
+    if action == "cancel":
+        await _clear_state(chat_id)
+        await _send_to_chat(chat_id, "Abgebrochen.")
+        return
+
+    if action == "emp" and len(parts) >= 3:
+        emp_id = parts[2]
+        from core.database import AsyncSessionLocal
+        from core.models import Employee
+        async with AsyncSessionLocal() as s:
+            emp = (await s.execute(
+                select(Employee).where(Employee.id == emp_id)
+            )).scalar_one_or_none()
+        if emp is None:
+            await _send_to_chat(chat_id, "Mitarbeiter nicht gefunden.")
+            return
+        await _save_state(
+            chat_id, STATE_KRANK_AWAIT_DURATION,
+            {"employee_id": str(emp.id), "employee_name": emp.name},
+        )
+        await _send_with_keyboard(
+            chat_id,
+            f"<b>🤒 {emp.name} krank — wie lange?</b>",
+            _krank_duration_keyboard(),
+        )
+        return
+
+    if action == "dur" and len(parts) >= 3:
+        kind = parts[2]
+        state = await _load_state(chat_id)
+        if state is None or state.state_key != STATE_KRANK_AWAIT_DURATION:
+            await _send_to_chat(chat_id, "Wizard-State verloren. Bitte /krank erneut.")
+            return
+        data = state.state_data or {}
+        emp_id = data.get("employee_id")
+        emp_name = data.get("employee_name") or "?"
+        if not emp_id:
+            await _send_to_chat(chat_id, "Mitarbeiter unbekannt — /krank erneut.")
+            return
+
+        today = _dt.date.today()
+        if kind == "today":
+            start, end = today, today
+        elif kind == "3":
+            start, end = today, today + _dt.timedelta(days=2)
+        elif kind == "7":
+            start, end = today, today + _dt.timedelta(days=6)
+        elif kind == "open":
+            start, end = today, None
+        elif kind == "custom":
+            await _save_state(
+                chat_id, STATE_KRANK_AWAIT_CUSTOM_DATE, data,
+            )
+            await _send_to_chat(
+                chat_id,
+                f"<b>Bis wann ist {emp_name} krank?</b>\n\n"
+                "Format <b>JJJJ-MM-TT</b> (z.B. 2026-05-20).",
+            )
+            return
+        else:
+            await _send_to_chat(chat_id, "Unbekannte Dauer.")
+            return
+
+        await _finalize_krankmeldung(
+            chat_id, emp_id=emp_id, emp_name=emp_name,
+            start=start, end=end,
+        )
+
+
+async def _handle_krank_custom_date_input(chat_id, text, state_data):
+    """Text-Input fuer 'Bis Datum' — JJJJ-MM-TT."""
+    import datetime as _dt
+    try:
+        end_date = _dt.date.fromisoformat(text.strip())
+    except ValueError:
+        return (
+            "🤔 Format: <b>JJJJ-MM-TT</b> (z.B. 2026-05-20). Erneut?"
+        )
+    today = _dt.date.today()
+    if end_date < today:
+        return "End-Datum liegt in der Vergangenheit. Erneut?"
+    data = state_data or {}
+    emp_id = data.get("employee_id")
+    emp_name = data.get("employee_name") or "?"
+    if not emp_id:
+        await _clear_state(chat_id)
+        return "State verloren — bitte /krank erneut."
+    await _finalize_krankmeldung(
+        chat_id, emp_id=emp_id, emp_name=emp_name,
+        start=today, end=end_date,
+    )
+    return None
+
+
+async def _finalize_krankmeldung(chat_id, *, emp_id, emp_name, start, end):
+    """Insert Absence + sofort Auto-Umverteilung anstossen."""
+    import datetime as _dt
+    from core.models import create_absence, ABSENCE_KRANK
+    res = await _get_current_employee(chat_id)
+    if res is None:
+        await _send_to_chat(chat_id, "Tenant nicht gefunden.")
+        return
+    tenant, current_emp = res
+    try:
+        absence = await create_absence(
+            employee_id=emp_id,
+            start_date=start,
+            end_date=end,
+            absence_type=ABSENCE_KRANK,
+            created_by_employee_id=current_emp.id,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.exception(f"create_absence fehlgeschlagen: {e}")
+        await _clear_state(chat_id)
+        await _send_to_chat(chat_id, f"Fehler beim Speichern: {e}")
+        return
+    await _clear_state(chat_id)
+
+    end_label = end.strftime("%d.%m.%Y") if end else "open-ended"
+    confirm_msg = (
+        f"✅ <b>{emp_name}</b> krankgemeldet "
+        f"vom {start.strftime('%d.%m.%Y')} bis {end_label}.\n\n"
+        "🔄 Verteile Termine um... (kommt gleich als Zusammenfassung)"
+    )
+    await _send_to_chat(chat_id, confirm_msg)
+
+    # Fire-and-forget — Cron + Telegram-Report kommt asynchron.
+    try:
+        from core.integrations.absence_redistribution import (
+            schedule_immediate_redistribution,
+        )
+        range_end = end if end else (start + _dt.timedelta(days=7))
+        schedule_immediate_redistribution(
+            tenant.id, absence.employee_id, (start, range_end),
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"schedule_immediate_redistribution failed: {e}")
+
+
+# ----- /urlaub Wizard -----
+
+async def _handle_urlaub_command(chat_id):
+    """/urlaub — Wizard: Mitarbeiter → Start-Datum → End-Datum.
+
+    Inhaber-only fuer fremde Mitarbeiter; Nicht-Inhaber: nur sich selbst.
+    KEINE Auto-Umverteilung bestehender Termine (Urlaub ist meist
+    vorausgeplant — Slot-Vorschlaege ab dann werden geblockt).
+    """
+    res = await _get_current_employee(chat_id)
+    if res is None:
+        return "Dieser Chat ist noch keinem Betrieb zugeordnet."
+    tenant, current_emp = res
+
+    from core.models.employee import get_employees_for_tenant
+    employees = await get_employees_for_tenant(tenant.id, active_only=True)
+
+    if not current_emp.is_default:
+        await _save_state(
+            chat_id, STATE_URLAUB_AWAIT_START,
+            {"employee_id": str(current_emp.id), "employee_name": current_emp.name},
+        )
+        return (
+            f"<b>🏖 Du planst Urlaub.</b>\n\n"
+            "Ab wann (JJJJ-MM-TT, z.B. 2026-06-01)?"
+        )
+
+    await _save_state(chat_id, STATE_URLAUB_AWAIT_EMPLOYEE, {})
+    rows = []
+    for e in employees:
+        label = e.name
+        if e.is_default:
+            label += " (Inhaber)"
+        rows.append([{"text": label, "callback_data": f"urlaub:emp:{e.id}"}])
+    rows.append([{"text": "Abbrechen", "callback_data": "urlaub:cancel"}])
+    await _send_with_keyboard(
+        chat_id,
+        "<b>🏖 Wer hat Urlaub?</b>",
+        {"inline_keyboard": rows},
+    )
+    return None
+
+
+async def _handle_urlaub_callback(chat_id, callback_data, callback_query_id, bot_token):
+    """urlaub:emp:<id> | urlaub:cancel"""
+    parts = callback_data.split(":")
+    action = parts[1] if len(parts) > 1 else ""
+    await _answer_callback_query(callback_query_id, "OK", bot_token)
+    if action == "cancel":
+        await _clear_state(chat_id)
+        await _send_to_chat(chat_id, "Abgebrochen.")
+        return
+    if action == "emp" and len(parts) >= 3:
+        emp_id = parts[2]
+        from core.database import AsyncSessionLocal
+        from core.models import Employee
+        async with AsyncSessionLocal() as s:
+            emp = (await s.execute(
+                select(Employee).where(Employee.id == emp_id)
+            )).scalar_one_or_none()
+        if emp is None:
+            await _send_to_chat(chat_id, "Mitarbeiter nicht gefunden.")
+            return
+        await _save_state(
+            chat_id, STATE_URLAUB_AWAIT_START,
+            {"employee_id": str(emp.id), "employee_name": emp.name},
+        )
+        await _send_to_chat(
+            chat_id,
+            f"<b>🏖 Urlaub {emp.name} — ab wann?</b>\n\n"
+            "Format JJJJ-MM-TT (z.B. 2026-06-01) oder <b>heute</b>.",
+        )
+
+
+async def _handle_urlaub_start_input(chat_id, text, state_data):
+    import datetime as _dt
+    txt = (text or "").strip().lower()
+    today = _dt.date.today()
+    if txt in ("heute", "today"):
+        start = today
+    else:
+        try:
+            start = _dt.date.fromisoformat(text.strip())
+        except ValueError:
+            return "🤔 Format: <b>JJJJ-MM-TT</b> oder <b>heute</b>. Erneut?"
+    if start < today:
+        return "Start-Datum liegt in der Vergangenheit. Erneut?"
+    data = dict(state_data or {})
+    data["start_date"] = start.isoformat()
+    await _save_state(chat_id, STATE_URLAUB_AWAIT_END, data)
+    emp_name = data.get("employee_name") or "?"
+    return (
+        f"<b>🏖 Urlaub {emp_name} ab {start.strftime('%d.%m.%Y')}.</b>\n\n"
+        "Bis wann? JJJJ-MM-TT oder <b>offen</b> (open-ended)."
+    )
+
+
+async def _handle_urlaub_end_input(chat_id, text, state_data):
+    import datetime as _dt
+    from core.models import create_absence, ABSENCE_URLAUB
+    txt = (text or "").strip().lower()
+    data = state_data or {}
+    start_str = data.get("start_date")
+    emp_id = data.get("employee_id")
+    emp_name = data.get("employee_name") or "?"
+    if not start_str or not emp_id:
+        await _clear_state(chat_id)
+        return "State verloren — /urlaub erneut."
+    start = _dt.date.fromisoformat(start_str)
+    if txt in ("offen", "open", "open-ended"):
+        end = None
+    else:
+        try:
+            end = _dt.date.fromisoformat(text.strip())
+        except ValueError:
+            return "🤔 Format: <b>JJJJ-MM-TT</b> oder <b>offen</b>. Erneut?"
+        if end < start:
+            return "End-Datum liegt vor Start. Erneut?"
+    res = await _get_current_employee(chat_id)
+    if res is None:
+        await _clear_state(chat_id)
+        return "Tenant verloren."
+    _, current_emp = res
+    try:
+        await create_absence(
+            employee_id=emp_id, start_date=start, end_date=end,
+            absence_type=ABSENCE_URLAUB,
+            created_by_employee_id=current_emp.id,
+        )
+    except Exception as e:  # noqa: BLE001
+        await _clear_state(chat_id)
+        return f"Fehler: {e}"
+    await _clear_state(chat_id)
+    end_label = end.strftime("%d.%m.%Y") if end else "open-ended"
+    return (
+        f"✅ <b>{emp_name}</b> Urlaub {start.strftime('%d.%m.%Y')}"
+        f"–{end_label} eingetragen.\n\n"
+        f"<i>Slot-Vorschlaege fuer diesen Mitarbeiter werden in dem "
+        f"Zeitraum geblockt. Bestehende Termine bleiben — bei kurzfristiger "
+        f"Aenderung bitte /krank nutzen, das verteilt die Termine "
+        f"automatisch um.</i>"
+    )
+
+
+# ----- /abwesend Liste -----
+
+async def _handle_abwesend_command(chat_id):
+    """Zeigt aktuelle + naechste 7 Tage Abwesenheiten."""
+    import datetime as _dt
+    res = await _get_current_employee(chat_id)
+    if res is None:
+        return "Dieser Chat ist noch keinem Betrieb zugeordnet."
+    tenant, _ = res
+
+    from core.models.employee_absence import (
+        get_active_absences, get_upcoming_absences,
+    )
+    today = _dt.date.today()
+    active = await get_active_absences(tenant.id, today)
+    upcoming = await get_upcoming_absences(tenant.id, days_ahead=7)
+
+    lines = ["📋 <b>Abwesenheiten</b>"]
+    if not active and not upcoming:
+        lines.append("\n<i>Heute + naechste 7 Tage: alle da.</i>")
+        return "\n".join(lines)
+
+    if active:
+        lines.append("\n<b>Heute:</b>")
+        for emp, ab in active:
+            icon = {"krank": "🤒", "urlaub": "🏖", "sonstiges": "🚫"}.get(ab.absence_type, "❌")
+            end_str = ab.end_date.strftime("%d.%m.") if ab.end_date else "open-ended"
+            lines.append(f"  {icon} {emp.name} — bis {end_str}")
+    if upcoming:
+        lines.append("\n<b>Naechste 7 Tage:</b>")
+        for emp, ab in upcoming:
+            icon = {"krank": "🤒", "urlaub": "🏖", "sonstiges": "🚫"}.get(ab.absence_type, "❌")
+            start_str = ab.start_date.strftime("%d.%m.")
+            end_str = ab.end_date.strftime("%d.%m.") if ab.end_date else "open"
+            lines.append(f"  {icon} {emp.name} {start_str}–{end_str}")
+    lines.append("\n<i>Zurueck holen: /zurueck &lt;slug&gt;</i>")
+    return "\n".join(lines)
+
+
+# ----- /zurueck <slug> -----
+
+async def _handle_zurueck_command(chat_id, text):
+    """/zurueck <slug> — beendet die aktive Absence eines Mitarbeiters.
+    Setzt end_date auf gestern (= ab heute wieder verfuegbar)."""
+    import datetime as _dt
+    from core.models import close_absence
+    args = text[len("/zurueck"):].strip()
+    if not args:
+        return "Nutzung: <b>/zurueck &lt;slug&gt;</b>"
+    res = await _get_current_employee(chat_id)
+    if res is None:
+        return "Dieser Chat ist noch keinem Betrieb zugeordnet."
+    tenant, current_emp = res
+    # Nicht-Inhaber nur sich selbst
+    from core.database import AsyncSessionLocal
+    from core.models import Employee
+    async with AsyncSessionLocal() as s:
+        target = (await s.execute(
+            select(Employee).where(
+                Employee.tenant_id == tenant.id,
+                Employee.slug == args.lower(),
+            )
+        )).scalar_one_or_none()
+    if target is None:
+        return f"Mitarbeiter <b>{args}</b> nicht gefunden."
+    if not current_emp.is_default and target.id != current_emp.id:
+        return "Nur der Inhaber darf andere Mitarbeiter zurueck-holen."
+
+    yesterday = _dt.date.today() - _dt.timedelta(days=1)
+    closed = await close_absence(target.id, yesterday)
+    if closed is None:
+        return f"<b>{target.name}</b> hat keine aktive Abwesenheit."
+    return (
+        f"✅ <b>{target.name}</b> wieder verfuegbar "
+        f"(Abwesenheit beendet zum {yesterday.strftime('%d.%m.%Y')}).\n\n"
+        "<i>⚠️ Bereits umverteilte Termine bleiben bei den Kollegen — "
+        "die haben ihre Tour geplant. Schau in /briefing.</i>"
+    )
+
+
+# ----- /team Status-Uebersicht -----
+
+async def _handle_team_command(chat_id):
+    """Status-Liste mit Symbolen pro Mitarbeiter."""
+    import datetime as _dt
+    res = await _get_current_employee(chat_id)
+    if res is None:
+        return "Dieser Chat ist noch keinem Betrieb zugeordnet."
+    tenant, _ = res
+
+    from core.models.employee import get_employees_for_tenant
+    from core.models.employee_absence import get_active_absences
+    employees = await get_employees_for_tenant(tenant.id, active_only=False)
+    today = _dt.date.today()
+    active_absences = await get_active_absences(tenant.id, today)
+    absence_by_emp = {emp.id: ab for emp, ab in active_absences}
+
+    lines = ["👥 <b>Team-Status (heute)</b>"]
+    # Limit auf 10 Mitarbeiter um Telegram-Message-Laenge zu schonen.
+    shown = 0
+    extra = 0
+    for emp in employees:
+        if shown >= 10:
+            extra += 1
+            continue
+        if not emp.is_active:
+            icon = "🚫"
+            status = "deaktiviert"
+        elif emp.id in absence_by_emp:
+            ab = absence_by_emp[emp.id]
+            icon = {"krank": "🤒", "urlaub": "🏖"}.get(ab.absence_type, "❌")
+            end_str = ab.end_date.strftime("%d.%m.") if ab.end_date else "open"
+            status = f"{ab.absence_type} bis {end_str}"
+        else:
+            icon = "✅"
+            status = "verfuegbar"
+        role = emp.job_title or ("Inhaber" if emp.is_default else "Mitarbeiter")
+        skills = _format_skills(emp.skills)
+        lines.append(
+            f"{icon} <b>{emp.name}</b> ({role}) "
+            f"— {status} · Skills: {skills}"
+        )
+        shown += 1
+    if extra > 0:
+        lines.append(f"<i>… und {extra} weitere</i>")
+    return "\n".join(lines)
+
+
+# ----- Arbeitszeit-Callback-Handler -----
+
+async def _handle_arbeitszeit_callback(chat_id, callback_data, callback_query_id, bot_token):
+    """az:p:<preset> — setzt Preset oder startet Custom-Wizard."""
+    parts = callback_data.split(":")
+    action = parts[1] if len(parts) > 1 else ""
+    preset = parts[2] if len(parts) > 2 else ""
+    await _answer_callback_query(callback_query_id, "OK", bot_token)
+    if action != "p":
+        return
+
+    state = await _load_state(chat_id)
+    if state is None or state.state_key != STATE_MITARBEITER_ARBEITSZEIT_PRESET:
+        await _send_to_chat(chat_id, "Wizard verloren — bitte /mitarbeiter <slug> arbeitszeit erneut.")
+        return
+    data = state.state_data or {}
+    emp_id = data.get("employee_id")
+    emp_name = data.get("employee_name") or "?"
+    if not emp_id:
+        await _send_to_chat(chat_id, "Mitarbeiter verloren.")
+        return
+
+    presets = {
+        "mofr_8_17": ([0,1,2,3,4], {"start": "08:00", "end": "17:00"}, "Mo–Fr 8–17"),
+        "mofr_7_16": ([0,1,2,3,4], {"start": "07:00", "end": "16:00"}, "Mo–Fr 7–16"),
+        "tz_mowed":  ([0,1,2],       {"start": "09:00", "end": "14:00"}, "Mo–Mi 9–14"),
+    }
+    if preset == "custom":
+        await _save_state(
+            chat_id, STATE_MITARBEITER_ARBEITSZEIT_CUSTOM_DAYS, data,
+        )
+        await _send_to_chat(
+            chat_id,
+            f"<b>Custom Arbeitstage fuer {emp_name}</b>\n\n"
+            "Schicke Wochentage als Komma-Liste: <b>Mo, Di, Mi, Do, Fr</b>\n"
+            "(0=Mo, 6=So — also auch <b>0,1,2,3,4</b> erlaubt).",
+        )
+        return
+    if preset == "reset":
+        await _set_arbeitszeit(emp_id, None, None)
+        await _clear_state(chat_id)
+        await _send_to_chat(
+            chat_id,
+            f"✅ Arbeitszeit fuer <b>{emp_name}</b> zurueckgesetzt "
+            "(Tenant-Default greift wieder).",
+        )
+        return
+    if preset in presets:
+        tage, zeit, label = presets[preset]
+        await _set_arbeitszeit(emp_id, tage, zeit)
+        await _clear_state(chat_id)
+        await _send_to_chat(
+            chat_id,
+            f"✅ Arbeitszeit fuer <b>{emp_name}</b> gesetzt: <b>{label}</b>",
+        )
+
+
+async def _set_arbeitszeit(emp_id, arbeitstage, arbeitszeiten):
+    from core.database import AsyncSessionLocal
+    from core.models import Employee
+    async with AsyncSessionLocal() as s:
+        emp = (await s.execute(
+            select(Employee).where(Employee.id == emp_id)
+        )).scalar_one()
+        emp.arbeitstage = arbeitstage
+        emp.arbeitszeiten = arbeitszeiten
+        await s.commit()
+
+
+async def _handle_arbeitszeit_custom_days_input(chat_id, text, state_data):
+    """Parser fuer 'Mo, Di, Mi' oder '0,1,2'."""
+    tag_map = {
+        "mo": 0, "montag": 0,
+        "di": 1, "dienstag": 1,
+        "mi": 2, "mittwoch": 2,
+        "do": 3, "donnerstag": 3,
+        "fr": 4, "freitag": 4,
+        "sa": 5, "samstag": 5,
+        "so": 6, "sonntag": 6,
+    }
+    parts = [p.strip().lower() for p in text.replace(";", ",").split(",") if p.strip()]
+    tage: list[int] = []
+    for p in parts:
+        if p.isdigit():
+            n = int(p)
+            if 0 <= n <= 6:
+                tage.append(n)
+                continue
+        if p in tag_map:
+            tage.append(tag_map[p])
+            continue
+        return f"🤔 '{p}' nicht erkannt. Bitte Mo,Di,... oder 0,1,2... erneut."
+    if not tage:
+        return "🤔 Keine Tage erkannt. Erneut?"
+    data = dict(state_data or {})
+    data["arbeitstage"] = sorted(set(tage))
+    await _save_state(
+        chat_id, STATE_MITARBEITER_ARBEITSZEIT_CUSTOM_HOURS, data,
+    )
+    return (
+        f"<b>Tage:</b> {_format_arbeitstage(data['arbeitstage'])}\n\n"
+        "Jetzt die Arbeitsstunden: Format <b>HH:MM-HH:MM</b> "
+        "(z.B. <b>08:00-17:00</b>)."
+    )
+
+
+async def _handle_arbeitszeit_custom_hours_input(chat_id, text, state_data):
+    """Parser fuer '08:00-17:00'."""
+    import re
+    m = re.match(r"^\s*(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})\s*$", text)
+    if m is None:
+        return "🤔 Format: <b>HH:MM-HH:MM</b> (z.B. 08:00-17:00). Erneut?"
+    h1, mi1, h2, mi2 = (int(x) for x in m.groups())
+    if not (0 <= h1 <= 23 and 0 <= h2 <= 23 and 0 <= mi1 <= 59 and 0 <= mi2 <= 59):
+        return "🤔 Stunden 0-23, Minuten 0-59. Erneut?"
+    start_str = f"{h1:02d}:{mi1:02d}"
+    end_str = f"{h2:02d}:{mi2:02d}"
+    data = state_data or {}
+    emp_id = data.get("employee_id")
+    emp_name = data.get("employee_name") or "?"
+    tage = data.get("arbeitstage") or [0, 1, 2, 3, 4]
+    if not emp_id:
+        await _clear_state(chat_id)
+        return "State verloren."
+    await _set_arbeitszeit(emp_id, tage, {"start": start_str, "end": end_str})
+    await _clear_state(chat_id)
+    return (
+        f"✅ Arbeitszeit fuer <b>{emp_name}</b> gesetzt:\n"
+        f"<b>{_format_arbeitstage(tage)} {start_str}–{end_str}</b>"
     )
 
 

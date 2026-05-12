@@ -863,7 +863,24 @@ class Plugin(BasePlugin):
         # Sticky: bestehende Conversation behaelt ihren assigned_employee_id.
         # Bei nur 1 Employee → Default (only-active). Best-effort, schluckt
         # eigene Fehler — Fallback ist None und Code laeuft wie vor Phase 5.
+        # Phase-6: target_datetime = Wunschtermin (falls Kunde einen angab),
+        # so dass abwesende/nicht-arbeitende Mitarbeiter rausgefiltert werden.
         routing_decision = None
+        target_dt = None
+        try:
+            wd = (extracted.get("wunschtermin_datum") or "").strip()
+            wt = (extracted.get("wunschtermin_uhrzeit") or "").strip() or "09:00"
+            if wd:
+                # Akzeptiert DD.MM.YYYY (laut Schema). Bei anderen Formaten:
+                # silent fallback auf None — target_datetime ist optional.
+                import datetime as _dt
+                day, month, year = wd.split(".")
+                hh, mm = wt.split(":")
+                target_dt = _dt.datetime(
+                    int(year), int(month), int(day), int(hh), int(mm),
+                )
+        except Exception:  # noqa: BLE001
+            target_dt = None
         try:
             from core.routing import choose_employee
             routing_decision = await choose_employee(
@@ -875,12 +892,14 @@ class Plugin(BasePlugin):
                 ]),
                 kunde_adresse=extracted.get("kunde_adresse"),
                 existing_conversation=conv,
+                target_datetime=target_dt,
             )
             if routing_decision:
                 logger.info(
                     f"Skill-Routing: {routing_decision.employee_slug} "
                     f"(reason={routing_decision.reason} "
-                    f"score={routing_decision.score})"
+                    f"score={routing_decision.score} "
+                    f"target_dt={target_dt})"
                 )
         except Exception as e:
             logger.exception(f"choose_employee crashed (best-effort): {e}")

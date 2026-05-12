@@ -174,3 +174,109 @@ async def list_events_for_day(
         f"{len(events)} events"
     )
     return events
+
+
+# ---------------------------------------------------------------------
+# EVENT-CREATE (Spiegel der Microsoft-Variante — fuer Termin-Umverteilung
+# bei Krankheit verwendet via core.integrations.absence_redistribution)
+# ---------------------------------------------------------------------
+
+async def create_event(
+    tenant_id: UUID,
+    *,
+    summary: str,
+    description: str,
+    location: str,
+    start: dt.datetime,
+    end: dt.datetime,
+    employee_id: UUID | None = None,
+    calendar_id: str = "primary",
+) -> dict[str, Any]:
+    """Erstellt einen Termin im Google-Calendar des Mitarbeiters.
+
+    Returns: {"id": <event-id>, "html_link": <https://...>}.
+    Bei fehlendem Token oder API-Fehler: raise (Caller muss
+    try/except machen — Move-Operation ist semi-kritisch).
+    """
+    oauth_token = await find_oauth_token(tenant_id, "google", employee_id)
+    if oauth_token is None:
+        raise RuntimeError(
+            f"Google-Calendar: kein OAuth-Token fuer tenant={tenant_id} "
+            f"employee={employee_id} — kann Event nicht anlegen"
+        )
+    access_token = await _ensure_fresh_access_token(oauth_token)
+
+    body: dict[str, Any] = {
+        "summary": summary,
+        "description": description or "",
+        "start": {
+            "dateTime": start.replace(microsecond=0).isoformat(),
+            "timeZone": DEFAULT_TIMEZONE,
+        },
+        "end": {
+            "dateTime": end.replace(microsecond=0).isoformat(),
+            "timeZone": DEFAULT_TIMEZONE,
+        },
+    }
+    if location:
+        body["location"] = location
+
+    url = f"{GOOGLE_CAL_BASE}/calendars/{calendar_id}/events"
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS) as client:
+        resp = await client.post(
+            url,
+            headers={"Authorization": f"Bearer {access_token}"},
+            json=body,
+        )
+        if resp.status_code not in (200, 201):
+            logger.warning(
+                f"Google-Calendar create_event {resp.status_code}: "
+                f"{resp.text[:200]}"
+            )
+            raise RuntimeError(
+                f"Google-Calendar create_event fehlgeschlagen: {resp.status_code}"
+            )
+        data = resp.json()
+    return {
+        "id": data.get("id") or "",
+        "html_link": data.get("htmlLink") or "",
+    }
+
+
+# ---------------------------------------------------------------------
+# EVENT-DELETE
+# ---------------------------------------------------------------------
+
+async def delete_event(
+    tenant_id: UUID,
+    event_id: str,
+    employee_id: UUID | None = None,
+    calendar_id: str = "primary",
+) -> bool:
+    """Loescht einen Termin. Returns True wenn 204/404 (404 = schon weg).
+
+    Bei fehlendem Token: return False (Caller entscheidet ob das ein
+    Bug ist — bei Umverteilung darf man dann nicht den Quell-Termin
+    auch noch loeschen, sonst doppelt-weg).
+    """
+    oauth_token = await find_oauth_token(tenant_id, "google", employee_id)
+    if oauth_token is None:
+        logger.warning(
+            f"Google-Calendar delete_event: kein Token fuer tenant={tenant_id} "
+            f"employee={employee_id}"
+        )
+        return False
+    access_token = await _ensure_fresh_access_token(oauth_token)
+
+    url = f"{GOOGLE_CAL_BASE}/calendars/{calendar_id}/events/{event_id}"
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS) as client:
+        resp = await client.delete(
+            url, headers={"Authorization": f"Bearer {access_token}"},
+        )
+    if resp.status_code in (200, 204, 404, 410):
+        return True
+    logger.warning(
+        f"Google-Calendar delete_event unerwarteter Status "
+        f"{resp.status_code}: {resp.text[:200]}"
+    )
+    return False
