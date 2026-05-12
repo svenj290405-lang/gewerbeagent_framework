@@ -767,9 +767,9 @@ async def _handle_help_command(chat_id=None):
         # Footer mit Lock-Erklaerung nur wenn auch wirklich Locks gerendert
         # wurden — sonst verwirrt's mehr als es hilft.
         lines.append("<i>🔒 = nicht in deinem Paket — Upgrade via "
-                     "hallo@gewerbeagent.de. Aktuelle Features: /paket</i>")
+                     "svenj05@gmx.de. Aktuelle Features: /paket</i>")
     else:
-        lines.append("<i>Alle Features aktiv. Hilfe: hallo@gewerbeagent.de</i>")
+        lines.append("<i>Alle Features aktiv. Kontakt: svenj05@gmx.de</i>")
     return "\n".join(lines)
 
 
