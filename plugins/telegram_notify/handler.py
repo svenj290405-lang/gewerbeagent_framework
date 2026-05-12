@@ -3981,28 +3981,45 @@ async def _send_kundengespraech_with_drive(
 
 
 async def _fetch_calendar_events_for_day(tenant, employee, target_date):
-    """Holt Kalender-Events fuer den Tag vom verbundenen Provider.
+    """Holt Kalender-Events fuer den Tag vom GEWAEHLTEN Provider
+    (employee.calendar_provider). Funktioniert symmetrisch fuer Outlook
+    UND Google — je nachdem was der Handwerker via /kalender_verbinden
+    ausgewaehlt hat.
 
-    Returns leere Liste bei nicht verbundenem Kalender oder Fehler —
-    /briefing soll trotzdem laufen (Kundengespraechs-Termine als
-    Fallback).
+    Returns:
+        (events_list, provider_label)
+        events_list: Liste von Event-dicts wie list_events_for_day liefert
+        provider_label: "Outlook" | "Google" | None (None = nicht verbunden)
+
+    Failsafe: API-Fehler -> leere Liste, der Caller faellt auf
+    Kundengespraech-Termine zurueck.
     """
     if not employee or not employee.calendar_provider:
-        return []
+        return [], None
+
+    provider = employee.calendar_provider
     try:
-        if employee.calendar_provider == "microsoft":
+        if provider == "microsoft":
             from core.integrations.microsoft_calendar import list_events_for_day
-            return await list_events_for_day(
+            evs = await list_events_for_day(
                 tenant.id, target_date, employee_id=employee.id,
             )
-        if employee.calendar_provider == "google":
+            return evs, "Outlook"
+        if provider == "google":
             from core.integrations.google_calendar import list_events_for_day
-            return await list_events_for_day(
+            evs = await list_events_for_day(
                 tenant.id, target_date, employee_id=employee.id,
             )
+            return evs, "Google"
     except Exception as exc:
-        logger.exception(f"Calendar-Fetch ({employee.calendar_provider}): {exc}")
-    return []
+        logger.exception(f"Calendar-Fetch ({provider}) gescheitert: {exc}")
+
+    # Unknown Provider oder Fehler — leer aber Provider-Label fuer
+    # Diagnostik mitgeben
+    label = "Outlook" if provider == "microsoft" else (
+        "Google" if provider == "google" else provider
+    )
+    return [], label
 
 
 def _match_kundengespraech_for_subject(subject: str, gespraeche: list) -> object | None:
@@ -4093,8 +4110,8 @@ async def _handle_briefing_command(chat_id):
             ).limit(5)
         )).scalars().all()
 
-    # 2) Kalender-Events heute (Google/Outlook)
-    cal_events = await _fetch_calendar_events_for_day(
+    # 2) Kalender-Events heute (gewaehlter Provider — Outlook oder Google)
+    cal_events, provider_label = await _fetch_calendar_events_for_day(
         tenant, current_emp, today_date,
     )
 
@@ -4141,8 +4158,7 @@ async def _handle_briefing_command(chat_id):
     eintraege.sort(key=lambda e: e["sort_key"])
 
     cal_source_label = ""
-    if cal_events:
-        provider_label = "Outlook" if current_emp.calendar_provider == "microsoft" else "Google"
+    if provider_label and cal_events:
         cal_source_label = f" <i>(aus {provider_label}-Kalender)</i>"
 
     if eintraege:
@@ -4187,9 +4203,10 @@ async def _handle_briefing_command(chat_id):
 
     # Kein Termin heute — Hinweis-Block
     lines = ["📅 <b>Heute kein Termin.</b>"]
-    if current_emp.calendar_provider:
-        provider_label = "Outlook" if current_emp.calendar_provider == "microsoft" else "Google"
-        lines.append(f"<i>(Kalender-Quelle: {provider_label})</i>\n")
+    if provider_label:
+        lines.append(
+            f"<i>(Geprueft: {provider_label}-Kalender — keine Events heute)</i>\n"
+        )
     else:
         lines.append(
             "<i>Kalender ist nicht verbunden. Mit /kalender_verbinden "
