@@ -8250,12 +8250,15 @@ async def _handle_formular_loeschen_input(chat_id, text: str, state_data: dict):
 
 
 async def _handle_formular_anzeigen_command(chat_id):
-    """/formular_anzeigen - Read-only-View des aktiven Schemas (DB oder Default)."""
+    """/formular_anzeigen - Read-only-View + Web-Preview-Link pro Typ."""
     tenant = await _get_tenant_by_chat(chat_id)
     if not tenant:
         return "Dieser Chat ist noch keinem Betrieb zugeordnet."
 
     from core.integrations.anfrage_forms import get_schema_for_tenant
+    from config.settings import settings as _settings
+    base_url = (_settings.public_url or "").rstrip("/")
+
     msg = "<b>📋 Aktive Formulare</b>\n\n"
     for typ in (ANFRAGE_TYP_TISCHLER, ANFRAGE_TYP_ALLGEMEIN):
         schema = await get_schema_for_tenant(tenant.id, typ)
@@ -8263,8 +8266,17 @@ async def _handle_formular_anzeigen_command(chat_id):
         msg += f"<b>{_FORMULAR_TYP_LABEL[typ]}</b> ({len(flds)} Felder)\n"
         for i, f in enumerate(flds, 1):
             msg += _formular_format_field_short(i, f) + "\n"
+        if base_url:
+            preview_url = f"{base_url}/anfrage/preview/{tenant.slug}/{typ}"
+            msg += f"🔗 <a href=\"{preview_url}\">Web-Vorschau oeffnen</a>\n"
         msg += "\n"
-    msg += "Mit /formular kannst du Felder anpassen."
+
+    msg += "<i>Mit /formular kannst du Felder anpassen.</i>"
+    if base_url:
+        msg += (
+            "\n<i>Die Vorschau-Links zeigen das Formular so wie deine "
+            "Kunden es sehen — Absenden ist im Preview-Modus deaktiviert.</i>"
+        )
     return msg
 
 

@@ -803,8 +803,15 @@ def render_anfrage_form_html(
     token: str,
     company_name: str = "",
     branche: str = "",
+    preview_mode: bool = False,
 ) -> str:
-    """Komplettes HTML fuer das Multi-Step Anfrage-Formular."""
+    """Komplettes HTML fuer das Multi-Step Anfrage-Formular.
+
+    `preview_mode=True`: zeigt das Formular ohne echten Token zum
+    Inspizieren durch den Handwerker (via /formular_anzeigen-Link).
+    Der Submit-Button ist disabled, das Form-Action zeigt nicht auf
+    /submit, und oben erscheint ein orangefarbenes Vorschau-Banner.
+    """
     title = _html.escape(schema.get("title", "Anfrage-Formular"))
     fields = schema.get("fields", [])
     company = _html.escape(company_name or "Anfrage")
@@ -821,11 +828,23 @@ def render_anfrage_form_html(
             '<button type="button" class="btn btn-secondary" data-action="prev">Zurück</button>'
             if not is_first else ""
         )
-        next_btn = (
-            '<button type="submit" class="btn btn-primary">Anfrage absenden</button>'
-            if is_last
-            else '<button type="button" class="btn btn-primary" data-action="next">Weiter</button>'
-        )
+        if is_last:
+            if preview_mode:
+                next_btn = (
+                    '<button type="button" class="btn btn-primary" '
+                    'disabled title="Vorschau: Absenden deaktiviert">'
+                    'Anfrage absenden (Vorschau)</button>'
+                )
+            else:
+                next_btn = (
+                    '<button type="submit" class="btn btn-primary">'
+                    'Anfrage absenden</button>'
+                )
+        else:
+            next_btn = (
+                '<button type="button" class="btn btn-primary" data-action="next">'
+                'Weiter</button>'
+            )
 
         fields_html = "\n".join(render_field(f) for f in step["fields"])
         # 01 / 03 Stil
@@ -843,6 +862,24 @@ def render_anfrage_form_html(
             </div>
         </div>''')
 
+    # Im Preview-Modus zeigt das Form-Action nicht auf /submit — verhindert
+    # versehentliches Absenden auch wenn jemand JS deaktiviert.
+    form_action = (
+        "javascript:void(0)" if preview_mode
+        else f"/anfrage/{_html.escape(token)}/submit"
+    )
+
+    preview_banner = ""
+    if preview_mode:
+        preview_banner = (
+            '<div style="background:#fff3cd;border-bottom:1px solid #ffe69c;'
+            'padding:12px 20px;text-align:center;font-size:14px;color:#664d03;'
+            'font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\',sans-serif;">'
+            '<strong>🔍 Vorschau</strong> &mdash; So sieht das Formular fuer '
+            'deinen Kunden aus. Absenden ist deaktiviert.'
+            '</div>'
+        )
+
     return f"""<!doctype html>
 <html lang="de">
 <head>
@@ -854,13 +891,15 @@ def render_anfrage_form_html(
 </head>
 <body>
 
+{preview_banner}
+
 <div class="progress-wrap">
     <div class="progress">
         <div id="progress-bar" class="progress-bar"></div>
     </div>
 </div>
 
-<form class="page" method="POST" action="/anfrage/{_html.escape(token)}/submit" autocomplete="off" novalidate enctype="multipart/form-data">
+<form class="page" method="POST" action="{form_action}" autocomplete="off" novalidate enctype="multipart/form-data">
 
     <div class="brand">{company}</div>
 

@@ -111,6 +111,67 @@ async def render_anfrage_form(token: str, request: Request):
     return HTMLResponse(content=body, status_code=200)
 
 
+@router.get(
+    "/anfrage/preview/{tenant_slug}/{anfrage_typ}",
+    response_class=HTMLResponse,
+)
+async def render_anfrage_preview(
+    tenant_slug: str, anfrage_typ: str, request: Request,
+):
+    """Vorschau des aktuellen Schemas — kein Token noetig.
+
+    Aufgerufen aus dem Telegram-Bot via /formular_anzeigen damit der
+    Handwerker sieht wie sein Web-Formular fuer Kunden aussieht.
+    Submit ist im Preview-Modus deaktiviert.
+
+    Rate-Limit identisch zum normalen Anfrage-GET (60/h pro IP).
+    Tenant-Lookup via slug — wir leaken keine Token, nur die
+    oeffentliche Schema-Struktur die der Tenant ohnehin via QR-Code
+    teilt.
+    """
+    if not _check_anfrage_rate_limit(request, kind="preview", max_per_hour=60):
+        return HTMLResponse(
+            content="<h1>Zu viele Versuche</h1>"
+                    "<p>Bitte einen Moment warten.</p>",
+            status_code=429,
+        )
+
+    from sqlalchemy import select as _select
+    from core.database import AsyncSessionLocal
+    from core.models import Tenant
+
+    async with AsyncSessionLocal() as s:
+        tenant = (await s.execute(
+            _select(Tenant).where(Tenant.slug == tenant_slug.lower())
+        )).scalar_one_or_none()
+    if tenant is None:
+        return HTMLResponse(
+            content=render_invalid_token_page(), status_code=404,
+        )
+
+    # Nur erlaubte anfrage-typen — sonst koennten User beliebige Strings
+    # mitgeben und wir machen unnoetige Schema-Lookups.
+    from core.models.anfrage import (
+        ANFRAGE_TYP_TISCHLER, ANFRAGE_TYP_ALLGEMEIN,
+    )
+    allowed = {ANFRAGE_TYP_TISCHLER, ANFRAGE_TYP_ALLGEMEIN}
+    if anfrage_typ not in allowed:
+        return HTMLResponse(
+            content=render_invalid_token_page(), status_code=404,
+        )
+
+    schema = await get_schema_for_tenant(tenant.id, anfrage_typ)
+    body = render_anfrage_form_html(
+        schema=schema,
+        token="preview",  # Placeholder — wird im Preview-Modus nicht
+                         # benutzt (form action = javascript:void(0))
+        company_name=tenant.company_name or "Dein Handwerker",
+        branche=getattr(tenant, "branche", "") or "",
+        preview_mode=True,
+    )
+    return HTMLResponse(content=body, status_code=200)
+
+
 @router.post("/anfrage/{token}/submit")
 async def submit_anfrage_form(token: str, request: Request):
     """Verarbeitet das abgesendete Formular.
