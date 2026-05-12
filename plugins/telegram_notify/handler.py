@@ -51,6 +51,7 @@ from core.models import (
     STATE_ANGEBOT_AWAITING_INSTRUCTIONS,
     STATE_ANGEBOT_AWAITING_MAIL,
     STATE_ANGEBOT_AWAITING_KUNDE_NAME,
+    STATE_ONBOARDING_ACTIVE,
     STATE_MATERIAL_NEU_NAME,
     STATE_MATERIAL_NEU_LINK,
     STATE_MATERIAL_NEU_LIEFERANT,
@@ -500,16 +501,22 @@ async def _handle_start_command(text, chat_id, from_data):
                 f"Sie sind als Mitarbeiter <b>{emp.name}</b> "
                 f"bei <b>{tenant.company_name}</b> angemeldet.\n\n"
             )
+
+        # Wenn der Tenant noch nicht durchs Onboarding ist: das Tutorial
+        # starten — Default-Employee, sonst regulaere Begruessung weil
+        # Mitarbeiter keinen Tenant einrichten muss.
+        if emp.is_default and tenant.onboarding_completed_at is None:
+            reply += (
+                "<i>Ich nehme dich jetzt einmal kurz an die Hand und "
+                "richte dein Setup ein — dauert ca. 5 Minuten.</i>\n\n"
+                "Tippe <b>/onboarding</b> um zu starten."
+            )
+            return reply
+
         reply += "Ab jetzt erhalten Sie hier:\n"
         reply += "- Push-Nachrichten zu Ihren Anrufen und Mails\n"
         reply += "- Bestaetigungen ueber gebuchte Termine\n"
         reply += "- Hinweise wenn Q nicht weiterkommt\n\n"
-        # Empfohlener naechster Schritt: Kalender + Heimat-Adresse einrichten
-        reply += (
-            "<b>Naechster Schritt:</b>\n"
-            "  • /kalender_verbinden — Google- oder Outlook-Kalender verknuepfen\n"
-            "  • /werkstatt — Heimat-Adresse fuer Smart-Termine setzen\n\n"
-        )
         reply += "Mit /help sehen Sie alle verfuegbaren Befehle."
         return reply
 
@@ -792,6 +799,10 @@ async def _handle_help_command(chat_id=None):
 
     # --- Sonstiges (always-on) ---
     _block("ℹ️", "Sonstiges", [
+        ("/onboarding",
+         "Setup-Tutorial starten oder fortsetzen — Schritt-fuer-Schritt "
+         "fragt der Bot alle Stammdaten ab und verbindet Lexware + "
+         "Kalender. Mit /hilfe gibts pro Schritt eine Erklaerung."),
         ("/paket",
          "Aktuelles Paket + Liste der aktivierten Features."),
         ("/status",
@@ -1912,6 +1923,8 @@ async def _dispatch_update(payload):
             await _handle_angebot_callback(cq_chat_id, cq_data, cq_id, bot_token)
         elif cq_data and cq_data.startswith("auftrag:"):
             await _handle_auftrag_callback(cq_chat_id, cq_data, cq_id, bot_token)
+        elif cq_data and cq_data.startswith("ob:"):
+            await _handle_onboarding_callback(cq_chat_id, cq_data, cq_id, bot_token)
         elif cq_data and cq_data.startswith("leistung:"):
             await _handle_leistung_callback(cq_chat_id, cq_data, cq_id, bot_token)
         elif cq_data and cq_data.startswith("formular:"):
@@ -2077,6 +2090,35 @@ async def _dispatch_update(payload):
         logger.info("Voice ohne passenden State ignoriert")
         return {"ok": True}
 
+    # ----- Onboarding-Tutorial: Game-Tutorial-Block -----
+    # Solange der Tenant im Onboarding ist, erlauben wir nur einen
+    # eingeschraenkten Befehlssatz. Alles andere wird mit einem Hinweis
+    # geblockt, der zurueck zum aktuellen Schritt fuehrt.
+    _ONBOARDING_ALLOWED = {
+        "/onboarding", "/hilfe", "/skip", "/abbrechen", "/cancel",
+        "/reset", "/stop", "/lexware_setup", "/kalender_verbinden",
+        "/start",
+    }
+    if text.startswith("/"):
+        first_token = text.split(maxsplit=1)[0]
+        try:
+            ob_active = await _is_onboarding_active(chat_id)
+        except Exception:
+            ob_active = False
+            logger.exception("Onboarding-Check fehlgeschlagen — bypass")
+        if ob_active and first_token not in _ONBOARDING_ALLOWED:
+            _t, idx, key = await _get_onboarding_state(chat_id)
+            await _send_to_chat(
+                chat_id,
+                f"⏳ <b>Du bist im Setup-Tutorial</b> "
+                f"({_onboarding_progress(idx)}).\n\n"
+                f"Bitte erst Schritt <b>{key}</b> abschliessen — die "
+                "letzte Frage steht oben. Mit /hilfe gibt's eine "
+                "Erklaerung dazu, mit /abbrechen kannst du pausieren "
+                "und spaeter mit /onboarding weitermachen.",
+            )
+            return {"ok": True}
+
     # ----- Auto-Reset alter Wizard-States bei neuem Slash-Befehl -----
     # Wenn der User mitten im Wizard einen ANDEREN Slash-Befehl tippt,
     # ist seine Absicht klar: alten Vorgang aufgeben, neuen anfangen.
@@ -2112,6 +2154,18 @@ async def _dispatch_update(payload):
     # ----- Text-Pfad -----
     if text == "/abbrechen":
         reply = await _handle_abbrechen(chat_id)
+    elif text == "/onboarding":
+        reply_or_none = await _handle_onboarding_command(chat_id)
+        if reply_or_none is None:
+            return {"ok": True}
+        reply = reply_or_none
+    elif text == "/hilfe":
+        reply = await _handle_onboarding_hilfe(chat_id)
+    elif text == "/skip":
+        reply_or_none = await _handle_onboarding_skip(chat_id)
+        if reply_or_none is None:
+            return {"ok": True}
+        reply = reply_or_none
     elif text.startswith("/start"):
         await _clear_state(chat_id)
         reply = await _handle_start_command(text, chat_id, from_data)
@@ -2293,6 +2347,26 @@ async def _dispatch_update(payload):
     else:
         state = await _load_state(chat_id)
         if state is None:
+            # Auch ohne State: wenn Onboarding aktiv ist, behandeln wir
+            # Text als Antwort auf den aktuellen Schritt (State TTL
+            # konnte abgelaufen sein, Tutorial laeuft trotzdem weiter).
+            try:
+                if await _is_onboarding_active(chat_id):
+                    _t, _idx, key = await _get_onboarding_state(chat_id)
+                    await _save_state(
+                        chat_id, STATE_ONBOARDING_ACTIVE,
+                        {"step_key": key},
+                    )
+                    reply_or_none = await _handle_onboarding_text_input(
+                        chat_id, text,
+                    )
+                    if reply_or_none is None:
+                        return {"ok": True}
+                    reply = reply_or_none
+                    await _send_to_chat(chat_id, reply)
+                    return {"ok": True}
+            except Exception:
+                logger.exception("Onboarding-Auto-Restore fehlgeschlagen")
             return {"ok": True}
         if state.state_key == STATE_WISSEN_KATEGORIE:
             reply = await _handle_wissen_kategorie_input(chat_id, text)
@@ -2385,6 +2459,12 @@ async def _dispatch_update(payload):
         elif state.state_key == STATE_ANGEBOT_AWAITING_KUNDE_NAME:
             # User reicht vollen Namen nach
             reply_or_none = await _handle_angebot_kunde_name_input(chat_id, text)
+            if reply_or_none is None:
+                return {"ok": True}
+            reply = reply_or_none
+        elif state.state_key == STATE_ONBOARDING_ACTIVE:
+            # Onboarding-Schritt: Text-Antwort verarbeiten
+            reply_or_none = await _handle_onboarding_text_input(chat_id, text)
             if reply_or_none is None:
                 return {"ok": True}
             reply = reply_or_none
@@ -9088,6 +9168,675 @@ async def _handle_kalender_callback(chat_id, cq_data, cq_id, bot_token) -> None:
         "welcher Provider aktiv ist."
     )
     await _send_to_chat(chat_id, msg, bot_token=bot_token)
+
+
+# =====================================================================
+# /onboarding-Tutorial: Game-style Schritt-fuer-Schritt-Setup
+# =====================================================================
+# Neue Handwerker werden beim ersten /start in einen Wizard geleitet,
+# der alle wichtigen Daten und Verbindungen einsammelt. Solange das
+# Tutorial laeuft, blockiert der Dispatcher andere Slash-Befehle
+# (analog zu Game-Tutorials: man kann nur das tun was gerade dran ist).
+# Mit /hilfe gibt's pro Schritt eine ausfuehrliche Erklaerung.
+
+ONBOARDING_STEPS = [
+    "welcome",         # 0  - Begruessung + Start-Button
+    "firmenname",      # 1  - Firmenname (Tenant.company_name)
+    "inhaber_name",    # 2  - Vor- und Nachname (Tenant.contact_name)
+    "strasse",         # 3  - Strasse + Hausnummer
+    "plz_ort",         # 4  - PLZ + Ort
+    "telefon",         # 5  - Telefonnummer (optional, /skip)
+    "email",           # 6  - Email
+    "branche",         # 7  - Buttons: Tischler/Sanitaer/etc.
+    "lexware",         # 8  - Lexware-Setup anbieten
+    "kalender",        # 9  - Kalender (Google/Outlook/Spaeter)
+    "knowledge",       # 10 - Erster Wissens-Eintrag (Anfahrt)
+    "done",            # 11 - Fertig + /help
+]
+
+ONBOARDING_TOTAL_USER_STEPS = 10  # 1..10 (welcome + done sind keine Eingabe)
+
+
+def _onboarding_progress(step_idx: int) -> str:
+    """Visualisierung des Fortschritts — z.B. '▓▓▓░░░░░░░ 3/10'"""
+    user_idx = min(max(step_idx, 0), ONBOARDING_TOTAL_USER_STEPS)
+    filled = "▓" * user_idx
+    empty = "░" * (ONBOARDING_TOTAL_USER_STEPS - user_idx)
+    return f"{filled}{empty}  {user_idx}/{ONBOARDING_TOTAL_USER_STEPS}"
+
+
+# Ausfuehrliche Hilfe-Texte pro Schritt (nur bei /hilfe-Anfrage sichtbar)
+ONBOARDING_HELP = {
+    "welcome": (
+        "Du startest gerade das Setup-Tutorial. Wir gehen 10 kurze "
+        "Schritte durch — Firmen-Stammdaten, Lexware-Anbindung, Kalender. "
+        "Dauert ca. 5 Minuten. Du kannst jederzeit /abbrechen und "
+        "spaeter mit /onboarding fortsetzen."
+    ),
+    "firmenname": (
+        "Der Firmenname wird im Impressum deiner E-Mails und in den "
+        "Lexware-Belegen genutzt. Beispiele: <i>Schreinerei Mueller GbR</i>, "
+        "<i>Sanitaer Schmidt</i>, <i>Elektro Weber GmbH</i>. Wenn du keine "
+        "eigene Firma hast, schreib einfach deinen Namen rein."
+    ),
+    "inhaber_name": (
+        "Dein voller Name (Vorname + Nachname). Wird als Absender in "
+        "Kunden-Mails verwendet — der Kunde sieht z.B. 'Anna Mueller' "
+        "als Absender, nicht 'Schreinerei Mueller GbR'."
+    ),
+    "strasse": (
+        "Deine Werkstatt- oder Geschaeftsadresse (Strasse + Hausnummer). "
+        "Wird im Impressum + fuer Anfahrtszeit-Berechnung verwendet."
+    ),
+    "plz_ort": (
+        "PLZ + Ort, zusammen in einer Zeile — z.B. <i>54290 Trier</i>. "
+        "Wird via OpenRouteService geocoded fuer Smart-Termin-Routing "
+        "(Fahrtzeit von Werkstatt zum Kunden)."
+    ),
+    "telefon": (
+        "Deine Telefonnummer fuers Impressum — mit Vorwahl, "
+        "z.B. <i>0651 12345</i>. Mit /skip ueberspringen wenn du keine "
+        "veroeffentlichen willst."
+    ),
+    "email": (
+        "Deine offizielle E-Mail-Adresse. Wird als Reply-To fuer "
+        "Kunden-Mails verwendet — wenn der Kunde auf ein Angebot "
+        "antwortet, landet die Antwort hier."
+    ),
+    "branche": (
+        "Die Branche hilft mir bei der KI-Klassifikation: Eine "
+        "Mail wie 'Wasserhahn tropft' ordne ich bei einem Sanitaer "
+        "anders ein als bei einem Tischler."
+    ),
+    "lexware": (
+        "Lexware ist der Buchhaltungs-Anbieter, ueber den ich Angebote "
+        "und Rechnungen anlege + dem Kunden schicke. Ohne Lexware geht "
+        "das nicht. Wenn du noch keinen Account hast, kannst du das hier "
+        "ueberspringen und spaeter mit /lexware_setup nachholen."
+    ),
+    "kalender": (
+        "Der Kalender wird fuer /briefing (deine Tagestermine) und fuer "
+        "Termin-Vorschlaege bei Kunden-Anfragen genutzt. Du kannst Google "
+        "ODER Outlook waehlen — beide funktionieren gleichwertig. Ohne "
+        "Kalender funktioniert der Bot trotzdem, aber ohne Termin-"
+        "Intelligenz."
+    ),
+    "knowledge": (
+        "Die Wissensbasis fuettert die KI mit Infos die sie sonst nicht "
+        "hat — z.B. 'wir kommen Mo-Fr 8-17 nicht in die Innenstadt' oder "
+        "'unser Stundensatz ist 75 EUR netto'. Du kannst spaeter mit "
+        "/wissen mehr eintragen. Hier nur ein erster Test-Eintrag."
+    ),
+    "done": (
+        "Du bist fertig! Mit /help siehst du alle Befehle. Wenn du etwas "
+        "vergessen hast: /lexware_setup, /kalender_verbinden, /werkstatt "
+        "etc. funktionieren auch einzeln."
+    ),
+}
+
+
+async def _get_onboarding_state(chat_id):
+    """Returns (tenant, current_step_idx, current_step_key) oder (None, 0, 'welcome')"""
+    tenant = await _get_tenant_by_chat(chat_id)
+    if tenant is None:
+        return None, 0, "welcome"
+    step_idx = tenant.onboarding_step or 0
+    step_idx = max(0, min(step_idx, len(ONBOARDING_STEPS) - 1))
+    return tenant, step_idx, ONBOARDING_STEPS[step_idx]
+
+
+async def _is_onboarding_active(chat_id) -> bool:
+    """True wenn der Tenant gerade im Onboarding ist (nicht completed
+    und mindestens beim 'welcome'-Schritt). Wird vom Dispatcher genutzt
+    um Game-Tutorial-Block zu aktivieren."""
+    tenant, step_idx, _ = await _get_onboarding_state(chat_id)
+    if tenant is None:
+        return False
+    return (
+        tenant.onboarding_completed_at is None
+        and tenant.onboarding_step > 0
+    )
+
+
+async def _onboarding_set_step(tenant_id, step_idx: int) -> None:
+    """Schreibt den neuen Schritt in die DB."""
+    async with AsyncSessionLocal() as s:
+        t = (await s.execute(
+            select(Tenant).where(Tenant.id == tenant_id)
+        )).scalar_one()
+        t.onboarding_step = step_idx
+        await s.commit()
+
+
+async def _onboarding_complete(tenant_id) -> None:
+    """Markiert das Onboarding als fertig und erstellt den Impressum-
+    Wissens-Eintrag aus den gesammelten Stammdaten. Wird aus jedem
+    Endpfad aufgerufen (Text-Input, /skip, Button), nicht nur aus dem
+    Text-Pfad — daher zentral hier."""
+    async with AsyncSessionLocal() as s:
+        t = (await s.execute(
+            select(Tenant).where(Tenant.id == tenant_id)
+        )).scalar_one()
+        t.onboarding_step = len(ONBOARDING_STEPS) - 1
+        t.onboarding_completed_at = dt.datetime.now(dt.timezone.utc)
+        await s.commit()
+        # Re-fetch fuer Impressum (erfasst aktuellste Werte)
+        tenant_refreshed = (await s.execute(
+            select(Tenant).where(Tenant.id == tenant_id)
+        )).scalar_one()
+    await _onboarding_create_impressum_eintrag(tenant_refreshed)
+
+
+async def _onboarding_save_field(tenant_id, field: str, value) -> None:
+    """Setzt ein Feld am Tenant (company_name, contact_*, heimat_*, ...)"""
+    async with AsyncSessionLocal() as s:
+        t = (await s.execute(
+            select(Tenant).where(Tenant.id == tenant_id)
+        )).scalar_one()
+        setattr(t, field, value)
+        await s.commit()
+
+
+async def _onboarding_create_impressum_eintrag(tenant) -> None:
+    """Erstellt einen Wissens-Eintrag mit den Stammdaten als 'Impressum'-
+    Kurz-Version. Wird am Ende des Onboardings gemacht, damit die KI in
+    Mails/Voice-Antworten den korrekten Firmen-Footer kennt."""
+    parts = []
+    if tenant.company_name:
+        parts.append(f"Firma: {tenant.company_name}")
+    if tenant.contact_name:
+        parts.append(f"Inhaber: {tenant.contact_name}")
+    if tenant.heimat_strasse:
+        parts.append(f"Adresse: {tenant.heimat_strasse}")
+    if tenant.heimat_plz or tenant.heimat_ort:
+        parts.append(f"PLZ/Ort: {tenant.heimat_plz or ''} {tenant.heimat_ort or ''}".strip())
+    if tenant.contact_phone:
+        parts.append(f"Telefon: {tenant.contact_phone}")
+    if tenant.contact_email:
+        parts.append(f"E-Mail: {tenant.contact_email}")
+    if not parts:
+        return
+    body = "\n".join(parts)
+
+    from core.models.tenant_knowledge import KATEGORIE_BESONDERHEITEN
+    async with AsyncSessionLocal() as s:
+        # Bestehenden Impressum-Eintrag (heuristisch ueber Praefix) ueberschreiben
+        existing = (await s.execute(
+            select(TenantKnowledge).where(
+                TenantKnowledge.tenant_id == tenant.id,
+                TenantKnowledge.kategorie == KATEGORIE_BESONDERHEITEN,
+                TenantKnowledge.text.like("Firma:%"),
+            )
+        )).scalars().first()
+        if existing:
+            existing.text = body
+        else:
+            s.add(TenantKnowledge(
+                tenant_id=tenant.id,
+                kategorie=KATEGORIE_BESONDERHEITEN,
+                text=body,
+            ))
+        await s.commit()
+
+
+# Prompt-Builder pro Schritt — sendet die Frage an den User. Returns
+# entweder einen plain-Text-String (wird per _send_to_chat verschickt)
+# oder None wenn der Step bereits per _send_with_keyboard inline
+# gesendet hat.
+
+async def _onboarding_send_welcome(chat_id, tenant):
+    keyboard = {"inline_keyboard": [[
+        {"text": "🚀 Los geht's", "callback_data": "ob:start"},
+        {"text": "Spaeter", "callback_data": "ob:later"},
+    ]]}
+    msg = (
+        "👋 <b>Willkommen beim Gewerbeagent-Bot!</b>\n\n"
+        "Ich helfe dir bei Angeboten, Rechnungen, Terminen und Kunden-"
+        "Mails — automatisch im Hintergrund. Damit das laeuft, brauche "
+        "ich einmal kurz <b>10 Infos</b>:\n\n"
+        "  • Stammdaten (Firma, Inhaber, Anschrift) — fuer Impressum + "
+        "Lexware\n"
+        "  • Lexware-API — fuer Angebote & Rechnungen\n"
+        "  • Kalender (Google oder Outlook) — fuer Termin-Briefings\n\n"
+        f"Fortschritt: {_onboarding_progress(0)}\n\n"
+        "<i>Mit /hilfe bekommst du in jedem Schritt eine "
+        "ausfuehrliche Erklaerung. Mit /abbrechen kannst du jederzeit "
+        "pausieren und spaeter mit /onboarding weitermachen.</i>"
+    )
+    await _send_with_keyboard(chat_id, msg, keyboard)
+    return None
+
+
+async def _onboarding_send_firmenname(chat_id, tenant):
+    return (
+        f"📦 <b>Schritt 1 von 10 — Firmenname</b>\n"
+        f"{_onboarding_progress(1)}\n\n"
+        "Wie heisst dein Betrieb?\n\n"
+        "<i>Beispiele:</i> <i>Schreinerei Mueller GbR</i>, "
+        "<i>Sanitaer Schmidt</i>, <i>Elektro Weber GmbH</i>.\n\n"
+        "Schick mir den Namen einfach als Text. Mit /hilfe gibt's "
+        "mehr Erklaerung."
+    )
+
+
+async def _onboarding_send_inhaber_name(chat_id, tenant):
+    return (
+        f"👤 <b>Schritt 2 von 10 — Dein Name</b>\n"
+        f"{_onboarding_progress(2)}\n\n"
+        "Wie heisst du persoenlich? <b>Vorname + Nachname</b>.\n\n"
+        "<i>Beispiel:</i> <i>Anna Mueller</i>\n\n"
+        "Wird als Absender deiner Kunden-Mails genutzt."
+    )
+
+
+async def _onboarding_send_strasse(chat_id, tenant):
+    return (
+        f"🏠 <b>Schritt 3 von 10 — Strasse</b>\n"
+        f"{_onboarding_progress(3)}\n\n"
+        "Strasse + Hausnummer deiner Werkstatt:\n\n"
+        "<i>Beispiel:</i> <i>Hauptstr 5</i>"
+    )
+
+
+async def _onboarding_send_plz_ort(chat_id, tenant):
+    return (
+        f"🏘 <b>Schritt 4 von 10 — PLZ + Ort</b>\n"
+        f"{_onboarding_progress(4)}\n\n"
+        "Postleitzahl und Ort, in einer Zeile:\n\n"
+        "<i>Beispiel:</i> <i>54290 Trier</i>"
+    )
+
+
+async def _onboarding_send_telefon(chat_id, tenant):
+    return (
+        f"📞 <b>Schritt 5 von 10 — Telefon</b>\n"
+        f"{_onboarding_progress(5)}\n\n"
+        "Deine Telefonnummer fuers Impressum:\n\n"
+        "<i>Beispiel:</i> <i>0651 12345</i>\n\n"
+        "Mit /skip ueberspringen wenn du keine veroeffentlichen willst."
+    )
+
+
+async def _onboarding_send_email(chat_id, tenant):
+    return (
+        f"📧 <b>Schritt 6 von 10 — E-Mail</b>\n"
+        f"{_onboarding_progress(6)}\n\n"
+        "Deine offizielle E-Mail fuer Kunden-Antworten:\n\n"
+        "<i>Beispiel:</i> <i>info@mein-betrieb.de</i>"
+    )
+
+
+_ONBOARDING_BRANCHEN = [
+    ("tischler", "Tischler / Schreiner"),
+    ("sanitaer", "Sanitaer / Heizung"),
+    ("elektrik", "Elektrik"),
+    ("maler", "Maler / Lackierer"),
+    ("dach", "Dachdecker"),
+    ("garten", "Garten / Landschaft"),
+    ("sonstiges", "Sonstiges"),
+]
+
+
+async def _onboarding_send_branche(chat_id, tenant):
+    rows = []
+    cur = []
+    for key, label in _ONBOARDING_BRANCHEN:
+        cur.append({"text": label, "callback_data": f"ob:branche:{key}"})
+        if len(cur) == 2:
+            rows.append(cur)
+            cur = []
+    if cur:
+        rows.append(cur)
+    keyboard = {"inline_keyboard": rows}
+    msg = (
+        f"🔧 <b>Schritt 7 von 10 — Branche</b>\n"
+        f"{_onboarding_progress(7)}\n\n"
+        "Welche Branche passt am besten?\n\n"
+        "<i>Hilft mir bei der KI-Klassifikation von Kunden-Mails.</i>"
+    )
+    await _send_with_keyboard(chat_id, msg, keyboard)
+    return None
+
+
+async def _onboarding_send_lexware(chat_id, tenant):
+    keyboard = {"inline_keyboard": [
+        [{"text": "🔑 Lexware jetzt verbinden", "callback_data": "ob:lexware:go"}],
+        [{"text": "⏭ Spaeter (mit /lexware_setup)", "callback_data": "ob:lexware:skip"}],
+    ]}
+    msg = (
+        f"🧾 <b>Schritt 8 von 10 — Lexware-API</b>\n"
+        f"{_onboarding_progress(8)}\n\n"
+        "Lexware ist <b>Pflicht</b> fuer Angebote + Rechnungen — ohne "
+        "API-Schluessel kann ich dir hier nicht helfen.\n\n"
+        "Wenn du schon einen Lexware-Account hast: <b>jetzt verbinden</b>. "
+        "Wenn du erstmal nur die anderen Sachen einrichten willst: <b>spaeter</b>."
+    )
+    await _send_with_keyboard(chat_id, msg, keyboard)
+    return None
+
+
+async def _onboarding_send_kalender(chat_id, tenant):
+    keyboard = {"inline_keyboard": [
+        [{"text": "📅 Google Calendar", "callback_data": "ob:kalender:google"}],
+        [{"text": "📆 Outlook / Microsoft 365", "callback_data": "ob:kalender:microsoft"}],
+        [{"text": "⏭ Spaeter (mit /kalender_verbinden)", "callback_data": "ob:kalender:skip"}],
+    ]}
+    msg = (
+        f"📅 <b>Schritt 9 von 10 — Kalender</b>\n"
+        f"{_onboarding_progress(9)}\n\n"
+        "Welchen Kalender nutzt du? Damit zeigt /briefing deine "
+        "Tagestermine und ich kann Kunden passende Termine vorschlagen."
+    )
+    await _send_with_keyboard(chat_id, msg, keyboard)
+    return None
+
+
+async def _onboarding_send_knowledge(chat_id, tenant):
+    return (
+        f"📚 <b>Schritt 10 von 10 — Erster Wissens-Eintrag</b>\n"
+        f"{_onboarding_progress(10)}\n\n"
+        "Letzte Frage: gib mir <b>einen kurzen Anfahrts-Hinweis</b> oder "
+        "irgendwas was die KI ueber dich wissen soll:\n\n"
+        "<i>Beispiele:</i>\n"
+        "  • <i>Mo-Fr 7-9 Uhr keine Termine in der Innenstadt (Stau)</i>\n"
+        "  • <i>Unser Stundensatz ist 75 EUR netto</i>\n"
+        "  • <i>Wir arbeiten nur im Umkreis von 30 km</i>\n\n"
+        "Mit /skip ueberspringen — kannst du auch spaeter mit /wissen "
+        "nachholen."
+    )
+
+
+async def _onboarding_send_done(chat_id, tenant):
+    return (
+        "🎉 <b>Setup abgeschlossen!</b>\n\n"
+        "Hier ist was du jetzt machen kannst:\n\n"
+        "  • <b>/angebot</b> — Angebot diktieren\n"
+        "  • <b>/auftraege</b> — laufende Projekte\n"
+        "  • <b>/briefing</b> — Tagestermine\n"
+        "  • <b>/aufnahme</b> — Kundengespraech analysieren\n"
+        "  • <b>/help</b> — alle Befehle\n"
+        "  • <b>/status</b> — was ist verbunden\n\n"
+        "Falls du Lexware oder Kalender spaeter nachholst:\n"
+        "  /lexware_setup · /kalender_verbinden · /drive_verbinden"
+    )
+
+
+_ONBOARDING_SENDERS = {
+    "welcome": _onboarding_send_welcome,
+    "firmenname": _onboarding_send_firmenname,
+    "inhaber_name": _onboarding_send_inhaber_name,
+    "strasse": _onboarding_send_strasse,
+    "plz_ort": _onboarding_send_plz_ort,
+    "telefon": _onboarding_send_telefon,
+    "email": _onboarding_send_email,
+    "branche": _onboarding_send_branche,
+    "lexware": _onboarding_send_lexware,
+    "kalender": _onboarding_send_kalender,
+    "knowledge": _onboarding_send_knowledge,
+    "done": _onboarding_send_done,
+}
+
+
+async def _onboarding_advance(chat_id, tenant):
+    """Geht zum naechsten Schritt — speichert step, sendet Prompt."""
+    new_idx = (tenant.onboarding_step or 0) + 1
+    if new_idx >= len(ONBOARDING_STEPS):
+        await _onboarding_complete(tenant.id)
+        await _send_to_chat(chat_id, await _onboarding_send_done(chat_id, tenant))
+        return
+    new_key = ONBOARDING_STEPS[new_idx]
+    await _onboarding_set_step(tenant.id, new_idx)
+    await _save_state(chat_id, STATE_ONBOARDING_ACTIVE, {"step_key": new_key})
+    # frischen Tenant laden (mit den gerade gespeicherten Stammdaten)
+    async with AsyncSessionLocal() as s:
+        tenant = (await s.execute(
+            select(Tenant).where(Tenant.id == tenant.id)
+        )).scalar_one()
+    if new_key == "done":
+        await _onboarding_complete(tenant.id)
+        await _send_to_chat(chat_id, await _onboarding_send_done(chat_id, tenant))
+        await _clear_state(chat_id)
+        return
+    sender = _ONBOARDING_SENDERS.get(new_key)
+    if sender:
+        prompt = await sender(chat_id, tenant)
+        if prompt:
+            await _send_to_chat(chat_id, prompt)
+
+
+async def _handle_onboarding_command(chat_id):
+    """/onboarding — startet oder setzt das Tutorial fort."""
+    tenant = await _get_tenant_by_chat(chat_id)
+    if tenant is None:
+        return (
+            "Dieser Chat ist noch keinem Betrieb zugeordnet.\n"
+            "Bitte zuerst /start ausfuehren."
+        )
+    if tenant.onboarding_completed_at is not None:
+        return (
+            "✅ Du hast das Setup schon durchlaufen. Mit /status "
+            "siehst du was verbunden ist, mit /help alle Befehle.\n\n"
+            "Wenn du etwas neu einrichten willst:\n"
+            "  /lexware_setup · /kalender_verbinden · /drive_verbinden · "
+            "/werkstatt · /microsoft_setup"
+        )
+    step_idx = tenant.onboarding_step or 0
+    if step_idx == 0:
+        # Welcome neu starten
+        await _save_state(chat_id, STATE_ONBOARDING_ACTIVE, {"step_key": "welcome"})
+        await _onboarding_set_step(tenant.id, 0)
+        await _onboarding_send_welcome(chat_id, tenant)
+        return None
+    # Mitten drin → aktuellen Schritt wiederholen
+    step_key = ONBOARDING_STEPS[step_idx]
+    await _save_state(chat_id, STATE_ONBOARDING_ACTIVE, {"step_key": step_key})
+    sender = _ONBOARDING_SENDERS.get(step_key)
+    if sender:
+        prompt = await sender(chat_id, tenant)
+        if prompt:
+            return prompt
+    return None
+
+
+async def _handle_onboarding_hilfe(chat_id):
+    """/hilfe waehrend Onboarding — zeigt ausfuehrliche Erklaerung zum aktuellen Schritt."""
+    tenant, step_idx, step_key = await _get_onboarding_state(chat_id)
+    if tenant is None or tenant.onboarding_completed_at is not None:
+        return (
+            "/hilfe gibt's nur waehrend des Onboardings. "
+            "Mit /help bekommst du die Befehlsuebersicht."
+        )
+    text = ONBOARDING_HELP.get(step_key, "Keine Hilfe verfuegbar.")
+    return (
+        f"💡 <b>Hilfe zu Schritt {step_idx}: {step_key}</b>\n\n"
+        f"{text}\n\n"
+        "<i>Mit der Antwort auf die obige Frage geht's weiter. "
+        "Oder /abbrechen / /skip wenn moeglich.</i>"
+    )
+
+
+async def _handle_onboarding_skip(chat_id):
+    """/skip waehrend Onboarding — nur fuer optionale Schritte (telefon,
+    knowledge)."""
+    tenant, step_idx, step_key = await _get_onboarding_state(chat_id)
+    if tenant is None or tenant.onboarding_completed_at is not None:
+        return "Onboarding ist nicht aktiv."
+    if step_key not in ("telefon", "knowledge"):
+        return (
+            f"Schritt '{step_key}' ist Pflicht — kann nicht uebersprungen "
+            "werden. Bitte die Frage beantworten oder /abbrechen um "
+            "spaeter weiterzumachen."
+        )
+    await _onboarding_advance(chat_id, tenant)
+    return None
+
+
+async def _handle_onboarding_text_input(chat_id, text: str):
+    """Verarbeitet eine Text-Antwort waehrend des Onboardings.
+
+    Validiert nach Schritt-Schema, speichert am Tenant, geht weiter.
+    """
+    tenant, step_idx, step_key = await _get_onboarding_state(chat_id)
+    if tenant is None:
+        return "Onboarding-State verloren. Bitte /start ausfuehren."
+    text = (text or "").strip()
+    if not text:
+        return "Bitte etwas eintippen oder /abbrechen."
+
+    if step_key == "firmenname":
+        if len(text) < 2 or len(text) > 200:
+            return "🤔 Bitte einen Firmennamen (2-200 Zeichen)."
+        await _onboarding_save_field(tenant.id, "company_name", text)
+    elif step_key == "inhaber_name":
+        if not _is_full_kunde_name(text):
+            return (
+                "🤔 Bitte <b>vollen Namen</b> (Vorname + Nachname).\n"
+                "Beispiel: <i>Anna Mueller</i>"
+            )
+        await _onboarding_save_field(tenant.id, "contact_name", text)
+    elif step_key == "strasse":
+        if len(text) < 4 or len(text) > 255:
+            return "🤔 Strasse + Hausnummer bitte (z.B. <i>Hauptstr 5</i>)."
+        await _onboarding_save_field(tenant.id, "heimat_strasse", text)
+    elif step_key == "plz_ort":
+        # Erwartet "PLZ Ort" — z.B. "54290 Trier"
+        parts = text.split(maxsplit=1)
+        if len(parts) < 2 or not parts[0].isdigit() or len(parts[0]) not in (4, 5):
+            return (
+                "🤔 Format: <b>PLZ Ort</b> — z.B. <i>54290 Trier</i>.\n"
+                "PLZ als Zahl, dann Leerzeichen, dann Ort."
+            )
+        await _onboarding_save_field(tenant.id, "heimat_plz", parts[0])
+        await _onboarding_save_field(tenant.id, "heimat_ort", parts[1].strip())
+    elif step_key == "telefon":
+        # Validierung leicht: mind. 5 Ziffern total
+        digits = "".join(c for c in text if c.isdigit())
+        if len(digits) < 5:
+            return (
+                "🤔 Das sieht nicht nach einer Telefonnummer aus.\n"
+                "Beispiel: <i>0651 12345</i>. Mit /skip ueberspringen."
+            )
+        await _onboarding_save_field(tenant.id, "contact_phone", text)
+    elif step_key == "email":
+        if "@" not in text or "." not in text.split("@")[-1] or " " in text:
+            return (
+                "🤔 Das sieht nicht wie eine E-Mail-Adresse aus.\n"
+                "Beispiel: <i>info@mein-betrieb.de</i>"
+            )
+        await _onboarding_save_field(tenant.id, "contact_email", text)
+    elif step_key == "knowledge":
+        if len(text) < 10 or len(text) > 1000:
+            return (
+                "🤔 Zwischen 10 und 1000 Zeichen. Oder /skip wenn du "
+                "noch nichts ergaenzen willst."
+            )
+        from core.models.tenant_knowledge import KATEGORIE_ANFAHRT
+        async with AsyncSessionLocal() as s:
+            s.add(TenantKnowledge(
+                tenant_id=tenant.id,
+                kategorie=KATEGORIE_ANFAHRT,
+                text=text,
+            ))
+            await s.commit()
+    else:
+        # Steps mit Button-Eingabe akzeptieren keinen Text
+        return (
+            f"⏳ Bitte einen der Buttons oben antippen — Text-Eingabe ist "
+            f"hier nicht vorgesehen. (Schritt: {step_key})"
+        )
+
+    # Re-fetch fuer naechsten Step (gespeicherte Felder)
+    async with AsyncSessionLocal() as s:
+        tenant = (await s.execute(
+            select(Tenant).where(Tenant.id == tenant.id)
+        )).scalar_one()
+    # Impressum-Eintrag wird in _onboarding_complete erzeugt (zentral
+    # fuer alle End-Pfade: Text, /skip, Button).
+    await _onboarding_advance(chat_id, tenant)
+    return None
+
+
+async def _handle_onboarding_callback(chat_id, callback_data, callback_query_id, bot_token):
+    """ob:start | ob:later | ob:branche:<key> | ob:lexware:<go|skip> |
+    ob:kalender:<google|microsoft|skip>"""
+    parts = callback_data.split(":")
+    await _answer_callback_query(callback_query_id, "OK", bot_token)
+    tenant, step_idx, step_key = await _get_onboarding_state(chat_id)
+    if tenant is None:
+        await _send_to_chat(chat_id, "Onboarding-State verloren. /start ausfuehren.")
+        return
+
+    action = parts[1] if len(parts) > 1 else ""
+
+    if action == "start":
+        await _onboarding_advance(chat_id, tenant)
+        return
+    if action == "later":
+        await _clear_state(chat_id)
+        await _send_to_chat(
+            chat_id,
+            "OK, fortsetzen kannst du jederzeit mit /onboarding.",
+        )
+        return
+
+    if action == "branche" and len(parts) >= 3 and step_key == "branche":
+        branche = parts[2]
+        await _onboarding_save_field(tenant.id, "branche", branche)
+        # Re-fetch
+        async with AsyncSessionLocal() as s:
+            tenant = (await s.execute(
+                select(Tenant).where(Tenant.id == tenant.id)
+            )).scalar_one()
+        await _onboarding_advance(chat_id, tenant)
+        return
+
+    if action == "lexware" and len(parts) >= 3 and step_key == "lexware":
+        choice = parts[2]
+        if choice == "go":
+            # Direkt in den Lexware-Setup-Flow gehen — der setzt seinen
+            # eigenen STATE_LEXWARE_SETUP_TOKEN. Nach Setup-Abschluss
+            # kommt User mit /onboarding zurueck (Hinweis im Text).
+            await _send_to_chat(
+                chat_id,
+                "🔗 Starte Lexware-Setup… Folge den 3 Schritten — "
+                "nach dem Verbinden kommst du mit /onboarding hier "
+                "zurueck und es geht weiter.",
+            )
+            reply = await _handle_lexware_setup_command(chat_id)
+            if reply:
+                await _send_to_chat(chat_id, reply)
+            return
+        # skip — direkt weiter
+        await _onboarding_advance(chat_id, tenant)
+        return
+
+    if action == "kalender" and len(parts) >= 3 and step_key == "kalender":
+        choice = parts[2]
+        if choice in ("google", "microsoft"):
+            # Wir reusen den bestehenden kalender_callback-Flow indirekt:
+            # _get_current_employee + OAuth-URL-Generation. Vereinfacht:
+            # bot ruft _handle_kalender_verbinden_command, das einen
+            # Button schickt — User klickt, OAuth, kommt zurueck.
+            await _send_to_chat(
+                chat_id,
+                f"🔗 Starte Kalender-Setup ({choice})… Folge dem Link, "
+                "nach dem Verbinden /onboarding um hier weiterzumachen.",
+            )
+            try:
+                await _handle_kalender_verbinden_command(chat_id)
+            except Exception:
+                logger.exception("Kalender-Setup im Onboarding fehlgeschlagen")
+                await _send_to_chat(
+                    chat_id,
+                    "Kalender-Setup hat nicht geklappt — mit "
+                    "/kalender_verbinden nochmal probieren.",
+                )
+            return
+        # skip — weiter
+        await _onboarding_advance(chat_id, tenant)
+        return
+
+    await _send_to_chat(chat_id, "Unbekannter Tutorial-Step.")
 
 
 # =====================================================================

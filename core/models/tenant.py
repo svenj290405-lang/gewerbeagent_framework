@@ -8,12 +8,13 @@ Jeder Tenant hat:
 - Status (active/inactive/suspended)
 - Relationships zu ToolConfigs und OAuthTokens
 """
+import datetime as dt
 import decimal
 import uuid
 from enum import Enum
 from typing import TYPE_CHECKING
 
-from sqlalchemy import BigInteger, Integer, Numeric, String
+from sqlalchemy import BigInteger, DateTime, Integer, Numeric, String
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -100,6 +101,16 @@ class Tenant(Base):
     # versehentlich downgraded werden (siehe scripts/backfill_tenant_features).
     package_tier: Mapped[str] = mapped_column(
         String(20), nullable=False, server_default="pro", default="pro",
+    )
+
+    # Onboarding-Wizard im Telegram-Bot — Tutorial-State.
+    # step 0 = nicht angefangen, completed_at != NULL = fertig.
+    # Steuerung in plugins/telegram_notify/handler.py (_onboarding_*).
+    onboarding_step: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="0", default=0,
+    )
+    onboarding_completed_at: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True,
     )
 
     # DSGVO-Retention in Tagen. Steuert dsgvo_cleanup_cron.

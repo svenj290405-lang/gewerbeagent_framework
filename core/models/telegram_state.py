@@ -63,6 +63,13 @@ STATE_ANGEBOT_AWAITING_INSTRUCTIONS = "angebot_awaiting_instructions"
 STATE_ANGEBOT_AWAITING_MAIL = "angebot_awaiting_mail"
 STATE_ANGEBOT_AWAITING_KUNDE_NAME = "angebot_awaiting_kunde_name"
 
+# /onboarding-Tutorial: Wizard fuehrt den Handwerker Schritt-fuer-
+# Schritt durch das Setup. Der aktuelle Schritt steht im Tenant
+# (onboarding_step), der State markiert dass wir gerade auf User-Input
+# warten. Solange dieser State aktiv ist, blockiert der Dispatcher
+# andere Slash-Befehle (Game-Tutorial-Stil).
+STATE_ONBOARDING_ACTIVE = "onboarding_active"
+
 STATE_LEISTUNG_WAITING_NAME = "leistung_waiting_name"
 STATE_LEISTUNG_WAITING_PREIS = "leistung_waiting_preis"
 STATE_LEISTUNG_WAITING_BESCHREIBUNG = "leistung_waiting_beschreibung"
