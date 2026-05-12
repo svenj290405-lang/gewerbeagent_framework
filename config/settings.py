@@ -43,9 +43,20 @@ class Settings(BaseSettings):
 
     elevenlabs_api_key: str = ""
 
-    # OpenRouteService — Geocoding + Travel-Time-Matrix fuer Smart-Termine.
-    # Free-Tier: 2.000 Requests/Tag. Ohne Key: Smart-Routing bleibt aus,
-    # Slot-Vorschlag faellt sauber auf bisherige Logik zurueck.
+    # Google Maps Platform — Geocoding API + Distance Matrix API. Bevorzugter
+    # Geo-Provider weil Sven schon ein GCP-Projekt fuer Vertex/Gemini hat;
+    # ein zusaetzlicher API-Key im selben Projekt ist 1-Klick statt
+    # 'neues OpenRouteService-Konto + Free-Tier-Quota nachhalten'.
+    # Free-Tier: $200/Monat Google-Credit = ca. 40k Geocodes + 40k Distance-
+    # Matrix-Eintraege im Monat. Reicht fuer Dutzende Tenants locker.
+    # Setup-Anleitung: siehe .env.prod.example.
+    google_maps_api_key: str = ""
+
+    # OpenRouteService — Geocoding + Travel-Time-Matrix als Fallback wenn
+    # kein Google-Maps-Key gesetzt ist. EU-hosted (Heidelberg), DSGVO-konform.
+    # Free-Tier: 2.000 Requests/Tag. Wir behalten ihn als Backup damit
+    # bestehende Installationen nicht brechen — neue Installs nehmen lieber
+    # Google Maps.
     openrouteservice_api_key: str = ""
 
     admin_telegram_bot_token: str = ""

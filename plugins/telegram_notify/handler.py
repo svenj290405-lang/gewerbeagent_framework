@@ -143,10 +143,16 @@ from core.ai.gemini import (
     generate_angebot_anschreiben_from_audio,
 )
 from core.integrations.lexware import LexwareProvider
-from core.integrations.openrouteservice import (
-    geocode_address as ors_geocode_address,
-    is_configured as ors_is_configured,
+from core.integrations.geo import (
+    geocode_address as geo_geocode_address,
+    is_configured as geo_is_configured,
+    active_provider as geo_active_provider,
 )
+# Backward-Compat-Aliase: alter Code in diesem File hiess ors_*, neue
+# Wrapper-Namen sind generischer. Die Funktion-Bodies sind nicht ORS-
+# spezifisch — die geo-Wrapper picked automatisch Maps oder ORS.
+ors_geocode_address = geo_geocode_address
+ors_is_configured = geo_is_configured
 from core.integrations.accounting_base import (
     AccountingError,
     InvoiceLineItem,
@@ -7126,12 +7132,13 @@ async def _handle_werkstatt_command(chat_id):
             "trage hier deine Heim-Adresse ein. Q rechnet dann bei deinen "
             "Termin-Vorschlaegen die Anfahrt von dort statt von der Werkstatt.\n\n"
         )
-    if not ors_is_configured():
+    if not geo_is_configured():
         msg += (
-            "<i>⚠ Hinweis: Smart-Routing-API noch nicht aktiviert "
-            "(Betreiber muss OPENROUTESERVICE_API_KEY setzen). "
-            "Adresse wird trotzdem schon gespeichert, "
-            "Routing greift sobald der Key da ist.</i>\n\n"
+            "<i>⚠ Hinweis: Geo-Routing-API noch nicht aktiviert "
+            "(Betreiber muss GOOGLE_MAPS_API_KEY in .env setzen — "
+            "selbes GCP-Projekt wie Vertex, ein Klick in der Console). "
+            "Adresse wird trotzdem schon gespeichert, Fahrtzeit-Optimierung "
+            "greift sobald der Key da ist.</i>\n\n"
         )
     msg += (
         "<b>Schicke die komplette Adresse</b>, z.B.:\n"

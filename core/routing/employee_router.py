@@ -296,12 +296,13 @@ async def choose_employee(
 async def _pick_by_distance(candidates, kunde_adresse: str):
     """Sucht den Kandidaten mit kuerzester Anfahrt zum Kunden.
 
-    Best-effort: bei ORS-Fehler oder fehlenden Geo-Daten faellt zurueck
-    auf None (Caller behaelt den ersten Skill-Kandidaten).
+    Best-effort: bei Geo-Provider-Fehler oder fehlenden Geo-Daten faellt
+    zurueck auf None (Caller behaelt den ersten Skill-Kandidaten).
+    Nutzt geo-Wrapper: Google Maps preferred, ORS Fallback.
     """
     try:
-        from core.integrations.openrouteservice import (
-            geocode_address, travel_time_minutes, is_configured,
+        from core.integrations.geo import (
+            geocode_address, travel_time_minutes, is_configured, GeoPoint,
         )
         if not is_configured():
             return None
@@ -309,7 +310,6 @@ async def _pick_by_distance(candidates, kunde_adresse: str):
         if kunde_geo is None:
             return None
 
-        from core.integrations.openrouteservice import GeoPoint
         best = None
         best_minutes = None
         for c in candidates:

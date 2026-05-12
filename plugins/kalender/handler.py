@@ -21,7 +21,7 @@ from uuid import UUID
 from sqlalchemy import select
 
 from core.database import AsyncSessionLocal
-from core.integrations.openrouteservice import (
+from core.integrations.geo import (
     GeoPoint,
     geocode_address as ors_geocode_address,
     is_configured as ors_is_configured,
