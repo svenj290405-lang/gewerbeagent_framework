@@ -605,8 +605,9 @@ async def _handle_help_command(chat_id=None):
     if _is_on("kalender"):
         kunden_items_active.append((
             "/briefing",
-            "Briefing zum naechsten Termin: Kunde, relevantes "
-            "Wissen, Anfahrtszeit.",
+            "Heutige Termine als Liste mit Uhrzeit + Kunde. Tap auf "
+            "den /briefing_xxxx-Befehl pro Eintrag zeigt Briefing, "
+            "TODOs, Notizen und den Drive-Ordner.",
         ))
     # /kunde ist always_on (kunde_lookup-Feature)
     kunden_items_active.append((
@@ -2213,6 +2214,14 @@ async def _dispatch_update(payload):
     elif text == "/briefing":
         await _clear_state(chat_id)
         reply_or_none = await _handle_briefing_command(chat_id)
+        if reply_or_none is None:
+            return {"ok": True}
+        reply = reply_or_none
+    elif text.startswith("/briefing_"):
+        # Detail-Ansicht eines einzelnen Termins per ID-Prefix
+        await _clear_state(chat_id)
+        id_prefix = text[len("/briefing_"):].strip().lower()
+        reply_or_none = await _handle_briefing_show_command(chat_id, id_prefix)
         if reply_or_none is None:
             return {"ok": True}
         reply = reply_or_none
@@ -3972,48 +3981,122 @@ async def _send_kundengespraech_with_drive(
 
 
 async def _handle_briefing_command(chat_id):
-    """Zeigt naechsten anstehenden Termin mit Briefing.
+    """Zeigt alle Termine fuer HEUTE als Liste.
 
-    Faellt zurueck auf juengstes Gespraech wenn kein zukuenftiger Termin.
+    Pro Termin eine kompakte Zeile mit Uhrzeit, Kunde und einem klick-
+    baren /briefing_<prefix>-Befehl fuer die Detail-Ansicht (volles
+    Briefing, TODOs, Notizen, Drive-Link).
 
-    Phase-4-Multi-Mitarbeiter: Default-Employee (Inhaber) sieht alle
-    Termine; Nicht-Default-Mitarbeiter sieht nur seine zugewiesenen
-    (assigned_employee_id == eigene id).
+    Wenn nichts heute: zeigt naechste Termine der kommenden 7 Tage
+    als kleinerer Hinweis. Wenn auch das leer: Fallback auf juengstes
+    Gespraech.
+
+    Phase-4-Multi-Mitarbeiter: Default-Employee sieht alle Termine,
+    Nicht-Default nur seine zugewiesenen.
     """
-    from datetime import datetime, timezone
-    from sqlalchemy import select, and_, or_
+    from datetime import datetime, timezone, timedelta
 
     res = await _get_current_employee(chat_id)
     if res is None:
         return "Dieser Chat ist noch keinem Betrieb zugeordnet."
     tenant, current_emp = res
 
-    now = datetime.now(timezone.utc)
+    # Tagesgrenzen — Europe/Berlin lokal, dann auf UTC normalisiert,
+    # damit der DB-Vergleich gegen termin_datum (timezone-aware UTC)
+    # konsistent ist. Sven-Lokalzeit ist die relevante "heute"-Grenze.
+    try:
+        from zoneinfo import ZoneInfo
+        local_tz = ZoneInfo("Europe/Berlin")
+    except Exception:
+        local_tz = timezone.utc
+    now_local = datetime.now(local_tz)
+    today_start = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+    today_end = today_start + timedelta(days=1)
+    week_end = today_start + timedelta(days=7)
 
     async with AsyncSessionLocal() as s:
-        # Erst: zukuenftiger Termin
-        stmt = (
+        base = (
             select(Kundengespraech)
             .where(
                 Kundengespraech.tenant_id == tenant.id,
                 Kundengespraech.termin_datum.is_not(None),
-                Kundengespraech.termin_datum >= now,
             )
             .order_by(Kundengespraech.termin_datum.asc())
-            .limit(1)
         )
         if not current_emp.is_default:
-            stmt = stmt.where(
+            base = base.where(
                 Kundengespraech.assigned_employee_id == current_emp.id
             )
-        future = (await s.execute(stmt)).scalar_one_or_none()
 
-        if future:
-            return await _send_kundengespraech_with_drive(
-                chat_id, "<b>🔔 Naechster Termin</b>\n\n", future, tenant.id,
+        heute = (await s.execute(
+            base.where(
+                Kundengespraech.termin_datum >= today_start,
+                Kundengespraech.termin_datum < today_end,
             )
+        )).scalars().all()
 
-        # Kein zukuenftiger Termin -> juengstes Gespraech zeigen
+        # Bonus: naechste 7 Tage (nur fuer den Footer wenn heute leer)
+        kommende = (await s.execute(
+            base.where(
+                Kundengespraech.termin_datum >= today_end,
+                Kundengespraech.termin_datum < week_end,
+            ).limit(5)
+        )).scalars().all()
+
+    if heute:
+        datum_str = today_start.strftime("%A, %d.%m.%Y")
+        lines = [f"🔔 <b>Termine heute</b> — {datum_str}\n"]
+        for g in heute:
+            uhr = g.termin_datum.astimezone(local_tz).strftime("%H:%M")
+            ort_suffix = ""
+            if g.termin_ort:
+                ort_suffix = f"  ·  {_h_safe(g.termin_ort)}"
+            lines.append(
+                f"<b>{uhr}</b>  ·  <b>{_h_safe(g.kunde_name)}</b>"
+                f"{ort_suffix}"
+            )
+            # Klickbarer Detail-Befehl pro Termin (Telegram macht /-Befehle
+            # auto-klickbar wenn alphanum+underscore am Wortanfang stehen).
+            lines.append(
+                f"  Details: /briefing_{str(g.id)[:8]}"
+            )
+            if g.briefing_kurz:
+                snippet = g.briefing_kurz
+                if len(snippet) > 140:
+                    snippet = snippet[:138] + "..."
+                lines.append(f"  <i>{_h_safe(snippet)}</i>")
+            lines.append("")
+        lines.append(
+            "<i>Tap auf /briefing_xxxxxxxx fuer Briefing + TODOs + "
+            "Drive-Ordner.</i>"
+        )
+        if kommende:
+            lines.append("")
+            lines.append(f"<i>📅 Naechste {len(kommende)} Tage:</i>")
+            for g in kommende:
+                d = g.termin_datum.astimezone(local_tz).strftime("%a %d.%m %H:%M")
+                lines.append(
+                    f"  · {d} — <b>{_h_safe(g.kunde_name)}</b>  "
+                    f"/briefing_{str(g.id)[:8]}"
+                )
+        return "\n".join(lines)
+
+    # Kein Termin heute — zeige naechste Woche als Trost-Block
+    if kommende:
+        lines = [
+            "📅 <b>Heute kein Termin.</b>\n",
+            f"<i>Naechste {len(kommende)} Tage:</i>",
+        ]
+        for g in kommende:
+            d = g.termin_datum.astimezone(local_tz).strftime("%a %d.%m %H:%M")
+            lines.append(
+                f"  · {d} — <b>{_h_safe(g.kunde_name)}</b>  "
+                f"/briefing_{str(g.id)[:8]}"
+            )
+        return "\n".join(lines)
+
+    # Nichts in Sicht — juengstes Gespraech als Fallback (wie vorher)
+    async with AsyncSessionLocal() as s:
         stmt2 = (
             select(Kundengespraech)
             .where(Kundengespraech.tenant_id == tenant.id)
@@ -4026,18 +4109,58 @@ async def _handle_briefing_command(chat_id):
             )
         latest = (await s.execute(stmt2)).scalar_one_or_none()
 
-        if not latest:
-            scope = "" if current_emp.is_default else " (auf dich zugewiesen)"
-            return (
-                f"Noch kein Kundengespraech{scope} erfasst.\n\n"
-                "Mit /aufnahme das erste anlegen."
-            )
-
-        return await _send_kundengespraech_with_drive(
-            chat_id,
-            "<b>📋 Letztes Gespraech</b>\n<i>(Kein anstehender Termin)</i>\n\n",
-            latest, tenant.id,
+    if not latest:
+        scope = "" if current_emp.is_default else " (auf dich zugewiesen)"
+        return (
+            f"Noch kein Kundengespraech{scope} erfasst.\n\n"
+            "Mit /aufnahme das erste anlegen."
         )
+
+    return await _send_kundengespraech_with_drive(
+        chat_id,
+        "<b>📋 Letztes Gespraech</b>\n<i>(Kein anstehender Termin)</i>\n\n",
+        latest, tenant.id,
+    )
+
+
+async def _handle_briefing_show_command(chat_id, id_prefix: str):
+    """/briefing_<8hex> — Detail-Ansicht eines Gespraechs mit Drive-Link.
+
+    Klickbar aus dem /briefing-Listing. Findet das Gespraech per UUID-
+    Prefix-Match (8 Hex-Chars sind genug fuer eindeutige Auswahl).
+    """
+    res = await _get_current_employee(chat_id)
+    if res is None:
+        return "Dieser Chat ist noch keinem Betrieb zugeordnet."
+    tenant, current_emp = res
+
+    from sqlalchemy import cast, String as SAString
+    async with AsyncSessionLocal() as s:
+        stmt = (
+            select(Kundengespraech)
+            .where(
+                Kundengespraech.tenant_id == tenant.id,
+                cast(Kundengespraech.id, SAString).like(f"{id_prefix}%"),
+            )
+            .limit(2)
+        )
+        if not current_emp.is_default:
+            stmt = stmt.where(
+                Kundengespraech.assigned_employee_id == current_emp.id,
+            )
+        rows = (await s.execute(stmt)).scalars().all()
+
+    if not rows:
+        return (
+            f"Kein Gespraech mit ID-Prefix <code>{_h_safe(id_prefix)}</code> "
+            "gefunden. /briefing zeigt die heutigen Termine."
+        )
+    if len(rows) > 1:
+        return "Mehrdeutiger Prefix — bitte /briefing erneut aufrufen."
+
+    return await _send_kundengespraech_with_drive(
+        chat_id, "", rows[0], tenant.id,
+    )
 
 
 async def _handle_kunde_command(chat_id, args):
