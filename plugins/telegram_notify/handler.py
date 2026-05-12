@@ -823,7 +823,7 @@ def _feature_locked_message(feature) -> str:
     """Klartext-Antwort wenn ein gesperrtes Feature angefragt wird."""
     return (
         f"🔒 <b>{_h_safe(feature.label)}</b> ist nicht in deinem Paket.\n"
-        f"Übersicht: /paket  ·  Upgrade: hallo@gewerbeagent.de"
+        f"Übersicht: /paket  ·  Upgrade: svenj05@gmx.de"
     )
 
 
@@ -872,7 +872,7 @@ async def _handle_paket_command(chat_id) -> str:
     if tenant.package_tier == PACKAGE_CUSTOM:
         msg_parts.append("<i>Custom-Paket. Aenderungen via Admin.</i>")
     else:
-        msg_parts.append("<i>Upgrade: hallo@gewerbeagent.de</i>")
+        msg_parts.append("<i>Upgrade: svenj05@gmx.de</i>")
     return "\n".join(msg_parts)
 
 async def _handle_status_command(chat_id):
