@@ -141,6 +141,8 @@ from core.ai.gemini import (
     extract_angebot_from_audio,
     generate_angebot_anschreiben,
     generate_angebot_anschreiben_from_audio,
+    personalize_angebot_with_corrections,
+    personalize_angebot_with_corrections_from_audio,
 )
 from core.integrations.lexware import LexwareProvider
 from core.integrations.geo import (
@@ -5646,8 +5648,8 @@ def _format_angebot_preview(extracted: dict, *, anschreiben: str | None = None) 
     else:
         lines.append("")
         lines.append(
-            "<i>Anschreiben: Standard. Mit ✏️ Anschreiben anpassen "
-            "personalisieren (Tonangabe, was rein soll, ...).</i>"
+            "<i>Anschreiben: Standard. Mit ✏️ Anpassen personalisieren — "
+            "geht auch fuer Korrekturen an Name/Adresse/E-Mail.</i>"
         )
 
     missing = extracted.get("missing_fields") or []
@@ -5671,7 +5673,7 @@ def _angebot_keyboard(angebot_id: str) -> dict:
             [{"text": "✅ Erstellen + Versenden",
               "callback_data": f"angebot:confirm:{angebot_id}"}],
             [
-                {"text": "✏️ Anschreiben anpassen",
+                {"text": "✏️ Anpassen (Text/Sprache)",
                  "callback_data": f"angebot:anschreiben:{angebot_id}"},
                 {"text": "❌ Verwerfen",
                  "callback_data": f"angebot:cancel:{angebot_id}"},
@@ -5942,12 +5944,19 @@ async def _handle_angebot_callback(chat_id, callback_data, callback_query_id, bo
         })
         await _send_to_chat(
             chat_id,
-            "✏️ <b>Anschreiben personalisieren</b>\n\n"
-            "Schreib oder diktier deine Anweisungen — z.B.:\n"
-            "<i>«freundlich und kurz, erwaehne dass wir naechste Woche "
-            "Donnerstag Zeit haetten»</i>\n\n"
-            "Oder direkt deinen Wunsch-Text — ich baue daraus einen sauberen "
-            "Brief-Anfang fuer das Lexware-PDF.\n\n"
+            "✏️ <b>Angebot anpassen</b>\n\n"
+            "Schreib oder diktier was geaendert werden soll — sowohl "
+            "<b>Anschreiben</b> als auch <b>Kundendaten</b>:\n\n"
+            "<b>Anschreiben (Ton/Inhalt):</b>\n"
+            "<i>«freundlich und kurz, erwaehne dass wir Donnerstag Zeit haetten»</i>\n\n"
+            "<b>Kunden-Korrekturen:</b>\n"
+            "<i>«Kunde heisst Mueller mit ue, nicht Müller»</i>\n"
+            "<i>«Adresse ist Hauptstr. 5, nicht 50»</i>\n"
+            "<i>«PLZ ist 54290 Trier»</i>\n"
+            "<i>«E-Mail kunde@example.de»</i>\n\n"
+            "Du kannst auch <b>beides in einer Nachricht</b> kombinieren — "
+            "ich erkenne automatisch was Datenkorrektur und was Anschreiben-"
+            "Anweisung ist.\n\n"
             "Mit /abbrechen verwerfen und zur Standard-Variante zurueck.",
         )
         return
@@ -5959,9 +5968,14 @@ async def _handle_angebot_instructions_received(
     chat_id, *, text: str | None = None, voice_dict: dict | None = None,
     bot_token: str | None = None,
 ):
-    """Gemini generiert ein personalisiertes Anschreiben aus den
-    Handwerker-Anweisungen, speichert in angebot.introduction_text,
-    zeigt aktualisierte Preview."""
+    """Gemini extrahiert in einem Call BEIDES:
+    (a) Korrekturen am Kunden-Block (Name, Strasse, PLZ, Ort, E-Mail)
+        falls der Handwerker welche mitsagt, und
+    (b) ein personalisiertes Anschreiben (Ton, Hinweise was rein soll).
+
+    Aktualisiert Angebot.kunde_* + introduction_text + den extracted-State,
+    damit die Preview die Korrekturen sofort zeigt.
+    """
     state = await _load_state(chat_id)
     if not state or state.state_key != STATE_ANGEBOT_AWAITING_INSTRUCTIONS:
         return "Status verloren — bitte /angebot neu starten."
@@ -5974,7 +5988,9 @@ async def _handle_angebot_instructions_received(
 
     tenant = await _get_tenant_by_chat(chat_id)
 
-    # Gemini-Generation — Text oder Audio
+    # Gemini-Call: gibt (field_updates, anschreiben) zurueck
+    field_updates: dict = {}
+    anschreiben = ""
     try:
         if voice_dict is not None:
             if not bot_token:
@@ -5983,35 +5999,41 @@ async def _handle_angebot_instructions_received(
             file_path = await _telegram_get_file_path(bot_token, file_id)
             audio_bytes = await _telegram_download_file(bot_token, file_path)
             mime = voice_dict.get("mime_type") or "audio/ogg"
-            anschreiben = await generate_angebot_anschreiben_from_audio(
+            field_updates, anschreiben = await personalize_angebot_with_corrections_from_audio(
                 extracted, audio_bytes, mime_type=mime,
                 tenant_id=tenant.id if tenant else None,
             )
         else:
-            anschreiben = await generate_angebot_anschreiben(
+            field_updates, anschreiben = await personalize_angebot_with_corrections(
                 extracted, text or "",
                 tenant_id=tenant.id if tenant else None,
             )
     except Exception as exc:
-        logger.exception(f"Anschreiben-Generation crashed: {exc}")
-        anschreiben = ""
+        logger.exception(f"Personalisierung crashed: {exc}")
+        field_updates, anschreiben = {}, ""
 
-    if not anschreiben:
-        # Zurueck zur Preview ohne Anschreiben
+    if not anschreiben and not field_updates:
+        # Nichts erkannt — User zur Wiederholung auffordern
         await _save_state(chat_id, STATE_ANGEBOT_PREVIEWING, {
             "angebot_id": angebot_id_str,
             "extracted": extracted,
         })
         await _send_to_chat(
             chat_id,
-            "⚠️ Konnte kein Anschreiben generieren. Bitte konkreter formulieren "
-            "(z.B. <i>«kurz und sachlich, Hinweis dass wir nach Ostern kommen»</i>).\n\n"
-            "Du kannst es nochmal versuchen oder direkt Erstellen + Versenden.",
+            "⚠️ Ich habe weder Anschreiben noch Datenkorrektur erkannt. "
+            "Bitte konkreter formulieren — z.B.:\n"
+            "<i>«Anschreiben kurz und sachlich»</i>\n"
+            "<i>«Kunde heisst Mueller mit ue»</i>\n"
+            "<i>«Adresse ist Hauptstr. 5, nicht 50»</i>\n\n"
+            "Oder direkt Erstellen + Versenden.",
         )
         await _resend_angebot_preview(chat_id, angebot_id_str)
         return None
 
-    # Anschreiben in DB persistieren
+    # field_updates auf extracted-Dict + Angebot-Spalten anwenden
+    if field_updates:
+        extracted.update(field_updates)
+
     import uuid as _uuid
     try:
         async with AsyncSessionLocal() as s:
@@ -6019,17 +6041,46 @@ async def _handle_angebot_instructions_received(
                 select(Angebot).where(Angebot.id == _uuid.UUID(angebot_id_str))
             )).scalar_one_or_none()
             if ang is not None:
-                ang.introduction_text = anschreiben
+                for col in ("kunde_name", "kunde_strasse", "kunde_plz",
+                            "kunde_ort", "kunde_email"):
+                    if col in field_updates:
+                        setattr(ang, col, field_updates[col])
+                if anschreiben:
+                    ang.introduction_text = anschreiben
                 await s.commit()
     except Exception:
-        logger.exception("Anschreiben-DB-Save fehlgeschlagen")
+        logger.exception("Angebot-DB-Save fehlgeschlagen")
 
-    # Zurueck zur Preview mit dem neuen Anschreiben sichtbar
+    # Bestaetigungs-Text — sagt was sich geaendert hat
+    if field_updates and anschreiben:
+        change_label = "Daten + Anschreiben"
+    elif field_updates:
+        change_label = "Kundendaten"
+    else:
+        change_label = "Anschreiben"
+    if field_updates:
+        feld_labels = {
+            "kunde_name": "Name", "kunde_strasse": "Strasse",
+            "kunde_plz": "PLZ", "kunde_ort": "Ort", "kunde_email": "E-Mail",
+        }
+        update_summary = ", ".join(
+            f"{feld_labels.get(k, k)}: <b>{_h_safe(v)}</b>"
+            for k, v in field_updates.items()
+        )
+        confirm_msg = (
+            f"✅ {change_label} angepasst.\n"
+            f"<i>Korrigiert: {update_summary}</i>\n\n"
+            "Hier die aktualisierte Vorschau:"
+        )
+    else:
+        confirm_msg = f"✅ {change_label} angepasst. Hier die Vorschau:"
+
+    # Zurueck zur Preview — extracted enthaelt jetzt die Korrekturen
     await _save_state(chat_id, STATE_ANGEBOT_PREVIEWING, {
         "angebot_id": angebot_id_str,
         "extracted": extracted,
     })
-    await _send_to_chat(chat_id, "✅ Anschreiben angepasst. Hier die Vorschau:")
+    await _send_to_chat(chat_id, confirm_msg)
     await _resend_angebot_preview(chat_id, angebot_id_str)
     return None
 

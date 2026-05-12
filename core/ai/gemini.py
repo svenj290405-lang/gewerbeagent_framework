@@ -1475,6 +1475,232 @@ async def generate_angebot_anschreiben_from_audio(
         return ""
 
 
+# =====================================================================
+# Kombinierte Personalisierung: Anschreiben + Kundendaten-Korrekturen
+# =====================================================================
+# Wenn der Handwerker auf "Anpassen" tippt, kann er nicht nur den Ton
+# des Anschreibens beeinflussen, sondern auch Korrekturen am Kunden-Block
+# ansagen ("Kunde heisst Mueller mit ue, nicht Müller-Schmidt").
+# Gemini extrahiert beides in einem Call und liefert sowohl
+# field_updates (kunde_name/strasse/plz/ort/email) als auch ein
+# fertiges Anschreiben in einem JSON.
+
+PERSONALIZE_ANGEBOT_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "field_updates": {
+            "type": "OBJECT",
+            "properties": {
+                "kunde_name": {"type": "STRING", "nullable": True},
+                "kunde_strasse": {"type": "STRING", "nullable": True},
+                "kunde_plz": {"type": "STRING", "nullable": True},
+                "kunde_ort": {"type": "STRING", "nullable": True},
+                "kunde_email": {"type": "STRING", "nullable": True},
+            },
+        },
+        "anschreiben": {"type": "STRING", "nullable": True},
+    },
+}
+
+
+PERSONALIZE_PROMPT_TEMPLATE = """Du bist Assistent fuer einen deutschen \
+Handwerksbetrieb. Der Handwerker hat ein Angebot vorbereitet und moechte \
+es vor dem Versand noch anpassen.
+
+AKTUELLER ANGEBOTS-STAND:
+- Kunde: {kunde_name}
+- Strasse: {kunde_strasse}
+- PLZ + Ort: {kunde_plz} {kunde_ort}
+- E-Mail: {kunde_email}
+- Positionen:
+{positionen_summary}
+- Gesamtbetrag brutto: {gesamt:.2f} EUR
+
+ANWEISUNGEN VOM HANDWERKER (Text oder Sprachnachricht):
+{instructions}
+
+AUFGABE:
+Erkenne im Handwerker-Input ZWEI Arten von Aenderungen:
+
+1) <b>Kundendaten-Korrekturen</b> — wenn der Handwerker Name, Strasse, \
+PLZ, Ort oder E-Mail explizit oder implizit aendert:
+   - "Kunde heisst Mueller, nicht Müller" → kunde_name="...Mueller..."
+   - "Strasse ist Hauptstrasse 5, nicht 50" → kunde_strasse=...
+   - "Ort ist Berlin" → kunde_ort=...
+   - Wenn ein Feld NICHT erwaehnt wird → null lassen (NICHT alten Wert wiederholen).
+
+2) <b>Anschreiben-Anweisungen</b> — Ton, Inhalt, Hinweise was rein soll.
+
+OUTPUT (JSON):
+- field_updates: nur Felder die geaendert werden sollen — alle anderen null.
+- anschreiben: kompletter neuer Einleitungstext (max 5 Saetze, max 600 Zeichen). \
+Beruecksichtigt die KORRIGIERTEN Werte falls es welche gibt.
+
+REGELN fuer den Anschreiben-Text:
+- Beginne mit "Sehr geehrte Damen und Herren" oder personalisiert (z.B. \
+"Sehr geehrte Frau Mueller") aus dem (ggf. korrigierten) Namen.
+- Beziehe dich kurz auf das angefragte Gewerk (aus Positionen).
+- Setze den vom Handwerker gewuenschten Ton um.
+- KEIN Schlusssatz wie "mit freundlichen Gruessen" (macht Lexware).
+- KEINE HTML/Markdown, reines Plaintext.
+
+Antworte AUSSCHLIESSLICH mit dem JSON, kein Erklaerungstext drumherum.
+"""
+
+
+def _build_personalize_prompt(extracted: dict, instructions: str) -> str:
+    return PERSONALIZE_PROMPT_TEMPLATE.format(
+        kunde_name=extracted.get("kunde_name") or "(nicht erkannt)",
+        kunde_strasse=extracted.get("kunde_strasse") or "(nicht erkannt)",
+        kunde_plz=extracted.get("kunde_plz") or "",
+        kunde_ort=extracted.get("kunde_ort") or "(nicht erkannt)",
+        kunde_email=extracted.get("kunde_email") or "(nicht erkannt)",
+        positionen_summary=_format_positionen_summary(
+            extracted.get("positionen") or []
+        ),
+        gesamt=float(extracted.get("gesamtbetrag_brutto_eur") or 0),
+        instructions=(instructions or "(siehe angehaengte Sprachnachricht)").strip(),
+    )
+
+
+def _clean_field_updates(raw: dict | None) -> dict:
+    """Saeubert die field_updates: leere Strings + Placeholder-Werte raus."""
+    if not isinstance(raw, dict):
+        return {}
+    out: dict = {}
+    bad_values = {"", "null", "none", "(nicht erkannt)", "—", "-"}
+    for k in ("kunde_name", "kunde_strasse", "kunde_plz", "kunde_ort", "kunde_email"):
+        v = raw.get(k)
+        if v is None:
+            continue
+        if not isinstance(v, str):
+            continue
+        v = v.strip()
+        if v.lower() in bad_values:
+            continue
+        out[k] = v
+    return out
+
+
+async def personalize_angebot_with_corrections(
+    extracted: dict,
+    instructions: str,
+    *,
+    tenant_id=None,
+) -> tuple[dict, str]:
+    """Kombinierter Call: extrahiert Kundendaten-Korrekturen + generiert
+    Anschreiben aus den Handwerker-Anweisungen.
+
+    Returns: (field_updates, anschreiben)
+        field_updates: dict mit nur den geaenderten Feldern.
+        anschreiben: Plaintext (max ~600 Zeichen), leer bei Fehler.
+    """
+    if not instructions or not instructions.strip():
+        return {}, ""
+
+    import json as _json
+    from google.genai.types import GenerateContentConfig
+
+    prompt = _build_personalize_prompt(extracted, instructions)
+    try:
+        client = _get_genai_client(location=GENAI_TEXT_LOCATION)
+        config = GenerateContentConfig(
+            temperature=0.4,
+            max_output_tokens=2048,
+            response_mime_type="application/json",
+            response_schema=PERSONALIZE_ANGEBOT_SCHEMA,
+        )
+        def _sync_call():
+            return client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=[prompt],
+                config=config,
+            )
+        loop = asyncio.get_event_loop()
+        response = await loop.run_in_executor(None, _sync_call)
+    except Exception as exc:
+        logger.exception(f"personalize_angebot crashed: {exc}")
+        return {}, ""
+
+    if not response.candidates or not response.candidates[0].content:
+        return {}, ""
+    raw_text = ""
+    for p in response.candidates[0].content.parts or []:
+        if getattr(p, "text", None):
+            raw_text += p.text
+    try:
+        data = _json.loads(raw_text)
+    except Exception as exc:
+        logger.warning(f"personalize_angebot JSON-parse failed: {exc}")
+        return {}, ""
+
+    field_updates = _clean_field_updates(data.get("field_updates"))
+    anschreiben = (data.get("anschreiben") or "").strip()
+    if len(anschreiben) > 800:
+        anschreiben = anschreiben[:797] + "..."
+    return field_updates, anschreiben
+
+
+async def personalize_angebot_with_corrections_from_audio(
+    extracted: dict,
+    audio_bytes: bytes,
+    mime_type: str = "audio/ogg",
+    *,
+    tenant_id=None,
+) -> tuple[dict, str]:
+    """Wie personalize_angebot_with_corrections, aber instructions kommen
+    aus einer Sprachnachricht.
+    """
+    if not audio_bytes:
+        return {}, ""
+
+    import json as _json
+    from google.genai.types import GenerateContentConfig, Part
+
+    prompt = _build_personalize_prompt(
+        extracted,
+        instructions="(siehe angehaengte Sprachnachricht des Handwerkers)",
+    )
+    try:
+        client = _get_genai_client(location=GENAI_TEXT_LOCATION)
+        config = GenerateContentConfig(
+            temperature=0.4,
+            max_output_tokens=2048,
+            response_mime_type="application/json",
+            response_schema=PERSONALIZE_ANGEBOT_SCHEMA,
+        )
+        audio_part = Part.from_bytes(data=audio_bytes, mime_type=mime_type)
+        def _sync_call():
+            return client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=[audio_part, prompt],
+                config=config,
+            )
+        loop = asyncio.get_event_loop()
+        response = await loop.run_in_executor(None, _sync_call)
+    except Exception as exc:
+        logger.exception(f"personalize_angebot_audio crashed: {exc}")
+        return {}, ""
+
+    if not response.candidates or not response.candidates[0].content:
+        return {}, ""
+    raw_text = ""
+    for p in response.candidates[0].content.parts or []:
+        if getattr(p, "text", None):
+            raw_text += p.text
+    try:
+        data = _json.loads(raw_text)
+    except Exception as exc:
+        logger.warning(f"personalize_angebot_audio JSON-parse failed: {exc}")
+        return {}, ""
+
+    field_updates = _clean_field_updates(data.get("field_updates"))
+    anschreiben = (data.get("anschreiben") or "").strip()
+    if len(anschreiben) > 800:
+        anschreiben = anschreiben[:797] + "..."
+    return field_updates, anschreiben
+
+
 # Antwort-Klassifikation: ist die eingehende Mail eine Annahme/Ablehnung
 # oder eine Rueckfrage zum Angebot?
 ANGEBOT_RESPONSE_RESPONSE_SCHEMA = {
