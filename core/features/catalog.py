@@ -100,7 +100,7 @@ FEATURES: dict[str, Feature] = {
         label="Material-Bestellungen",
         description="Verbrauchsartikel-Katalog mit Quick-Order-Buttons.",
         telegram_commands=(
-            "/material", "/material_neu", "/bestellen", "/bestellungen",
+            "/material", "/material_neu",
         ),
     ),
     "kalkulation": Feature(

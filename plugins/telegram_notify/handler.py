@@ -677,20 +677,14 @@ async def _handle_help_command(chat_id=None):
 
     # --- Material ---
     if _is_on("material"):
-        _block("🛒", "Material-Bestellungen", [
+        _block("🛒", "Material", [
             ("/material",
-             "Verbrauchsmaterial-Katalog mit Inline-Buttons fuer "
-             "Schnellbestellung."),
+             "Verbrauchsmaterial-Katalog + letzte Bestellungen."),
             ("/material [name]",
-             "Artikel-Detail: Lieferant, Preis, Bestell-Link."),
+             "Artikel-Detail mit <b>🛒 Jetzt bestellen</b>-Button — "
+             "ein Tap loggt die Bestellung + oeffnet den Lieferanten-Link."),
             ("/material_neu",
-             "Neuen Artikel anlegen (Wizard: Name → Lieferant → "
-             "Link)."),
-            ("/bestellen [name]",
-             "Quick-Order — direkt 1 Stueck; Bestellung wird "
-             "gespeichert."),
-            ("/bestellungen",
-             "Letzte Bestellungen mit Datum und Status."),
+             "Neuen Artikel anlegen (Wizard: Name → Lieferant → Link)."),
         ])
 
     # --- Wissensbasis ---
@@ -1954,6 +1948,8 @@ async def _dispatch_update(payload):
             await _handle_auftrag_callback(cq_chat_id, cq_data, cq_id, bot_token)
         elif cq_data and cq_data.startswith("ob:"):
             await _handle_onboarding_callback(cq_chat_id, cq_data, cq_id, bot_token)
+        elif cq_data and cq_data.startswith("bestell:"):
+            await _handle_bestell_callback(cq_chat_id, cq_data, cq_id, bot_token)
         elif cq_data and cq_data.startswith("krank:"):
             await _handle_krank_callback(cq_chat_id, cq_data, cq_id, bot_token)
         elif cq_data and cq_data.startswith("urlaub:"):
@@ -2276,15 +2272,9 @@ async def _dispatch_update(payload):
         await _clear_state(chat_id)
         args = text[len("/material "):].strip()
         reply = await _handle_material_command(chat_id, args)
-    elif text == "/bestellen":
-        await _clear_state(chat_id)
-        reply = await _handle_bestellen_list_command(chat_id)
-    elif text.startswith("/bestellen "):
-        args = text[len("/bestellen "):].strip()
-        reply = await _handle_bestellen_command(chat_id, args)
-    elif text == "/bestellungen":
-        await _clear_state(chat_id)
-        reply = await _handle_bestellungen_list_command(chat_id)
+        if reply is None:
+            # Wizard hat schon per _send_with_keyboard geantwortet
+            return {"ok": True}
     elif text == "/briefing":
         await _clear_state(chat_id)
         reply_or_none = await _handle_briefing_command(chat_id)
@@ -10316,7 +10306,7 @@ class Plugin(BasePlugin):
 
 
 # =====================================================================
-# Material-Verwaltung + /bestellen
+# Material-Verwaltung — Quick-Order ueber Inline-Button im Detail
 # =====================================================================
 # Verbrauchs-Artikel (Schrauben, Klebstoff, Akku, ...) die der Handwerker
 # regelmaessig nachbestellt. Tenant pflegt einen Katalog mit Bestell-URL,
@@ -10324,8 +10314,8 @@ class Plugin(BasePlugin):
 # Bewusst KEINE Mail-Bestellung — Sven wollte URL-only.
 
 async def _handle_material_list_command(chat_id):
-    """Zeigt alle aktiven Materialien des Tenants."""
-    from core.models.tenant_material import TenantMaterial
+    """Zeigt alle aktiven Materialien + die letzten 5 Bestellungen."""
+    from core.models.tenant_material import TenantMaterial, MaterialBestellung
     tenant = await _get_tenant_by_chat(chat_id)
     if not tenant:
         return "Dieser Chat ist noch keinem Betrieb zugeordnet."
@@ -10335,6 +10325,12 @@ async def _handle_material_list_command(chat_id):
             .where(TenantMaterial.tenant_id == tenant.id)
             .where(TenantMaterial.aktiv.is_(True))
             .order_by(TenantMaterial.name)
+        )).scalars().all()
+        recent = (await s.execute(
+            select(MaterialBestellung)
+            .where(MaterialBestellung.tenant_id == tenant.id)
+            .order_by(MaterialBestellung.created_at.desc())
+            .limit(5)
         )).scalars().all()
 
     if not materialien:
@@ -10352,8 +10348,14 @@ async def _handle_material_list_command(chat_id):
             f"• <code>{_h_safe(m.slug)}</code> — {_h_safe(m.name)}{lieferant_label}"
         )
     lines.append("")
-    lines.append("Bestellen: <b>/bestellen &lt;slug&gt;</b>")
-    lines.append("Details:   <b>/material &lt;slug&gt;</b>")
+    lines.append("Detail + Bestellen: <b>/material &lt;slug&gt;</b>")
+
+    if recent:
+        lines.append("")
+        lines.append("<b>Letzte Bestellungen:</b>")
+        for r in recent:
+            ts = r.created_at.strftime("%d.%m. %H:%M") if r.created_at else "-"
+            lines.append(f"  • {ts} — {_h_safe(r.material_name)}")
     return "\n".join(lines)
 
 
@@ -10496,7 +10498,7 @@ async def _save_material_from_wizard(chat_id, data: dict) -> str:
         "<b>✅ Material angelegt</b>\n\n"
         f"<b>Name:</b> {_h_safe(name)}\n"
         f"<b>Slug:</b> <code>{slug}</code>{lieferant_line}\n\n"
-        f"Jetzt bestellen mit:\n<b>/bestellen {slug}</b>"
+        f"Detail + Bestellen mit:\n<b>/material {slug}</b>"
     )
 
 
@@ -10562,11 +10564,18 @@ async def _handle_material_command(chat_id, args: str):
             ts = r.created_at.strftime("%d.%m. %H:%M") if r.created_at else "-"
             parts_msg.append(f"  • {ts}")
     parts_msg.append("")
-    parts_msg.append(f"<b>Bestellen:</b> /bestellen {m.slug}")
     if m.aktiv:
-        parts_msg.append(f"<b>Deaktivieren:</b> /material {m.slug} deaktivieren")
+        parts_msg.append(f"<i>Deaktivieren:</i> /material {m.slug} deaktivieren")
     else:
-        parts_msg.append(f"<b>Aktivieren:</b> /material {m.slug} aktivieren")
+        parts_msg.append(f"<i>Aktivieren:</i> /material {m.slug} aktivieren")
+
+    # Inline-Button: Bestellung ausloesen via Callback
+    if m.aktiv:
+        keyboard = {"inline_keyboard": [[
+            {"text": "🛒 Jetzt bestellen", "callback_data": f"bestell:{m.slug}"},
+        ]]}
+        await _send_with_keyboard(chat_id, "\n".join(parts_msg), keyboard)
+        return None
     return "\n".join(parts_msg)
 
 
@@ -10701,6 +10710,43 @@ async def _ausloesen_bestellung(chat_id, material, menge: int) -> str:
     if not sent:
         return text_msg + f"\n\n{material.bestell_link}"
     return None  # Button schon gesendet, kein zusaetzlicher Reply
+
+
+async def _handle_bestell_callback(chat_id, callback_data, callback_query_id, bot_token):
+    """bestell:<slug> — Tap auf den 'Jetzt bestellen'-Button im
+    /material-Detail. Ruft _ausloesen_bestellung mit Menge 1.
+    """
+    from core.models.tenant_material import TenantMaterial
+    parts = callback_data.split(":", 1)
+    if len(parts) != 2:
+        await _answer_callback_query(callback_query_id, "Format-Fehler", bot_token)
+        return
+    slug = parts[1].strip().lower()
+    await _answer_callback_query(callback_query_id, "Bestelle…", bot_token)
+
+    tenant = await _get_tenant_by_chat(chat_id)
+    if not tenant:
+        await _send_to_chat(chat_id, "Tenant nicht gefunden.")
+        return
+    async with AsyncSessionLocal() as s:
+        m = (await s.execute(
+            select(TenantMaterial)
+            .where(TenantMaterial.tenant_id == tenant.id)
+            .where(TenantMaterial.slug == slug)
+            .where(TenantMaterial.aktiv.is_(True))
+        )).scalar_one_or_none()
+    if m is None:
+        await _send_to_chat(
+            chat_id,
+            f"Material <code>{_h_safe(slug)}</code> nicht mehr aktiv. "
+            "Liste: /material",
+        )
+        return
+    result = await _ausloesen_bestellung(chat_id, m, 1)
+    # _ausloesen_bestellung gibt None zurueck wenn Button schon
+    # versandt wurde, sonst Fallback-Text.
+    if result is not None:
+        await _send_to_chat(chat_id, result)
 
 
 async def _handle_bestellungen_list_command(chat_id):
