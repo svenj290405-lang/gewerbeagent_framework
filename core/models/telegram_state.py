@@ -61,6 +61,7 @@ STATE_ANGEBOT_WAITING_INPUT = "angebot_waiting_input"
 STATE_ANGEBOT_PREVIEWING = "angebot_previewing"
 STATE_ANGEBOT_AWAITING_INSTRUCTIONS = "angebot_awaiting_instructions"
 STATE_ANGEBOT_AWAITING_MAIL = "angebot_awaiting_mail"
+STATE_ANGEBOT_AWAITING_KUNDE_NAME = "angebot_awaiting_kunde_name"
 
 STATE_LEISTUNG_WAITING_NAME = "leistung_waiting_name"
 STATE_LEISTUNG_WAITING_PREIS = "leistung_waiting_preis"

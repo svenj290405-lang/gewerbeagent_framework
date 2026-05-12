@@ -50,6 +50,7 @@ from core.models import (
     STATE_ANGEBOT_PREVIEWING,
     STATE_ANGEBOT_AWAITING_INSTRUCTIONS,
     STATE_ANGEBOT_AWAITING_MAIL,
+    STATE_ANGEBOT_AWAITING_KUNDE_NAME,
     STATE_MATERIAL_NEU_NAME,
     STATE_MATERIAL_NEU_LINK,
     STATE_MATERIAL_NEU_LIEFERANT,
@@ -611,9 +612,10 @@ async def _handle_help_command(chat_id=None):
         ))
     # /kunde ist always_on (kunde_lookup-Feature)
     kunden_items_active.append((
-        "/kunde [name]",
-        "Kundenhistorie: alle Gespraeche, Termine und "
-        "Drive-Ordner-Link.",
+        "/kunde [name | email]",
+        "Kundensuche: voller Name (z.B. <i>Anna Mueller</i>) oder "
+        "Mail-Adresse (<i>anna@example.com</i>). Zeigt Gespraeche, "
+        "Angebote, Lexware-Kontakte und Drive-Ordner.",
     ))
     _block("📞", "Kundengespraeche", kunden_items_active)
     if kunden_items_locked:
@@ -2377,6 +2379,12 @@ async def _dispatch_update(payload):
             reply_or_none = await _handle_angebot_instructions_received(
                 chat_id, text=text,
             )
+            if reply_or_none is None:
+                return {"ok": True}
+            reply = reply_or_none
+        elif state.state_key == STATE_ANGEBOT_AWAITING_KUNDE_NAME:
+            # User reicht vollen Namen nach
+            reply_or_none = await _handle_angebot_kunde_name_input(chat_id, text)
             if reply_or_none is None:
                 return {"ok": True}
             reply = reply_or_none
@@ -4292,16 +4300,26 @@ async def _handle_briefing_show_command(chat_id, id_prefix: str):
 
 
 async def _handle_kunde_command(chat_id, args):
-    """/kunde [Name] - alle Gespraeche zu einem Kunden.
+    """/kunde [Name|Email] - alle Gespraeche zu einem Kunden.
 
-    args = String nach '/kunde ' (z.B. 'Mueller' oder 'Frau Mueller')
+    args = String nach '/kunde ' — entweder vollstaendiger Name
+           (z.B. 'Anna Mueller'), Namens-Token ('Mueller') oder
+           E-Mail-Adresse ('anna@example.com'). Email-Modus wird
+           automatisch erkannt wenn '@' im Argument vorkommt.
+
+    Sucht in:
+      1. Kundengespraeche (Name-Match auf kunde_name)
+      2. Angebote (Name + Email-Match) — fuegt 'Kunde nur als Angebots-
+         Eintrag bekannt'-Resultate hinzu
+      3. Lexware-Kontakte — globaler Adressbuch-Fallback
     """
-    from sqlalchemy import select, func
+    from sqlalchemy import select, func, or_
 
     if not args or len(args.strip()) < 2:
         return (
-            "Bitte einen Kunden-Namen angeben.\n\n"
-            "Beispiel: <code>/kunde Mueller</code>"
+            "Bitte einen Kunden-Namen oder eine Mail-Adresse angeben.\n\n"
+            "Beispiele: <code>/kunde Anna Mueller</code> oder "
+            "<code>/kunde anna@example.com</code>"
         )
 
     res = await _get_current_employee(chat_id)
@@ -4309,9 +4327,13 @@ async def _handle_kunde_command(chat_id, args):
         return "Dieser Chat ist noch keinem Betrieb zugeordnet."
     tenant, current_emp = res
 
-    suchbegriff = args.strip().lower()
+    raw = args.strip()
+    suchbegriff = raw.lower()
+    is_email_search = "@" in raw
 
     async with AsyncSessionLocal() as s:
+        # 1) Kundengespraeche per Name-Match (Email speichert das Modell
+        # selbst nicht — wir haben nur kunde_name dort)
         stmt = (
             select(Kundengespraech)
             .where(
@@ -4327,39 +4349,138 @@ async def _handle_kunde_command(chat_id, args):
             )
         gespraeche = (await s.execute(stmt)).scalars().all()
 
+        # 2) Angebote per Name ODER Email — wenn Email-Suche, primaer
+        # auf kunde_email; sonst auf kunde_name. Liefert nur Angebote
+        # die nicht schon ueber Kundengespraech.angebot_id verlinkt sind.
+        existing_angebot_ids = {
+            g.angebot_id for g in gespraeche if g.angebot_id
+        }
+        angebot_stmt = select(Angebot).where(Angebot.tenant_id == tenant.id)
+        if is_email_search:
+            angebot_stmt = angebot_stmt.where(
+                func.lower(Angebot.kunde_email).contains(suchbegriff)
+            )
+        else:
+            angebot_stmt = angebot_stmt.where(or_(
+                func.lower(Angebot.kunde_name).contains(suchbegriff),
+                func.lower(Angebot.kunde_email).contains(suchbegriff),
+            ))
+        angebot_stmt = angebot_stmt.order_by(
+            Angebot.created_at.desc()
+        ).limit(10)
+        angebote = (await s.execute(angebot_stmt)).scalars().all()
+        angebote = [a for a in angebote if a.id not in existing_angebot_ids]
+
+    # 3) Lexware-Kontakte (globales Adressbuch — Pattern-Match auf Name
+    # ODER Email, beides via gleichem endpoint).
+    lexware_hits: list = []
+    try:
+        provider = await _get_lexware_provider_for_tenant(tenant)
+        if provider is not None and len(raw) >= 3:
+            lexware_hits = await provider.search_contacts(
+                raw, customer_only=True, limit=5,
+            )
+    except Exception:
+        logger.exception("Lexware-Contact-Lookup fuer /kunde fehlgeschlagen")
+
+    # ----- Ausgabe -----
+    def _angebot_line(a) -> str:
+        bits = []
+        if a.kunde_email:
+            bits.append(f"📧 {_h_safe(a.kunde_email)}")
+        if a.gesamtbetrag_brutto_eur is not None:
+            bits.append(f"💶 {float(a.gesamtbetrag_brutto_eur):.2f}€")
+        if a.created_at:
+            bits.append(a.created_at.strftime("%d.%m.%Y"))
+        bits.append(f"/auftrag_{str(a.id)[:8]}")
+        return (
+            f"  · <b>{_h_safe(a.kunde_name)}</b>  "
+            + "  ·  ".join(bits)
+        )
+
+    def _lexware_line(c) -> str:
+        bits = []
+        if getattr(c, "email", None):
+            bits.append(f"📧 {_h_safe(c.email)}")
+        if getattr(c, "city", None):
+            bits.append(_h_safe(c.city))
+        if getattr(c, "role", None):
+            bits.append(c.role)
+        return (
+            f"  · <b>{_h_safe(c.name or '(ohne Name)')}</b>  "
+            + ("  ·  ".join(bits) if bits else "")
+        )
+
+    # Wenn nur Lexware/Angebot-Treffer aber kein Gespraech → spezieller
+    # Branch damit wir wenigstens irgendwas Brauchbares zeigen.
     if not gespraeche:
-        # Auch ohne Gespraech: schauen ob ein Drive-Ordner existiert
-        # (z.B. Tenant hat /archiv ohne vorheriges Gespraech genutzt).
+        if angebote or lexware_hits:
+            lines = [
+                f"<b>🔎 Kunde '{_h_safe(raw)}'</b>"
+                + (" (Mail-Suche)" if is_email_search else "")
+                + "  ·  keine Gespraeche, aber gefunden in:",
+                "",
+            ]
+            if angebote:
+                lines.append("<b>📋 Angebote / Auftraege</b>")
+                for a in angebote[:5]:
+                    lines.append(_angebot_line(a))
+                lines.append("")
+            if lexware_hits:
+                lines.append("<b>📇 Lexware-Kontakte</b>")
+                for c in lexware_hits[:5]:
+                    lines.append(_lexware_line(c))
+                lines.append("")
+            return "\n".join(lines)
+        # Auch ohne Gespraech / Angebot / Lexware: Drive-Ordner-Check
         drive_block, _ = await _drive_link_section(tenant.id, suchbegriff)
         if drive_block:
             return (
-                f"Keine Gespraeche zu <i>{_h_safe(suchbegriff)}</i> gefunden."
+                f"Keine Treffer zu <i>{_h_safe(raw)}</i> gefunden."
                 f"{drive_block}"
             )
-        return f"Keine Gespraeche zu <i>{_h_safe(suchbegriff)}</i> gefunden."
+        return f"Keine Treffer zu <i>{_h_safe(raw)}</i> gefunden."
 
-    if len(gespraeche) == 1:
-        # Nur eins -> volle Anzeige + Drive-Link-Block
+    # Genau ein Gespraech → volle Anzeige (+ ggf. Angebot/Lexware-Block
+    # zusaetzlich anhaengen)
+    if len(gespraeche) == 1 and not angebote and not lexware_hits:
         return await _send_kundengespraech_with_drive(
             chat_id, "", gespraeche[0], tenant.id,
         )
 
-    # Mehrere -> Liste mit Briefings
-    msg = f"<b>📋 Gespraeche zu '{_h_safe(suchbegriff)}'</b> ({len(gespraeche)})\n\n"
-    for i, g in enumerate(gespraeche[:5], 1):
-        msg += f"<b>{i}. {_format_kundengespraech_short(g)}</b>\n"
-        if g.briefing_kurz:
-            briefing = g.briefing_kurz
-            if len(briefing) > 200:
-                briefing = briefing[:180] + "..."
-            msg += f"<i>{briefing}</i>\n\n"
-    if len(gespraeche) > 5:
-        msg += f"<i>... und {len(gespraeche) - 5} weitere</i>\n"
+    # Mehrere Gespraeche ODER mit zusaetzlichen Angebots-/Lexware-Treffern
+    header = f"<b>📋 Treffer zu '{_h_safe(raw)}'</b>"
+    if is_email_search:
+        header += " (Mail-Suche)"
+    msg = f"{header}\n\n"
+
+    if gespraeche:
+        msg += f"<b>📞 Gespraeche</b> ({len(gespraeche)})\n"
+        for i, g in enumerate(gespraeche[:5], 1):
+            msg += f"<b>{i}. {_format_kundengespraech_short(g)}</b>\n"
+            if g.briefing_kurz:
+                briefing = g.briefing_kurz
+                if len(briefing) > 200:
+                    briefing = briefing[:180] + "..."
+                msg += f"<i>{briefing}</i>\n"
+            msg += f"  Details: /briefing_{str(g.id)[:8]}\n\n"
+        if len(gespraeche) > 5:
+            msg += f"<i>... und {len(gespraeche) - 5} weitere</i>\n\n"
+
+    if angebote:
+        msg += f"<b>📋 Angebote / Auftraege</b> ({len(angebote)})\n"
+        for a in angebote[:5]:
+            msg += _angebot_line(a) + "\n"
+        msg += "\n"
+
+    if lexware_hits:
+        msg += f"<b>📇 Lexware-Kontakte</b> ({len(lexware_hits)})\n"
+        for c in lexware_hits[:5]:
+            msg += _lexware_line(c) + "\n"
+        msg += "\n"
 
     # Drive-Link nur wenn der Suchbegriff genau einem Kunden-Folder
-    # entspricht (alle 5 Treffer haben den gleichen normalisierten
-    # kunde_name). Sonst lassen wir's weg — Tenant kann mit /kunde <exakt>
-    # nochmal nachfragen.
+    # entspricht (alle 5 Gespraech-Treffer haben den gleichen kunde_name).
     distinct_names = {g.kunde_name for g in gespraeche}
     if len(distinct_names) == 1:
         kunde_name = next(iter(distinct_names))
@@ -5587,6 +5708,49 @@ async def _send_with_keyboard(chat_id, text, keyboard_dict, bot_token=None):
     return ok_all
 
 
+def _is_full_kunde_name(name: str | None) -> bool:
+    """True wenn der Kundenname als 'voll' gilt: min. 2 Tokens mit je
+    min. 2 Buchstaben. Anredeworte (Herr, Frau, Familie) zaehlen als
+    Token nur wenn ein echter Name danach kommt.
+
+    Beispiele:
+      "Müller"             → False (nur ein Name)
+      "Frau Müller"        → True (2 Tokens, jedes >=2 Buchstaben)
+      "F. Müller"          → False ("F." hat nur 1 Buchstabe)
+      "Anna Müller"        → True
+      "Bauunternehmen Schmidt GmbH" → True
+      "(unbekannt)"        → False
+      ""                   → False
+    """
+    if not name:
+        return False
+    cleaned = name.strip()
+    if cleaned.lower().startswith("(") or cleaned.lower() in (
+        "unbekannt", "kunde", "kunde unbekannt", "n/a", "nn",
+    ):
+        return False
+    tokens = [t for t in cleaned.split() if len(t.strip(".,;:-")) >= 2]
+    return len(tokens) >= 2
+
+
+async def _send_angebot_full_name_prompt(chat_id, current_name: str | None):
+    """Bot fragt den User nach dem vollen Namen — wird sowohl beim
+    Erst-Insert wie auch bei einer expliziten Korrektur genutzt."""
+    msg = (
+        "⚠️ <b>Kein vollstaendiger Name erkannt</b>"
+    )
+    if current_name:
+        msg += f" — habe verstanden: <i>{_h_safe(current_name)}</i>"
+    msg += (
+        ".\n\n"
+        "Bitte schick mir den <b>vollstaendigen Namen</b> "
+        "(Vor- und Nachname, z.B. <i>Anna Mueller</i> oder "
+        "<i>Bauunternehmen Schmidt GmbH</i>).\n\n"
+        "Mit /abbrechen verwirfst du den Vorgang."
+    )
+    await _send_to_chat(chat_id, msg)
+
+
 async def _handle_angebot_command(chat_id):
     """Startet den /angebot-Wizard. Akzeptiert danach Text ODER Voice."""
     tenant = await _get_tenant_by_chat(chat_id)
@@ -5795,12 +5959,45 @@ async def _handle_angebot_input_received(
             "Mit /angebot neu starten."
         )
 
-    # 4) Angebot in DB anlegen
+    # 3b) Pflicht: voller Kunden-Name. Wenn nicht erkannt → State
+    # AWAITING_KUNDE_NAME, der naechste Text-Input vom User wird als
+    # vollstaendiger Name uebernommen und der Flow geht hier weiter.
+    if not _is_full_kunde_name(extracted.get("kunde_name")):
+        await _save_state(chat_id, STATE_ANGEBOT_AWAITING_KUNDE_NAME, {
+            "extracted": extracted,
+            "raw_input": raw_input_text,
+            "source": "telegram_voice" if voice_dict is not None else "telegram_text",
+        })
+        await _send_angebot_full_name_prompt(chat_id, extracted.get("kunde_name"))
+        return None  # auf User-Antwort warten
+
+    # 4) DB-Insert + Preview anzeigen — extrahierte Helper-Funktion
+    # damit der STATE_ANGEBOT_AWAITING_KUNDE_NAME-Handler nach der
+    # Name-Korrektur direkt hier wieder einsteigen kann.
+    await _persist_angebot_and_show_preview(
+        chat_id, tenant, extracted, raw_input_text,
+        source="telegram_voice" if voice_dict is not None else "telegram_text",
+        bot_token=bot_token,
+    )
+    return None
+
+
+async def _persist_angebot_and_show_preview(
+    chat_id, tenant, extracted: dict, raw_input_text: str,
+    *, source: str, bot_token: str | None = None,
+):
+    """Macht den DB-Insert + Preview-Render fuer ein Angebot.
+
+    Wird aus _handle_angebot_input_received aufgerufen (Hauptweg) UND
+    aus dem STATE_ANGEBOT_AWAITING_KUNDE_NAME-Handler (nach Name-
+    Korrektur durch User).
+    """
+    positionen = extracted.get("positionen") or []
     gesamt = Decimal("0")
     async with AsyncSessionLocal() as s:
         ang = Angebot(
             tenant_id=tenant.id,
-            quelle="telegram_voice" if voice_dict is not None else "telegram_text",
+            quelle=source,
             raw_input=raw_input_text,
             kunde_name=extracted.get("kunde_name") or "(unbekannt)",
             kunde_strasse=extracted.get("kunde_strasse"),
@@ -5830,7 +6027,6 @@ async def _handle_angebot_input_received(
         await s.commit()
         angebot_id = str(ang.id)
 
-    # 5) Preview + State setzen
     preview = _format_angebot_preview(extracted)
     keyboard = _angebot_keyboard(angebot_id)
     await _save_state(chat_id, STATE_ANGEBOT_PREVIEWING, {
@@ -5845,7 +6041,35 @@ async def _handle_angebot_input_received(
     )
     bot_token_for_send = bot_token or await _load_global_bot_token()
     await _send_with_keyboard(chat_id, msg, keyboard, bot_token_for_send)
-    return None  # Antwort bereits per _send_with_keyboard rausgeschickt
+
+
+async def _handle_angebot_kunde_name_input(chat_id, text: str | None):
+    """User hat den vollen Kundennamen eingegeben — validieren, in
+    extracted mergen, dann DB-Insert + Preview."""
+    state = await _load_state(chat_id)
+    if not state or state.state_key != STATE_ANGEBOT_AWAITING_KUNDE_NAME:
+        return "Status verloren — /angebot neu starten."
+
+    data = state.state_data or {}
+    extracted = data.get("extracted") or {}
+    raw_input_text = data.get("raw_input") or ""
+    source = data.get("source") or "telegram_text"
+
+    name = (text or "").strip()
+    if not _is_full_kunde_name(name):
+        # Erneut fragen — kein Fortschritt ohne vollen Namen
+        await _send_angebot_full_name_prompt(chat_id, name or None)
+        return None
+
+    extracted["kunde_name"] = name
+    tenant = await _get_tenant_by_chat(chat_id)
+    if not tenant:
+        await _clear_state(chat_id)
+        return "Tenant nicht gefunden. /start ausfuehren."
+    await _persist_angebot_and_show_preview(
+        chat_id, tenant, extracted, raw_input_text, source=source,
+    )
+    return None
 
 
 async def _handle_angebot_callback(chat_id, callback_data, callback_query_id, bot_token):

@@ -229,7 +229,11 @@ RECHNUNG_PROMPT = """Du bekommst entweder einen Text oder eine Sprachnachricht e
 Extrahiere strukturierte Felder als JSON. Wenn ein Feld nicht erwaehnt wird, setze es auf null. Erfinde KEINE Werte.
 
 KUNDE:
-- kunde_name: Name des Kunden (z.B. "Frau Mueller", "Bauunternehmen Schmidt"). Pflicht.
+- kunde_name: VOLLSTAENDIGER Name des Kunden — bevorzugt Anrede + Nachname
+  oder Vor- + Nachname. Beispiele: "Frau Anna Mueller", "Herr Schmidt",
+  "Familie Weber", "Bauunternehmen Schmidt GmbH". Pflicht. Wenn der
+  Handwerker nur einen einzelnen Nachnamen nennt: setze ihn trotzdem,
+  aber liste "kunde_name" in missing_fields auf — der Bot fragt dann nach.
 - kunde_ort: Stadt/Ort falls genannt
 - kunde_strasse: Strasse + Hausnummer falls genannt
 - kunde_plz: Postleitzahl falls genannt
@@ -437,7 +441,9 @@ Dein Ziel: Strukturierte Daten extrahieren als JSON, damit der Handwerker
 EXTRAHIERE FOLGENDE FELDER:
 
 KUNDE:
-- kunde_name: Vollstaendiger Name (z.B. "Frau Mueller", "Familie Schmidt"). Pflicht.
+- kunde_name: Vollstaendiger Name — bevorzugt Anrede+Nachname oder
+  Vor+Nachname (z.B. "Frau Anna Mueller", "Familie Schmidt",
+  "Bauunternehmen Schmidt GmbH"). Pflicht: mindestens 2 Wortbestandteile.
 - kunde_ort: Ort falls genannt
 - kunde_strasse: Strasse + Hausnummer falls genannt
 - kunde_plz: PLZ falls genannt
@@ -1157,7 +1163,11 @@ ANGEBOT_PROMPT = """Du bekommst entweder einen Text oder eine Sprachnachricht ei
 Extrahiere strukturierte Felder als JSON. Wenn ein Feld nicht erwaehnt wird, setze es auf null. Erfinde KEINE Werte.
 
 KUNDE:
-- kunde_name: Name des Kunden (z.B. "Frau Mueller", "Bauunternehmen Schmidt"). Pflicht.
+- kunde_name: VOLLSTAENDIGER Name des Kunden — bevorzugt Anrede + Nachname
+  oder Vor- + Nachname. Beispiele: "Frau Anna Mueller", "Herr Schmidt",
+  "Familie Weber", "Bauunternehmen Schmidt GmbH". Pflicht. Wenn der
+  Handwerker nur einen einzelnen Nachnamen nennt: setze ihn trotzdem,
+  aber liste "kunde_name" in missing_fields auf — der Bot fragt dann nach.
 - kunde_ort: Stadt/Ort falls genannt
 - kunde_strasse: Strasse + Hausnummer falls genannt
 - kunde_plz: Postleitzahl falls genannt
