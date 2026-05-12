@@ -128,7 +128,7 @@ FEATURES: dict[str, Feature] = {
         label="Kunden-Archiv",
         description="Bilder/PDFs pro Kunde in Drive-Ordnern archivieren.",
         requires=("kalender",),  # braucht Google-OAuth (kommt aus Kalender)
-        telegram_commands=("/drive_verbinden", "/drive_status", "/archiv", "/fertig"),
+        telegram_commands=("/drive_verbinden", "/drive_status", "/drive", "/archiv", "/fertig"),
     ),
     "visualisierung": Feature(
         key="visualisierung",

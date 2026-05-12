@@ -740,7 +740,11 @@ async def _handle_help_command(chat_id=None):
         ("/drive_verbinden",
          "Google-Drive mit dem Tenant verknuepfen (OAuth-Flow)."),
         ("/drive_status",
-         "Drive-Verbindung + verknuepfter Account."),
+         "Drive-Status + Liste der letzten Kunden-Ordner mit "
+         "klickbaren Drive-Links."),
+        ("/drive [name]",
+         "Kunden-Ordner im Drive suchen — Substring-Match, "
+         "zeigt alle Treffer als klickbare Links."),
         ("/archiv [kunde]",
          "Datei-Upload starten — Fotos und PDFs landen "
          "automatisch im Kunden-Ordner."),
@@ -2343,6 +2347,10 @@ async def _dispatch_update(payload):
         reply = reply_or_none
     elif text == "/drive_status":
         reply = await _handle_drive_status_command(chat_id)
+    elif text == "/drive" or text.startswith("/drive "):
+        await _clear_state(chat_id)
+        args = text[len("/drive"):].strip()
+        reply = await _handle_drive_search_command(chat_id, args)
     elif text == "/archiv":
         await _clear_state(chat_id)
         reply = await _handle_archiv_list_command(chat_id)
@@ -4634,6 +4642,33 @@ async def _handle_kunde_command(chat_id, args):
                 for c in lexware_hits[:5]:
                     lines.append(_lexware_line(c))
                 lines.append("")
+
+            # Drive-Ordner: pruefe alle Kandidaten-Namen aus Angeboten +
+            # Lexware-Hits. Erster Treffer gewinnt — wahrscheinlichster
+            # Kunden-Name.
+            drive_candidates: list[str] = []
+            for a in angebote:
+                if a.kunde_name and a.kunde_name not in drive_candidates:
+                    drive_candidates.append(a.kunde_name)
+            for c in lexware_hits:
+                lex_name = (c or {}).get("name") or ""
+                if lex_name and lex_name not in drive_candidates:
+                    drive_candidates.append(lex_name)
+            # Fallback: der Roh-Suchbegriff selbst (kein Email!)
+            if not is_email_search:
+                drive_candidates.append(raw)
+            drive_block_html = ""
+            for cand in drive_candidates[:5]:
+                blk, url = await _drive_link_section(tenant.id, cand)
+                if url:
+                    drive_block_html = blk
+                    break
+            if not drive_block_html and drive_candidates:
+                # Auch kein Treffer — wenigstens den Tipp anzeigen
+                blk, _ = await _drive_link_section(tenant.id, drive_candidates[0])
+                drive_block_html = blk
+            if drive_block_html:
+                lines.append(drive_block_html.strip())
             return "\n".join(lines)
         # Auch ohne Gespraech / Angebot / Lexware: Drive-Ordner-Check
         drive_block, _ = await _drive_link_section(tenant.id, suchbegriff)
@@ -10869,7 +10904,8 @@ async def _handle_drive_verbinden_command(chat_id):
 
 
 async def _handle_drive_status_command(chat_id) -> str:
-    """Zeigt Drive-Verbindungs-Status + Statistik."""
+    """Zeigt Drive-Verbindungs-Status + Liste der letzten Kunden-Ordner
+    mit klickbaren Links + Such-Hinweis."""
     from core.security.oauth_token_lookup import find_oauth_token
     from core.integrations.google_drive import (
         is_drive_configured, list_tenant_kunde_drives,
@@ -10905,15 +10941,75 @@ async def _handle_drive_status_command(chat_id) -> str:
         last_upload.strftime("%d.%m.%Y %H:%M") if last_upload else "—"
     )
 
-    msg = (
-        "<b>☁️ Drive</b>  ✅\n"
-        f"{len(folders)} Ordner  ·  {total_uploads} Dateien  ·  letzter {last_str}\n"
-    )
+    lines = [
+        "<b>☁️ Drive</b>  ✅",
+        f"{len(folders)} Ordner  ·  {total_uploads} Dateien  ·  letzter {last_str}",
+    ]
     if not folders:
-        msg += (
-            "Mit /archiv &lt;name&gt; den ersten anlegen."
+        lines.append("")
+        lines.append("Mit <b>/archiv &lt;name&gt;</b> den ersten anlegen.")
+        return "\n".join(lines)
+
+    # Top-10 nach letztem Upload — klickbare Drive-Links
+    lines.append("")
+    lines.append("<b>📁 Letzte Kunden-Ordner:</b>")
+    for f in folders[:10]:
+        ts = f.last_upload_at.strftime("%d.%m.%y") if f.last_upload_at else "-"
+        lines.append(
+            f"• <a href=\"{_h_safe(f.drive_folder_url)}\">"
+            f"{_h_safe(f.kunde_name)}</a> — "
+            f"{f.upload_count or 0} Dateien, letzter {ts}"
         )
-    return msg
+    if len(folders) > 10:
+        lines.append(f"<i>… und {len(folders) - 10} weitere</i>")
+    lines.append("")
+    lines.append(
+        "🔍 Suche: <b>/drive &lt;name&gt;</b>  ·  "
+        "Upload: <b>/archiv &lt;name&gt;</b>"
+    )
+    return "\n".join(lines)
+
+
+async def _handle_drive_search_command(chat_id, args: str) -> str:
+    """/drive <suchtext> — sucht in den Kunden-Ordnern (substring,
+    case-insensitive). Zeigt alle Treffer als klickbare Drive-Links.
+
+    Aenderung KEINE Daten — reine Such-Funktion. Wer hochladen will:
+    /archiv <exakter Name>.
+    """
+    from core.integrations.google_drive import list_tenant_kunde_drives
+
+    suchtext = (args or "").strip()
+    if len(suchtext) < 2:
+        return (
+            "Nutzung: <b>/drive &lt;suchtext&gt;</b>\n\n"
+            "Beispiel: <code>/drive Mueller</code> findet alle Kunden-"
+            "Ordner deren Name 'Mueller' enthaelt."
+        )
+    tenant = await _get_tenant_by_chat(chat_id)
+    if not tenant:
+        return "Dieser Chat ist noch keinem Betrieb zugeordnet."
+
+    folders = await list_tenant_kunde_drives(tenant.id, limit=500)
+    needle = suchtext.lower()
+    matches = [f for f in folders if needle in (f.kunde_name or "").lower()]
+    if not matches:
+        return (
+            f"Kein Drive-Ordner gefunden zu <i>{_h_safe(suchtext)}</i>.\n\n"
+            f"Mit <b>/archiv {_h_safe(suchtext)}</b> neuen anlegen."
+        )
+
+    lines = [f"<b>🔍 {len(matches)} Treffer fuer '{_h_safe(suchtext)}'</b>\n"]
+    for f in matches[:20]:
+        ts = f.last_upload_at.strftime("%d.%m.%y") if f.last_upload_at else "-"
+        lines.append(
+            f"• <a href=\"{_h_safe(f.drive_folder_url)}\">"
+            f"{_h_safe(f.kunde_name)}</a> — "
+            f"{f.upload_count or 0} Dateien, letzter {ts}"
+        )
+    if len(matches) > 20:
+        lines.append(f"\n<i>… und {len(matches) - 20} weitere — bitte praeziser suchen.</i>")
+    return "\n".join(lines)
 
 
 async def _handle_archiv_list_command(chat_id) -> str:
