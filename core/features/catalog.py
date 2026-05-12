@@ -93,7 +93,6 @@ FEATURES: dict[str, Feature] = {
             "/rechnung", "/rechnungen_anzeigen", "/rechnung_pruefen",
             "/angebot",
             "/auftraege", "/auftrag",
-            "/leistungen", "/leistung", "/leistung_loeschen",
         ),
     ),
     "material": Feature(
