@@ -560,9 +560,12 @@ async def _gemini_extract_rechnung(parts: list, mode: str) -> dict:
     client = _get_genai_client(location=GENAI_TEXT_LOCATION)
     model = "gemini-2.5-flash"
 
+    # Gemini 2.5 verbraucht intern Thinking-Tokens — bei nur 2048 kann es
+    # passieren dass die Response leer kommt (finish_reason=MAX_TOKENS),
+    # speziell wenn der Prompt um den Kalkulationsblock erweitert ist.
     config = GenerateContentConfig(
         temperature=0.1,
-        max_output_tokens=2048,
+        max_output_tokens=4096,
         response_mime_type="application/json",
         response_schema=RECHNUNG_RESPONSE_SCHEMA,
     )

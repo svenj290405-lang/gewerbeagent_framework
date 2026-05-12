@@ -755,6 +755,7 @@ class LexwareProvider(AccountingProvider):
         introduction: str | None = None,
         remark: str | None = None,
         tax_type: str = "gross",
+        finalize: bool = False,
     ) -> QuotationDraft:
         """
         POST /v1/quotations  (ohne ?finalize -> bleibt 'draft')
@@ -830,10 +831,19 @@ class LexwareProvider(AccountingProvider):
         if remark:
             body["remark"] = remark
 
+        # ?finalize=true bewirkt dass die Quotation direkt als "open"
+        # angelegt wird statt als Draft. Nur dann ist der PDF-Download
+        # verfuegbar — was wir fuer die automatische Mail an den Kunden
+        # brauchen. Achtung: finalisierte Angebote koennen in Lexware
+        # nicht mehr inhaltlich geaendert werden.
+        url = f"{LEXWARE_API_BASE}/v1/quotations"
+        if finalize:
+            url += "?finalize=true"
+
         await self._rate_limit()
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             r = await client.post(
-                f"{LEXWARE_API_BASE}/v1/quotations",
+                url,
                 headers={**self._headers, "Content-Type": "application/json"},
                 json=body,
             )
@@ -842,8 +852,9 @@ class LexwareProvider(AccountingProvider):
 
         quotation_id = UUID(data["id"])
         logger.info(
-            "Lexware create_quotation_draft OK: id=%s items=%d expires=%s tax=%s",
-            quotation_id, len(line_items), expiration_date[:10], tax_type,
+            "Lexware create_quotation_draft OK: id=%s items=%d expires=%s "
+            "tax=%s finalize=%s",
+            quotation_id, len(line_items), expiration_date[:10], tax_type, finalize,
         )
         return QuotationDraft(
             quotation_id=quotation_id,

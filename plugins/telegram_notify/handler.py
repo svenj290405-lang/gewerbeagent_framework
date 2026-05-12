@@ -6,6 +6,7 @@ from __future__ import annotations
 import datetime as dt
 import logging
 import uuid
+from decimal import Decimal
 from typing import Any
 
 import httpx
@@ -45,6 +46,9 @@ from core.models import (
     STATE_RECHNUNG_AWAITING_MAIL,
     STATE_AUFNAHME_WAITING_AUDIO,
     STATE_AUFNAHME_PREVIEWING,
+    STATE_ANGEBOT_WAITING_INPUT,
+    STATE_ANGEBOT_PREVIEWING,
+    STATE_ANGEBOT_AWAITING_MAIL,
     STATE_MATERIAL_NEU_NAME,
     STATE_MATERIAL_NEU_LINK,
     STATE_MATERIAL_NEU_LIEFERANT,
@@ -103,11 +107,24 @@ from core.models import (
     Visualisierung,
     TenantLeistung,
 )
+from core.models.angebot import (
+    Angebot,
+    ANGEBOT_STATUS_ERSTELLT,
+    ANGEBOT_STATUS_IN_LEXWARE,
+    ANGEBOT_STATUS_MAIL_SENT,
+    ANGEBOT_STATUS_MAIL_QUEUED,
+    ANGEBOT_STATUS_RECHNUNG_ERSTELLT,
+)
+from core.models.angebot_position import AngebotPosition
 from core.security import decrypt, encrypt
 from core.ai import (
     extract_rechnung_from_audio,
     extract_rechnung_from_text,
     analyse_kundengespraech_from_audio,
+)
+from core.ai.gemini import (
+    extract_angebot_from_text,
+    extract_angebot_from_audio,
 )
 from core.integrations.lexware import LexwareProvider
 from core.integrations.openrouteservice import (
@@ -597,6 +614,11 @@ async def _handle_help_command(chat_id=None):
     # --- Buchhaltung (lexware) ---
     if _is_on("lexware"):
         _block("💰", "Buchhaltung — Belege & Rechnungen", [
+            ("/angebot",
+             "Angebot per Text oder Sprache diktieren — Bot wendet "
+             "deine /kalkulation-Formeln an, legt das Angebot in Lexware "
+             "an, schickt PDF per Mail an den Kunden und bereitet eine "
+             "passende Rechnung als Lexware-Draft vor."),
             ("/beleg",
              "Beleg-Foto oder PDF schicken — wird als Buchungsbeleg "
              "in Lexware angelegt."),
@@ -1868,6 +1890,8 @@ async def _dispatch_update(payload):
             await _handle_rechnung_callback(cq_chat_id, cq_data, cq_id, bot_token)
         elif cq_data and cq_data.startswith("aufnahme:"):
             await _handle_aufnahme_callback(cq_chat_id, cq_data, cq_id, bot_token)
+        elif cq_data and cq_data.startswith("angebot:"):
+            await _handle_angebot_callback(cq_chat_id, cq_data, cq_id, bot_token)
         elif cq_data and cq_data.startswith("leistung:"):
             await _handle_leistung_callback(cq_chat_id, cq_data, cq_id, bot_token)
         elif cq_data and cq_data.startswith("formular:"):
@@ -1997,6 +2021,22 @@ async def _dispatch_update(payload):
             if reply:
                 await _send_to_chat(chat_id, reply)
             return {"ok": True}
+        # ----- Angebot-Wizard: Voice-Note empfangen -----
+        if state and state.state_key == STATE_ANGEBOT_WAITING_INPUT:
+            bot_token = await _load_global_bot_token()
+            if not bot_token:
+                await _send_to_chat(
+                    chat_id,
+                    "Bot-Konfiguration fehlt - bitte beim Betreiber melden.",
+                )
+                return {"ok": True}
+            await _send_to_chat(chat_id, "⏳ Verstehe deine Aufnahme…")
+            reply = await _handle_angebot_input_received(
+                chat_id, voice_dict=voice, bot_token=bot_token,
+            )
+            if reply:
+                await _send_to_chat(chat_id, reply)
+            return {"ok": True}
         # Voice-Note ohne aktiven Wizard - ignorieren
         logger.info("Voice ohne passenden State ignoriert")
         return {"ok": True}
@@ -2084,6 +2124,8 @@ async def _dispatch_update(payload):
         reply = await _handle_microsoft_test_command(chat_id)
     elif text == "/aufnahme":
         reply = await _handle_aufnahme_command(chat_id)
+    elif text == "/angebot":
+        reply = await _handle_angebot_command(chat_id)
     elif text == "/formular":
         reply = await _handle_formular_command(chat_id)
     elif text == "/formular_anzeigen":
@@ -2264,6 +2306,17 @@ async def _dispatch_update(payload):
         elif state.state_key == STATE_AUFNAHME_WAITING_AUDIO:
             reply = "Bitte sende eine Sprachnachricht (kein Text). Oder /abbrechen."
         elif state.state_key == STATE_AUFNAHME_PREVIEWING:
+            reply = "Bitte einen der Buttons oben antippen oder /abbrechen schicken."
+        elif state.state_key == STATE_ANGEBOT_WAITING_INPUT:
+            # Text-Eingabe waehrend Angebot-Wizard (Voice geht weiter oben).
+            await _send_to_chat(chat_id, "⏳ Verstehe deine Eingabe…")
+            reply_or_none = await _handle_angebot_input_received(
+                chat_id, text=text,
+            )
+            if reply_or_none is None:
+                return {"ok": True}
+            reply = reply_or_none
+        elif state.state_key == STATE_ANGEBOT_PREVIEWING:
             reply = "Bitte einen der Buttons oben antippen oder /abbrechen schicken."
         elif state.state_key == STATE_LEISTUNG_WAITING_NAME:
             reply = await _handle_leistung_name_input(chat_id, text)
@@ -5188,6 +5241,443 @@ async def _handle_aufnahme_callback(chat_id, callback_data, callback_query_id, b
             return
 
     await _answer_callback_query(callback_query_id, "Unbekannte Aktion", bot_token)
+
+
+# =====================================================================
+# /angebot-Pipeline: Text/Voice → Gemini → Kalkulation → Lexware (Quotation
+# finalisiert) → Mail-Versand an Kunde → Auto-Invoice-Draft in Lexware
+# =====================================================================
+
+async def _send_with_keyboard(chat_id, text, keyboard_dict, bot_token=None):
+    """sendMessage mit reply_markup. Text wird ggf. auto-gesplittet —
+    Keyboard kommt nur ans LETZTE Stueck (sonst wuerde Telegram die
+    Buttons in jedem Chunk anzeigen)."""
+    if bot_token is None:
+        bot_token = await _load_global_bot_token()
+        if bot_token is None:
+            return False
+    chunks = _split_message_safely(str(text))
+    ok_all = True
+    for i, chunk in enumerate(chunks):
+        is_last = (i == len(chunks) - 1)
+        url = f"{TELEGRAM_API_BASE}/bot{bot_token}/sendMessage"
+        payload = {
+            "chat_id": chat_id,
+            "text": chunk,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        }
+        if is_last and keyboard_dict:
+            payload["reply_markup"] = keyboard_dict
+        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS) as client:
+            try:
+                resp = await client.post(url, json=payload)
+                if resp.status_code != 200:
+                    logger.warning(
+                        f"_send_with_keyboard {resp.status_code}: {resp.text[:200]}"
+                    )
+                    ok_all = False
+            except Exception as exc:
+                logger.exception(f"_send_with_keyboard crashed: {exc}")
+                ok_all = False
+    return ok_all
+
+
+async def _handle_angebot_command(chat_id):
+    """Startet den /angebot-Wizard. Akzeptiert danach Text ODER Voice."""
+    tenant = await _get_tenant_by_chat(chat_id)
+    if not tenant:
+        return (
+            "Dieser Chat ist noch keinem Betrieb zugeordnet.\n"
+            "Bitte zuerst /start ausfuehren."
+        )
+    provider = LexwareProvider.from_global_config()
+    if provider is None:
+        return (
+            "🔒 <b>Lexware ist nicht eingerichtet.</b>\n"
+            "Erst /lexware_setup ausfuehren, dann /angebot."
+        )
+    await _save_state(chat_id, STATE_ANGEBOT_WAITING_INPUT, {})
+    return (
+        "📋 <b>Neues Angebot</b>\n\n"
+        "Diktiere oder schreibe was du anbieten willst — z.B.:\n"
+        "<i>«Angebot fuer Frau Mueller, Hauptstr 5 Trier, mueller@example.com:\n"
+        "100 qm Parkett verlegen plus Anfahrt»</i>\n\n"
+        "Ich nutze deine /kalkulation-Formeln fuer die Preise und lege das "
+        "Angebot direkt in Lexware an, sende es per Mail an den Kunden und "
+        "bereite eine passende Rechnung als Lexware-Draft vor.\n\n"
+        "Mit /abbrechen beenden."
+    )
+
+
+def _format_angebot_preview(extracted: dict) -> str:
+    """Markdown-Vorschau fuer den Confirm-Step."""
+    kunde = extracted.get("kunde_name") or "(unbekannt)"
+    email = extracted.get("kunde_email")
+    strasse = extracted.get("kunde_strasse")
+    plz = extracted.get("kunde_plz")
+    ort = extracted.get("kunde_ort")
+
+    lines = [f"📋 <b>Angebot fuer {_h_safe(kunde)}</b>"]
+    if email:
+        lines.append(f"📧 {_h_safe(email)}")
+    addr_parts = [p for p in [strasse, f"{plz or ''} {ort or ''}".strip()] if p]
+    if addr_parts:
+        lines.append("📍 " + ", ".join(_h_safe(p) for p in addr_parts))
+    lines.append("")
+
+    positionen = extracted.get("positionen") or []
+    gesamt = Decimal("0")
+    for i, pos in enumerate(positionen, 1):
+        name = pos.get("name") or "(ohne Name)"
+        menge = float(pos.get("menge") or 1)
+        einheit = pos.get("einheit") or "Stueck"
+        preis = float(pos.get("preis_brutto_eur") or 0)
+        zeile_total = Decimal(str(round(menge * preis, 2)))
+        gesamt += zeile_total
+        kalk = pos.get("kalkulation") or {}
+        kalk_hint = ""
+        if isinstance(kalk, dict) and kalk.get("regel_name"):
+            kalk_hint = f"  <i>(Formel: {_h_safe(kalk['regel_name'])})</i>"
+        lines.append(
+            f"<b>{i}.</b> {_h_safe(name)} — {menge:g} {_h_safe(einheit)} × "
+            f"{preis:.2f}€ = <b>{float(zeile_total):.2f}€</b>{kalk_hint}"
+        )
+        if pos.get("beschreibung"):
+            lines.append(f"   <i>{_h_safe(pos['beschreibung'])}</i>")
+
+    lines.append("")
+    lines.append(f"<b>Gesamt brutto: {float(gesamt):.2f} €</b>")
+
+    missing = extracted.get("missing_fields") or []
+    if missing:
+        lines.append("")
+        lines.append(
+            f"⚠️ <i>Unklare Felder: {', '.join(str(m) for m in missing)}</i>"
+        )
+
+    return "\n".join(lines)
+
+
+async def _handle_angebot_input_received(
+    chat_id, *, text: str | None = None, voice_dict: dict | None = None,
+    bot_token: str | None = None,
+):
+    """Verarbeitet Text- oder Voice-Input fuer ein neues Angebot.
+
+    1. Gemini-Extraction (mit Kalkulationsregeln im Prompt)
+    2. _apply_kalkulationen (deterministische Formel-Anwendung)
+    3. Angebot + AngebotPositions in DB anlegen
+    4. Preview senden mit Confirm-Buttons
+    """
+    tenant = await _get_tenant_by_chat(chat_id)
+    if not tenant:
+        await _clear_state(chat_id)
+        return "Tenant nicht gefunden. /start ausfuehren."
+
+    # 1) Extraction
+    try:
+        if voice_dict is not None:
+            if not bot_token:
+                bot_token = await _load_global_bot_token()
+            file_id = voice_dict.get("file_id")
+            file_path = await _telegram_get_file_path(bot_token, file_id)
+            audio_bytes = await _telegram_download_file(bot_token, file_path)
+            mime = voice_dict.get("mime_type") or "audio/ogg"
+            extracted = await extract_angebot_from_audio(
+                audio_bytes, mime_type=mime, tenant_id=tenant.id,
+            )
+            raw_input_text = f"[Voice {len(audio_bytes)} bytes, mime={mime}]"
+        else:
+            extracted = await extract_angebot_from_text(
+                text or "", tenant_id=tenant.id,
+            )
+            raw_input_text = (text or "")[:5000]
+    except Exception as exc:
+        logger.exception(f"Angebot-Extraction fehlgeschlagen: {exc}")
+        await _clear_state(chat_id)
+        return (
+            "❌ Konnte die Eingabe nicht verstehen.\n"
+            "Bitte mit /angebot erneut starten und Kunde + Leistungen klar nennen."
+        )
+
+    # 2) Kalkulation anwenden — gleiche Funktion wie /aufnahme nutzt
+    extracted = await _apply_kalkulationen(tenant.id, extracted)
+
+    # 3) Mindestens 1 Position mit Preis Pflicht
+    positionen = extracted.get("positionen") or []
+    if not positionen or not any(
+        p.get("preis_brutto_eur") for p in positionen
+    ):
+        await _clear_state(chat_id)
+        return (
+            "❌ Konnte keine Positionen mit Preis erkennen.\n\n"
+            "Bitte erwaehne Leistungen explizit — z.B. <i>«Parkett verlegen, "
+            "100qm»</i>. Wenn du Kalkulations-Formeln nutzt, in /kalkulation "
+            "anzeigen mit /kalkulation_anzeigen.\n\n"
+            "Mit /angebot neu starten."
+        )
+
+    # 4) Angebot in DB anlegen
+    gesamt = Decimal("0")
+    async with AsyncSessionLocal() as s:
+        ang = Angebot(
+            tenant_id=tenant.id,
+            quelle="telegram_voice" if voice_dict is not None else "telegram_text",
+            raw_input=raw_input_text,
+            kunde_name=extracted.get("kunde_name") or "(unbekannt)",
+            kunde_strasse=extracted.get("kunde_strasse"),
+            kunde_plz=extracted.get("kunde_plz"),
+            kunde_ort=extracted.get("kunde_ort"),
+            kunde_email=extracted.get("kunde_email"),
+            status=ANGEBOT_STATUS_ERSTELLT,
+            confidence=extracted.get("extraction_confidence"),
+        )
+        s.add(ang)
+        await s.flush()
+        for i, pos in enumerate(positionen, 1):
+            menge = Decimal(str(round(float(pos.get("menge") or 1), 4)))
+            preis = Decimal(str(round(float(pos.get("preis_brutto_eur") or 0), 2)))
+            gesamt += menge * preis
+            s.add(AngebotPosition(
+                angebot_id=ang.id,
+                position_nr=i,
+                name=(pos.get("name") or "")[:300],
+                beschreibung=pos.get("beschreibung"),
+                menge=menge,
+                einheit=(pos.get("einheit") or "Stueck")[:50],
+                preis_brutto_eur=preis,
+                mwst_prozent=int(pos.get("mwst_prozent") or 19),
+            ))
+        ang.gesamtbetrag_brutto_eur = gesamt
+        await s.commit()
+        angebot_id = str(ang.id)
+
+    # 5) Preview + State setzen
+    preview = _format_angebot_preview(extracted)
+    # Inline-Buttons fuer Confirm/Cancel
+    keyboard = {
+        "inline_keyboard": [[
+            {"text": "✅ Erstellen + Versenden",
+             "callback_data": f"angebot:confirm:{angebot_id}"},
+            {"text": "❌ Verwerfen",
+             "callback_data": f"angebot:cancel:{angebot_id}"},
+        ]]
+    }
+    await _save_state(chat_id, STATE_ANGEBOT_PREVIEWING, {
+        "angebot_id": angebot_id,
+        "extracted": extracted,
+    })
+    msg = (
+        preview
+        + "\n\n<i>Bestaetigen erstellt das Angebot in Lexware, schickt das "
+        "PDF per Mail an den Kunden und legt eine passende Rechnung als "
+        "Lexware-Draft an.</i>"
+    )
+    bot_token_for_send = bot_token or await _load_global_bot_token()
+    await _send_with_keyboard(chat_id, msg, keyboard, bot_token_for_send)
+    return None  # Antwort bereits per _send_with_keyboard rausgeschickt
+
+
+async def _handle_angebot_callback(chat_id, callback_data, callback_query_id, bot_token):
+    """Verarbeitet angebot:<action>:<id>-Callbacks."""
+    import uuid as _uuid
+    parts = callback_data.split(":", 2)
+    if len(parts) != 3:
+        await _answer_callback_query(callback_query_id, "Format-Fehler", bot_token)
+        return
+    _, action, angebot_id_str = parts
+    try:
+        angebot_uuid = _uuid.UUID(angebot_id_str)
+    except (ValueError, AttributeError):
+        await _answer_callback_query(callback_query_id, "Ungueltige ID", bot_token)
+        return
+
+    if action == "cancel":
+        await _answer_callback_query(callback_query_id, "Verworfen", bot_token)
+        async with AsyncSessionLocal() as s:
+            ang = (await s.execute(
+                select(Angebot).where(Angebot.id == angebot_uuid)
+            )).scalar_one_or_none()
+            if ang is not None:
+                await s.delete(ang)
+                await s.commit()
+        await _clear_state(chat_id)
+        await _send_to_chat(chat_id, "Angebot verworfen.")
+        return
+
+    if action == "confirm":
+        await _answer_callback_query(
+            callback_query_id, "Erstelle Angebot…", bot_token,
+        )
+        await _send_to_chat(
+            chat_id,
+            "⏳ Lege Angebot in Lexware an, versende Mail, erzeuge Rechnung…",
+        )
+        await _clear_state(chat_id)
+        result = await _run_angebot_pipeline(angebot_uuid)
+        await _send_to_chat(chat_id, result)
+        return
+
+    await _answer_callback_query(callback_query_id, "Unbekannte Aktion", bot_token)
+
+
+async def _run_angebot_pipeline(angebot_id) -> str:
+    """Volle Pipeline: Lexware-Quotation finalisiert anlegen → Mail mit
+    PDF → Lexware-Invoice-Draft mit gleichen Positionen.
+
+    Jede Stufe wird einzeln gefangen — die anderen laufen weiter und
+    der User kriegt einen aussagekraeftigen Status-Report.
+    """
+    from core.integrations.angebot_mail import send_angebot_to_customer
+
+    provider = LexwareProvider.from_global_config()
+    if provider is None:
+        return "❌ Lexware ist nicht eingerichtet. /lexware_setup ausfuehren."
+
+    # Angebot laden inkl. Positionen
+    async with AsyncSessionLocal() as s:
+        ang = (await s.execute(
+            select(Angebot).where(Angebot.id == angebot_id)
+        )).scalar_one_or_none()
+        if ang is None:
+            return "❌ Angebot nicht gefunden."
+        positions = (await s.execute(
+            select(AngebotPosition).where(AngebotPosition.angebot_id == angebot_id)
+            .order_by(AngebotPosition.position_nr)
+        )).scalars().all()
+        tenant = (await s.execute(
+            select(Tenant).where(Tenant.id == ang.tenant_id)
+        )).scalar_one()
+        kunde_name = ang.kunde_name
+        kunde_email = ang.kunde_email
+        kunde_strasse = ang.kunde_strasse
+        kunde_plz = ang.kunde_plz
+        kunde_ort = ang.kunde_ort
+
+    # Lexware-LineItems vorbereiten (einmal — fuer Quotation + Invoice)
+    line_items = [
+        InvoiceLineItem(
+            name=p.name,
+            quantity=float(p.menge),
+            unit_name=p.einheit or "Stueck",
+            unit_price_gross=float(p.preis_brutto_eur),
+            description=p.beschreibung,
+            tax_rate_percent=int(p.mwst_prozent or 19),
+        )
+        for p in positions
+    ]
+    one_time_address = {
+        "name": kunde_name,
+        "countryCode": "DE",
+    }
+    if kunde_strasse:
+        one_time_address["street"] = kunde_strasse
+    if kunde_plz:
+        one_time_address["zip"] = kunde_plz
+    if kunde_ort:
+        one_time_address["city"] = kunde_ort
+
+    report: list[str] = [f"📋 <b>Angebot: {_h_safe(kunde_name)}</b>", ""]
+
+    # Stufe 1: Lexware-Quotation FINALISIERT anlegen (Pflicht — sonst
+    # kein PDF-Download moeglich, also keine Mail an Kunde).
+    try:
+        quotation = await provider.create_quotation_draft(
+            line_items=line_items,
+            one_time_address=one_time_address,
+            title=f"Angebot {kunde_name}",
+            introduction=(
+                f"Sehr geehrte Damen und Herren,\n\nvielen Dank fuer Ihre "
+                f"Anfrage. Anbei unser Angebot."
+            ),
+            remark="Preise inkl. MwSt. Angebot gueltig 30 Tage.",
+            tax_type="gross",
+            finalize=True,
+        )
+    except Exception as exc:
+        logger.exception(f"Lexware-Quotation-Anlage gescheitert: {exc}")
+        return (
+            "❌ <b>Angebot in Lexware konnte nicht angelegt werden.</b>\n\n"
+            f"Fehler: <code>{_h_safe(str(exc)[:200])}</code>\n\n"
+            "Pruefe /lexware_status — ggf. /lexware_setup neu durchlaufen."
+        )
+
+    async with AsyncSessionLocal() as s:
+        ang = (await s.execute(
+            select(Angebot).where(Angebot.id == angebot_id)
+        )).scalar_one()
+        ang.lexware_quotation_id = quotation.quotation_id
+        ang.lexware_voucher_number = quotation.voucher_number
+        ang.status = ANGEBOT_STATUS_IN_LEXWARE
+        await s.commit()
+
+    report.append(
+        f"✅ Lexware-Angebot angelegt — "
+        f"<a href=\"{quotation.deeplink_view}\">in Lexware oeffnen</a>"
+    )
+
+    # Stufe 2: Mail an Kunden (nur wenn Mail-Adresse erkannt wurde)
+    if kunde_email:
+        try:
+            mail_result = await send_angebot_to_customer(
+                angebot_id=angebot_id, to_email=kunde_email,
+            )
+        except Exception as exc:
+            logger.exception(f"Mail-Versand crashed: {exc}")
+            mail_result = {"success": False, "error": str(exc)}
+
+        if mail_result.get("success"):
+            report.append(f"✅ Mail mit PDF an <b>{_h_safe(kunde_email)}</b> versendet")
+        elif mail_result.get("queued"):
+            report.append(
+                f"⏳ Mail an {_h_safe(kunde_email)} eingereiht "
+                "(wird vom Cron erneut versucht)"
+            )
+        else:
+            err = mail_result.get("error", "unbekannt")
+            report.append(
+                f"⚠️ Mail an {_h_safe(kunde_email)} nicht versendet — "
+                f"<i>{_h_safe(err[:160])}</i>"
+            )
+    else:
+        report.append(
+            "ℹ️ Keine Kunden-Mail-Adresse erkannt — Mail nicht versendet. "
+            "Du kannst das Angebot manuell aus Lexware verschicken."
+        )
+
+    # Stufe 3: Auto-Rechnung als Lexware-Draft mit den gleichen Positionen
+    try:
+        invoice = await provider.create_invoice_draft(
+            line_items=line_items,
+            one_time_address=one_time_address,
+            title=f"Rechnung {kunde_name}",
+            introduction=(
+                f"Sehr geehrte Damen und Herren,\n\nvielen Dank fuer Ihren "
+                f"Auftrag. Nachstehend unsere Rechnung."
+            ),
+            remark="Bitte begleichen Sie den Rechnungsbetrag innerhalb von 14 Tagen.",
+            tax_type="gross",
+        )
+    except Exception as exc:
+        logger.exception(f"Auto-Rechnung-Draft gescheitert: {exc}")
+        report.append(
+            f"⚠️ Rechnungs-Draft konnte nicht angelegt werden — "
+            f"<i>{_h_safe(str(exc)[:160])}</i>"
+        )
+    else:
+        async with AsyncSessionLocal() as s:
+            ang = (await s.execute(
+                select(Angebot).where(Angebot.id == angebot_id)
+            )).scalar_one()
+            ang.status = ANGEBOT_STATUS_RECHNUNG_ERSTELLT
+            await s.commit()
+        report.append(
+            f"✅ Rechnungs-Draft in Lexware bereit — "
+            f"<a href=\"{invoice.deeplink_edit}\">finalisieren + versenden</a>"
+        )
+
+    return "\n".join(report)
 
 
 async def _mark_rechnung_cancelled(rechnung_id):

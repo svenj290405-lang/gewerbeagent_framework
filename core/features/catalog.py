@@ -91,6 +91,7 @@ FEATURES: dict[str, Feature] = {
             "/lexware_setup", "/lexware_status",
             "/beleg", "/belege_anzeigen",
             "/rechnung", "/rechnungen_anzeigen", "/rechnung_pruefen",
+            "/angebot",
             "/leistungen", "/leistung", "/leistung_loeschen",
         ),
     ),
