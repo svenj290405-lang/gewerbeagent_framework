@@ -3980,16 +3980,70 @@ async def _send_kundengespraech_with_drive(
     return msg
 
 
+async def _fetch_calendar_events_for_day(tenant, employee, target_date):
+    """Holt Kalender-Events fuer den Tag vom verbundenen Provider.
+
+    Returns leere Liste bei nicht verbundenem Kalender oder Fehler —
+    /briefing soll trotzdem laufen (Kundengespraechs-Termine als
+    Fallback).
+    """
+    if not employee or not employee.calendar_provider:
+        return []
+    try:
+        if employee.calendar_provider == "microsoft":
+            from core.integrations.microsoft_calendar import list_events_for_day
+            return await list_events_for_day(
+                tenant.id, target_date, employee_id=employee.id,
+            )
+        if employee.calendar_provider == "google":
+            from core.integrations.google_calendar import list_events_for_day
+            return await list_events_for_day(
+                tenant.id, target_date, employee_id=employee.id,
+            )
+    except Exception as exc:
+        logger.exception(f"Calendar-Fetch ({employee.calendar_provider}): {exc}")
+    return []
+
+
+def _match_kundengespraech_for_subject(subject: str, gespraeche: list) -> object | None:
+    """Verbindet einen Kalender-Event-Subject mit einem Kundengespraech
+    per Substring-Match auf kunde_name.
+
+    Beispiel: Subject "Termin Müller — Parkett" matched ein Gespraech
+    mit kunde_name "Frau Mueller". Case-insensitiv, normalisiert.
+    """
+    if not subject or not gespraeche:
+        return None
+    subject_lower = subject.lower()
+    # 1) exact substring kunde_name in subject
+    for g in gespraeche:
+        if not g.kunde_name:
+            continue
+        if g.kunde_name.lower() in subject_lower:
+            return g
+    # 2) Token-Match: irgendein Wort aus kunde_name (>= 3 Buchstaben) im subject
+    for g in gespraeche:
+        if not g.kunde_name:
+            continue
+        for token in g.kunde_name.split():
+            t = token.lower()
+            if len(t) >= 3 and t in subject_lower:
+                return g
+    return None
+
+
 async def _handle_briefing_command(chat_id):
-    """Zeigt alle Termine fuer HEUTE als Liste.
+    """Zeigt alle Termine fuer HEUTE als Liste — aus dem verbundenen
+    Kalender (Google/Outlook) UND aus Kundengespraechen mit termin_datum
+    heute, dedupliziert und nach Uhrzeit sortiert.
 
-    Pro Termin eine kompakte Zeile mit Uhrzeit, Kunde und einem klick-
-    baren /briefing_<prefix>-Befehl fuer die Detail-Ansicht (volles
-    Briefing, TODOs, Notizen, Drive-Link).
+    Pro Termin: Uhrzeit, Subject (oder Kundenname), Ort, klickbarer
+    Detail-Befehl fuer das matchende Kundengespraech wenn vorhanden.
+    Sonst zeigt der Eintrag nur die Kalender-Daten — der User kann
+    via /kunde <name> manuell mehr Infos holen.
 
-    Wenn nichts heute: zeigt naechste Termine der kommenden 7 Tage
-    als kleinerer Hinweis. Wenn auch das leer: Fallback auf juengstes
-    Gespraech.
+    Wenn nichts heute: zeigt naechste 7 Tage aus den Kundengespraechen
+    als Trost-Block. Falls auch das leer: juengstes Gespraech.
 
     Phase-4-Multi-Mitarbeiter: Default-Employee sieht alle Termine,
     Nicht-Default nur seine zugewiesenen.
@@ -4001,19 +4055,18 @@ async def _handle_briefing_command(chat_id):
         return "Dieser Chat ist noch keinem Betrieb zugeordnet."
     tenant, current_emp = res
 
-    # Tagesgrenzen — Europe/Berlin lokal, dann auf UTC normalisiert,
-    # damit der DB-Vergleich gegen termin_datum (timezone-aware UTC)
-    # konsistent ist. Sven-Lokalzeit ist die relevante "heute"-Grenze.
     try:
         from zoneinfo import ZoneInfo
         local_tz = ZoneInfo("Europe/Berlin")
     except Exception:
         local_tz = timezone.utc
     now_local = datetime.now(local_tz)
+    today_date = now_local.date()
     today_start = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
     today_end = today_start + timedelta(days=1)
     week_end = today_start + timedelta(days=7)
 
+    # 1) Kundengespraeche mit termin_datum heute / kommende Woche
     async with AsyncSessionLocal() as s:
         base = (
             select(Kundengespraech)
@@ -4027,53 +4080,104 @@ async def _handle_briefing_command(chat_id):
             base = base.where(
                 Kundengespraech.assigned_employee_id == current_emp.id
             )
-
-        heute = (await s.execute(
+        gespraeche_heute = (await s.execute(
             base.where(
                 Kundengespraech.termin_datum >= today_start,
                 Kundengespraech.termin_datum < today_end,
             )
         )).scalars().all()
-
-        # Bonus: naechste 7 Tage (nur fuer den Footer wenn heute leer)
-        kommende = (await s.execute(
+        gespraeche_kommend = (await s.execute(
             base.where(
                 Kundengespraech.termin_datum >= today_end,
                 Kundengespraech.termin_datum < week_end,
             ).limit(5)
         )).scalars().all()
 
-    if heute:
+    # 2) Kalender-Events heute (Google/Outlook)
+    cal_events = await _fetch_calendar_events_for_day(
+        tenant, current_emp, today_date,
+    )
+
+    # 3) Merge: Eintraege bauen mit Quelle "cal" oder "ges"
+    # Vermeide Duplikate: wenn Kalender-Event und Gespraech aufs gleiche
+    # Zeitfenster + matching Name fallen, zeige nur den Kalender-Eintrag
+    # mit verlinktem Gespraech fuer die Details.
+    matched_g_ids: set = set()
+    eintraege: list[dict] = []
+    for ev in cal_events:
+        s_dt = ev["start_dt"]
+        # naive → mit lokaler tz versehen damit strftime mit %H:%M passt
+        if s_dt.tzinfo is None:
+            s_dt_local = s_dt.replace(tzinfo=local_tz)
+        else:
+            s_dt_local = s_dt.astimezone(local_tz)
+        matched_g = _match_kundengespraech_for_subject(
+            ev.get("subject", ""), gespraeche_heute,
+        )
+        if matched_g:
+            matched_g_ids.add(matched_g.id)
+        eintraege.append({
+            "uhr": s_dt_local.strftime("%H:%M"),
+            "sort_key": s_dt_local,
+            "title": ev.get("subject") or "(ohne Titel)",
+            "ort": ev.get("location") or "",
+            "preview": ev.get("body_preview") or "",
+            "matched_g": matched_g,
+            "source": "cal",
+        })
+    for g in gespraeche_heute:
+        if g.id in matched_g_ids:
+            continue  # schon im Kalender-Eintrag verlinkt
+        s_dt_local = g.termin_datum.astimezone(local_tz)
+        eintraege.append({
+            "uhr": s_dt_local.strftime("%H:%M"),
+            "sort_key": s_dt_local,
+            "title": g.kunde_name or "(unbekannter Kunde)",
+            "ort": g.termin_ort or "",
+            "preview": g.briefing_kurz or "",
+            "matched_g": g,
+            "source": "ges",
+        })
+    eintraege.sort(key=lambda e: e["sort_key"])
+
+    cal_source_label = ""
+    if cal_events:
+        provider_label = "Outlook" if current_emp.calendar_provider == "microsoft" else "Google"
+        cal_source_label = f" <i>(aus {provider_label}-Kalender)</i>"
+
+    if eintraege:
         datum_str = today_start.strftime("%A, %d.%m.%Y")
-        lines = [f"🔔 <b>Termine heute</b> — {datum_str}\n"]
-        for g in heute:
-            uhr = g.termin_datum.astimezone(local_tz).strftime("%H:%M")
-            ort_suffix = ""
-            if g.termin_ort:
-                ort_suffix = f"  ·  {_h_safe(g.termin_ort)}"
+        lines = [f"🔔 <b>Termine heute</b> — {datum_str}{cal_source_label}\n"]
+        for e in eintraege:
+            ort_suffix = f"  ·  {_h_safe(e['ort'])}" if e["ort"] else ""
             lines.append(
-                f"<b>{uhr}</b>  ·  <b>{_h_safe(g.kunde_name)}</b>"
-                f"{ort_suffix}"
+                f"<b>{e['uhr']}</b>  ·  <b>{_h_safe(e['title'])}</b>{ort_suffix}"
             )
-            # Klickbarer Detail-Befehl pro Termin (Telegram macht /-Befehle
-            # auto-klickbar wenn alphanum+underscore am Wortanfang stehen).
-            lines.append(
-                f"  Details: /briefing_{str(g.id)[:8]}"
-            )
-            if g.briefing_kurz:
-                snippet = g.briefing_kurz
-                if len(snippet) > 140:
-                    snippet = snippet[:138] + "..."
-                lines.append(f"  <i>{_h_safe(snippet)}</i>")
+            if e["matched_g"]:
+                lines.append(
+                    f"  Details: /briefing_{str(e['matched_g'].id)[:8]}"
+                )
+            elif e["source"] == "cal":
+                # Kalender-Event ohne gemerktes Gespraech — Tipp:
+                # Kunden-Lookup ueber /kunde
+                hint_name = (e["title"] or "").split(" — ")[0].split("(")[0].strip()
+                if hint_name:
+                    lines.append(f"  Kunden-Lookup: /kunde {hint_name}")
+            preview = e["preview"]
+            if preview:
+                if len(preview) > 140:
+                    preview = preview[:138] + "..."
+                lines.append(f"  <i>{_h_safe(preview)}</i>")
             lines.append("")
         lines.append(
             "<i>Tap auf /briefing_xxxxxxxx fuer Briefing + TODOs + "
-            "Drive-Ordner.</i>"
+            "Drive-Ordner. Bei Kalender-Eintraegen ohne Gespraech: "
+            "/kunde &lt;Name&gt; fuer manuelle Suche.</i>"
         )
-        if kommende:
+        if gespraeche_kommend:
             lines.append("")
-            lines.append(f"<i>📅 Naechste {len(kommende)} Tage:</i>")
-            for g in kommende:
+            lines.append(f"<i>📅 Naechste Tage:</i>")
+            for g in gespraeche_kommend:
                 d = g.termin_datum.astimezone(local_tz).strftime("%a %d.%m %H:%M")
                 lines.append(
                     f"  · {d} — <b>{_h_safe(g.kunde_name)}</b>  "
@@ -4081,13 +4185,20 @@ async def _handle_briefing_command(chat_id):
                 )
         return "\n".join(lines)
 
-    # Kein Termin heute — zeige naechste Woche als Trost-Block
-    if kommende:
-        lines = [
-            "📅 <b>Heute kein Termin.</b>\n",
-            f"<i>Naechste {len(kommende)} Tage:</i>",
-        ]
-        for g in kommende:
+    # Kein Termin heute — Hinweis-Block
+    lines = ["📅 <b>Heute kein Termin.</b>"]
+    if current_emp.calendar_provider:
+        provider_label = "Outlook" if current_emp.calendar_provider == "microsoft" else "Google"
+        lines.append(f"<i>(Kalender-Quelle: {provider_label})</i>\n")
+    else:
+        lines.append(
+            "<i>Kalender ist nicht verbunden. Mit /kalender_verbinden "
+            "Google oder Outlook anbinden — dann zeigt /briefing auch "
+            "die echten Termine.</i>\n"
+        )
+    if gespraeche_kommend:
+        lines.append(f"<i>Naechste Tage aus /aufnahme:</i>")
+        for g in gespraeche_kommend:
             d = g.termin_datum.astimezone(local_tz).strftime("%a %d.%m %H:%M")
             lines.append(
                 f"  · {d} — <b>{_h_safe(g.kunde_name)}</b>  "
@@ -4095,7 +4206,7 @@ async def _handle_briefing_command(chat_id):
             )
         return "\n".join(lines)
 
-    # Nichts in Sicht — juengstes Gespraech als Fallback (wie vorher)
+    # Nichts in Sicht — juengstes Gespraech als Fallback
     async with AsyncSessionLocal() as s:
         stmt2 = (
             select(Kundengespraech)
@@ -4112,13 +4223,13 @@ async def _handle_briefing_command(chat_id):
     if not latest:
         scope = "" if current_emp.is_default else " (auf dich zugewiesen)"
         return (
-            f"Noch kein Kundengespraech{scope} erfasst.\n\n"
+            f"\n\nNoch kein Kundengespraech{scope} erfasst.\n"
             "Mit /aufnahme das erste anlegen."
         )
 
     return await _send_kundengespraech_with_drive(
         chat_id,
-        "<b>📋 Letztes Gespraech</b>\n<i>(Kein anstehender Termin)</i>\n\n",
+        "\n\n<b>📋 Letztes Gespraech</b>\n",
         latest, tenant.id,
     )
 

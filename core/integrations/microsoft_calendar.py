@@ -120,10 +120,15 @@ async def list_events_for_day(
     tenant_id: UUID, target_date: dt.date,
     employee_id: UUID | None = None,
 ) -> list[dict[str, Any]]:
-    """Alle Events des Tages mit Lokation. Wird von Smart-Filter genutzt
-    um Vor-/Nach-Termine zu finden.
+    """Alle Events des Tages mit Lokation + Subject. Wird genutzt von:
+    - Smart-Filter (Vor-/Nach-Termine fuer Fahrtzeit-Rechnung)
+    - /briefing (Tages-Uebersicht im Telegram-Bot)
 
-    Returns: Liste von {"start_dt": datetime, "end_dt": datetime, "location": str}
+    Returns: Liste von dicts mit Keys:
+      - start_dt, end_dt (datetime, naive Lokal-Zeit DEFAULT_TIMEZONE)
+      - location (str)
+      - subject (str) — Event-Titel (kann leer sein)
+      - event_id (str) — Outlook-Event-ID
     """
     token = await get_microsoft_token(tenant_id, employee_id=employee_id)
     day_start = dt.datetime.combine(target_date, dt.time(0, 0))
@@ -139,8 +144,9 @@ async def list_events_for_day(
             params={
                 "startDateTime": _iso_no_tz(day_start),
                 "endDateTime": _iso_no_tz(day_end),
-                "$select": "start,end,location",
+                "$select": "id,subject,start,end,location,bodyPreview",
                 "$top": 200,
+                "$orderby": "start/dateTime",
             },
         )
         resp.raise_for_status()
@@ -156,6 +162,9 @@ async def list_events_for_day(
                 "start_dt": dt.datetime.fromisoformat(s_iso).replace(tzinfo=None),
                 "end_dt": dt.datetime.fromisoformat(e_iso).replace(tzinfo=None),
                 "location": loc.strip(),
+                "subject": (ev.get("subject") or "").strip(),
+                "event_id": ev.get("id") or "",
+                "body_preview": (ev.get("bodyPreview") or "").strip(),
             })
         except (KeyError, ValueError) as exc:
             logger.warning(f"Skipping malformed event: {exc}")
