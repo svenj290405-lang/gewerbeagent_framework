@@ -56,7 +56,6 @@ from core.models import (
     STATE_MATERIAL_NEU_LINK,
     STATE_MATERIAL_NEU_LIEFERANT,
     STATE_MATERIAL_NEU_PREVIEWING,
-    STATE_BESTELLEN_MENGE,
     STATE_ARCHIV_WAITING_FILES,
     STATE_WERKSTATT_WAITING_ADDRESS,
     STATE_WERKSTATT_CONFIRMING,
@@ -670,7 +669,7 @@ async def _handle_help_command(chat_id=None):
              "Neuen Artikel anlegen (Wizard: Name → Lieferant → "
              "Link)."),
             ("/bestellen [name]",
-             "Quick-Order mit Mengen-Eingabe; Bestellung wird "
+             "Quick-Order — direkt 1 Stueck; Bestellung wird "
              "gespeichert."),
             ("/bestellungen",
              "Letzte Bestellungen mit Datum und Status."),
@@ -2461,10 +2460,6 @@ async def _dispatch_update(payload):
             )
         elif state.state_key == STATE_MATERIAL_NEU_PREVIEWING:
             reply = "Bitte einen der Buttons oben antippen oder /abbrechen schicken."
-        elif state.state_key == STATE_BESTELLEN_MENGE:
-            reply = await _handle_bestellen_menge_input(
-                chat_id, text, state.state_data,
-            )
         elif state.state_key == STATE_ARCHIV_WAITING_FILES:
             kunde = (state.state_data or {}).get("kunde_name") or "diesen Kunden"
             reply = (
@@ -9470,7 +9465,7 @@ async def _handle_material_list_command(chat_id):
             f"• <code>{_h_safe(m.slug)}</code> — {_h_safe(m.name)}{lieferant_label}"
         )
     lines.append("")
-    lines.append("Bestellen: <b>/bestellen &lt;slug&gt; [menge]</b>")
+    lines.append("Bestellen: <b>/bestellen &lt;slug&gt;</b>")
     lines.append("Details:   <b>/material &lt;slug&gt;</b>")
     return "\n".join(lines)
 
@@ -9672,14 +9667,13 @@ async def _handle_material_command(chat_id, args: str):
     ]
     if m.lieferant_name:
         parts_msg.append(f"<i>Lieferant:</i> {_h_safe(m.lieferant_name)}")
-    parts_msg.append(f"<i>Standard-Menge:</i> {m.standard_menge} {m.einheit}")
     parts_msg.append(f"<i>Status:</i> {'aktiv' if m.aktiv else 'deaktiviert'}")
     parts_msg.append(f"\n<b>Bestell-Link:</b>\n{_h_safe(m.bestell_link)}")
     if recent:
         parts_msg.append("\n<b>Letzte Bestellungen:</b>")
         for r in recent:
             ts = r.created_at.strftime("%d.%m. %H:%M") if r.created_at else "-"
-            parts_msg.append(f"  • {ts} — {r.menge} {r.einheit}")
+            parts_msg.append(f"  • {ts}")
     parts_msg.append("")
     parts_msg.append(f"<b>Bestellen:</b> /bestellen {m.slug}")
     if m.aktiv:
@@ -9723,25 +9717,16 @@ async def _handle_bestellen_list_command(chat_id):
 
 
 async def _handle_bestellen_command(chat_id, args: str):
-    """/bestellen <slug> [menge] — zeigt URL-Button + loggt die Bestellung."""
-    from core.models.tenant_material import (
-        TenantMaterial, MaterialBestellung, BESTELL_ART_LINK,
-    )
+    """/bestellen <slug> — zeigt URL-Button + loggt die Bestellung.
+    Menge ist immer 1 (User-Wunsch: kein Mengen-Prompt). Wer mehr will,
+    schickt /bestellen erneut.
+    """
+    from core.models.tenant_material import TenantMaterial
 
     parts = args.split()
     slug = parts[0].strip().lower() if parts else ""
     if not slug:
         return await _handle_bestellen_list_command(chat_id)
-
-    # Optional menge im Argument
-    menge_arg = None
-    if len(parts) > 1:
-        try:
-            menge_arg = int(parts[1])
-            if menge_arg <= 0 or menge_arg > 9999:
-                return "Menge muss zwischen 1 und 9999 sein."
-        except ValueError:
-            return f"'{_h_safe(parts[1])}' ist keine Zahl. Format: /bestellen {slug} 5"
 
     tenant = await _get_tenant_by_chat(chat_id)
     if not tenant:
@@ -9762,62 +9747,7 @@ async def _handle_bestellen_command(chat_id, args: str):
             "Liste: /material"
         )
 
-    # Wenn keine Menge angegeben + standard_menge > 1: zurueck-fragen
-    if menge_arg is None and m.standard_menge != 1:
-        await _save_state(
-            chat_id, STATE_BESTELLEN_MENGE,
-            {"material_id": str(m.id)},
-        )
-        return (
-            f"<b>{_h_safe(m.name)}</b>\n\n"
-            f"Wie viele <b>{m.einheit}</b> bestellen?\n\n"
-            f"Standard: {m.standard_menge}\n"
-            f"Schick eine Zahl oder <b>/skip</b> für Standard."
-        )
-
-    menge = menge_arg if menge_arg is not None else m.standard_menge
-    return await _ausloesen_bestellung(chat_id, m, menge)
-
-
-async def _handle_bestellen_menge_input(
-    chat_id, text: str, state_data: dict | None,
-):
-    """Schritt 2 wenn /bestellen ohne Menge geschickt wurde."""
-    from core.models.tenant_material import TenantMaterial
-
-    txt = (text or "").strip().lower()
-    data = state_data or {}
-    material_id = data.get("material_id")
-    if not material_id:
-        await _clear_state(chat_id)
-        return "Wizard-Session abgelaufen. Bitte /bestellen erneut."
-
-    tenant = await _get_tenant_by_chat(chat_id)
-    if not tenant:
-        await _clear_state(chat_id)
-        return "Tenant nicht gefunden."
-
-    async with AsyncSessionLocal() as s:
-        m = (await s.execute(
-            select(TenantMaterial)
-            .where(TenantMaterial.id == material_id)
-        )).scalar_one_or_none()
-    if not m:
-        await _clear_state(chat_id)
-        return "Material nicht mehr gefunden."
-
-    if txt in {"/skip", "skip", "-"}:
-        menge = m.standard_menge
-    else:
-        try:
-            menge = int(txt)
-            if menge <= 0 or menge > 9999:
-                return "Menge muss zwischen 1 und 9999 sein. Erneut?"
-        except ValueError:
-            return f"'{_h_safe(text)}' ist keine Zahl. Bitte Zahl oder /skip."
-
-    await _clear_state(chat_id)
-    return await _ausloesen_bestellung(chat_id, m, menge)
+    return await _ausloesen_bestellung(chat_id, m, 1)
 
 
 async def _ausloesen_bestellung(chat_id, material, menge: int) -> str:
@@ -9855,18 +9785,17 @@ async def _ausloesen_bestellung(chat_id, material, menge: int) -> str:
     except Exception as e:
         logger.warning(f"material_bestellung-Log failed: {e}")
 
-    # Button-Text + URL
+    # Button-Text + URL — kein Mengen-Hinweis mehr (User-Wunsch).
     lieferant_part = f" bei {_h_safe(material.lieferant_name)}" if material.lieferant_name else ""
-    btn_text = f"🛒 {menge} {material.einheit} {material.name[:40]} bestellen{lieferant_part if material.lieferant_name else ''}"
+    btn_text = f"🛒 {material.name[:50]} bestellen{lieferant_part}"
     if len(btn_text) > 64:  # Telegram-Limit fuer Button-Text
-        btn_text = f"🛒 {menge}x {material.name[:50]} bestellen"
+        btn_text = f"🛒 {material.name[:55]} bestellen"
     if len(btn_text) > 64:
-        btn_text = f"🛒 Jetzt bestellen ({menge} {material.einheit})"
+        btn_text = "🛒 Jetzt bestellen"
 
     text_msg = (
         f"<b>🛒 Bestellung vorbereitet</b>\n\n"
         f"<b>{_h_safe(material.name)}</b>\n"
-        f"Menge: {menge} {material.einheit}\n"
     )
     if material.lieferant_name:
         text_msg += f"Lieferant: {_h_safe(material.lieferant_name)}\n"
@@ -9907,7 +9836,7 @@ async def _handle_bestellungen_list_command(chat_id):
     lines = [f"<b>Letzte {len(bestellungen)} Bestellungen:</b>\n"]
     for b in bestellungen:
         ts = b.created_at.strftime("%d.%m. %H:%M") if b.created_at else "-"
-        lines.append(f"• {ts} — {b.menge} {b.einheit} <b>{_h_safe(b.material_name)}</b>")
+        lines.append(f"• {ts} — <b>{_h_safe(b.material_name)}</b>")
     return "\n".join(lines)
 
 
