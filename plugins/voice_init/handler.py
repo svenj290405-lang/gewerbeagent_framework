@@ -87,6 +87,46 @@ def _build_knowledge_block(by_kat):
     return "\n".join(parts).strip()
 
 
+def _split_wunschzeit(wunschzeit):
+    """Zerlegt einen Wunschzeit-String in (datum, uhrzeit).
+
+    ElevenLabs liefert die Wunschzeit als ein Feld — je nach Agent-Prompt
+    als ISO ('2026-05-20T14:00'), mit Leerzeichen ('2026-05-20 14:00')
+    oder im deutschen Format ('20.05.2026 14:00'). Das kalender-Plugin
+    erwartet datum + uhrzeit getrennt und parst beide Datumsformate
+    selbst. Fehlt die Uhrzeit, ankern wir auf 09:00 (Tagesanfang).
+    """
+    s = (wunschzeit or "").strip()
+    if "T" in s:
+        datum, _, uhrzeit = s.partition("T")
+    elif " " in s:
+        datum, _, uhrzeit = s.partition(" ")
+    else:
+        datum, uhrzeit = s, ""
+    datum = datum.strip()
+    uhrzeit = uhrzeit.strip()[:5] or "09:00"
+    return datum, uhrzeit
+
+
+# Slot-IDs sind bewusst zustandslos: das kalender-Plugin kennt keine
+# persistenten Slot-Objekte, Termine sind nur datum+uhrzeit. Wir kodieren
+# die Slot-Koordinaten in einen String den der Voice-Agent unveraendert
+# von checke_kalender an buche_termin zurueckreicht — kein DB-Lookup noetig.
+_SLOT_ID_SEP = "|"
+
+
+def _encode_slot_id(datum, uhrzeit, dauer_min):
+    return f"{datum}{_SLOT_ID_SEP}{uhrzeit}{_SLOT_ID_SEP}{int(dauer_min)}"
+
+
+def _decode_slot_id(slot_id):
+    parts = (slot_id or "").split(_SLOT_ID_SEP)
+    if len(parts) != 3:
+        raise ValueError(f"Ungueltige slot_id: {slot_id!r}")
+    datum, uhrzeit, dauer_raw = parts
+    return datum.strip(), uhrzeit.strip(), int(dauer_raw)
+
+
 class Plugin(BasePlugin):
     """voice_init Plugin: liefert Init-Daten fuer ElevenLabs-Conversations."""
 
@@ -116,6 +156,10 @@ class Plugin(BasePlugin):
             return await self._handle_initiation(payload)
         if endpoint == "save_contact":
             return await self._handle_save_contact(payload)
+        if endpoint == "checke_kalender":
+            return await self._handle_checke_kalender(payload)
+        if endpoint == "buche_termin":
+            return await self._handle_buche_termin(payload)
         if endpoint == "call_ended":
             return await self._handle_call_ended(payload)
         return {"error": f"Unbekannter Endpunkt: {endpoint}"}
@@ -190,6 +234,146 @@ class Plugin(BasePlugin):
                 "tenant_knowledge_block": knowledge_block,
             },
         }
+
+
+    async def _handle_checke_kalender(self, payload):
+        """Webhook von ElevenLabs wenn Q das Tool 'checke_kalender' aufruft.
+
+        Erwartet payload:
+          {
+            "wunschzeit": "2026-05-20T14:00",
+            "dauer_min": 90,            # optional, sonst kalender-Default
+            "kunde_adresse": "...",     # optional, aktiviert Smart-Routing
+            "tenant_slug": "demo"
+          }
+
+        Delegiert an das bestehende kalender-Plugin (find_free_slots).
+        Jeder Slot bekommt eine zustandslose slot_id, die buche_termin
+        spaeter wieder dekodiert.
+        """
+        from core.plugin_system import get_plugin_for_tenant
+
+        tenant_slug = (payload.get("tenant_slug") or "").strip()
+        if not tenant_slug:
+            return {"erfolg": False, "nachricht": "tenant_slug fehlt"}
+
+        kalender = await get_plugin_for_tenant(tenant_slug, "kalender")
+        if kalender is None:
+            logger.warning(
+                f"checke_kalender: kalender-Plugin fuer Tenant {tenant_slug!r} "
+                f"nicht verfuegbar/aktiviert"
+            )
+            return {
+                "erfolg": False,
+                "nachricht": "Der Kalender ist fuer diesen Betrieb nicht eingerichtet.",
+            }
+
+        datum, uhrzeit = _split_wunschzeit(payload.get("wunschzeit", ""))
+        dauer_min = payload.get("dauer_min")
+
+        kalender_payload = {"datum": datum, "uhrzeit": uhrzeit}
+        if dauer_min:
+            kalender_payload["dauer_minuten"] = int(dauer_min)
+        kunde_adresse = (payload.get("kunde_adresse") or "").strip()
+        if kunde_adresse:
+            kalender_payload["kunde_adresse"] = kunde_adresse
+
+        result = await kalender.on_webhook("find_free_slots", kalender_payload)
+        if not result.get("erfolg"):
+            return result
+
+        # Dauer fuer die slot_id: explizit uebergeben oder kalender-Default.
+        slot_dauer = int(dauer_min) if dauer_min else int(
+            kalender.config.get("termin_dauer_minuten", 90)
+        )
+        slots = []
+        for slot in result.get("slots", []):
+            slot = dict(slot)
+            slot["slot_id"] = _encode_slot_id(
+                slot["datum"], slot["uhrzeit"], slot_dauer
+            )
+            slots.append(slot)
+
+        logger.info(
+            f"checke_kalender: tenant={tenant_slug} wunsch={datum} {uhrzeit} "
+            f"-> {len(slots)} Slots"
+        )
+        return {
+            "erfolg": True,
+            "slots": slots,
+            "anzahl": len(slots),
+            "smart_routing": result.get("smart_routing"),
+        }
+
+
+    async def _handle_buche_termin(self, payload):
+        """Webhook von ElevenLabs wenn Q das Tool 'buche_termin' aufruft.
+
+        Erwartet payload:
+          {
+            "slot_id": "20.05.2026|14:00|90",   # aus checke_kalender
+            "anliegen": "Kuechenmontage",
+            "kunde_name": "Frau Mueller",
+            "kunde_telefon": "+49 ...",          # optional
+            "kunde_adresse": "...",              # optional
+            "tenant_slug": "demo"
+          }
+
+        Hinweis: die urspruengliche Spec sah 'kunde_id' vor. Das
+        kalender-Plugin (book_appointment) traegt Name/Telefon/Adresse
+        direkt ins Kalender-Event ein — es gibt keine Kunden-Tabelle mit
+        IDs. Daher reicht der Voice-Agent die Kundendaten direkt durch.
+        """
+        from core.plugin_system import get_plugin_for_tenant
+
+        tenant_slug = (payload.get("tenant_slug") or "").strip()
+        if not tenant_slug:
+            return {"erfolg": False, "nachricht": "tenant_slug fehlt"}
+
+        slot_id = (payload.get("slot_id") or "").strip()
+        try:
+            datum, uhrzeit, dauer_min = _decode_slot_id(slot_id)
+        except ValueError as e:
+            logger.warning(f"buche_termin: {e}")
+            return {
+                "erfolg": False,
+                "nachricht": (
+                    "Der gewaehlte Termin-Slot ist ungueltig. Bitte zuerst "
+                    "freie Termine abfragen."
+                ),
+            }
+
+        name = (payload.get("kunde_name") or "").strip()
+        if not name:
+            return {"erfolg": False, "nachricht": "kunde_name fehlt"}
+
+        kalender = await get_plugin_for_tenant(tenant_slug, "kalender")
+        if kalender is None:
+            return {
+                "erfolg": False,
+                "nachricht": "Der Kalender ist fuer diesen Betrieb nicht eingerichtet.",
+            }
+
+        book_payload = {
+            "name": name,
+            "anliegen": (payload.get("anliegen") or "").strip(),
+            "datum": datum,
+            "uhrzeit": uhrzeit,
+            "dauer_minuten": dauer_min,
+        }
+        telefon = (payload.get("kunde_telefon") or "").strip()
+        if telefon:
+            book_payload["telefon"] = telefon
+        adresse = (payload.get("kunde_adresse") or "").strip()
+        if adresse:
+            book_payload["adresse"] = adresse
+
+        result = await kalender.on_webhook("book_appointment", book_payload)
+        logger.info(
+            f"buche_termin: tenant={tenant_slug} slot={slot_id} "
+            f"name={name!r} erfolg={result.get('erfolg')}"
+        )
+        return result
 
 
     async def _handle_save_contact(self, payload):
