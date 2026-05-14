@@ -444,6 +444,11 @@ class Plugin(BasePlugin):
                 return {"success": False, "error": f"Tenant {tenant_slug} unbekannt"}
             tenant_id = tenant.id
             tenant_telegram = tenant.telegram_chat_id
+            tenant_company_name = tenant.company_name
+            tenant_contact_name = tenant.contact_name
+            tenant_contact_email = tenant.contact_email
+            tenant_contact_phone = tenant.contact_phone
+            tenant_branche = tenant.branche
 
         # Lexware-Provider holen
         provider = await self._get_lexware_provider(tenant_id)
@@ -485,6 +490,25 @@ class Plugin(BasePlugin):
             f"name={name!r} action={action}"
         )
 
+        # Anfrage-Formular-Mail an den Kunden (nur wenn eine E-Mail vorliegt).
+        # Der Kontakt ist an dieser Stelle bereits in Lexware gespeichert —
+        # ein Mail-Fehler darf das nicht ruecksetzen, er loest nur eine
+        # Telegram-Warnung an den Inhaber aus.
+        mail_status = "skipped-no-email"
+        if email:
+            mail_status = await self._send_anfrage_mail(
+                tenant_id=tenant_id,
+                tenant_telegram=tenant_telegram,
+                company_name=tenant_company_name,
+                contact_name=tenant_contact_name,
+                contact_email=tenant_contact_email,
+                contact_phone=tenant_contact_phone,
+                branche=tenant_branche,
+                kunde_name=name,
+                kunde_email=email,
+                anliegen=anliegen,
+            )
+
         # Tenant per Telegram informieren — alle User-Inputs HTML-escapen,
         # weil parse_mode=HTML in Telegram. Sonst koennte ein Anrufer mit
         # praepariertem Namen/Anliegen in fremde Bot-Antworten injizieren.
@@ -509,7 +533,102 @@ class Plugin(BasePlugin):
             "contact_id": str(contact.contact_id),
             "action": action,
             "message": f"Kontakt {action}",
+            "mail": mail_status,
         }
+
+    async def _send_anfrage_mail(
+        self, *, tenant_id, tenant_telegram, company_name, contact_name,
+        contact_email, contact_phone, branche, kunde_name, kunde_email,
+        anliegen,
+    ):
+        """Erzeugt einen Anfrage-Token und mailt dem Kunden den Formular-Link.
+
+        Laeuft erst nach erfolgreichem Lexware-Upsert. Bei jedem Fehler
+        (Token, Rendering, Versand) bleibt der Kontakt gespeichert; der
+        Inhaber bekommt eine Telegram-Warnung zum manuellen Nachfassen.
+
+        Returns einen Status-String fuers Logging/Response:
+        'sent' | 'send-failed' | 'error'.
+        """
+        from html import escape as _h
+        try:
+            from core.integrations.anfrage_forms import (
+                build_anfrage_url, create_anfrage_token,
+            )
+            from core.integrations.mail_template import (
+                build_kunde_reply_html, extract_first_name,
+            )
+            from core.integrations.microsoft import send_mail_as_user
+            from core.models.anfrage import (
+                ANFRAGE_TYP_ALLGEMEIN, ANFRAGE_TYP_TISCHLER,
+            )
+
+            anfrage_typ = (
+                ANFRAGE_TYP_TISCHLER
+                if (branche or "").lower() == "tischler"
+                else ANFRAGE_TYP_ALLGEMEIN
+            )
+            token_obj = await create_anfrage_token(
+                tenant_id=tenant_id,
+                kunde_email=kunde_email,
+                kunde_name=kunde_name,
+                anfrage_typ=anfrage_typ,
+            )
+            form_url = build_anfrage_url(token_obj.token)
+
+            reply_text = (
+                f"vielen Dank fuer deinen Anruf bei {company_name}. "
+                + (
+                    f"Du hast dich nach folgendem Anliegen erkundigt: "
+                    f"{anliegen}. " if anliegen else ""
+                )
+                + "Damit wir dir ein passendes Angebot machen koennen, "
+                "fuell bitte kurz unser Anfrage-Formular aus."
+            )
+            body_html = build_kunde_reply_html(
+                kunde_anrede_name=extract_first_name(kunde_name),
+                kunde_email=kunde_email,
+                reply_text=reply_text,
+                form_url=form_url,
+                company_name=company_name or "",
+                contact_name=contact_name or "",
+                contact_email=contact_email or "",
+                contact_phone=contact_phone or "",
+            )
+            sent = await send_mail_as_user(
+                tenant_id=tenant_id,
+                to_email=kunde_email,
+                subject=f"Dein Anfrage-Formular fuer {company_name}",
+                body_html=body_html,
+            )
+            if sent:
+                logger.info(
+                    f"save_contact: Anfrage-Mail gesendet an {kunde_email}"
+                )
+                return "sent"
+
+            logger.warning(
+                f"save_contact: Anfrage-Mail an {kunde_email} fehlgeschlagen"
+            )
+            await self._push_to_tenant(
+                tenant_telegram,
+                f"⚠️ <b>Voice-Anruf:</b> Kontakt gespeichert, aber die "
+                f"Anfrage-Mail an <code>{_h(kunde_email)}</code> konnte "
+                f"nicht gesendet werden. Bitte manuell nachfassen.",
+            )
+            return "send-failed"
+        except Exception as e:
+            logger.exception(f"save_contact: Anfrage-Mail-Fehler: {e}")
+            try:
+                await self._push_to_tenant(
+                    tenant_telegram,
+                    "⚠️ <b>Voice-Anruf:</b> Kontakt gespeichert, aber beim "
+                    "Versand der Anfrage-Mail gab es einen Fehler. Bitte "
+                    "manuell nachfassen.",
+                )
+            except Exception:
+                pass
+            return "error"
 
 
     async def _get_lexware_provider(self, tenant_id):
