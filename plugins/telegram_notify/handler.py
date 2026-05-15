@@ -243,6 +243,100 @@ class TelegramNotifier:
             return False
 
     @staticmethod
+    async def send_for_employee(
+        tenant_id, text, *, employee_id, employee_label=None,
+    ):
+        """Push an `employee_id`, oder Fallback an Default-Employee mit
+        Aktivierungs-Hinweis.
+
+        Drei Faelle:
+        1. employee_id None → Default-Employee, kein Praefix.
+        2. employee_id gesetzt + Mitarbeiter hat telegram_chat_id → dorthin.
+        3. employee_id gesetzt aber kein Chat (Mitarbeiter noch nicht
+           ueber /start aktiviert) → Default-Employee mit Praefix
+           `[unzugewiesen fuer NAME]\\n\\n…`, damit der Inhaber sofort
+           sieht dass die Aktivierung fehlt.
+
+        employee_label: Anzeige-Name fuer den Praefix; ohne Angabe wird
+        der Employee.name aus der DB genutzt.
+
+        Returns True bei erfolgreichem Versand.
+        """
+        try:
+            bot_token, chat_id, prefix = (
+                await TelegramNotifier.resolve_employee_push_target(
+                    tenant_id, employee_id,
+                    employee_label=employee_label,
+                )
+            )
+            if not bot_token or not chat_id:
+                return False
+            final = f"{prefix}{text}" if prefix else text
+            return await TelegramNotifier._send_raw(bot_token, chat_id, final)
+        except Exception as e:
+            logger.exception(f"send_for_employee fehlgeschlagen: {e}")
+            return False
+
+    @staticmethod
+    async def resolve_employee_push_target(
+        tenant_id, employee_id, *, employee_label=None,
+    ):
+        """Liefert `(bot_token, chat_id, prefix_text)` fuer Push-Routing.
+
+        Genutzt von `send_for_employee` und von Callern die zusaetzliche
+        Daten (z.B. Dateien) an dieselbe Ziel-Chat schicken muessen,
+        siehe `anfrage_telegram.notify_tenant_anfrage_submitted`.
+
+        Returns `(None, None, "")` wenn weder bot_token noch ein
+        sinnvoller chat_id-Fallback aufloesbar ist (Tenant ohne
+        konfiguriertes telegram_notify-Tool, kein Default-Employee,
+        kein Legacy-chat_id).
+        """
+        from core.models.employee import Employee
+        async with AsyncSessionLocal() as s:
+            tc = (await s.execute(
+                select(ToolConfig).where(
+                    ToolConfig.tenant_id == tenant_id,
+                    ToolConfig.tool_name == "telegram_notify",
+                )
+            )).scalar_one_or_none()
+            if tc is None or not tc.enabled:
+                return None, None, ""
+            cfg = {**MANIFEST.default_config, **(tc.config or {})}
+            bot_token = cfg.get("bot_token", "")
+            if not bot_token:
+                return None, None, ""
+
+            prefix = ""
+            if employee_id is not None:
+                emp = (await s.execute(
+                    select(Employee).where(Employee.id == employee_id)
+                )).scalar_one_or_none()
+                if emp and emp.telegram_chat_id:
+                    return bot_token, str(emp.telegram_chat_id), ""
+                # Mitarbeiter existiert aber hat (noch) keinen Chat —
+                # Aktivierungs-Praefix vorbereiten.
+                if emp is not None:
+                    label = employee_label or emp.name
+                    prefix = f"[unzugewiesen fuer {label}]\n\n"
+
+            # Fallback: Default-Employee chat_id
+            default_emp = (await s.execute(
+                select(Employee).where(
+                    Employee.tenant_id == tenant_id,
+                    Employee.is_default.is_(True),
+                )
+            )).scalar_one_or_none()
+            if default_emp and default_emp.telegram_chat_id:
+                return bot_token, str(default_emp.telegram_chat_id), prefix
+
+            # Last resort: legacy chat_id aus tool_configs
+            legacy = cfg.get("chat_id", "")
+            if legacy:
+                return bot_token, str(legacy), prefix
+            return None, None, ""
+
+    @staticmethod
     async def _send_raw(bot_token, chat_id, text):
         url = f"{TELEGRAM_API_BASE}/bot{bot_token}/sendMessage"
         payload = {

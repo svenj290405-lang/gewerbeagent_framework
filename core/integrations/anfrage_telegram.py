@@ -78,29 +78,70 @@ async def _send_file_to_telegram(
         return False
 
 
+def _anliegen_text_from_antworten(antworten: dict) -> str:
+    """Aggregiert die Freitext-Antworten zu einem Skill-Routing-Input.
+
+    Listen/Dicts (z.B. Multi-Select, File-Uploads) werden ausgelassen —
+    der Skill-Router matcht nur ueber Substring-Vergleich auf
+    KEYWORD_TO_SKILL und braucht Freitext, nicht strukturierte Daten.
+    """
+    parts = []
+    for value in (antworten or {}).values():
+        if isinstance(value, str) and value.strip():
+            parts.append(value.strip())
+    return " ".join(parts)
+
+
 async def notify_tenant_anfrage_submitted(token_str: str, antworten: dict) -> None:
-    """Schickt eine Telegram-Nachricht an den Tenant wenn jemand Anfrage abschickt."""
-    from plugins.telegram_notify.handler import send_telegram_message
+    """Schickt eine Telegram-Nachricht an den mail-zustaendigen Mitarbeiter
+    wenn jemand das Anfrage-Formular abschickt.
+
+    Routing-Quelle (in dieser Reihenfolge):
+    1. `AnfrageToken.assigned_employee_id` — sticky, falls die Anfrage
+       aus einer bereits zugewiesenen Mail-Conversation kommt.
+    2. `choose_employee()` ueber den aggregierten Antwort-Text.
+
+    Mitarbeiter ohne aktivierte telegram_chat_id loesen `[unzugewiesen
+    fuer NAME]`-Praefix-Fallback an den Default-Employee aus
+    (siehe TelegramNotifier.send_for_employee).
+    """
+    from plugins.telegram_notify.handler import TelegramNotifier
+    from core.routing.employee_router import choose_employee
 
     async with AsyncSessionLocal() as session:
-        result = await session.execute(
+        token_obj = (await session.execute(
             select(AnfrageToken).where(AnfrageToken.token == token_str)
-        )
-        token_obj = result.scalar_one_or_none()
+        )).scalar_one_or_none()
         if not token_obj:
             return
 
-        t_result = await session.execute(
+        tenant = (await session.execute(
             select(Tenant).where(Tenant.id == token_obj.tenant_id)
-        )
-        tenant = t_result.scalar_one_or_none()
+        )).scalar_one_or_none()
         if not tenant:
             return
 
-    # Tenant-Telegram-Chat-ID laden
-    chat_id = getattr(tenant, "telegram_chat_id", None)
-    if not chat_id:
-        logger.warning(f"Tenant {tenant.slug} hat keine telegram_chat_id, kein Push moeglich")
+    # Skill-Routing: bevorzugt sticky aus Conversation, sonst skill-match.
+    sticky_emp_id = getattr(token_obj, "assigned_employee_id", None)
+    employee_id = sticky_emp_id
+    if employee_id is None:
+        try:
+            routing = await choose_employee(
+                tenant_id=tenant.id,
+                anliegen_text=_anliegen_text_from_antworten(antworten),
+            )
+            employee_id = routing.employee_id if routing else None
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"anfrage_telegram: choose_employee failed: {e}")
+
+    # Push-Ziel + Aktivierungs-Praefix aufloesen.
+    bot_token, chat_id, prefix = await TelegramNotifier.resolve_employee_push_target(
+        tenant.id, employee_id,
+    )
+    if not bot_token or not chat_id:
+        logger.warning(
+            f"Tenant {tenant.slug} hat kein Telegram-Ziel — anfrage-Push skip"
+        )
         return
 
     # Nachricht bauen — alle Kunden-Inputs HTML-escapen vor f-String-Build
@@ -124,31 +165,18 @@ async def notify_tenant_anfrage_submitted(token_str: str, antworten: dict) -> No
     msg += "\nMit /angebot kannst du jetzt direkt ein Lexware-Angebot anlegen."
 
     try:
-        await send_telegram_message(chat_id=chat_id, text=msg, parse_mode="HTML")
+        await TelegramNotifier._send_raw(bot_token, chat_id, f"{prefix}{msg}")
         logger.info(f"Anfrage-Push an Tenant {tenant.slug} gesendet")
     except Exception as e:
         logger.exception(f"Telegram-Push fehler: {e}")
         return
 
-    # Hochgeladene Dateien einzeln nachsenden (sendPhoto / sendDocument).
-    # Failsafe — schluckt eigene Fehler, schickt niemals den ganzen Push down.
+    # Hochgeladene Dateien einzeln nachsenden (sendPhoto / sendDocument)
+    # an dieselbe Chat-ID. Failsafe — schluckt eigene Fehler, schickt
+    # niemals den ganzen Push down.
     try:
         files = _extract_files(antworten)
         if not files:
-            return
-        # bot_token holen analog send_telegram_message
-        from core.models import ToolConfig
-        async with AsyncSessionLocal() as session:
-            tc = (await session.execute(
-                select(ToolConfig)
-                .join(Tenant, ToolConfig.tenant_id == Tenant.id)
-                .where(
-                    Tenant.slug == "_global",
-                    ToolConfig.tool_name == "telegram_notify",
-                )
-            )).scalar_one_or_none()
-        bot_token = (tc.config or {}).get("bot_token") if tc else None
-        if not bot_token:
             return
         for f in files:
             await _send_file_to_telegram(

@@ -697,24 +697,42 @@ class Plugin(BasePlugin):
                 anliegen=anliegen,
             )
 
-        # Tenant per Telegram informieren — alle User-Inputs HTML-escapen,
-        # weil parse_mode=HTML in Telegram. Sonst koennte ein Anrufer mit
-        # praepariertem Namen/Anliegen in fremde Bot-Antworten injizieren.
-        if tenant_telegram:
-            from html import escape as _h
-            anliegen_str = f"\n<b>Anliegen:</b> {_h(anliegen)}" if anliegen else ""
-            phone_str = f"\n<b>Telefon:</b> <code>{_h(phone)}</code>" if phone else ""
-            email_str = f"\n<b>Mail:</b> <code>{_h(email)}</code>" if email else ""
-            deeplink = f"https://app.lexware.de/permalink/contacts/edit/{contact.contact_id}"
-            msg = (
-                f"☎️ <b>Neuer Anruf - Kontakt {action}</b>\n\n"
-                f"<b>Name:</b> {_h(name)}"
-                f"{phone_str}"
-                f"{email_str}"
-                f"{anliegen_str}\n\n"
-                f'<a href="{deeplink}">In Lexware oeffnen</a>'
+        # Push an den fuer dieses Anliegen passenden Mitarbeiter routen.
+        # Hier kein target_datetime — der Anruf ist gerade jetzt, und der
+        # Kontakt-Speichern-Pfad bucht noch keinen Termin. choose_employee
+        # nutzt Skill-Match + optional Distanz (kunde_adresse ist hier
+        # nicht erfasst, save_contact bekommt sie nicht vom Voice-Agent).
+        routing = None
+        try:
+            routing = await choose_employee(
+                tenant_id=tenant_id,
+                anliegen_text=anliegen or "",
             )
-            await self._push_to_tenant(tenant_telegram, msg)
+        except Exception as e:
+            logger.warning(f"save_contact: choose_employee crashed: {e}")
+
+        # Tenant/Mitarbeiter per Telegram informieren — alle User-Inputs
+        # HTML-escapen, weil parse_mode=HTML in Telegram. Sonst koennte ein
+        # Anrufer mit praepariertem Namen/Anliegen in fremde Bot-Antworten
+        # injizieren.
+        from html import escape as _h
+        anliegen_str = f"\n<b>Anliegen:</b> {_h(anliegen)}" if anliegen else ""
+        phone_str = f"\n<b>Telefon:</b> <code>{_h(phone)}</code>" if phone else ""
+        email_str = f"\n<b>Mail:</b> <code>{_h(email)}</code>" if email else ""
+        deeplink = f"https://app.lexware.de/permalink/contacts/edit/{contact.contact_id}"
+        msg = (
+            f"☎️ <b>Neuer Anruf - Kontakt {action}</b>\n\n"
+            f"<b>Name:</b> {_h(name)}"
+            f"{phone_str}"
+            f"{email_str}"
+            f"{anliegen_str}\n\n"
+            f'<a href="{deeplink}">In Lexware oeffnen</a>'
+        )
+        from plugins.telegram_notify.handler import TelegramNotifier
+        await TelegramNotifier.send_for_employee(
+            tenant_id, msg,
+            employee_id=routing.employee_id if routing else None,
+        )
 
         return {
             "success": True,
@@ -722,6 +740,7 @@ class Plugin(BasePlugin):
             "action": action,
             "message": f"Kontakt {action}",
             "mail": mail_status,
+            "routing": _routing_to_response(routing),
         }
 
     async def _send_anfrage_mail(

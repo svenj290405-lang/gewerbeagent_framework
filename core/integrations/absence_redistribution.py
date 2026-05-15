@@ -296,6 +296,11 @@ async def _handle_one_event(
 
     try:
         new_event = await _move_event(tenant, sick_emp, new_emp, event)
+        # Beide Beteiligten direkt benachrichtigen — Inhaber bekommt
+        # zusaetzlich die Sammel-Zusammenfassung am Ende ueber
+        # _send_report_to_inhaber. Pushes sind silent-fail: Versand-
+        # Fehler stoppen die Umverteilung nicht.
+        await _notify_move(tenant, sick_emp, new_emp, event, start_dt)
         return EventRedistributionResult(
             event_id=event_id, event_subject=subject,
             event_start=start_dt, sick_emp_slug=sick_emp.slug,
@@ -311,6 +316,47 @@ async def _handle_one_event(
             new_emp_slug=new_emp.slug if new_emp else None, reason="error",
             error=str(e)[:200],
         )
+
+
+async def _notify_move(
+    tenant: Tenant, sick_emp: Employee, new_emp: Employee,
+    event: dict, start_dt: dt.datetime,
+) -> None:
+    """Push an sick_emp und new_emp ueber die Umverteilung.
+
+    Silent-fail: Telegram-Fehler werden geloggt aber nicht weitergereicht
+    (Umverteilung selbst soll nicht an Push-Problemen scheitern).
+    """
+    from html import escape as _h
+    from plugins.telegram_notify.handler import TelegramNotifier
+    when = start_dt.strftime("%a %d.%m. %H:%M")
+    subject = (event.get("subject") or "(Termin)")[:80]
+    try:
+        await TelegramNotifier.send_for_employee(
+            tenant.id,
+            (
+                f"🔄 <b>Dein Termin wurde umgehaengt</b>\n"
+                f"<b>Wann:</b> {when}\n"
+                f"<b>Was:</b> {_h(subject)}\n"
+                f"<b>Uebernimmt:</b> {_h(new_emp.name)}"
+            ),
+            employee_id=sick_emp.id, employee_label=sick_emp.name,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"_notify_move sick push failed: {e}")
+    try:
+        await TelegramNotifier.send_for_employee(
+            tenant.id,
+            (
+                f"📥 <b>Du uebernimmst einen Termin</b>\n"
+                f"<b>Wann:</b> {when}\n"
+                f"<b>Was:</b> {_h(subject)}\n"
+                f"<b>Von:</b> {_h(sick_emp.name)} (krank)"
+            ),
+            employee_id=new_emp.id, employee_label=new_emp.name,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"_notify_move new push failed: {e}")
 
 
 async def redistribute_for_employee(
