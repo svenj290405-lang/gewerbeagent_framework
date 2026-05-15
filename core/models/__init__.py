@@ -126,6 +126,11 @@ from core.models.employee_absence import (
     is_employee_working_at,
     get_available_employees,
 )
+from core.models.employee_activation_token import (
+    EmployeeActivationToken,
+    create_activation_token,
+    consume_activation_token,
+)
 from core.models.tenant_knowledge import (
     TenantKnowledge,
     KATEGORIE_LEISTUNGEN,
@@ -201,6 +206,9 @@ __all__ = [
     "close_absence",
     "is_employee_working_at",
     "get_available_employees",
+    "EmployeeActivationToken",
+    "create_activation_token",
+    "consume_activation_token",
     "TenantKnowledge",
     "KATEGORIE_LEISTUNGEN",
     "KATEGORIE_MATERIALIEN",

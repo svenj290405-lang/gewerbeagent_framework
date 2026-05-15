@@ -518,6 +518,83 @@ async def _send_to_chat(chat_id, text, bot_token=None):
         ok_all = ok_all and bool(ok)
     return ok_all
 
+async def _handle_activate_token_start(token_str, chat_id, from_data):
+    """Loest einen `activate_<token>` Deep-Link ein.
+
+    Schritte (zwei Transaktionen, akzeptierte Mini-Race):
+    1. consume_activation_token markiert den Token atomar als used_at.
+       Bei abgelaufenem/gebrauchtem/unbekanntem Token: None → Fehler.
+    2. Employee laden, telegram_chat_id zuweisen mit Konfliktaufloesung
+       (gleiches Pattern wie der Legacy-Pfad: fremde Bindungen
+       dieselben chat_id loesen, alte chat_id desselben Employees
+       ueberschreiben).
+    """
+    from core.models import consume_activation_token
+    from core.models.employee import Employee
+
+    token_row = await consume_activation_token(token_str)
+    if token_row is None:
+        return (
+            "Aktivierungs-Link ungueltig, abgelaufen oder bereits "
+            "eingeloest. Bitte beim Inhaber einen neuen anfordern."
+        )
+
+    async with AsyncSessionLocal() as s:
+        emp = (await s.execute(
+            select(Employee).where(Employee.id == token_row.employee_id)
+        )).scalar_one_or_none()
+        if emp is None:
+            return "Der zugehoerige Mitarbeiter existiert nicht mehr."
+        tenant = (await s.execute(
+            select(Tenant).where(Tenant.id == emp.tenant_id)
+        )).scalar_one_or_none()
+        if tenant is None:
+            return "Tenant nicht gefunden."
+
+        # Konfliktaufloesung (selbe Logik wie der Legacy-/start-Pfad):
+        # - Wenn der gleiche chat_id schon an einen fremden Employee
+        #   gebunden ist (z.B. Inhaber-Account, der jetzt zusaetzlich
+        #   Mitarbeiter sein moechte): alte Bindung loesen.
+        # - Wenn dieser Employee bereits eine ANDERE chat_id hatte:
+        #   warnen + ueberschreiben.
+        if emp.telegram_chat_id and emp.telegram_chat_id != chat_id:
+            logger.warning(
+                f"activate-token: Chat-ID-Wechsel fuer Mitarbeiter "
+                f"{tenant.slug}/{emp.slug}: "
+                f"{emp.telegram_chat_id} -> {chat_id}"
+            )
+        if emp.telegram_chat_id != chat_id:
+            stale = (await s.execute(
+                select(Employee).where(
+                    Employee.telegram_chat_id == chat_id,
+                    Employee.id != emp.id,
+                )
+            )).scalars().all()
+            for old in stale:
+                logger.info(
+                    f"activate-token: loese alte chat_id-Bindung "
+                    f"Employee {old.id} bevor sie an {emp.slug} uebergeht"
+                )
+                old.telegram_chat_id = None
+            if stale:
+                await s.flush()
+        emp.telegram_chat_id = chat_id
+        if emp.is_default:
+            tenant.telegram_chat_id = chat_id
+        emp_name = emp.name
+        company = tenant.company_name
+        await s.commit()
+
+    first_name = (from_data.get("first_name") or "").strip() or "dort"
+    return (
+        f"Willkommen, {first_name}!\n\n"
+        f"Du bist jetzt als <b>{emp_name}</b> mit "
+        f"<b>{company}</b> verknuepft.\n\n"
+        "Tippe <b>/kalender_verbinden</b> um deinen Kalender hinzuzufuegen — "
+        "dann routet das System Anrufe und Mails passend zu deinen Skills."
+    )
+
+
 async def _handle_start_command(text, chat_id, from_data):
     parts = text.split(maxsplit=1)
     if len(parts) < 2 or not parts[1].strip():
@@ -525,9 +602,18 @@ async def _handle_start_command(text, chat_id, from_data):
         msg += "Falls Sie sich gerade einrichten, scannen Sie bitte den QR-Code, "
         msg += "den Sie von uns erhalten haben."
         return msg
-    raw = parts[1].strip().lower()
+    raw_payload = parts[1].strip()
+    # Neuer Pfad: token-basiertes Mitarbeiter-Onboarding ueber
+    # `activate_<token>`. Token ist URL-safe base64 (case-sensitiv!),
+    # daher VOR dem .lower() pruefen und Original-Casing weitergeben.
+    if raw_payload.lower().startswith("activate_"):
+        return await _handle_activate_token_start(
+            raw_payload[len("activate_"):], chat_id, from_data,
+        )
+    raw = raw_payload.lower()
     # Format: "<tenant_slug>" (Owner-Onboarding, Default-Employee)
-    # oder:   "<tenant_slug>__<employee_slug>" (Mitarbeiter-Onboarding)
+    # oder:   "<tenant_slug>__<employee_slug>" (Mitarbeiter-Onboarding,
+    # Legacy-Pfad ohne Token — bleibt aus Rueckwaertskompatibilitaet).
     if "__" in raw:
         tenant_slug, _, employee_slug = raw.partition("__")
     else:
@@ -8938,7 +9024,7 @@ async def _handle_mitarbeiter_neu_skills_input(chat_id, text, state_data):
 
     # Anlegen
     from core.database import AsyncSessionLocal
-    from core.models import Employee
+    from core.models import Employee, create_activation_token
     async with AsyncSessionLocal() as s:
         emp = Employee(
             tenant_id=tenant.id,
@@ -8957,18 +9043,36 @@ async def _handle_mitarbeiter_neu_skills_input(chat_id, text, state_data):
             logger.exception(f"Employee-Insert fehlgeschlagen: {e}")
             return f"Anlegen fehlgeschlagen: {e}"
         await s.refresh(emp)
+        emp_id = emp.id
+
+    # One-Time-Use Aktivierungs-Token erzeugen + Deeplink bauen.
+    # Faellt der Token-Insert aus irgendeinem Grund aus, faellt das
+    # Wizard-Ergebnis auf den Legacy-Pfad (?start=tenant__slug) zurueck,
+    # damit der Inhaber den Mitarbeiter zumindest weiter onboarden kann.
+    activation_token = None
+    try:
+        token_obj = await create_activation_token(tenant.id, emp_id)
+        activation_token = token_obj.token
+    except Exception as e:  # noqa: BLE001
+        logger.exception(f"Aktivierungs-Token-Insert fehlgeschlagen: {e}")
 
     await _clear_state(chat_id)
 
     bot_username = await _get_bot_username()
-    deeplink = (
-        f"https://t.me/{bot_username}?start={tenant.slug}__{slug}"
-        if bot_username else "(Bot-Username unbekannt — pruefe Bot-Konfig)"
-    )
+    if not bot_username:
+        deeplink = "(Bot-Username unbekannt — pruefe Bot-Konfig)"
+        gueltig_hinweis = ""
+    elif activation_token:
+        deeplink = f"https://t.me/{bot_username}?start=activate_{activation_token}"
+        gueltig_hinweis = "\n<i>(Gueltig 7 Tage, einmalig einloesbar.)</i>"
+    else:
+        # Fallback: Legacy-Slug-Pfad, ohne Token (Audit-loses Onboarding).
+        deeplink = f"https://t.me/{bot_username}?start={tenant.slug}__{slug}"
+        gueltig_hinweis = ""
     return (
         f"✅ Mitarbeiter <b>{name}</b> angelegt (Slug <code>{slug}</code>).\n\n"
         f"<b>Telegram-Onboarding-Link</b> an den Mitarbeiter weiterleiten:\n"
-        f"<code>{deeplink}</code>\n\n"
+        f"<code>{deeplink}</code>{gueltig_hinweis}\n\n"
         "Sobald er den Link oeffnet + /start drueckt, wird er als "
         f"<b>{name}</b> mit dem Bot verbunden.\n\n"
         "Spaeter kann er optional <i>/werkstatt</i> ausfuehren um seine "
