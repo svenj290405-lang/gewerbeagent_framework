@@ -16,6 +16,8 @@ from core.models import (
     TenantKnowledge,
     ToolConfig,
 )
+from core.models.employee import Employee
+from core.routing.employee_router import RoutingDecision, choose_employee
 from core.integrations.lexware import LexwareProvider
 from core.integrations.accounting_base import AccountingError
 from core.security import decrypt
@@ -125,6 +127,100 @@ def _decode_slot_id(slot_id):
         raise ValueError(f"Ungueltige slot_id: {slot_id!r}")
     datum, uhrzeit, dauer_raw = parts
     return datum.strip(), uhrzeit.strip(), int(dauer_raw)
+
+
+# ---------------------------------------------------------------------
+# Skill-Routing-Helper (Teil A der Multi-Mitarbeiter-Voice-Anbindung)
+# ---------------------------------------------------------------------
+
+
+def _parse_wunschzeit_for_routing(datum, uhrzeit):
+    """Parst datum+uhrzeit zu datetime fuer choose_employee.target_datetime.
+
+    Liefert None bei Parse-Fehler — Router skipt dann den Verfuegbarkeits-
+    Filter (Absence + Arbeitstag + Arbeitszeit) statt zu crashen. Wenn das
+    Datum echt kaputt ist, liefert kalender.find_free_slots danach eine
+    eigene Fehlermeldung.
+    """
+    try:
+        from plugins.kalender.handler import Plugin as _KalenderPlugin
+        return _KalenderPlugin._parse_datum_uhrzeit(datum, uhrzeit)
+    except Exception:
+        return None
+
+
+async def _ensure_calendar_capable_routing(tenant_id, routing):
+    """Faengt Routing-Entscheidungen auf, deren Employee keinen Kalender hat.
+
+    Hintergrund: `choose_employee()` darf — laut Skill-Score allein —
+    einen Mitarbeiter ohne `calendar_provider` waehlen. Der Adapter
+    fiele auf Google + fehlenden OAuth-Token zurueck und wuerde
+    spaeter beim find_free_slots brechen. Hier korrigieren wir vor
+    der Buchung auf den Default-Employee (falls der einen Kalender
+    hat) mit reason='no-calendar' — der ursprueglich gerouteten
+    Slug landet im debug-Block fuer Audit.
+    """
+    if routing is None:
+        return None
+    async with AsyncSessionLocal() as s:
+        emp = (await s.execute(
+            select(Employee).where(Employee.id == routing.employee_id)
+        )).scalar_one_or_none()
+        if emp is None or emp.calendar_provider:
+            return routing
+        original_slug = emp.slug
+        default_emp = (await s.execute(
+            select(Employee).where(
+                Employee.tenant_id == tenant_id,
+                Employee.is_default.is_(True),
+            )
+        )).scalar_one_or_none()
+        if default_emp is None or not default_emp.calendar_provider:
+            # Auch der Default hat keinen Kalender — find_free_slots wird
+            # mit Tenant-Setup-Fehler antworten, das Routing lassen wir
+            # zur besseren Diagnose stehen.
+            return routing
+        return RoutingDecision(
+            employee_id=default_emp.id,
+            employee_name=default_emp.name,
+            employee_slug=default_emp.slug,
+            reason="no-calendar",
+            score=0.0,
+            debug={
+                "original_routing": {
+                    "employee_slug": original_slug,
+                    "reason": routing.reason,
+                }
+            },
+        )
+
+
+def _routing_to_response(routing):
+    """RoutingDecision → kompakter Dict fuer die Voice-Tool-Response.
+
+    reason wird angereichert: bei skill-match haengen wir die getroffenen
+    Skills an (`skill-match: tischler, holz`), damit der Voice-Agent
+    dem Kunden bei Rueckfrage erklaeren kann warum gerade dieser
+    Mitarbeiter passt.
+    """
+    if routing is None:
+        return None
+    reason = routing.reason
+    needed = (
+        routing.debug.get("needed_skills")
+        if isinstance(routing.debug, dict) else None
+    )
+    if reason == "skill-match" and needed:
+        reason_str = f"skill-match: {', '.join(needed)}"
+    else:
+        reason_str = reason
+    return {
+        "employee_id": str(routing.employee_id),
+        "employee_slug": routing.employee_slug,
+        "employee_name": routing.employee_name,
+        "reason": reason_str,
+        "score": float(routing.score),
+    }
 
 
 class Plugin(BasePlugin):
@@ -244,18 +340,32 @@ class Plugin(BasePlugin):
             "wunschzeit": "2026-05-20T14:00",
             "dauer_min": 90,            # optional, sonst kalender-Default
             "kunde_adresse": "...",     # optional, aktiviert Smart-Routing
+            "anliegen": "Kuechenmontage", # optional, Basis fuer Skill-Routing
             "tenant_slug": "demo"
           }
 
-        Delegiert an das bestehende kalender-Plugin (find_free_slots).
-        Jeder Slot bekommt eine zustandslose slot_id, die buche_termin
-        spaeter wieder dekodiert.
+        Routet zuerst per choose_employee() auf den passenden Mitarbeiter
+        (Skill + Verfuegbarkeit + Distanz), delegiert dann an das
+        kalender-Plugin (find_free_slots). Jeder Slot bekommt eine
+        zustandslose slot_id; die gewaehlte employee_id wird im
+        Response-`routing`-Block zurueckgegeben, damit der Voice-Agent
+        sie spaeter an buche_termin durchreichen kann.
         """
         from core.plugin_system import get_plugin_for_tenant
 
         tenant_slug = (payload.get("tenant_slug") or "").strip()
         if not tenant_slug:
             return {"erfolg": False, "nachricht": "tenant_slug fehlt"}
+
+        async with AsyncSessionLocal() as s:
+            tenant = (await s.execute(
+                select(Tenant).where(Tenant.slug == tenant_slug)
+            )).scalar_one_or_none()
+        if tenant is None:
+            return {
+                "erfolg": False,
+                "nachricht": f"Tenant '{tenant_slug}' nicht gefunden",
+            }
 
         kalender = await get_plugin_for_tenant(tenant_slug, "kalender")
         if kalender is None:
@@ -270,13 +380,29 @@ class Plugin(BasePlugin):
 
         datum, uhrzeit = _split_wunschzeit(payload.get("wunschzeit", ""))
         dauer_min = payload.get("dauer_min")
+        kunde_adresse = (payload.get("kunde_adresse") or "").strip()
+        anliegen = (payload.get("anliegen") or "").strip()
+
+        # Skill-Routing: target_datetime fuer Verfuegbarkeits-Filter
+        # (Absence + Arbeitstag + Arbeitszeit). Bei Parse-Fehler None,
+        # dann skipt der Router den Filter und matcht nur ueber Skill.
+        target_dt = _parse_wunschzeit_for_routing(datum, uhrzeit)
+        routing = await choose_employee(
+            tenant_id=tenant.id,
+            anliegen_text=anliegen,
+            kunde_adresse=kunde_adresse if kunde_adresse else None,
+            target_datetime=target_dt,
+        )
+        # A.3: gewaehlten Mitarbeiter gegen calendar_provider validieren.
+        routing = await _ensure_calendar_capable_routing(tenant.id, routing)
 
         kalender_payload = {"datum": datum, "uhrzeit": uhrzeit}
         if dauer_min:
             kalender_payload["dauer_minuten"] = int(dauer_min)
-        kunde_adresse = (payload.get("kunde_adresse") or "").strip()
         if kunde_adresse:
             kalender_payload["kunde_adresse"] = kunde_adresse
+        if routing is not None:
+            kalender_payload["employee_id"] = routing.employee_id
 
         result = await kalender.on_webhook("find_free_slots", kalender_payload)
         if not result.get("erfolg"):
@@ -294,15 +420,18 @@ class Plugin(BasePlugin):
             )
             slots.append(slot)
 
+        routing_response = _routing_to_response(routing)
         logger.info(
             f"checke_kalender: tenant={tenant_slug} wunsch={datum} {uhrzeit} "
-            f"-> {len(slots)} Slots"
+            f"emp={routing.employee_slug if routing else '?'} "
+            f"reason={routing.reason if routing else '-'} -> {len(slots)} Slots"
         )
         return {
             "erfolg": True,
             "slots": slots,
             "anzahl": len(slots),
             "smart_routing": result.get("smart_routing"),
+            "routing": routing_response,
         }
 
 
@@ -312,6 +441,7 @@ class Plugin(BasePlugin):
         Erwartet payload:
           {
             "slot_id": "20.05.2026|14:00|90",   # aus checke_kalender
+            "employee_id": "...",                # aus checke_kalender.routing
             "anliegen": "Kuechenmontage",
             "kunde_name": "Frau Mueller",
             "kunde_telefon": "+49 ...",          # optional
@@ -323,8 +453,14 @@ class Plugin(BasePlugin):
         kalender-Plugin (book_appointment) traegt Name/Telefon/Adresse
         direkt ins Kalender-Event ein — es gibt keine Kunden-Tabelle mit
         IDs. Daher reicht der Voice-Agent die Kundendaten direkt durch.
+
+        Wenn employee_id fehlt (z.B. wenn der Agent das Feld vergisst),
+        wird das Skill-Routing on-the-fly aus anliegen+adresse+slot
+        rekonstruiert — damit bleibt der Endpunkt robust auch wenn das
+        Tool-Manifest im ElevenLabs-Dashboard noch nicht erweitert ist.
         """
         from core.plugin_system import get_plugin_for_tenant
+        import uuid as _uuid
 
         tenant_slug = (payload.get("tenant_slug") or "").strip()
         if not tenant_slug:
@@ -347,6 +483,16 @@ class Plugin(BasePlugin):
         if not name:
             return {"erfolg": False, "nachricht": "kunde_name fehlt"}
 
+        async with AsyncSessionLocal() as s:
+            tenant = (await s.execute(
+                select(Tenant).where(Tenant.slug == tenant_slug)
+            )).scalar_one_or_none()
+        if tenant is None:
+            return {
+                "erfolg": False,
+                "nachricht": f"Tenant '{tenant_slug}' nicht gefunden",
+            }
+
         kalender = await get_plugin_for_tenant(tenant_slug, "kalender")
         if kalender is None:
             return {
@@ -354,24 +500,66 @@ class Plugin(BasePlugin):
                 "nachricht": "Der Kalender ist fuer diesen Betrieb nicht eingerichtet.",
             }
 
+        adresse = (payload.get("kunde_adresse") or "").strip()
+        anliegen = (payload.get("anliegen") or "").strip()
+        telefon = (payload.get("kunde_telefon") or "").strip()
+
+        # employee_id: bevorzugt aus dem Payload (Voice-Agent reicht die
+        # checke_kalender-Routing-Entscheidung weiter). Fehlt sie, machen
+        # wir das Routing neu mit denselben Daten — slot-datum/-uhrzeit
+        # dienen als target_datetime fuer den Verfuegbarkeits-Filter.
+        raw_emp_id = (payload.get("employee_id") or "").strip()
+        routing = None
+        employee_id = None
+        if raw_emp_id:
+            try:
+                employee_id = _uuid.UUID(raw_emp_id)
+            except (ValueError, TypeError):
+                logger.warning(
+                    f"buche_termin: ungueltige employee_id {raw_emp_id!r} — "
+                    f"reroute via choose_employee"
+                )
+                employee_id = None
+        if employee_id is None:
+            target_dt = _parse_wunschzeit_for_routing(datum, uhrzeit)
+            routing = await choose_employee(
+                tenant_id=tenant.id,
+                anliegen_text=anliegen,
+                kunde_adresse=adresse if adresse else None,
+                target_datetime=target_dt,
+            )
+            routing = await _ensure_calendar_capable_routing(
+                tenant.id, routing,
+            )
+            employee_id = routing.employee_id if routing else None
+
         book_payload = {
             "name": name,
-            "anliegen": (payload.get("anliegen") or "").strip(),
+            "anliegen": anliegen,
             "datum": datum,
             "uhrzeit": uhrzeit,
             "dauer_minuten": dauer_min,
         }
-        telefon = (payload.get("kunde_telefon") or "").strip()
         if telefon:
             book_payload["telefon"] = telefon
-        adresse = (payload.get("kunde_adresse") or "").strip()
         if adresse:
             book_payload["adresse"] = adresse
+        if employee_id is not None:
+            book_payload["employee_id"] = employee_id
+            # Idempotency-Key enthaelt employee_id: derselbe Slot kann von
+            # verschiedenen Mitarbeitern unabhaengig gebucht werden (eigene
+            # Kalender), und Retries auf denselben (slot, employee)
+            # liefern das gecachte Resultat statt doppelt anzulegen.
+            book_payload["idempotency_key"] = (
+                f"voice-{tenant_slug}-{employee_id}-{slot_id}"
+            )
 
         result = await kalender.on_webhook("book_appointment", book_payload)
+        if routing is not None and isinstance(result, dict) and result.get("erfolg"):
+            result = {**result, "routing": _routing_to_response(routing)}
         logger.info(
             f"buche_termin: tenant={tenant_slug} slot={slot_id} "
-            f"name={name!r} erfolg={result.get('erfolg')}"
+            f"emp={employee_id} name={name!r} erfolg={result.get('erfolg')}"
         )
         return result
 
