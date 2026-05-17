@@ -1991,17 +1991,29 @@ async def _handle_kalkulation_anzeigen(chat_id):
     by_kat: dict[str, list[TenantKalkulation]] = {}
     for e in entries:
         by_kat.setdefault(e.kategorie, []).append(e)
+
+    # Render-Reihenfolge: erst die bekannten Kategorien in definierter
+    # Reihenfolge (ALLE_KALK_KATEGORIEN), dann ALLE restlichen die
+    # in der DB irgendwie auftauchen. Sonst wuerden Eintraege mit
+    # alter/manuell-gesetzter Kategorie unsichtbar bleiben.
+    bekannt = [k for k in ALLE_KALK_KATEGORIEN if k in by_kat]
+    unbekannt = sorted(k for k in by_kat if k not in ALLE_KALK_KATEGORIEN)
+    render_order = bekannt + unbekannt
+
     msg = f"<b>🧮 Kalkulationsregeln · {tenant.company_name}</b>\n\n"
     total = 0
-    for kat in ALLE_KALK_KATEGORIEN:
-        if kat not in by_kat:
-            continue
-        label = KALK_KATEGORIE_LABELS.get(kat, kat)
+    for kat in render_order:
+        label = KALK_KATEGORIE_LABELS.get(kat, kat or "Ohne Kategorie")
         msg += f"<b>{label}</b>\n"
         for e in by_kat[kat]:
             tail = f"  →  {e.einheit}" if e.einheit else ""
             src_tag = "  (Excel)" if e.source == KALK_SOURCE_EXCEL else ""
             msg += f"  • <b>{e.name}</b>{src_tag}\n"
+            # Semantische Beschreibung (vom Gemini-Classifier oder
+            # manuellen Wizard) sichtbar machen — Daniel will am
+            # Telefon das vorlesen koennen.
+            if e.beschreibung:
+                msg += f"    <i>{e.beschreibung}</i>\n"
             msg += f"    <code>{e.formel}</code>{tail}\n"
             total += 1
         msg += "\n"
