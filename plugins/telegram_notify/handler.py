@@ -6960,19 +6960,22 @@ async def _run_angebot_pipeline(angebot_id) -> str:
 
 # Stati die als "laufende Auftraege" angezeigt werden — alles ab
 # rechnung_erstellt (Angebot raus + Invoice-Draft bereit) bis
-# rechnung_gesendet (Rechnung beim Kunden).
+# work_done (Edge: Fertig aber Rechnungs-Versand crashte, Retry-Knopf
+# braucht den noch). RECHNUNG_GESENDET ist BEWUSST raus — Auftrag ist
+# abgeschlossen sobald die Rechnung beim Kunden ist, dann blockiert
+# er die Tages-Sicht nicht mehr. Detail-View /auftrag_<id> zeigt ihn
+# weiter wenn man die ID kennt (z.B. via /kunde).
 _AUFTRAG_ACTIVE_STATI = {
     ANGEBOT_STATUS_RECHNUNG_ERSTELLT,
     ANGEBOT_STATUS_ACCEPTED,
     ANGEBOT_STATUS_WORK_IN_PROGRESS,
     ANGEBOT_STATUS_WORK_DONE,
-    ANGEBOT_STATUS_RECHNUNG_GESENDET,
 }
 
 
 def _auftrag_progress_line(status: str) -> str:
-    """Visuelle Fortschritts-Anzeige — ✓ fuer erledigte Schritte, ▸ fuer
-    den aktuellen, ─ fuer noch offene."""
+    """Visuelle Fortschritts-Anzeige — Strikethrough fuer erledigte
+    Schritte, Bold fuer aktuellen, Italic fuer noch offene."""
     if status not in AUFTRAG_LIFECYCLE:
         return AUFTRAG_LIFECYCLE_LABELS.get(status, status)
     current_idx = AUFTRAG_LIFECYCLE.index(status)
@@ -6990,7 +6993,15 @@ def _auftrag_progress_line(status: str) -> str:
 
 
 async def _handle_auftraege_command(chat_id):
-    """Listet laufende Auftraege des Tenants mit aktuellem Lifecycle-Schritt."""
+    """Listet laufende Auftraege mit prominent angezeigtem State.
+
+    Format pro Eintrag:
+      <STATE_LABEL>  ·  Kundenname  ·  Brutto
+      <Progress-Bar>  ·  angelegt <Datum>  ·  /auftrag_<8hex>
+
+    Fertige Auftraege (RECHNUNG_GESENDET) sind NICHT in der Liste —
+    sie sind nur noch via /auftrag_<id> oder /kunde erreichbar.
+    """
     tenant = await _get_tenant_by_chat(chat_id)
     if not tenant:
         return (
@@ -7011,27 +7022,28 @@ async def _handle_auftraege_command(chat_id):
         return (
             "📂 <b>Keine laufenden Auftraege</b>\n\n"
             "Mit /angebot eins anlegen — sobald das Angebot in Lexware "
-            "ist, taucht der Auftrag hier auf."
+            "ist, taucht der Auftrag hier auf.\n\n"
+            "<i>Fertige Auftraege sind hier bewusst nicht mehr drin — "
+            "die findest du via /kunde &lt;name&gt;.</i>"
         )
 
-    lines = ["📂 <b>Laufende Auftraege</b>\n"]
+    lines = [f"📂 <b>Laufende Auftraege</b> ({len(rows)})\n"]
     for ang in rows:
+        state_label = AUFTRAG_LIFECYCLE_LABELS.get(ang.status, ang.status)
         progress = _auftrag_progress_line(ang.status)
         gesamt = float(ang.gesamtbetrag_brutto_eur or 0)
-        created = ang.created_at.strftime("%d.%m.%Y") if ang.created_at else "?"
+        created = ang.created_at.strftime("%d.%m.") if ang.created_at else "?"
+        cmd = f"/auftrag_{str(ang.id)[:8]}"
         lines.append(
-            f"<b>{_h_safe(ang.kunde_name)}</b>  ·  "
-            f"{gesamt:.2f}€  ·  {created}"
+            f"<b>{state_label}</b>  ·  "
+            f"{_h_safe(ang.kunde_name)}  ·  {gesamt:.2f}€"
         )
-        lines.append(f"  {progress}")
-        lines.append(
-            f"  <b>Status setzen:</b> /auftrag_{str(ang.id)[:8]}"
-        )
+        lines.append(f"  {progress}  ·  angelegt {created}  ·  {cmd}")
         lines.append("")
     lines.append(
         "<i>Tap auf /auftrag_xxxxxxxx fuer Details + Buttons zum "
         "Status-Wechseln. Bei 🏁 Fertig wird die Rechnung automatisch "
-        "rausgeschickt.</i>"
+        "rausgeschickt und der Auftrag verschwindet aus dieser Liste.</i>"
     )
     return "\n".join(lines)
 
