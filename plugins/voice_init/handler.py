@@ -4,7 +4,10 @@ voice_init Plugin: Conversation-Initiation-Webhook fuer ElevenLabs.
 from __future__ import annotations
 
 import logging
+import secrets
+from datetime import datetime, timedelta, timezone
 from typing import Any
+from uuid import UUID
 
 from sqlalchemy import select
 
@@ -25,6 +28,85 @@ from core.plugin_system import BasePlugin
 from plugins.voice_init.manifest import MANIFEST
 
 logger = logging.getLogger(__name__)
+
+
+# ----------------------------------------------------------------------
+# Storno-Token-Cache (Voice-Pipeline)
+# ----------------------------------------------------------------------
+# In-Memory-Cache fuer Stornier-Tokens. Wir verschicken keine event_ids
+# direkt an den Anrufer/Agent — sondern kurzlebige, einmalig einloesbare
+# Tokens. Damit kann niemand mit erratener event_id einen fremden Termin
+# loeschen, und Replay-Versuche scheitern automatisch.
+#
+# Phase 1: in-process dict ohne Redis. Bei Multi-Worker-Setup waeren
+# Tokens an einen einzelnen Worker gebunden — aktuell laeuft das
+# Framework single-worker (uvicorn ohne --workers), darum ok. Wenn
+# multi-worker kommt: auf Redis umstellen.
+STORNIER_TOKEN_TTL_SECONDS = 30 * 60  # 30 Minuten
+STORNIER_TOKEN_MAX_ENTRIES = 1000     # safety cap
+
+_STORNIER_TOKENS: dict[str, dict[str, Any]] = {}
+
+
+def _gc_stornier_tokens() -> None:
+    """Garbage-collect abgelaufene Tokens. Wird vor jedem Insert
+    aufgerufen — kostet O(n) aber n bleibt klein."""
+    now = datetime.now(timezone.utc)
+    stale = [
+        tok for tok, entry in _STORNIER_TOKENS.items()
+        if (now - entry["created_at"]).total_seconds() > STORNIER_TOKEN_TTL_SECONDS
+    ]
+    for tok in stale:
+        _STORNIER_TOKENS.pop(tok, None)
+    # Hard cap falls trotzdem zu viele: aelteste rausschmeissen
+    if len(_STORNIER_TOKENS) > STORNIER_TOKEN_MAX_ENTRIES:
+        sorted_items = sorted(
+            _STORNIER_TOKENS.items(), key=lambda kv: kv[1]["created_at"],
+        )
+        for tok, _ in sorted_items[: len(_STORNIER_TOKENS) - STORNIER_TOKEN_MAX_ENTRIES]:
+            _STORNIER_TOKENS.pop(tok, None)
+
+
+def _create_stornier_token(
+    tenant_id: UUID, event_id: str, employee_id: str | None,
+) -> str:
+    """Generiert einen Stornier-Token fuer ein Event und speichert das Mapping."""
+    _gc_stornier_tokens()
+    token = secrets.token_urlsafe(16)
+    _STORNIER_TOKENS[token] = {
+        "tenant_id": str(tenant_id),
+        "event_id": event_id,
+        "employee_id": employee_id,
+        "created_at": datetime.now(timezone.utc),
+        "used": False,
+    }
+    return token
+
+
+def _consume_stornier_token(
+    token: str, expected_tenant_id: UUID,
+) -> dict[str, Any] | None:
+    """Loest einen Token ein. Returns Token-Daten oder None.
+
+    None-Gruende (alle relevant zum Loggen, nicht zum Mit-User-Sharen):
+    - Token unbekannt
+    - Token expired (>30 min)
+    - Token bereits eingeloest
+    - Tenant-Mismatch (Token gehoert anderem Tenant)
+    """
+    entry = _STORNIER_TOKENS.get(token)
+    if entry is None:
+        return None
+    if entry["used"]:
+        return None
+    age = (datetime.now(timezone.utc) - entry["created_at"]).total_seconds()
+    if age > STORNIER_TOKEN_TTL_SECONDS:
+        return None
+    if entry["tenant_id"] != str(expected_tenant_id):
+        return None
+    # Atomar einlosen: erst markieren, dann zurueckgeben
+    entry["used"] = True
+    return entry
 
 
 def _normalize_phone(num):
@@ -256,6 +338,10 @@ class Plugin(BasePlugin):
             return await self._handle_checke_kalender(payload)
         if endpoint == "buche_termin":
             return await self._handle_buche_termin(payload)
+        if endpoint == "finde_termine":
+            return await self._handle_finde_termine(payload)
+        if endpoint == "storniere_termin":
+            return await self._handle_storniere_termin(payload)
         if endpoint == "call_ended":
             return await self._handle_call_ended(payload)
         return {"error": f"Unbekannter Endpunkt: {endpoint}"}
@@ -568,6 +654,210 @@ class Plugin(BasePlugin):
         logger.info(
             f"buche_termin: tenant={tenant_slug} slot={slot_id} "
             f"emp={employee_id} name={name!r} erfolg={result.get('erfolg')}"
+        )
+        return result
+
+    async def _handle_finde_termine(self, payload):
+        """Webhook von ElevenLabs wenn Q das Tool 'finde_termine' aufruft.
+
+        Sucht Termine des Anrufers anhand seiner Telefonnummer oder
+        Email-Adresse, damit Q sie ihm zur Auswahl vorlesen kann
+        (Storno-Phase 1). Pro Treffer erzeugen wir einen kurzlebigen
+        Stornier-Token — Q reicht den spaeter an /storniere_termin,
+        damit der Agent nie eine event_id direkt sieht (Security:
+        keine Replay-/Cross-Tenant-Loeschungen moeglich).
+
+        Erwartet payload:
+          {
+            "tenant_slug": "demo",
+            "kunde_telefon": "+49 ...",   # optional
+            "kunde_email": "...",         # optional
+            "time_min": "ISO" | null,     # optional, default: heute
+            "time_max": "ISO" | null      # optional, default: +30d
+          }
+        Mindestens eines von kunde_telefon/kunde_email muss gesetzt sein.
+
+        Response (fuer ElevenLabs-Tool):
+          {
+            "erfolg": True, "anzahl": 2,
+            "termine": [
+              {
+                "stornier_token": "<random>",
+                "datum": "22.05.2026", "wochentag": "Do",
+                "uhrzeit": "14:00", "anliegen": "...", "ort": "..."
+              }, ...
+            ]
+          }
+        """
+        from core.plugin_system import get_plugin_for_tenant
+
+        tenant_slug = (payload.get("tenant_slug") or "").strip()
+        if not tenant_slug:
+            return {"erfolg": False, "nachricht": "tenant_slug fehlt"}
+
+        telefon = (payload.get("kunde_telefon") or "").strip()
+        email = (payload.get("kunde_email") or "").strip()
+        if not telefon and not email:
+            return {
+                "erfolg": False,
+                "nachricht": "kunde_telefon oder kunde_email erforderlich",
+            }
+
+        async with AsyncSessionLocal() as s:
+            tenant = (await s.execute(
+                select(Tenant).where(Tenant.slug == tenant_slug)
+            )).scalar_one_or_none()
+        if tenant is None:
+            return {
+                "erfolg": False,
+                "nachricht": f"Tenant '{tenant_slug}' nicht gefunden",
+            }
+
+        kalender = await get_plugin_for_tenant(tenant_slug, "kalender")
+        if kalender is None:
+            return {
+                "erfolg": False,
+                "nachricht": "Kalender ist fuer diesen Betrieb nicht eingerichtet.",
+            }
+
+        find_payload: dict[str, Any] = {}
+        if telefon:
+            find_payload["kunde_telefon"] = telefon
+        if email:
+            find_payload["kunde_email"] = email
+        if payload.get("time_min"):
+            find_payload["time_min"] = payload["time_min"]
+        if payload.get("time_max"):
+            find_payload["time_max"] = payload["time_max"]
+
+        result = await kalender.on_webhook("find_events", find_payload)
+        if not result.get("erfolg"):
+            return {
+                "erfolg": False,
+                "nachricht": result.get("nachricht") or "Suche fehlgeschlagen",
+            }
+
+        # Pro Treffer Stornier-Token + voice-freundliche Felder bauen
+        wochentage = ["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"]
+        from dateutil import parser as _p  # type: ignore
+        out = []
+        for ev in result.get("termine", []):
+            try:
+                start_dt = _p.isoparse(ev["start_dt"])
+            except Exception:  # noqa: BLE001
+                continue
+            token = _create_stornier_token(
+                tenant.id, ev["event_id"], ev.get("employee_id"),
+            )
+            out.append({
+                "stornier_token": token,
+                "datum": start_dt.strftime("%d.%m.%Y"),
+                "wochentag": wochentage[start_dt.weekday()],
+                "uhrzeit": start_dt.strftime("%H:%M"),
+                "anliegen": ev.get("summary", ""),
+                "ort": ev.get("location", ""),
+            })
+
+        logger.info(
+            f"finde_termine: tenant={tenant_slug} "
+            f"telefon={'set' if telefon else 'none'} "
+            f"email={'set' if email else 'none'} "
+            f"treffer={len(out)}"
+        )
+        return {"erfolg": True, "anzahl": len(out), "termine": out}
+
+    async def _handle_storniere_termin(self, payload):
+        """Webhook von ElevenLabs wenn Q das Tool 'storniere_termin' aufruft.
+
+        Loest einen vorher per /finde_termine erzeugten Stornier-Token
+        ein und loescht den zugeordneten Termin. Token ist einmalig +
+        30 min gueltig + Tenant-gebunden — siehe _consume_stornier_token.
+
+        Erwartet payload:
+          {
+            "tenant_slug": "demo",
+            "stornier_token": "<token aus finde_termine>",
+            "kunde_bestaetigung_text": "..."  # optional, fuer Audit-Log
+          }
+        """
+        from core.plugin_system import get_plugin_for_tenant
+
+        tenant_slug = (payload.get("tenant_slug") or "").strip()
+        if not tenant_slug:
+            return {"erfolg": False, "nachricht": "tenant_slug fehlt"}
+
+        token = (payload.get("stornier_token") or "").strip()
+        if not token:
+            return {"erfolg": False, "nachricht": "stornier_token fehlt"}
+
+        async with AsyncSessionLocal() as s:
+            tenant = (await s.execute(
+                select(Tenant).where(Tenant.slug == tenant_slug)
+            )).scalar_one_or_none()
+        if tenant is None:
+            return {
+                "erfolg": False,
+                "nachricht": f"Tenant '{tenant_slug}' nicht gefunden",
+            }
+
+        entry = _consume_stornier_token(token, tenant.id)
+        if entry is None:
+            # Bewusst generische Meldung — kein Hint ob "expired" /
+            # "unknown" / "tenant-mismatch", damit Token-Probing nichts
+            # ueber das System verraet.
+            logger.info(f"storniere_termin: tenant={tenant_slug} ungueltiger Token")
+            return {
+                "erfolg": False,
+                "nachricht": (
+                    "Der Stornier-Vorgang ist abgelaufen oder bereits "
+                    "erledigt. Bitte den Termin erneut suchen."
+                ),
+            }
+
+        event_id = entry["event_id"]
+        employee_id_str = entry.get("employee_id")
+
+        kalender = await get_plugin_for_tenant(tenant_slug, "kalender")
+        if kalender is None:
+            return {
+                "erfolg": False,
+                "nachricht": "Kalender ist fuer diesen Betrieb nicht eingerichtet.",
+            }
+
+        cancel_payload: dict[str, Any] = {"event_id": event_id}
+        if employee_id_str:
+            try:
+                cancel_payload["employee_id"] = UUID(employee_id_str)
+            except (ValueError, TypeError):
+                pass
+        result = await kalender.on_webhook("cancel_appointment", cancel_payload)
+
+        # Telegram-Push an den zustaendigen Mitarbeiter
+        # (silent fail; loggen aber blockieren nie das Storno-Response).
+        try:
+            from plugins.telegram_notify.handler import TelegramNotifier
+            emp_uuid = None
+            if employee_id_str:
+                try:
+                    emp_uuid = UUID(employee_id_str)
+                except (ValueError, TypeError):
+                    emp_uuid = None
+            bestaetigung = (payload.get("kunde_bestaetigung_text") or "").strip()
+            push = (
+                "🚫 <b>Termin storniert (telefonisch)</b>\n"
+                f"<b>Event:</b> <code>{event_id[:12]}…</code>"
+            )
+            if bestaetigung:
+                push += f"\n<b>Aussage Kunde:</b> {bestaetigung}"
+            await TelegramNotifier.send_for_employee(
+                tenant.id, push, employee_id=emp_uuid,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"storniere_termin telegram-push failed: {exc}")
+
+        logger.info(
+            f"storniere_termin: tenant={tenant_slug} event={event_id[:12]}… "
+            f"emp={employee_id_str} erfolg={result.get('erfolg')}"
         )
         return result
 
