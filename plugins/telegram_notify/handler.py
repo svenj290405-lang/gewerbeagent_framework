@@ -5498,7 +5498,14 @@ async def _handle_microsoft_setup_command(chat_id):
 
 
 async def _handle_microsoft_status_command(chat_id):
-    """Zeigt Microsoft-Verbindungsstatus."""
+    """Zeigt Microsoft-Verbindungsstatus.
+
+    Bewusst KEINE Anzeige der access_token-Verfallszeit (~1h, alarmiert
+    nur unnoetig). Stattdessen "Verbunden seit" + "Letzter Refresh"
+    + klare Aussage dass der Auto-Refresh aktiv ist.
+    """
+    import datetime as _dt
+
     from core.integrations.microsoft import get_microsoft_status
 
     tenant = await _get_tenant_by_chat(chat_id)
@@ -5512,15 +5519,38 @@ async def _handle_microsoft_status_command(chat_id):
             "Anbindung starten mit /microsoft_setup"
         )
 
-    msg = "<b>Microsoft 365: verbunden</b>\n\n"
+    msg = "<b>✅ Microsoft 365: verbunden</b>\n\n"
     msg += f"Account: <b>{status['account_email']}</b>\n"
-    if status.get("expires_at"):
+
+    connected_since = status.get("connected_since")
+    if connected_since:
         try:
-            expires_str = status["expires_at"].strftime("%d.%m.%Y %H:%M")
-            msg += f"Token gueltig bis: {expires_str}\n"
+            msg += f"Verbunden seit: {connected_since.strftime('%d.%m.%Y')}\n"
         except Exception:
             pass
+
+    last_refresh = status.get("last_refresh")
+    if last_refresh:
+        try:
+            now = _dt.datetime.now(_dt.timezone.utc)
+            ts = last_refresh
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=_dt.timezone.utc)
+            delta = now - ts
+            mins = int(delta.total_seconds() / 60)
+            if mins < 60:
+                ago = f"vor {mins} Min"
+            elif mins < 60 * 24:
+                ago = f"vor {mins // 60} Std"
+            else:
+                ago = f"vor {mins // (60 * 24)} Tag(en)"
+            msg += f"Letzter Auto-Refresh: {ago}\n"
+        except Exception:
+            pass
+
     msg += f"Berechtigungen: {status.get('scopes', '?')}\n\n"
+    msg += "🔄 <i>Auto-Refresh aktiv — die Verbindung erneuert sich "
+    msg += "selbst, solange du angemeldet bleibst.</i>\n\n"
     msg += "Test-Mail senden mit /microsoft_test\n"
     msg += "Neu verbinden (anderer Account) mit /microsoft_setup"
     return msg

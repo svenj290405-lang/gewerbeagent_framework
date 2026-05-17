@@ -393,7 +393,17 @@ async def get_microsoft_status(
     Phase 1 Multi-OAuth: optional employee_id — nutzt zentralen Lookup
     (employee → default-employee → legacy-tenant).
 
-    Returns: {connected, account_email, expires_at, scopes}
+    Returns:
+        connected (bool)
+        account_email (str|None)
+        expires_at (datetime|None): Access-Token-Verfall (kurzlebig, ~1h,
+            wird transparent refreshed — nicht fuer User-Anzeige)
+        scopes (str|None)
+        connected_since (datetime|None): Token-created_at — wann der
+            User zum ersten Mal /microsoft_setup gemacht hat.
+        last_refresh (datetime|None): Token-updated_at — wann der
+            letzte Access-Token-Refresh durchgelaufen ist (oder bei
+            frisch verbundenen Tokens == connected_since).
     """
     from core.security.oauth_token_lookup import find_oauth_token
 
@@ -405,6 +415,8 @@ async def get_microsoft_status(
             "account_email": None,
             "expires_at": None,
             "scopes": None,
+            "connected_since": None,
+            "last_refresh": None,
         }
 
     return {
@@ -412,4 +424,6 @@ async def get_microsoft_status(
         "account_email": oauth_token.account_email,
         "expires_at": oauth_token.access_token_expires_at,
         "scopes": oauth_token.scopes,
+        "connected_since": oauth_token.created_at,
+        "last_refresh": oauth_token.updated_at,
     }
