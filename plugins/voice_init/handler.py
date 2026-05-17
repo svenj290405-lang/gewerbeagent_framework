@@ -590,11 +590,44 @@ class Plugin(BasePlugin):
         adresse = (payload.get("kunde_adresse") or "").strip()
         anliegen = (payload.get("anliegen") or "").strip()
         telefon = (payload.get("kunde_telefon") or "").strip()
-        # kunde_email optional — wird vom ElevenLabs-Tool durchgereicht
-        # wenn Q die Adresse fuer Bestaetigungs-Mail abgefragt hat. Wird
-        # an kalender.book_appointment als kunde_email weitergereicht,
-        # damit der Termin via Mail spaeter storno-findbar ist.
-        kunde_email = (payload.get("kunde_email") or "").strip()
+
+        # kunde_email-Resolution (Clean-Architecture-Source-of-Truth):
+        # 1. Server-seitiger Lookup ueber den juengsten AnfrageToken zu
+        #    dieser Telefonnummer (created via _handle_save_contact —
+        #    selbe Voice-Session-Lebensdauer = 2h)
+        # 2. Fallback auf explicit payload-Feld (fuer non-voice-Caller,
+        #    z.B. Mail-Pipeline die das Tool direkt anzapft, oder
+        #    Legacy-Tests)
+        # 3. Sonst: keine Mail im Kalender-Event — Storno-Lookup faellt
+        #    spaeter auf Telefon-Suche zurueck (siehe find_events).
+        from core.integrations.anfrage_forms import (
+            lookup_recent_anfrage_by_phone,
+        )
+        from core.utils.phone import normalize_phone
+
+        kunde_email_payload = (payload.get("kunde_email") or "").strip().lower()
+        kunde_email = ""
+        email_source = "none"
+        token_id_short = ""
+        phone_norm = normalize_phone(telefon) if telefon else ""
+        if phone_norm:
+            try:
+                token = await lookup_recent_anfrage_by_phone(
+                    tenant.id, phone_norm,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    f"buche_termin: lookup_recent_anfrage_by_phone "
+                    f"({phone_norm[-4:]}***) crashed: {exc}"
+                )
+                token = None
+            if token and token.kunde_email:
+                kunde_email = token.kunde_email
+                email_source = "anfrage_token"
+                token_id_short = str(token.id)[:8]
+        if not kunde_email and kunde_email_payload:
+            kunde_email = kunde_email_payload
+            email_source = "payload"
 
         # employee_id: bevorzugt aus dem Payload (Voice-Agent reicht die
         # checke_kalender-Routing-Entscheidung weiter). Fehlt sie, machen
@@ -651,9 +684,15 @@ class Plugin(BasePlugin):
         result = await kalender.on_webhook("book_appointment", book_payload)
         if routing is not None and isinstance(result, dict) and result.get("erfolg"):
             result = {**result, "routing": _routing_to_response(routing)}
+        # email_source = anfrage_token | payload | none — fuer Nachverfolg-
+        # barkeit. token-id (short) nur geloggt wenn aus Token gezogen.
+        email_log = f"email_source={email_source}"
+        if token_id_short:
+            email_log += f" token={token_id_short}"
         logger.info(
             f"buche_termin: tenant={tenant_slug} slot={slot_id} "
-            f"emp={employee_id} name={name!r} erfolg={result.get('erfolg')}"
+            f"emp={employee_id} name={name!r} erfolg={result.get('erfolg')} "
+            f"{email_log}"
         )
         return result
 
