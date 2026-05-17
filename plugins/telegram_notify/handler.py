@@ -57,6 +57,8 @@ from core.models import (
     STATE_MATERIAL_NEU_LIEFERANT,
     STATE_MATERIAL_NEU_PREVIEWING,
     STATE_ARCHIV_WAITING_FILES,
+    STATE_ARCHIV_AWAIT_CHOICE,
+    STATE_ARCHIV_AWAIT_NEW_CONFIRM,
     STATE_WERKSTATT_WAITING_ADDRESS,
     STATE_WERKSTATT_CONFIRMING,
     STATE_MITARBEITER_NEU_NAME,
@@ -926,20 +928,21 @@ async def _handle_help_command(chat_id=None):
 
     # --- Kunden-Archiv (Drive, immer anzeigen mit Lock wenn inaktiv) ---
     drive_items = [
-        ("/drive_verbinden",
-         "Google-Drive mit dem Tenant verknuepfen (OAuth-Flow)."),
-        ("/drive_status",
-         "Drive-Status + Liste der letzten Kunden-Ordner mit "
-         "klickbaren Drive-Links."),
-        ("/drive [name]",
-         "Kunden-Ordner im Drive suchen — Substring-Match, "
-         "zeigt alle Treffer als klickbare Links."),
-        ("/archiv [kunde]",
-         "Datei-Upload starten — Fotos und PDFs landen "
-         "automatisch im Kunden-Ordner."),
+        ("/archiv_verbinden",
+         "Google-Drive mit dem Tenant verknuepfen (OAuth-Flow). "
+         "Calendar bleibt erhalten — wir erweitern nur den Scope."),
+        ("/archiv",
+         "Alle Kunden-Ordner als klickbare Liste mit Dateizahl + "
+         "letztem Upload."),
+        ("/archiv [name]",
+         "Intelligent: 1 Treffer -> direkt Upload-Wizard, mehrere -> "
+         "Auswahl, keine -> 'neu anlegen?'. Substring-Match, "
+         "case-insensitiv."),
+        ("/archiv_status",
+         "Verbindungs-Check + Quick-Stats (Anzahl Ordner / Dateien / "
+         "letzter Upload)."),
         ("/fertig",
-         "Archiv-Upload abschliessen (nur im laufenden "
-         "/archiv-Wizard)."),
+         "Archiv-Upload abschliessen (nur im laufenden Upload-Wizard)."),
     ]
     _block(
         "☁️", "Kunden-Archiv (Google Drive)",
@@ -1174,9 +1177,9 @@ async def _collect_setup_status(tenant, employee) -> list[tuple[str, str, str | 
             if tok and is_drive_configured(tok):
                 items.append(("✅", "Kunden-Archiv", None))
             elif tok:
-                items.append(("⚠️", "Kunden-Archiv (Scope fehlt)", "/drive_verbinden"))
+                items.append(("⚠️", "Kunden-Archiv (Scope fehlt)", "/archiv_verbinden"))
             else:
-                items.append(("❌", "Kunden-Archiv", "/drive_verbinden"))
+                items.append(("❌", "Kunden-Archiv", "/archiv_verbinden"))
         except Exception:
             logger.exception("drive_archiv-Status-Check fehlgeschlagen")
             items.append(("•", "Kunden-Archiv (Status unklar)", None))
@@ -2727,24 +2730,28 @@ async def _dispatch_update(payload):
         return {"ok": True}
     elif text == "/kalender_status":
         reply = await _handle_kalender_status_command(chat_id)
-    elif text == "/drive_verbinden":
+    elif text == "/archiv_verbinden":
         await _clear_state(chat_id)
-        reply_or_none = await _handle_drive_verbinden_command(chat_id)
+        reply_or_none = await _handle_archiv_verbinden_command(chat_id)
         if reply_or_none is None:
             return {"ok": True}
         reply = reply_or_none
-    elif text == "/drive_status":
-        reply = await _handle_drive_status_command(chat_id)
-    elif text == "/drive" or text.startswith("/drive "):
-        await _clear_state(chat_id)
-        args = text[len("/drive"):].strip()
-        reply = await _handle_drive_search_command(chat_id, args)
+    elif text == "/archiv_status":
+        reply = await _handle_archiv_status_command(chat_id)
     elif text == "/archiv":
         await _clear_state(chat_id)
         reply = await _handle_archiv_list_command(chat_id)
     elif text.startswith("/archiv "):
         args = text[len("/archiv "):].strip()
-        reply = await _handle_archiv_command(chat_id, args)
+        reply = await _handle_archiv_smart_command(chat_id, args)
+    # Soft-Deprecation der alten /drive*-Namen.
+    elif text == "/drive_verbinden":
+        reply = await _handle_deprecated_drive_command(text)
+    elif text == "/drive_status":
+        reply = await _handle_deprecated_drive_command(text)
+    elif text == "/drive" or text.startswith("/drive "):
+        args = text[len("/drive"):].strip()
+        reply = await _handle_deprecated_drive_command("/drive", args)
     elif text == "/fertig":
         # /fertig ist nur sinnvoll im Archiv-Wizard. Sonst freundlicher Hinweis.
         state = await _load_state(chat_id)
@@ -2946,6 +2953,14 @@ async def _dispatch_update(payload):
                 f"Schick mir Bilder, PDFs oder andere Dokumente fuer "
                 f"<b>{_h_safe(kunde)}</b>. Mit <b>/fertig</b> abschliessen "
                 f"oder /abbrechen."
+            )
+        elif state.state_key == STATE_ARCHIV_AWAIT_CHOICE:
+            reply = await _handle_archiv_choice_input(
+                chat_id, text, state.state_data,
+            )
+        elif state.state_key == STATE_ARCHIV_AWAIT_NEW_CONFIRM:
+            reply = await _handle_archiv_new_confirm_input(
+                chat_id, text, state.state_data,
             )
         elif state.state_key == STATE_RECHNUNG_AWAITING_MAIL:
             stage = (state.state_data or {}).get("stage")
@@ -3565,8 +3580,8 @@ async def _handle_viz_drive_kunde_input(chat_id, text, state_data):
         # Buttons zurueck damit User stattdessen Mail probieren kann
         await _show_viz_post_action_buttons(chat_id, viz_id, prompt or "")
         return (
-            "⚠️ <b>Drive ist noch nicht verbunden.</b>\n\n"
-            "Bitte einmal /drive_verbinden ausfuehren — danach klappt "
+            "⚠️ <b>Kunden-Archiv ist noch nicht verbunden.</b>\n\n"
+            "Bitte einmal /archiv_verbinden ausfuehren — danach klappt "
             "auch das Archivieren direkt aus der Visualisierung."
         )
 
@@ -3596,7 +3611,7 @@ async def _handle_viz_drive_kunde_input(chat_id, text, state_data):
         return (
             f"⚠️ <b>Drive-Upload fehlgeschlagen</b>\n\n"
             f"{_h_safe(str(e))}\n\n"
-            "Bitte ggf. /drive_verbinden ausfuehren."
+            "Bitte ggf. /archiv_verbinden ausfuehren."
         )
     except Exception as e:
         err = str(e)
@@ -10637,7 +10652,7 @@ async def _onboarding_send_done(chat_id, tenant):
         "  • <b>/help</b> — alle Befehle\n"
         "  • <b>/status</b> — was ist verbunden\n\n"
         "Falls du Lexware oder Kalender spaeter nachholst:\n"
-        "  /lexware_setup · /kalender_verbinden · /drive_verbinden"
+        "  /lexware_setup · /kalender_verbinden · /archiv_verbinden"
     )
 
 
@@ -10697,7 +10712,7 @@ async def _handle_onboarding_command(chat_id):
             "✅ Du hast das Setup schon durchlaufen. Mit /status "
             "siehst du was verbunden ist, mit /help alle Befehle.\n\n"
             "Wenn du etwas neu einrichten willst:\n"
-            "  /lexware_setup · /kalender_verbinden · /drive_verbinden · "
+            "  /lexware_setup · /kalender_verbinden · /archiv_verbinden · "
             "/werkstatt · /microsoft_setup"
         )
     step_idx = tenant.onboarding_step or 0
@@ -11434,15 +11449,22 @@ def _h_safe(s) -> str:
 
 
 # =====================================================================
-# Google-Drive-Archiv (pro Kunde Ordner, Bilder/PDFs ueber Telegram)
+# Google-Drive Kunden-Archiv (alle Befehle unter /archiv)
 # =====================================================================
-# Workflow:
-#   /drive_verbinden      → einmaliger OAuth-Re-Auth (Drive-Scope)
-#   /drive_status         → Verbindung + Statistik
-#   /archiv               → Liste aller Kunden mit Drive-Ordner
-#   /archiv <name>        → Wizard-Start: Bot wartet auf Files
-#   <Photo/Document/PDF>  → Upload in Kunden-Ordner (lazy create)
+# Architektur (refactored 2026-05-17):
+#   /archiv_verbinden     → OAuth-Re-Auth fuer Drive-Scope
+#   /archiv_status        → reine Verbindungs-Pruefung + Quick-Stats
+#   /archiv               → Liste aller Kunden-Ordner MIT Klick-Links
+#   /archiv <text>        → INTELLIGENT (siehe _handle_archiv_smart):
+#                             1 Treffer  -> Upload-Wizard direkt
+#                             N Treffer  -> Auswahl-Liste (ja/nummer)
+#                             0 Treffer  -> "Neu anlegen?" (ja/nein)
+#   <Photo/PDF>           → Upload in Kunden-Ordner (lazy create)
 #   /fertig               → Wizard schliessen, Drive-Link zeigen
+#
+# /drive_verbinden, /drive_status, /drive <text> sind als Soft-
+# Deprecation auf die /archiv-Varianten weitergeleitet — siehe
+# _handle_deprecated_drive_command.
 #
 # Failsafe-Pattern: alle Drive-Errors fangen wir, schicken die Klartext-
 # Meldung im Telegram (statt Stacktraces) und brechen den Wizard nicht
@@ -11451,7 +11473,7 @@ def _h_safe(s) -> str:
 ARCHIV_MAX_FILE_SIZE = 25 * 1024 * 1024  # 25 MB Telegram-Bot-API-Limit
 
 
-async def _handle_drive_verbinden_command(chat_id):
+async def _handle_archiv_verbinden_command(chat_id):
     """Schickt OAuth-Deeplink mit Drive-Scope.
 
     Calendar-Token bleibt gueltig — der naechste OAuth-Roundtrip
@@ -11467,8 +11489,9 @@ async def _handle_drive_verbinden_command(chat_id):
     tok = await find_oauth_token(tenant.id, "google", emp.id)
     if tok and is_drive_configured(tok):
         return (
-            "✅ <b>Drive ist verbunden.</b>\n"
-            "Mit <b>/archiv &lt;kundenname&gt;</b> kannst du loslegen."
+            "✅ <b>Kunden-Archiv ist verbunden.</b>\n"
+            "Mit <b>/archiv</b> die Ordner-Liste oeffnen oder "
+            "<b>/archiv &lt;kundenname&gt;</b> direkt Files schicken."
         )
 
     from config.settings import settings
@@ -11482,9 +11505,9 @@ async def _handle_drive_verbinden_command(chat_id):
     oauth_url = f"{base}/oauth/start?{qs}"
 
     msg = (
-        "<b>☁️ Drive verbinden</b>\n"
-        "Einmal-Login. Calendar bleibt verbunden — wir erweitern nur "
-        "den Scope.\n\n"
+        "<b>☁️ Kunden-Archiv verbinden</b>\n"
+        "Einmal-Login zu Google Drive. Calendar bleibt verbunden — wir "
+        "erweitern nur den Scope.\n\n"
         "<i>Q sieht nur die Ordner die er selbst anlegt. "
         "Private Files bleiben unsichtbar.</i>"
     )
@@ -11494,13 +11517,11 @@ async def _handle_drive_verbinden_command(chat_id):
     )
     if sent:
         return None  # type: ignore[return-value]
-    # Fallback ohne Buttons
     return msg + f"\n\nLink: {oauth_url}"
 
 
-async def _handle_drive_status_command(chat_id) -> str:
-    """Zeigt Drive-Verbindungs-Status + Liste der letzten Kunden-Ordner
-    mit klickbaren Links + Such-Hinweis."""
+async def _handle_archiv_status_command(chat_id) -> str:
+    """Verbindungs-Status + Quick-Stats. Fuer die volle Ordner-Liste -> /archiv."""
     from core.security.oauth_token_lookup import find_oauth_token
     from core.integrations.google_drive import (
         is_drive_configured, list_tenant_kunde_drives,
@@ -11514,17 +11535,17 @@ async def _handle_drive_status_command(chat_id) -> str:
     tok = await find_oauth_token(tenant.id, "google", emp.id)
     if not tok:
         return (
-            "❌ <b>Drive nicht verbunden.</b>\n\n"
-            "Mit /drive_verbinden den OAuth-Flow starten."
+            "❌ <b>Kunden-Archiv nicht verbunden.</b>\n\n"
+            "Mit /archiv_verbinden den OAuth-Flow starten."
         )
     if not is_drive_configured(tok):
         return (
             "⚠️ <b>Google ist verbunden, aber ohne Drive-Scope.</b>\n\n"
-            "Bitte einmal /drive_verbinden ausfuehren — Calendar bleibt "
+            "Bitte einmal /archiv_verbinden ausfuehren — Calendar bleibt "
             "weiter verbunden."
         )
 
-    folders = await list_tenant_kunde_drives(tenant.id, limit=100)
+    folders = await list_tenant_kunde_drives(tenant.id, limit=500)
     total_uploads = sum(int(f.upload_count or 0) for f in folders)
     last_upload = None
     for f in folders:
@@ -11536,119 +11557,116 @@ async def _handle_drive_status_command(chat_id) -> str:
         last_upload.strftime("%d.%m.%Y %H:%M") if last_upload else "—"
     )
 
-    lines = [
-        "<b>☁️ Drive</b>  ✅",
-        f"{len(folders)} Ordner  ·  {total_uploads} Dateien  ·  letzter {last_str}",
-    ]
-    if not folders:
-        lines.append("")
-        lines.append("Mit <b>/archiv &lt;name&gt;</b> den ersten anlegen.")
-        return "\n".join(lines)
-
-    # Top-10 nach letztem Upload — klickbare Drive-Links
-    lines.append("")
-    lines.append("<b>📁 Letzte Kunden-Ordner:</b>")
-    for f in folders[:10]:
-        ts = f.last_upload_at.strftime("%d.%m.%y") if f.last_upload_at else "-"
-        lines.append(
-            f"• <a href=\"{_h_safe(f.drive_folder_url)}\">"
-            f"{_h_safe(f.kunde_name)}</a> — "
-            f"{f.upload_count or 0} Dateien, letzter {ts}"
-        )
-    if len(folders) > 10:
-        lines.append(f"<i>… und {len(folders) - 10} weitere</i>")
-    lines.append("")
-    lines.append(
-        "🔍 Suche: <b>/drive &lt;name&gt;</b>  ·  "
-        "Upload: <b>/archiv &lt;name&gt;</b>"
+    msg = (
+        "<b>☁️ Kunden-Archiv</b>  ✅\n"
+        f"{len(folders)} Ordner  ·  {total_uploads} Dateien  ·  "
+        f"letzter Upload {last_str}\n\n"
+        "Liste der Ordner: <b>/archiv</b>\n"
+        "Suche/Upload:    <b>/archiv &lt;name&gt;</b>"
     )
-    return "\n".join(lines)
-
-
-async def _handle_drive_search_command(chat_id, args: str) -> str:
-    """/drive <suchtext> — sucht in den Kunden-Ordnern (substring,
-    case-insensitive). Zeigt alle Treffer als klickbare Drive-Links.
-
-    Aenderung KEINE Daten — reine Such-Funktion. Wer hochladen will:
-    /archiv <exakter Name>.
-    """
-    from core.integrations.google_drive import list_tenant_kunde_drives
-
-    suchtext = (args or "").strip()
-    if len(suchtext) < 2:
-        return (
-            "Nutzung: <b>/drive &lt;suchtext&gt;</b>\n\n"
-            "Beispiel: <code>/drive Mueller</code> findet alle Kunden-"
-            "Ordner deren Name 'Mueller' enthaelt."
-        )
-    tenant = await _get_tenant_by_chat(chat_id)
-    if not tenant:
-        return "Dieser Chat ist noch keinem Betrieb zugeordnet."
-
-    folders = await list_tenant_kunde_drives(tenant.id, limit=500)
-    needle = suchtext.lower()
-    matches = [f for f in folders if needle in (f.kunde_name or "").lower()]
-    if not matches:
-        return (
-            f"Kein Drive-Ordner gefunden zu <i>{_h_safe(suchtext)}</i>.\n\n"
-            f"Mit <b>/archiv {_h_safe(suchtext)}</b> neuen anlegen."
-        )
-
-    lines = [f"<b>🔍 {len(matches)} Treffer fuer '{_h_safe(suchtext)}'</b>\n"]
-    for f in matches[:20]:
-        ts = f.last_upload_at.strftime("%d.%m.%y") if f.last_upload_at else "-"
-        lines.append(
-            f"• <a href=\"{_h_safe(f.drive_folder_url)}\">"
-            f"{_h_safe(f.kunde_name)}</a> — "
-            f"{f.upload_count or 0} Dateien, letzter {ts}"
-        )
-    if len(matches) > 20:
-        lines.append(f"\n<i>… und {len(matches) - 20} weitere — bitte praeziser suchen.</i>")
-    return "\n".join(lines)
+    return msg
 
 
 async def _handle_archiv_list_command(chat_id) -> str:
-    """Listet alle Kunden mit Drive-Ordner — sortiert nach last_upload."""
-    from core.integrations.google_drive import list_tenant_kunde_drives
+    """Liste aller Kunden-Ordner mit KLICK-Links + Stats.
 
-    tenant = await _get_tenant_by_chat(chat_id)
-    if not tenant:
+    Vereint die alte /drive_status-Liste und den alten /archiv-Listing
+    in einer einzigen Sicht. Sortiert nach letztem Upload (Helper liefert
+    das schon so).
+    """
+    from core.security.oauth_token_lookup import find_oauth_token
+    from core.integrations.google_drive import (
+        is_drive_configured, list_tenant_kunde_drives,
+    )
+
+    res = await _get_current_employee(chat_id)
+    if res is None:
         return "Dieser Chat ist noch keinem Betrieb zugeordnet."
+    tenant, emp = res
 
-    folders = await list_tenant_kunde_drives(tenant.id, limit=30)
-    if not folders:
+    tok = await find_oauth_token(tenant.id, "google", emp.id)
+    if not tok or not is_drive_configured(tok):
         return (
-            "<b>📁 Kunden-Archiv (Google Drive)</b>\n\n"
-            "Noch keine Kunden mit Drive-Ordner.\n\n"
-            "Lege den ersten an mit:\n"
-            "<b>/archiv &lt;Kundenname&gt;</b>\n\n"
-            "Beispiel: <code>/archiv Mueller</code>\n\n"
-            "Falls noch nicht passiert: einmal /drive_verbinden zur "
-            "OAuth-Freigabe."
+            "❌ <b>Kunden-Archiv noch nicht verbunden.</b>\n\n"
+            "Mit /archiv_verbinden den OAuth-Flow starten."
         )
 
+    folders = await list_tenant_kunde_drives(tenant.id, limit=100)
+    if not folders:
+        return (
+            "<b>📁 Kunden-Archiv</b>\n\n"
+            "Noch keine Kunden mit Ordner.\n\n"
+            "Den ersten anlegen: <b>/archiv &lt;Kundenname&gt;</b>\n"
+            "Beispiel: <code>/archiv Mueller</code>"
+        )
+
+    total_uploads = sum(int(f.upload_count or 0) for f in folders)
     lines = [
-        f"<b>📁 Kunden-Archiv</b> — {len(folders)} Kunden\n",
+        f"<b>📁 Kunden-Archiv</b> — {len(folders)} Ordner, "
+        f"{total_uploads} Dateien\n",
     ]
     for f in folders[:20]:
         ts = (
             f.last_upload_at.strftime("%d.%m.%y") if f.last_upload_at else "-"
         )
-        lines.append(
-            f"• <b>{_h_safe(f.kunde_name)}</b> — "
-            f"{f.upload_count or 0} Files, letzter: {ts}"
-        )
+        link = f.drive_folder_url or ""
+        if link:
+            lines.append(
+                f"• <a href=\"{_h_safe(link)}\">{_h_safe(f.kunde_name)}</a> "
+                f"— {f.upload_count or 0} Dateien, letzter {ts}"
+            )
+        else:
+            lines.append(
+                f"• <b>{_h_safe(f.kunde_name)}</b> — "
+                f"{f.upload_count or 0} Dateien, letzter {ts}"
+            )
     if len(folders) > 20:
-        lines.append(f"\n<i>... und {len(folders) - 20} weitere</i>")
+        lines.append(f"\n<i>… und {len(folders) - 20} weitere</i>")
     lines.append("")
     lines.append(
-        "Neuen Upload starten: <b>/archiv &lt;name&gt;</b>"
+        "Suche/Upload: <b>/archiv &lt;name&gt;</b>"
     )
     return "\n".join(lines)
 
 
-async def _handle_archiv_command(chat_id, args: str) -> str:
-    """Wizard-Start: '/archiv Mueller' setzt State + erwartet Files."""
+async def _start_archiv_upload_wizard(
+    chat_id, kunde_name: str, tenant_id, employee_id,
+) -> str:
+    """Setzt STATE_ARCHIV_WAITING_FILES + liefert Wizard-Start-Text.
+
+    Wird sowohl direkt aus _handle_archiv_smart (Single-Match-Pfad) als
+    auch aus den Disambiguation-Handlern (Choice / NewConfirm) genutzt.
+    """
+    await _save_state(
+        chat_id, STATE_ARCHIV_WAITING_FILES,
+        {
+            "kunde_name": kunde_name,
+            "employee_id": str(employee_id),
+            "tenant_id": str(tenant_id),
+            "uploaded": 0,
+        },
+    )
+    return (
+        f"<b>📁 {_h_safe(kunde_name)}</b>\n"
+        "Schick Bilder/PDFs. Mehrere OK.\n"
+        "<b>/fertig</b> zum Abschliessen."
+    )
+
+
+async def _handle_archiv_smart_command(chat_id, args: str) -> str:
+    """Intelligenter Pfad fuer '/archiv <text>'.
+
+    Statt blind einen Wizard zu starten suchen wir erst — und je nach
+    Treffer-Lage routen wir den User:
+    - 0 Treffer  -> STATE_ARCHIV_AWAIT_NEW_CONFIRM (ja/nein-Nachfrage)
+    - 1 Treffer  -> Wizard direkt fuer den gefundenen Ordner
+    - N Treffer  -> STATE_ARCHIV_AWAIT_CHOICE (Auswahlliste)
+    """
+    from core.security.oauth_token_lookup import find_oauth_token
+    from core.integrations.google_drive import (
+        is_drive_configured, list_tenant_kunde_drives,
+    )
+
     name = (args or "").strip()
     if not name or len(name) < 2:
         return (
@@ -11666,34 +11684,173 @@ async def _handle_archiv_command(chat_id, args: str) -> str:
         )
     tenant, emp = res
 
-    # Drive-Verbindung pruefen — sonst direkt freundlicher Hint statt
-    # 5-Sekunden-Wartezeit beim ersten Upload-Versuch.
-    from core.security.oauth_token_lookup import find_oauth_token
-    from core.integrations.google_drive import is_drive_configured
     tok = await find_oauth_token(tenant.id, "google", emp.id)
     if not tok or not is_drive_configured(tok):
         return (
-            "⚠️ <b>Drive ist noch nicht verbunden.</b>\n\n"
-            "Bitte einmal /drive_verbinden ausfuehren — danach klappt "
+            "⚠️ <b>Kunden-Archiv noch nicht verbunden.</b>\n\n"
+            "Bitte einmal /archiv_verbinden ausfuehren — danach klappt "
             "/archiv direkt."
         )
 
-    # State setzen
-    await _save_state(
-        chat_id, STATE_ARCHIV_WAITING_FILES,
-        {
-            "kunde_name": name,
-            "employee_id": str(emp.id),
-            "tenant_id": str(tenant.id),
-            "uploaded": 0,
-        },
+    # Substring-Suche (case-insensitive) ueber alle Ordner
+    needle = name.lower()
+    folders = await list_tenant_kunde_drives(tenant.id, limit=500)
+    matches = [f for f in folders if needle in (f.kunde_name or "").lower()]
+
+    if not matches:
+        # 0 Treffer -> "Neu anlegen?"
+        await _save_state(
+            chat_id, STATE_ARCHIV_AWAIT_NEW_CONFIRM,
+            {
+                "kunde_name": name,
+                "tenant_id": str(tenant.id),
+                "employee_id": str(emp.id),
+            },
+        )
+        return (
+            f"Kein Ordner gefunden zu <i>{_h_safe(name)}</i>.\n\n"
+            f"Soll ich <b>{_h_safe(name)}</b> neu anlegen und auf "
+            f"Files warten? Antworten mit <b>ja</b> oder <b>nein</b>."
+        )
+
+    if len(matches) == 1:
+        # 1 Treffer -> direkt Wizard fuer den existierenden Namen
+        f = matches[0]
+        return await _start_archiv_upload_wizard(
+            chat_id, f.kunde_name, tenant.id, emp.id,
+        )
+
+    # Mehrere Treffer -> Auswahlliste
+    choices = []
+    msg_lines = [
+        f"<b>{len(matches)} Treffer fuer '{_h_safe(name)}'</b> — "
+        f"welcher Ordner?\n"
+    ]
+    for i, f in enumerate(matches[:9], start=1):  # max 9 fuer 1-stellige Nummer
+        ts = (
+            f.last_upload_at.strftime("%d.%m.%y") if f.last_upload_at else "-"
+        )
+        choices.append({
+            "kunde_name": f.kunde_name,
+            "drive_folder_url": f.drive_folder_url or "",
+        })
+        link_part = ""
+        if f.drive_folder_url:
+            link_part = (
+                f"  ·  <a href=\"{_h_safe(f.drive_folder_url)}\">Ordner</a>"
+            )
+        msg_lines.append(
+            f"{i}) <b>{_h_safe(f.kunde_name)}</b> "
+            f"({f.upload_count or 0} Dateien, letzter {ts}){link_part}"
+        )
+    if len(matches) > 9:
+        msg_lines.append(
+            f"\n<i>… und {len(matches) - 9} weitere — bitte praeziser suchen.</i>"
+        )
+    msg_lines.append(
+        "\nAntworten Sie mit der Nummer (1-9) — oder /abbrechen, "
+        "oder einen ganz neuen Namen via <b>/archiv &lt;anderer name&gt;</b>."
     )
 
-    return (
-        f"<b>📁 {_h_safe(name)}</b>\n"
-        "Schick Bilder/PDFs. Mehrere OK.\n"
-        "<b>/fertig</b> zum Abschliessen."
+    await _save_state(
+        chat_id, STATE_ARCHIV_AWAIT_CHOICE,
+        {
+            "matches": choices,
+            "tenant_id": str(tenant.id),
+            "employee_id": str(emp.id),
+        },
     )
+    return "\n".join(msg_lines)
+
+
+async def _handle_archiv_choice_input(chat_id, text, state_data) -> str:
+    """State-Handler STATE_ARCHIV_AWAIT_CHOICE: User waehlt eine Nummer."""
+    matches = (state_data or {}).get("matches") or []
+    try:
+        idx = int(text.strip()) - 1
+    except (ValueError, TypeError):
+        return (
+            "Bitte die Nummer eines Eintrags (1, 2, …) eingeben — oder "
+            "/abbrechen."
+        )
+    if not (0 <= idx < len(matches)):
+        return f"Es gibt nur {len(matches)} Treffer. Bitte gueltige Nummer."
+
+    pick = matches[idx]
+    tenant_id_str = (state_data or {}).get("tenant_id")
+    employee_id_str = (state_data or {}).get("employee_id")
+    if not tenant_id_str:
+        await _clear_state(chat_id)
+        return "State korrupt. Bitte /archiv erneut aufrufen."
+    try:
+        tenant_id = uuid.UUID(tenant_id_str)
+        employee_id = (
+            uuid.UUID(employee_id_str) if employee_id_str else None
+        )
+    except (ValueError, TypeError):
+        await _clear_state(chat_id)
+        return "State korrupt. Bitte /archiv erneut aufrufen."
+
+    return await _start_archiv_upload_wizard(
+        chat_id, pick["kunde_name"], tenant_id, employee_id,
+    )
+
+
+async def _handle_archiv_new_confirm_input(chat_id, text, state_data) -> str:
+    """State-Handler STATE_ARCHIV_AWAIT_NEW_CONFIRM: ja/nein-Bestaetigung."""
+    decision = (text or "").strip().lower()
+    if decision in ("ja", "j", "y", "yes"):
+        kunde_name = (state_data or {}).get("kunde_name") or ""
+        tenant_id_str = (state_data or {}).get("tenant_id")
+        employee_id_str = (state_data or {}).get("employee_id")
+        if not kunde_name or not tenant_id_str:
+            await _clear_state(chat_id)
+            return "State korrupt. Bitte /archiv erneut aufrufen."
+        try:
+            tenant_id = uuid.UUID(tenant_id_str)
+            employee_id = (
+                uuid.UUID(employee_id_str) if employee_id_str else None
+            )
+        except (ValueError, TypeError):
+            await _clear_state(chat_id)
+            return "State korrupt. Bitte /archiv erneut aufrufen."
+        return await _start_archiv_upload_wizard(
+            chat_id, kunde_name, tenant_id, employee_id,
+        )
+    if decision in ("nein", "n", "no"):
+        await _clear_state(chat_id)
+        return "Abgebrochen — kein neuer Ordner angelegt."
+    return "Bitte mit <b>ja</b> oder <b>nein</b> antworten."
+
+
+# Soft-Deprecation: alte /drive*-Befehle leiten freundlich um
+_DRIVE_DEPRECATIONS = {
+    "drive_verbinden": "/archiv_verbinden",
+    "drive_status": "/archiv_status",
+    "drive": "/archiv [name]",
+}
+
+
+async def _handle_deprecated_drive_command(old_command: str, args: str = "") -> str:
+    """Liefert einen Umleitungs-Hinweis fuer /drive*-Aufrufe.
+
+    Wir koennten direkt auf den neuen Befehl umrouten — fuer den
+    Bestandsuser ist ein expliziter Hinweis aber besser, damit er
+    die neue Namensgebung lernt.
+    """
+    key = old_command.lstrip("/").split()[0]
+    new = _DRIVE_DEPRECATIONS.get(key, "/archiv")
+    hint = (
+        f"<b>/{key}</b> heisst jetzt <b>{new}</b>.\n\n"
+        f"Bitte ab sofort den neuen Befehl verwenden — der alte wird "
+        f"in einer kuenftigen Version entfernt."
+    )
+    if args:
+        hint += (
+            f"\n\nUm das gleich zu machen: <code>"
+            f"{new.replace('[name]', args.strip())}</code>"
+        )
+    return hint
 
 
 async def _handle_archiv_file_received(
@@ -11784,7 +11941,7 @@ async def _handle_archiv_file_received(
         return (
             f"⚠️ <b>Drive-Upload fehlgeschlagen</b>\n\n"
             f"{_h_safe(msg)}\n\n"
-            "Bitte einmal /drive_verbinden — danach /archiv erneut."
+            "Bitte einmal /archiv_verbinden — danach /archiv erneut."
         )
     except Exception as e:
         # Quota / Network / API-Error — Wizard NICHT abbrechen
@@ -11801,7 +11958,7 @@ async def _handle_archiv_file_received(
         else:
             hint = (
                 "Unerwarteter Drive-Fehler. Bitte erneut versuchen oder "
-                "/drive_status pruefen."
+                "/archiv_status pruefen."
             )
         return f"⚠️ <b>Upload fehlgeschlagen</b>\n\n{hint}"
 

@@ -77,6 +77,8 @@ from core.models.telegram_state import (
     STATE_FORMULAR_LOESCHEN,
     STATE_FORMULAR_RESET_CONFIRM,
     STATE_ARCHIV_WAITING_FILES,
+    STATE_ARCHIV_AWAIT_CHOICE,
+    STATE_ARCHIV_AWAIT_NEW_CONFIRM,
 )
 from core.models.visualisierung import (
     Visualisierung,
@@ -304,6 +306,8 @@ __all__ = [
     "STATE_STORNO_AWAIT_CHOICE",
     "STATE_STORNO_AWAIT_CONFIRM",
     "STATE_ARCHIV_WAITING_FILES",
+    "STATE_ARCHIV_AWAIT_CHOICE",
+    "STATE_ARCHIV_AWAIT_NEW_CONFIRM",
     "TenantKundeDrive",
 ]
 from core.models.tenant_leistung import TenantLeistung

@@ -108,6 +108,11 @@ STATE_BESTELLEN_MENGE = "bestellen_menge"
 
 # Archiv-Wizard (Google-Drive-Upload pro Kunde)
 STATE_ARCHIV_WAITING_FILES = "archiv_waiting_files"
+# Disambiguation-States: /archiv <text> ist intelligent und kann eine
+# Auswahl-Frage oder eine "neu anlegen?"-Bestaetigung ausloesen wenn die
+# Suche mehrere oder gar keine Treffer liefert.
+STATE_ARCHIV_AWAIT_CHOICE = "archiv_await_choice"
+STATE_ARCHIV_AWAIT_NEW_CONFIRM = "archiv_await_new_confirm"
 
 # Storno-Wizard (Termin per Telegram absagen)
 STATE_STORNO_AWAIT_QUERY = "storno_await_query"
