@@ -2136,18 +2136,38 @@ async def _handle_kalk_excel_received(chat_id, document, bot_token):
             f"{warn_text}"
         )
 
-    # State auf "Confirm" setzen mit den gefundenen Eintraegen
-    eintraege_serial = [
+    # Gemini-Batch-Call: Kategorisierung + Beschreibung pro Eintrag.
+    # Fallback ist intern in classify_excel_eintraege (immer N Eintraege
+    # gleicher Laenge zurueck, im Worst-Case alle "sonstiges" + "").
+    tenant = await _get_tenant_by_chat(chat_id)
+    from core.ai.excel_classifier import classify_excel_eintraege
+    classifier_input = [
         {
+            "name": e.name,
+            "formel": e.formel,
+            "variablen": e.variablen,
+            "sheet": e.sheet,
+        }
+        for e in result.eintraege
+    ]
+    classifications = await classify_excel_eintraege(
+        classifier_input,
+        tenant_id=str(tenant.id) if tenant else None,
+    )
+
+    # State auf "Confirm" setzen mit den gefundenen + klassifizierten Eintraegen
+    eintraege_serial = []
+    for e, cls in zip(result.eintraege, classifications):
+        eintraege_serial.append({
             "name": e.name,
             "formel": e.formel,
             "variablen": e.variablen,
             "raw_excel": e.raw_excel,
             "cell": e.cell,
             "sheet": e.sheet,
-        }
-        for e in result.eintraege
-    ]
+            "kategorie": cls.get("kategorie") or "sonstiges",
+            "beschreibung": cls.get("beschreibung") or "",
+        })
     await _save_state(
         chat_id,
         STATE_KALK_EXCEL_CONFIRM,
@@ -2168,11 +2188,18 @@ async def _handle_kalk_excel_received(chat_id, document, bot_token):
     else:
         msg = f"<b>📊 Gefunden: {len(result.eintraege)} Formel(n)</b>\n\n"
 
-    for i, e in enumerate(result.eintraege[:15], start=1):
-        msg += f"{i}) <b>{e.name}</b>\n"
-        msg += f"   <code>{e.formel}</code>\n"
-    if len(result.eintraege) > 15:
-        msg += f"\n... und {len(result.eintraege) - 15} weitere.\n"
+    # Liste mit Kategorie + Beschreibung (statt nur Name+Formel)
+    from core.models.tenant_kalkulation import KALK_KATEGORIE_LABELS
+    for i, entry in enumerate(eintraege_serial[:15], start=1):
+        kat_label = KALK_KATEGORIE_LABELS.get(
+            entry["kategorie"], entry["kategorie"],
+        )
+        msg += f"{i}) <b>{entry['name']}</b> · <i>{kat_label}</i>\n"
+        if entry.get("beschreibung"):
+            msg += f"   {entry['beschreibung']}\n"
+        msg += f"   <code>{entry['formel']}</code>\n"
+    if len(eintraege_serial) > 15:
+        msg += f"\n... und {len(eintraege_serial) - 15} weitere.\n"
 
     # Quality-Filter-Counts gruppiert (statt unleserliche 270 Einzel-
     # Warnungen wie vorher) — damit ist klar warum Formeln rausgeflogen
@@ -2192,15 +2219,57 @@ async def _handle_kalk_excel_received(chat_id, document, bot_token):
         if len(result.warnungen) > 3:
             msg += f"... und {len(result.warnungen) - 3} weitere.\n"
 
-    msg += "\nAlle als Kategorie <b>'Sonstiges'</b> uebernehmen?\n"
-    msg += "Antworte mit <b>ja</b> zum Speichern oder /abbrechen."
+    msg += (
+        "\n<b>Speichern?</b>\n"
+        "• <b>ja</b> = alle uebernehmen (mit Kategorien wie oben)\n"
+        "• <b>einzeln</b> = pro Formel entscheiden (Wizard)\n"
+        "• <b>/abbrechen</b> = verwerfen"
+    )
     return msg
 
 
+def _build_kalk_entry_for_db(entry: dict, filename: str | None) -> TenantKalkulation:
+    """Baut den TenantKalkulation-Row aus einem State-Entry (Excel-Import).
+
+    beschreibung kommt vom Gemini-Classifier (semantisch); falls leer,
+    fallback auf die technische Excel-Herkunft (filename + sheet!cell +
+    original-Formel) damit der Eintrag in /kalkulation_anzeigen nie
+    ganz nackt steht.
+    """
+    semantic = (entry.get("beschreibung") or "").strip()
+    technical = (
+        f"Aus {filename} ({entry.get('sheet')}!{entry.get('cell')}, "
+        f"Original: {entry.get('raw_excel')})"
+    )
+    beschreibung = semantic or technical
+    return TenantKalkulation(
+        kategorie=entry.get("kategorie") or "sonstiges",
+        name=entry.get("name") or "ohne Namen",
+        formel=entry.get("formel") or "",
+        variablen=entry.get("variablen") or [],
+        source=KALK_SOURCE_EXCEL,
+        excel_filename=filename,
+        beschreibung=beschreibung,
+    )
+
+
 async def _handle_kalk_excel_confirm_input(chat_id, text, state_data):
-    if text.strip().lower() not in {"ja", "j", "yes", "ok"}:
-        return ("Antworte mit <b>ja</b> um die Formeln zu speichern, "
-                "oder /abbrechen um zu verwerfen.")
+    """Behandelt die Antwort auf den Preview.
+
+    Drei Optionen:
+    - "ja"      -> alle Eintraege speichern (Bulk-Import)
+    - "einzeln" -> Per-Entry-Wizard starten (Teil E)
+    - sonst     -> Hilfetext
+    """
+    raw = text.strip().lower()
+    if raw in {"einzeln", "e", "pro", "step"}:
+        return await _start_kalk_excel_per_entry_wizard(chat_id, state_data)
+    if raw not in {"ja", "j", "yes", "ok", "alle"}:
+        return (
+            "Antworte mit <b>ja</b> (alle uebernehmen), "
+            "<b>einzeln</b> (pro Formel entscheiden), "
+            "oder /abbrechen um zu verwerfen."
+        )
 
     data = state_data or {}
     eintraege = data.get("eintraege") or []
@@ -2217,19 +2286,9 @@ async def _handle_kalk_excel_confirm_input(chat_id, text, state_data):
     saved = 0
     async with AsyncSessionLocal() as s:
         for entry in eintraege:
-            s.add(TenantKalkulation(
-                tenant_id=tenant.id,
-                kategorie="sonstiges",
-                name=entry.get("name") or "ohne Namen",
-                formel=entry.get("formel") or "",
-                variablen=entry.get("variablen") or [],
-                source=KALK_SOURCE_EXCEL,
-                excel_filename=filename,
-                beschreibung=(
-                    f"Aus {filename} ({entry.get('sheet')}!{entry.get('cell')}, "
-                    f"Original: {entry.get('raw_excel')})"
-                ),
-            ))
+            row = _build_kalk_entry_for_db(entry, filename)
+            row.tenant_id = tenant.id
+            s.add(row)
             saved += 1
         await s.commit()
 
