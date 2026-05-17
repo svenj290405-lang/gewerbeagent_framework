@@ -717,82 +717,89 @@ async def _handle_start_command(text, chat_id, from_data):
         reply += "Mit /help sehen Sie alle verfuegbaren Befehle."
         return reply
 
-async def _handle_help_command(chat_id=None):
-    """Zeigt die Befehlsliste — gefiltert nach aktiven Features.
+async def _resolve_enabled_features(chat_id):
+    """Holt das Set aktiver Features fuer den Tenant des Chats.
 
-    Layout: pro Befehl eine Zeile mit Kurzbeschreibung. Vollstaendig
-    (alle dispatchbaren Commands sind drin) aber minimalistisch
-    (1 Satz pro Befehl, keine Wall-of-Text).
-
-    Wenn der Tenant z.B. das Drive-Feature nicht hat, blendet /help den
-    KUNDEN-ARCHIV-Block komplett aus. Tenants im Basis-Paket sehen
-    keinen Lexware-, Material- oder Visualisierungs-Block.
-
-    chat_id=None = Fallback (zeigt alles, fuer Test/Doku).
+    None = Chat noch keinem Tenant zugeordnet (Erstkontakt vor /start)
+    oder Feature-Load-Fehler — Caller sollte das als "alles anzeigen"
+    interpretieren (Default-Hilfe).
     """
-    # Aktive Features fuer diesen Tenant ermitteln. Wenn der Chat noch
-    # keinem Tenant zugeordnet ist (z.B. Erstkontakt vor /start),
-    # zeigen wir nur die immer-verfuegbaren Befehle.
-    enabled_features: frozenset[str] | None = None
-    if chat_id is not None:
-        tenant = await _get_tenant_by_chat(chat_id)
-        if tenant is not None:
-            from core.features import enabled_features_for_tenant
-            try:
-                enabled_features = await enabled_features_for_tenant(tenant.id)
-            except Exception as e:
-                logger.warning(f"_handle_help_command: feature-load failed: {e}")
-                enabled_features = None
+    if chat_id is None:
+        return None
+    tenant = await _get_tenant_by_chat(chat_id)
+    if tenant is None:
+        return None
+    from core.features import enabled_features_for_tenant
+    try:
+        return await enabled_features_for_tenant(tenant.id)
+    except Exception as e:
+        logger.warning(f"feature-load failed: {e}")
+        return None
 
-    def _is_on(feature_key: str) -> bool:
-        # Bei fehlendem Tenant-Mapping -> alles anzeigen (Default-Hilfe)
-        if enabled_features is None:
-            return True
-        return feature_key in enabled_features
 
-    lines: list[str] = ["<b>📋 Befehle</b>"]
-    locked_block_count = 0  # fuer kontext-sensitiven Footer-Hinweis
+def _render_command_blocks(
+    header: str,
+    blocks: list[tuple[str, str, list[tuple[str, str]], bool]],
+    footer: str,
+) -> str:
+    """Rendert eine Help-Sicht aus Block-Definitionen.
 
-    def _block(
-        emoji: str, title: str, items: list[tuple[str, str]],
-        *, locked: bool = False,
-    ) -> None:
-        """items = [(cmd, kurzbeschreibung), ...]. Eine Zeile pro Eintrag.
+    blocks = Liste von (emoji, title, items, locked) — items sind
+    (command-mit-args, kurzbeschreibung)-Tupel. Leere items-Listen
+    werden uebersprungen.
 
-        Wenn locked=True: Block-Header bekommt 🔒-Suffix, Befehle
-        bleiben aber sichtbar mit Beschreibung — der User soll wissen
-        was es gibt. Beim Tippen eines locked Befehls greift dann das
-        Feature-Gate mit Upgrade-Hinweis.
+    Locked-Blocks zeigen 🔒-Suffix am Header und triggern den Footer-
+    Hinweis "🔒 = nicht in deinem Paket" — Befehle bleiben sichtbar
+    damit der User weiss was es gibt.
 
-        Wichtig: KEIN <code>-Wrap um den Befehl — Telegram macht
-        Slash-Commands sonst nicht klickbar. Wir nehmen <b> fuer
-        visuelle Unterscheidung. Argument-Hint (z.B. '[name]') steht
-        ausserhalb von <b>, sonst hebt der Bold-Block die Argumente
-        ein und Telegram interpretiert nur das erste Wort als Command
-        — wir wollen aber dass der Link das ganze '/cmd' umfasst.
-        """
-        nonlocal locked_block_count
+    Wichtig: KEIN <code>-Wrap um den Befehl — Telegram macht
+    Slash-Commands sonst nicht klickbar. Wir nehmen <b>. Argument-Hint
+    (z.B. '[name]') steht ausserhalb von <b>, sonst hebt Telegram nur
+    das erste Wort als Command-Link.
+    """
+    lines: list[str] = [header]
+    locked_block_count = 0
+    for emoji, title, items, locked in blocks:
         if not items:
-            return
+            continue
         lines.append("")
         lock_marker = "  🔒" if locked else ""
         if locked:
             locked_block_count += 1
         lines.append(f"{emoji} <b>{title}</b>{lock_marker}")
         for cmd, desc in items:
-            # Command + Args trennen damit nur der echte Slash-Command
-            # in <b> steht und Telegram ihn als clickable parsed.
             cmd_word, _, cmd_args = cmd.partition(" ")
             cmd_args_html = f" {cmd_args}" if cmd_args else ""
             lines.append(f"<b>{cmd_word}</b>{cmd_args_html} — {desc}")
+    lines.append("")
+    if locked_block_count > 0:
+        lines.append(
+            "<i>🔒 = nicht in deinem Paket — Upgrade via "
+            "svenj05@gmx.de. Aktuelle Features: /paket</i>"
+        )
+    if footer:
+        lines.append(footer)
+    return "\n".join(lines)
 
-    # --- Workflow: Kundengespraeche (voice + kalender + always-on kunde) ---
-    # Voice-Init-Befehle haben den expliziten Angebot-Hinweis — wir
-    # zeigen sie auch wenn das Feature nicht aktiv ist, damit der User
-    # sieht dass die Funktionalitaet existiert (mit 🔒-Marker).
-    kunden_items_active: list[tuple[str, str]] = []
-    kunden_items_locked: list[tuple[str, str]] = []
 
+async def _handle_help_command(chat_id=None):
+    """Tages-Help: zeigt was du im Alltag brauchst — Aufnahme, Briefing,
+    Angebote, Material, Archiv etc.
+
+    Setup-Sachen (OAuth-Verbindungen, Status-Checks, Mitarbeiter-
+    Verwaltung) sind bewusst NICHT hier — die kommen in /config. So
+    bleibt die Tages-Sicht uebersichtlich.
+    """
+    enabled_features = await _resolve_enabled_features(chat_id)
+
+    def _is_on(feature_key: str) -> bool:
+        if enabled_features is None:
+            return True
+        return feature_key in enabled_features
+
+    blocks: list[tuple[str, str, list[tuple[str, str]], bool]] = []
+
+    # --- Kundengespraeche (voice + kalender + always-on kunde + storno) ---
     voice_items = [
         ("/aufnahme",
          "Sprachnachricht zum Kundengespraech schicken — Bot "
@@ -802,11 +809,12 @@ async def _handle_help_command(chat_id=None):
          "Letzte eingehende Anrufe mit KI-Zusammenfassung und "
          "erkannten Kunden-Daten."),
     ]
+    kunden_items_active: list[tuple[str, str]] = []
+    kunden_items_locked: list[tuple[str, str]] = []
     if _is_on("voice_init"):
         kunden_items_active.extend(voice_items)
     else:
         kunden_items_locked.extend(voice_items)
-
     if _is_on("kalender"):
         kunden_items_active.append((
             "/briefing",
@@ -820,23 +828,27 @@ async def _handle_help_command(chat_id=None):
             "dazugekommen sind (max 7 Tage voraus). Jeder Eintrag "
             "mit Link direkt zum Outlook-/Google-Calendar-Event.",
         ))
-    # /kunde ist always_on (kunde_lookup-Feature)
+        kunden_items_active.append((
+            "/storno",
+            "Wizard fuer manuellen Termin-Storno: Telefon/Mail "
+            "eingeben -> Trefferliste -> Bestaetigen.",
+        ))
     kunden_items_active.append((
         "/kunde [name | email]",
         "Kundensuche: voller Name (z.B. <i>Anna Mueller</i>) oder "
         "Mail-Adresse (<i>anna@example.com</i>). Zeigt Gespraeche, "
         "Angebote, Lexware-Kontakte und Drive-Ordner.",
     ))
-    _block("📞", "Kundengespraeche", kunden_items_active)
+    blocks.append(("📞", "Kundengespraeche", kunden_items_active, False))
     if kunden_items_locked:
-        _block(
+        blocks.append((
             "📞", "Kundengespraeche — Telefon-Annahme",
-            kunden_items_locked, locked=True,
-        )
+            kunden_items_locked, True,
+        ))
 
-    # --- Buchhaltung (lexware) ---
+    # --- Buchhaltung (lexware) ohne Setup/Status — die sind in /config ---
     if _is_on("lexware"):
-        _block("💰", "Buchhaltung — Belege & Rechnungen", [
+        blocks.append(("💰", "Buchhaltung — Belege & Rechnungen", [
             ("/angebot",
              "Angebot per Text oder Sprache diktieren — Bot wendet "
              "deine /kalkulation-Formeln an, legt das Angebot in Lexware "
@@ -860,15 +872,10 @@ async def _handle_help_command(chat_id=None):
             ("/rechnung_pruefen",
              "Bezahl-Status der offenen Rechnungen sofort gegen "
              "Lexware abgleichen."),
-            ("/lexware_setup",
-             "Lexware-API-Token hinterlegen (einmalig pro Tenant)."),
-            ("/lexware_status",
-             "Lexware-Verbindung + letzte Sync-Zeit pruefen."),
-        ])
+        ], False))
 
-    # --- Material ---
     if _is_on("material"):
-        _block("🛒", "Material", [
+        blocks.append(("🛒", "Material", [
             ("/material",
              "Verbrauchsmaterial-Katalog + letzte Bestellungen."),
             ("/material [name]",
@@ -876,11 +883,10 @@ async def _handle_help_command(chat_id=None):
              "ein Tap loggt die Bestellung + oeffnet den Lieferanten-Link."),
             ("/material_neu",
              "Neuen Artikel anlegen (Wizard: Name → Lieferant → Link)."),
-        ])
+        ], False))
 
-    # --- Wissensbasis ---
     if _is_on("wissensbasis"):
-        _block("📚", "Wissensbasis", [
+        blocks.append(("📚", "Wissensbasis", [
             ("/wissen",
              "Eintrag anlegen — Kategorien: Anfahrt, Leistungen "
              "(Stundensaetze + Pauschalen), Besonderheiten, "
@@ -889,11 +895,10 @@ async def _handle_help_command(chat_id=None):
              "Alle Eintraege gruppiert nach Kategorie."),
             ("/wissen_loeschen",
              "Einen Eintrag entfernen."),
-        ])
+        ], False))
 
-    # --- Kalkulations-Engine ---
     if _is_on("kalkulation"):
-        _block("🧮", "Kalkulation (fuer Angebote)", [
+        blocks.append(("🧮", "Kalkulation (fuer Angebote)", [
             ("/kalkulation",
              "Neue Formel anlegen — z.B. m²-Preis, Pauschale, "
              "Aufschlag-%."),
@@ -903,11 +908,10 @@ async def _handle_help_command(chat_id=None):
              "Eine Formel entfernen."),
             ("/kalkulation_excel",
              "Formel-Set aus .xlsx-Datei importieren."),
-        ])
+        ], False))
 
-    # --- Anfrage-Formular ---
     if _is_on("anfrage_formular"):
-        _block("📋", "Web-Anfrageformular", [
+        blocks.append(("📋", "Web-Anfrageformular", [
             ("/formular",
              "Felder bearbeiten — hinzufuegen, loeschen, "
              "Live-Vorschau."),
@@ -915,22 +919,20 @@ async def _handle_help_command(chat_id=None):
              "Aktuelles Schema mit allen Feldern + Pflichtangaben."),
             ("/formular_zuruecksetzen",
              "Auf Tischler- oder Allgemein-Default zuruecksetzen."),
-        ])
+        ], False))
 
-    # --- Visualisierung (immer anzeigen, mit Lock wenn inaktiv) ---
     viz_items = [
         ("/visualisierung",
          "Foto + Text-Beschreibung schicken → photorealistisches "
          "KI-Rendering. Danach an Kunden mailen, ins "
          "Drive-Archiv legen oder verwerfen."),
     ]
-    _block("🎨", "Visualisierung", viz_items, locked=not _is_on("visualisierung"))
+    blocks.append(("🎨", "Visualisierung", viz_items, not _is_on("visualisierung")))
 
-    # --- Kunden-Archiv (Drive, immer anzeigen mit Lock wenn inaktiv) ---
+    # --- Kunden-Archiv (nur Daily-Use — Setup ist in /config) ---
+    # /fertig bewusst NICHT hier: existiert nur waehrend des laufenden
+    # Upload-Wizards (Bot erinnert dort selbst dran), sonst No-Op.
     drive_items = [
-        ("/archiv_verbinden",
-         "Google-Drive mit dem Tenant verknuepfen (OAuth-Flow). "
-         "Calendar bleibt erhalten — wir erweitern nur den Scope."),
         ("/archiv",
          "Alle Kunden-Ordner als klickbare Liste mit Dateizahl + "
          "letztem Upload."),
@@ -938,82 +940,136 @@ async def _handle_help_command(chat_id=None):
          "Intelligent: 1 Treffer -> direkt Upload-Wizard, mehrere -> "
          "Auswahl, keine -> 'neu anlegen?'. Substring-Match, "
          "case-insensitiv."),
-        ("/archiv_status",
-         "Verbindungs-Check + Quick-Stats (Anzahl Ordner / Dateien / "
-         "letzter Upload)."),
-        ("/fertig",
-         "Archiv-Upload abschliessen (nur im laufenden Upload-Wizard)."),
     ]
-    _block(
+    blocks.append((
         "☁️", "Kunden-Archiv (Google Drive)",
-        drive_items, locked=not _is_on("drive_archiv"),
+        drive_items, not _is_on("drive_archiv"),
+    ))
+
+    blocks.append(("ℹ️", "Sonstiges", [
+        ("/config",
+         "Setup, Verbindungen, Status, Mitarbeiter — alles was du nur "
+         "ab und zu brauchst."),
+        ("/abbrechen",
+         "Laufenden Wizard oder State sofort beenden."),
+        ("/help",
+         "Diese Tages-Sicht."),
+    ], False))
+
+    return _render_command_blocks(
+        header="<b>📋 Befehle</b>",
+        blocks=blocks,
+        footer="<i>Setup, Verbindungen und Status: /config</i>",
     )
 
-    # --- Mail-Inbox (mail_intake) ---
-    if _is_on("mail_intake"):
-        _block("📨", "Mail-Inbox (Outlook)", [
-            ("/microsoft_setup",
-             "Outlook-Postfach via Microsoft-OAuth verbinden."),
-            ("/microsoft_status",
-             "Konfigurierter Account + letzter Polling-Zyklus."),
-            ("/microsoft_check",
-             "Inbox sofort einmal abrufen (statt 2-min-Cron zu "
-             "warten)."),
-        ])
 
-    # --- Setup (Kalender + Standort + Mitarbeiter) ---
-    setup_items: list[tuple[str, str]] = []
+async def _handle_config_command(chat_id=None):
+    """Setup-Sicht: alles was du nur ab und zu brauchst.
+
+    OAuth-Verbindungen (Kalender, Drive, Lexware, Outlook-Mail),
+    Status-Checks fuer dieselben, Werkstatt-Adresse, Mitarbeiter-
+    Verwaltung, Onboarding-Tutorial, Paket-Info. Bewusst getrennt
+    von /help damit die Tages-Sicht uebersichtlich bleibt.
+    """
+    enabled_features = await _resolve_enabled_features(chat_id)
+
+    def _is_on(feature_key: str) -> bool:
+        if enabled_features is None:
+            return True
+        return feature_key in enabled_features
+
+    blocks: list[tuple[str, str, list[tuple[str, str]], bool]] = []
+
+    # --- Verbindungen einrichten (OAuth-Flows) ---
+    verbinden_items: list[tuple[str, str]] = []
     if _is_on("kalender"):
-        setup_items.append((
+        verbinden_items.append((
             "/kalender_verbinden",
             "Google- oder Outlook-Kalender via OAuth verknuepfen.",
         ))
-        setup_items.append((
+    verbinden_items.append((
+        "/archiv_verbinden",
+        "Google-Drive fuer Kunden-Archiv verknuepfen. Calendar bleibt "
+        "erhalten — wir erweitern nur den Scope.",
+    ))
+    if _is_on("lexware"):
+        verbinden_items.append((
+            "/lexware_setup",
+            "Lexware-API-Token hinterlegen (einmalig pro Tenant).",
+        ))
+    if _is_on("mail_intake"):
+        verbinden_items.append((
+            "/microsoft_setup",
+            "Outlook-Postfach via Microsoft-OAuth fuer Mail-Inbox.",
+        ))
+    blocks.append(("🔌", "Verbindungen einrichten", verbinden_items, False))
+
+    # --- Status & Tests ---
+    status_items: list[tuple[str, str]] = []
+    if _is_on("kalender"):
+        status_items.append((
             "/kalender_status",
             "Welcher Kalender ist mit welchem Account verknuepft.",
         ))
+    status_items.append((
+        "/archiv_status",
+        "Verbindungs-Check + Quick-Stats (Anzahl Ordner / Dateien / "
+        "letzter Upload).",
+    ))
+    if _is_on("lexware"):
+        status_items.append((
+            "/lexware_status",
+            "Lexware-Verbindung + letzte Sync-Zeit pruefen.",
+        ))
+    if _is_on("mail_intake"):
+        status_items.append((
+            "/microsoft_status",
+            "Konfigurierter Account + letzter Polling-Zyklus.",
+        ))
+        status_items.append((
+            "/microsoft_check",
+            "Inbox sofort einmal abrufen (statt 2-min-Cron zu warten).",
+        ))
     if _is_on("werkstatt"):
-        setup_items.append((
-            "/werkstatt",
-            "Heimat-Adresse setzen — Basis fuer Fahrtzeit-aware "
-            "Termin-Vorschlaege.",
-        ))
-        setup_items.append((
+        status_items.append((
             "/werkstatt_status",
-            "Aktuell hinterlegte Adresse + Koordinaten.",
+            "Aktuell hinterlegte Heimat-Adresse + Koordinaten.",
         ))
-    if _is_on("mitarbeiter"):
-        setup_items.append((
-            "/mitarbeiter",
-            "Mitarbeiter anlegen — eigener Telegram-Chat, eigener "
-            "Kalender, eigene Skills. Sub-Befehle: <b>aktivieren</b>, "
-            "<b>deaktivieren</b>, <b>skills</b>, <b>job_title</b>, "
-            "<b>arbeitszeit</b>.",
-        ))
-        setup_items.append((
-            "/team",
-            "Team-Status: wer ist heute da, wer krank, wer Urlaub — "
-            "inkl. Vorausschau der naechsten 7 Tage.",
-        ))
-        setup_items.append((
-            "/krank",
-            "Mitarbeiter krankmelden — Bot verteilt Tagestermine "
-            "automatisch auf passende Kollegen um (Skill+Distanz+Verfuegbarkeit).",
-        ))
-        setup_items.append((
-            "/urlaub",
-            "Urlaub planen (Start-/End-Datum). Blockt Slot-Vorschlaege "
-            "in dem Zeitraum, bestehende Termine bleiben.",
-        ))
-        setup_items.append((
-            "/zurueck [slug]",
-            "Mitarbeiter ist wieder gesund/zurueck — beendet die "
-            "aktive Abwesenheit.",
-        ))
-    _block("⚙️", "Setup", setup_items)
+    blocks.append(("📊", "Status & Tests", status_items, False))
 
-    # --- Sonstiges (always-on) ---
-    _block("ℹ️", "Sonstiges", [
+    # --- Standort ---
+    if _is_on("werkstatt"):
+        blocks.append(("📍", "Standort", [
+            ("/werkstatt",
+             "Heimat-Adresse setzen — Basis fuer Fahrtzeit-aware "
+             "Termin-Vorschlaege."),
+        ], False))
+
+    # --- Mitarbeiter & Schichten ---
+    if _is_on("mitarbeiter"):
+        blocks.append(("👥", "Mitarbeiter & Schichten", [
+            ("/mitarbeiter",
+             "Mitarbeiter anlegen — eigener Telegram-Chat, eigener "
+             "Kalender, eigene Skills. Sub-Befehle: <b>aktivieren</b>, "
+             "<b>deaktivieren</b>, <b>skills</b>, <b>job_title</b>, "
+             "<b>arbeitszeit</b>."),
+            ("/team",
+             "Team-Status: wer ist heute da, wer krank, wer Urlaub — "
+             "inkl. Vorausschau der naechsten 7 Tage."),
+            ("/krank",
+             "Mitarbeiter krankmelden — Bot verteilt Tagestermine "
+             "automatisch auf passende Kollegen um "
+             "(Skill+Distanz+Verfuegbarkeit)."),
+            ("/urlaub",
+             "Urlaub planen (Start-/End-Datum). Blockt Slot-Vorschlaege "
+             "in dem Zeitraum, bestehende Termine bleiben."),
+            ("/zurueck [slug]",
+             "Mitarbeiter ist wieder gesund/zurueck — beendet die "
+             "aktive Abwesenheit."),
+        ], False))
+
+    # --- Konto / Tutorial ---
+    blocks.append(("🚀", "Setup & Konto", [
         ("/onboarding",
          "Setup-Tutorial starten oder fortsetzen — Schritt-fuer-Schritt "
          "fragt der Bot alle Stammdaten ab und verbindet Lexware + "
@@ -1022,21 +1078,13 @@ async def _handle_help_command(chat_id=None):
          "Aktuelles Paket + Liste der aktivierten Features."),
         ("/status",
          "Tenant-Slug und Aktivierungs-Status."),
-        ("/abbrechen",
-         "Laufenden Wizard oder State sofort beenden."),
-        ("/help",
-         "Diese Befehlsuebersicht."),
-    ])
+    ], False))
 
-    lines.append("")
-    if locked_block_count > 0:
-        # Footer mit Lock-Erklaerung nur wenn auch wirklich Locks gerendert
-        # wurden — sonst verwirrt's mehr als es hilft.
-        lines.append("<i>🔒 = nicht in deinem Paket — Upgrade via "
-                     "svenj05@gmx.de. Aktuelle Features: /paket</i>")
-    else:
-        lines.append("<i>Alle Features aktiv. Kontakt: svenj05@gmx.de</i>")
-    return "\n".join(lines)
+    return _render_command_blocks(
+        header="<b>⚙️ Config — Setup, Verbindungen & Status</b>",
+        blocks=blocks,
+        footer="<i>Taegliche Befehle: /help</i>",
+    )
 
 
 # =====================================================================
@@ -2586,6 +2634,8 @@ async def _dispatch_update(payload):
         reply = await _handle_start_command(text, chat_id, from_data)
     elif text == "/help":
         reply = await _handle_help_command(chat_id)
+    elif text == "/config":
+        reply = await _handle_config_command(chat_id)
     elif text == "/paket":
         reply = await _handle_paket_command(chat_id)
     elif text == "/status":
@@ -10643,16 +10693,16 @@ async def _onboarding_send_knowledge(chat_id, tenant):
 async def _onboarding_send_done(chat_id, tenant):
     return (
         "🎉 <b>Setup abgeschlossen!</b>\n\n"
-        "Hier ist was du jetzt machen kannst:\n\n"
+        "Im Alltag brauchst du vor allem:\n\n"
         "  • <b>/angebot</b> — Angebot diktieren\n"
         "  • <b>/auftraege</b> — laufende Projekte\n"
         "  • <b>/briefing</b> — Tagestermine\n"
         "  • <b>/neue_termine</b> — neu gebuchte Termine (Diff)\n"
         "  • <b>/aufnahme</b> — Kundengespraech analysieren\n"
-        "  • <b>/help</b> — alle Befehle\n"
-        "  • <b>/status</b> — was ist verbunden\n\n"
-        "Falls du Lexware oder Kalender spaeter nachholst:\n"
-        "  /lexware_setup · /kalender_verbinden · /archiv_verbinden"
+        "  • <b>/help</b> — alle Daily-Befehle\n\n"
+        "<b>Setup, Verbindungen und Status</b> findest du jederzeit "
+        "unter <b>/config</b> — dort kannst du auch spaeter Lexware, "
+        "Kalender oder Drive nachholen."
     )
 
 
@@ -10709,11 +10759,11 @@ async def _handle_onboarding_command(chat_id):
         )
     if tenant.onboarding_completed_at is not None:
         return (
-            "✅ Du hast das Setup schon durchlaufen. Mit /status "
-            "siehst du was verbunden ist, mit /help alle Befehle.\n\n"
-            "Wenn du etwas neu einrichten willst:\n"
-            "  /lexware_setup · /kalender_verbinden · /archiv_verbinden · "
-            "/werkstatt · /microsoft_setup"
+            "✅ Du hast das Setup schon durchlaufen.\n\n"
+            "<b>/help</b> — taegliche Befehle\n"
+            "<b>/config</b> — Verbindungen, Status und Setup-Sachen "
+            "(Lexware, Kalender, Drive, Mail-Inbox, Werkstatt, "
+            "Mitarbeiter)"
         )
     step_idx = tenant.onboarding_step or 0
     if step_idx == 0:
