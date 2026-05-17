@@ -2108,6 +2108,7 @@ async def _handle_kalk_excel_received(chat_id, document, bot_token):
 
     # Parsen
     from core.integrations.excel_kalkulation import (
+        SKIP_REASON_LABELS,
         ExcelImportError,
         extract_formulas_from_xlsx,
     )
@@ -2120,10 +2121,18 @@ async def _handle_kalk_excel_received(chat_id, document, bot_token):
 
     if not result.eintraege:
         warn_text = ("\n\n" + "\n".join(result.warnungen[:5])) if result.warnungen else ""
+        skip_text = ""
+        if result.verworfen_counts:
+            parts = [
+                f"{n}× {SKIP_REASON_LABELS.get(reason, reason)}"
+                for reason, n in result.verworfen_counts.items()
+            ]
+            skip_text = "\n\nQuality-Filter verworfen: " + ", ".join(parts)
         await _clear_state(chat_id)
         return (
-            "⚠️ Keine importierbaren Formeln gefunden.\n\n"
+            "⚠️ Keine brauchbaren Formeln gefunden.\n\n"
             f"Sheets gelesen: {', '.join(result.sheets_gelesen)}"
+            f"{skip_text}"
             f"{warn_text}"
         )
 
@@ -2149,18 +2158,40 @@ async def _handle_kalk_excel_received(chat_id, document, bot_token):
         },
     )
 
-    msg = f"<b>📊 Gefunden: {len(result.eintraege)} Formel(n)</b>\n\n"
+    # Header: "X brauchbar von Y gefunden" — so sieht der Handwerker
+    # sofort wieviel der Tabelle wirklich uebernommen wird.
+    if result.technisch_extrahiert and result.technisch_extrahiert > len(result.eintraege):
+        msg = (
+            f"<b>📊 {len(result.eintraege)} brauchbare Formel(n)</b> "
+            f"<i>(von {result.technisch_extrahiert} gefundenen)</i>\n\n"
+        )
+    else:
+        msg = f"<b>📊 Gefunden: {len(result.eintraege)} Formel(n)</b>\n\n"
+
     for i, e in enumerate(result.eintraege[:15], start=1):
         msg += f"{i}) <b>{e.name}</b>\n"
         msg += f"   <code>{e.formel}</code>\n"
     if len(result.eintraege) > 15:
         msg += f"\n... und {len(result.eintraege) - 15} weitere.\n"
+
+    # Quality-Filter-Counts gruppiert (statt unleserliche 270 Einzel-
+    # Warnungen wie vorher) — damit ist klar warum Formeln rausgeflogen
+    # sind, ohne die Preview zu sprengen.
+    if result.verworfen_counts:
+        msg += "\n<b>🧹 Filter:</b>\n"
+        for reason, n in result.verworfen_counts.items():
+            label = SKIP_REASON_LABELS.get(reason, reason)
+            msg += f"• {n}× verworfen ({label})\n"
+
+    # Uebersetzungs-Warnungen separat — die zeigen welche Excel-Konstrukte
+    # der Parser gar nicht verstanden hat (z.B. SVERWEIS).
     if result.warnungen:
-        msg += "\n<b>⚠️ Hinweise:</b>\n"
-        for w in result.warnungen[:5]:
+        msg += "\n<b>⚠️ Excel-Hinweise:</b>\n"
+        for w in result.warnungen[:3]:
             msg += f"• {w}\n"
-        if len(result.warnungen) > 5:
-            msg += f"... und {len(result.warnungen) - 5} weitere Warnungen.\n"
+        if len(result.warnungen) > 3:
+            msg += f"... und {len(result.warnungen) - 3} weitere.\n"
+
     msg += "\nAlle als Kategorie <b>'Sonstiges'</b> uebernehmen?\n"
     msg += "Antworte mit <b>ja</b> zum Speichern oder /abbrechen."
     return msg

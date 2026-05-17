@@ -77,6 +77,16 @@ class ExcelImportResult:
     eintraege: list[ExcelFormelEintrag]
     warnungen: list[str]
     sheets_gelesen: list[str]
+    # Wieviele Formeln wurden vom Quality-Filter verworfen, gruppiert
+    # nach Grund. Schluessel = Kurz-Code (constant, cell_ref, duplicate),
+    # Wert = Anzahl. Wird in der Telegram-Preview als Counts gezeigt,
+    # damit der Handwerker versteht warum nicht alle Zellen-Formeln
+    # uebernommen wurden.
+    verworfen_counts: dict[str, int] = field(default_factory=dict)
+    # Wieviele Formeln waren technisch valide aber wurden trotzdem
+    # nicht aufgenommen, falls der Handwerker nachvollziehen will
+    # wieviele Formeln "knapp daneben" lagen.
+    technisch_extrahiert: int = 0
 
 
 class ExcelImportError(Exception):
@@ -298,6 +308,27 @@ def _split_top_level_args(s: str) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
+# Skip-Filter-Codes — werden in result.verworfen_counts hochgezaehlt
+# damit die Telegram-Preview gruppiert ausgeben kann warum Formeln
+# nicht in der Endliste landen.
+SKIP_REASON_CONSTANT = "constant"          # Formel hat keine Variablen
+SKIP_REASON_CELL_REF = "cell_ref"          # Formel ist eine einzige Cell-Ref
+SKIP_REASON_DUPLICATE = "duplicate"        # Gleicher pretty_name + Formel
+SKIP_REASON_LABELS = {
+    SKIP_REASON_CONSTANT: "nur Konstante, keine Variable",
+    SKIP_REASON_CELL_REF: "reine Zell-Referenz",
+    SKIP_REASON_DUPLICATE: "Duplikat (Name+Formel kommen mehrfach vor)",
+}
+
+
+def _is_pure_cell_ref(py_formula: str, variablen: list[str]) -> bool:
+    """True wenn die Formel exakt einer Variable entspricht (Bsp:
+    `=B23` wird zu `stufenzahl` — das ist keine Berechnung sondern
+    nur ein Alias auf eine andere Zelle und gehoert nicht in die
+    Kalkulationsregel-Liste)."""
+    return len(variablen) == 1 and py_formula.strip() == variablen[0]
+
+
 def extract_formulas_from_xlsx(
     file_bytes: bytes,
     *,
@@ -306,6 +337,11 @@ def extract_formulas_from_xlsx(
     """
     Liest .xlsx, extrahiert pro Sheet alle Zellen mit Formel und
     uebersetzt sie in Kalkulations-taugliche Python-Formeln.
+
+    Quality-Filter (siehe SKIP_REASON_*): verwirft Konstanten-Formeln,
+    reine Zell-Referenzen, und Duplikate (gleicher pretty_name + gleiche
+    Formel kommen oft bei komplexen Tabellen mit Block-Layout vor —
+    z.B. "Standard" als Label fuer 3 zusammengehoerige Berechnungen).
     """
     try:
         import openpyxl  # noqa: PLC0415 (lazy: optional dep nur fuer Excel)
@@ -326,6 +362,17 @@ def extract_formulas_from_xlsx(
     eintraege: list[ExcelFormelEintrag] = []
     warnungen: list[str] = []
     sheets_gelesen: list[str] = []
+    verworfen_counts: dict[str, int] = {}
+    technisch_extrahiert = 0
+    # (pretty_name_lower, py_formula) -> Anzahl der bereits gesehenen
+    # Treffer. Wird fuer Dedup und Name-Suffix (#2, #3 ...) benutzt.
+    seen_name_formel: dict[tuple[str, str], int] = {}
+    # pretty_name_lower -> wie oft wurde der Name vergeben (auch ueber
+    # unterschiedliche Formeln hinweg) — Basis fuer den Anzeige-Suffix.
+    name_counter: dict[str, int] = {}
+
+    def _bump_skip(reason: str) -> None:
+        verworfen_counts[reason] = verworfen_counts.get(reason, 0) + 1
 
     for ws in wb.worksheets:
         sheets_gelesen.append(ws.title)
@@ -389,9 +436,40 @@ def extract_formulas_from_xlsx(
                     )
                     continue
 
-                name = _label_for_cell(grid, col_idx, row_idx) or f"formel_{ref}"
-                # Schoener Name fuer Anzeige (nicht der Slug)
+                technisch_extrahiert += 1
+
+                # Quality-Filter 1: Konstanten-Formeln (z.B. `1/60`)
+                # bringen als Kalkulationsregel nichts — keine Variable
+                # heisst nichts vom Handwerker zu uebergeben.
+                if not variablen:
+                    _bump_skip(SKIP_REASON_CONSTANT)
+                    continue
+
+                # Quality-Filter 2: Reine Zell-Referenzen (`=B23` -> `stufenzahl`)
+                # sind Aliase und keine Berechnungen.
+                if _is_pure_cell_ref(py_formula, variablen):
+                    _bump_skip(SKIP_REASON_CELL_REF)
+                    continue
+
                 pretty_name = _pretty_label_for_cell(grid, col_idx, row_idx) or ref
+
+                # Quality-Filter 3: Duplikate (gleicher pretty_name +
+                # gleiche Formel) verwerfen. Beispiel: Excel-Block mit
+                # 3x "Standard"-Spalte deren Formeln identisch sind.
+                dedup_key = (pretty_name.lower(), py_formula)
+                if dedup_key in seen_name_formel:
+                    _bump_skip(SKIP_REASON_DUPLICATE)
+                    continue
+                seen_name_formel[dedup_key] = 1
+
+                # Suffix-Nummerierung wenn Name (case-insensitive) schon
+                # vergeben aber Formel unterschiedlich war: "Standard",
+                # "Standard #2", "Standard #3" — so kann der Handwerker
+                # die Eintraege in der Liste unterscheiden.
+                name_key = pretty_name.lower()
+                name_counter[name_key] = name_counter.get(name_key, 0) + 1
+                if name_counter[name_key] > 1:
+                    pretty_name = f"{pretty_name} #{name_counter[name_key]}"
 
                 # Default-Werte aus den Quellzellen einsammeln
                 variable_defaults: dict[str, float] = {}
@@ -430,12 +508,16 @@ def extract_formulas_from_xlsx(
                         eintraege=eintraege,
                         warnungen=warnungen,
                         sheets_gelesen=sheets_gelesen,
+                        verworfen_counts=verworfen_counts,
+                        technisch_extrahiert=technisch_extrahiert,
                     )
 
     return ExcelImportResult(
         eintraege=eintraege,
         warnungen=warnungen,
         sheets_gelesen=sheets_gelesen,
+        verworfen_counts=verworfen_counts,
+        technisch_extrahiert=technisch_extrahiert,
     )
 
 
