@@ -918,13 +918,19 @@ class Plugin(BasePlugin):
         booking_result = None
         action = "neu"  # fuer Logging/Telegram
 
-        # Fall STORNO: Kunde sagt ab, kein neuer Termin
+        # Fall STORNO: Kunde sagt ab, kein neuer Termin.
+        # Resolver versucht erst find_events (kunde_email -> strukturierte
+        # Metadaten oder Volltext), faellt auf conv.gcal_event_id zurueck.
+        # Dadurch werden auch Termine storniert wo der EmailConversation-
+        # Eintrag fehlt (z.B. Mail vom Sekundaer-Account des Kunden).
         if ist_storno:
-            if conv and conv.gcal_event_id:
-                logger.info(f"Storno: cancel event {conv.gcal_event_id}")
-                await self._cancel_via_kalender(tenant, conv.gcal_event_id)
+            cancelled_ids = await self._resolve_and_cancel_storno_events(
+                tenant, sender_email,
+                conv.gcal_event_id if conv else None,
+            )
+            if cancelled_ids:
                 action = "storniert"
-                # Konversation als closed markieren
+                # Konversation als closed markieren (falls vorhanden)
                 conv = await upsert_conversation(
                     tenant_id=tenant.id,
                     kunde_email=sender_email,
@@ -942,9 +948,13 @@ class Plugin(BasePlugin):
                 await self._send_storno_reply(
                     global_cfg, tenant, sender_email, sender_name, subject, message_id
                 )
-                return {"status": "storniert", "tenant": tenant.slug, "event_id": conv.gcal_event_id if conv else None}
+                return {
+                    "status": "storniert",
+                    "tenant": tenant.slug,
+                    "event_ids": cancelled_ids,
+                }
             else:
-                # Kein bestehender Termin gefunden - nur eskalieren
+                # Weder find_events noch fallback hat einen Termin gefunden
                 action = "storno_ohne_termin"
                 await self._notify_tenant_telegram(
                     tenant, sender_email, sender_name, subject, extracted, action="storno_ohne_termin"
@@ -1544,7 +1554,14 @@ class Plugin(BasePlugin):
         return []
 
     async def _cancel_via_kalender(self, tenant, event_id: str) -> None:
-        """Loescht alten Termin ueber kalender.cancel_appointment."""
+        """Loescht einen einzelnen Termin ueber kalender.cancel_appointment.
+
+        Wird benutzt wenn die event_id bekannt ist (z.B. Slot-Wahl-Pfad
+        wo wir gerade das alte Event gebucht hatten). Fuer Storno-Mails
+        wo Kunde nur "ich sage ab" schreibt, nutzt `_resolve_and_cancel_
+        storno_events` — der versucht erst find_events ueber die Mail-
+        Adresse und faellt auf die EmailConversation.gcal_event_id zurueck.
+        """
         from core.plugin_system import get_plugin_for_tenant
         kalender = await get_plugin_for_tenant(tenant.slug, "kalender")
         if not kalender:
@@ -1554,6 +1571,65 @@ class Plugin(BasePlugin):
             logger.info(f"Termin {event_id} geloescht")
         except Exception as e:
             logger.exception(f"cancel fehlgeschlagen: {e}")
+
+    async def _resolve_and_cancel_storno_events(
+        self, tenant, kunde_email: str, conv_event_id: str | None,
+    ) -> list[str]:
+        """Findet + loescht Termine fuer einen Storno-Mail-Absender.
+
+        Strategie:
+        1. PRIMAERE Suche via kalender.find_events(kunde_email=...) —
+           findet alle Termine mit der Mail-Adresse in den strukturierten
+           Metadaten (Termine nach Phase A) ODER per Volltext-Fallback
+           in der description (Bestands-Termine vor Phase A). Funktioniert
+           auch ueber mehrere Mitarbeiter-Kalender.
+        2. FALLBACK auf conv.gcal_event_id wenn find_events nichts liefert
+           — fuer ganz alte Termine bei denen weder Metadaten noch die
+           Mail-Adresse in der description steht.
+
+        Returns: Liste der tatsaechlich geloeschten event_ids (kann leer
+        sein wenn weder find noch fallback was hatte).
+        """
+        from core.plugin_system import get_plugin_for_tenant
+        kalender = await get_plugin_for_tenant(tenant.slug, "kalender")
+        if not kalender:
+            return []
+
+        cancelled: list[str] = []
+        seen: set[str] = set()
+
+        # 1. find_events: nur kunde_email — Telefon haben wir hier nicht
+        # zuverlaessig (Mail-Pipeline hat die nicht aus dem Body extrahiert)
+        try:
+            find_res = await kalender.on_webhook(
+                "find_events", {"kunde_email": kunde_email},
+            )
+            if find_res.get("erfolg"):
+                for ev in find_res.get("termine", []):
+                    eid = ev.get("event_id")
+                    if not eid or eid in seen:
+                        continue
+                    seen.add(eid)
+                    await self._cancel_via_kalender(tenant, eid)
+                    cancelled.append(eid)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(f"Storno find_events fehlgeschlagen: {exc}")
+
+        # 2. Fallback: conv.gcal_event_id (nur wenn find_events leer war
+        # ODER conv_event_id noch nicht via find_events erfasst wurde —
+        # ueblicherweise wuerde find_events den event ohnehin auch
+        # finden, aber Legacy-Events ohne Mail in description/Metadaten
+        # nicht. Idempotent: cancel_event swallowt 404.)
+        if conv_event_id and conv_event_id not in seen:
+            await self._cancel_via_kalender(tenant, conv_event_id)
+            cancelled.append(conv_event_id)
+
+        logger.info(
+            f"Storno: tenant={tenant.slug} mail={kunde_email} "
+            f"geloescht={len(cancelled)} (via find_events={len(seen)}, "
+            f"fallback={'1' if conv_event_id and conv_event_id not in seen else '0'})"
+        )
+        return cancelled
 
     async def _send_slot_proposals(
         self,
