@@ -53,9 +53,17 @@ _EXCEL_FUNCS = {
     # WENN/IF behandeln wir gesondert (3 Args -> Python ternary)
 }
 
-# Regex fuer eine Excel-Zellreferenz, mit optionalem Sheet-Praefix.
-# Wir ignorieren Sheet-Praefix in Phase 1 (gleiches Sheet erwartet).
-_CELL_RE = re.compile(r"(?<![A-Za-z_])(\$?[A-Z]+\$?\d+)(?![A-Za-z_0-9])")
+# Regex fuer eine Excel-Zellreferenz. Optional mit Sheet-Praefix:
+# - `B2`                — Same-Sheet
+# - `VK!B2`             — Cross-Sheet ohne Spaces
+# - `'Sheet Name'!B2`   — Cross-Sheet mit Spaces (Excel-Quotes)
+# Group 1 = Sheet-Name (oder None), Group 2 = Cell-Ref.
+_CELL_RE = re.compile(
+    r"(?<![A-Za-z_])"
+    r"(?:([A-Za-z_][A-Za-z0-9_]*|'[^']+')!)?"
+    r"(\$?[A-Z]+\$?\d+)"
+    r"(?![A-Za-z_0-9])"
+)
 _RANGE_RE = re.compile(r"\$?[A-Z]+\$?\d+:\$?[A-Z]+\$?\d+")
 
 
@@ -175,12 +183,18 @@ def _label_for_cell(
 def _translate_excel_formula(
     excel_formula: str,
     cell_to_var: dict[str, str],
+    current_sheet: str = "",
 ) -> str:
     """
     Uebersetzt eine Excel-Formel in einen Python-Ausdruck, den unsere
     Kalkulations-Engine versteht.
 
-    cell_to_var: Mapping z.B. {"B2": "entfernung_km", "C3": "stunden"}
+    cell_to_var: GLOBALES Mapping ueber alle Sheets. Keys haben das
+        Format "{SheetName}!{CellRef}" — z.B. {"VK!B2": "preis_standard",
+        "Maske!C3": "kunde_wahl"}. Cell-Refs ohne Sheet-Prefix in der
+        Formel werden im current_sheet aufgeloest.
+    current_sheet: Sheet-Name der Formel-Quelle (fuer implizite
+        Same-Sheet-Lookups).
     """
     f = excel_formula.lstrip("=").strip()
 
@@ -220,11 +234,23 @@ def _translate_excel_formula(
     # nicht. Wir wandeln nur einsame "=" um, nicht "==", "<=", ">=", "!=".
     f = re.sub(r"(?<![<>=!])=(?!=)", "==", f)
 
-    # Zellreferenzen -> Variablen
+    # Zellreferenzen -> Variablen. Sheet-Prefix optional, Default ist
+    # current_sheet (impliziter Same-Sheet-Lookup).
     def _repl(m: re.Match[str]) -> str:
-        ref = m.group(1).replace("$", "")
-        if ref in cell_to_var:
+        sheet_raw = m.group(1)
+        ref = m.group(2).replace("$", "")
+        sheet = sheet_raw.strip("'") if sheet_raw else current_sheet
+        key = f"{sheet}!{ref}"
+        if key in cell_to_var:
+            return cell_to_var[key]
+        # Backward-Kompat: alte Tests rufen ohne current_sheet auf —
+        # dort liegt die Map mit reinen Cell-Keys ohne Sheet-Prefix.
+        if not current_sheet and ref in cell_to_var:
             return cell_to_var[ref]
+        if sheet_raw:
+            raise ValueError(
+                f"Zelle {sheet}!{ref} hat keinen erkennbaren Namen (Label)"
+            )
         raise ValueError(f"Zelle {ref} hat keinen erkennbaren Namen (Label)")
 
     f = _CELL_RE.sub(_repl, f)
@@ -268,11 +294,21 @@ def _translate_if(formula: str) -> str:
         inner = formula[args_start:in_func_end]
         # Args splitten - Trennzeichen ; oder , auf Top-Level
         args = _split_top_level_args(inner)
-        if len(args) != 3:
+        # Excel erlaubt sowohl 3-Arg IF(cond, then, else) als auch
+        # 2-Arg IF(cond, then). Bei 2 Args ist die false-Branch in
+        # Excel implizit FALSE — in unserem numerischen Kontext = 0.
+        # Daniels Tabelle nutzt das in Form von verschachtelten IFs:
+        # IF(OR(...), "U-Profil", IF(OR(...), "L-Profil")) wo das
+        # innere IF die 2-Arg-Kurzform ist.
+        if len(args) == 2:
+            bed, dann = (a.strip() for a in args)
+            sonst = "0"
+        elif len(args) == 3:
+            bed, dann, sonst = (a.strip() for a in args)
+        else:
             raise ValueError(
-                f"WENN/IF erwartet 3 Argumente, hat {len(args)}"
+                f"WENN/IF erwartet 2 oder 3 Argumente, hat {len(args)}"
             )
-        bed, dann, sonst = (a.strip() for a in args)
         # rekursiv weiter aufloesen, falls verschachtelt
         bed = _translate_if(bed)
         dann = _translate_if(dann)
@@ -314,11 +350,27 @@ def _split_top_level_args(s: str) -> list[str]:
 SKIP_REASON_CONSTANT = "constant"          # Formel hat keine Variablen
 SKIP_REASON_CELL_REF = "cell_ref"          # Formel ist eine einzige Cell-Ref
 SKIP_REASON_DUPLICATE = "duplicate"        # Gleicher pretty_name + Formel
+SKIP_REASON_STRING_OP = "string_op"        # Excel & = String-Concat (=A1&":")
 SKIP_REASON_LABELS = {
     SKIP_REASON_CONSTANT: "nur Konstante, keine Variable",
     SKIP_REASON_CELL_REF: "reine Zell-Referenz",
     SKIP_REASON_DUPLICATE: "Duplikat (Name+Formel kommen mehrfach vor)",
+    SKIP_REASON_STRING_OP: "String-Concatenation (nicht numerisch)",
 }
+
+
+def _has_string_concat(excel_formula: str) -> bool:
+    """True wenn die Formel den Excel-`&`-Operator (String-Concat) ausserhalb
+    von Stringliteralen verwendet. Solche Formeln sind Beiwerk fuer Beschriftung
+    (z.B. `=VK!B23&":"`) und keine Berechnung — wir skippen sie statt zu
+    versuchen sie zu uebersetzen."""
+    in_str = False
+    for ch in excel_formula:
+        if ch == '"':
+            in_str = not in_str
+        elif ch == "&" and not in_str:
+            return True
+    return False
 
 
 def _is_pure_cell_ref(py_formula: str, variablen: list[str]) -> bool:
@@ -374,35 +426,44 @@ def extract_formulas_from_xlsx(
     def _bump_skip(reason: str) -> None:
         verworfen_counts[reason] = verworfen_counts.get(reason, 0) + 1
 
+    # Sheets als Grids materialisieren (Pass 1 + Pass 2 brauchen beide
+    # alle Grids — bei Cross-Sheet-Refs muss VK!B23 aufloesbar sein
+    # auch wenn die Formel im Sheet "Maske" steht).
+    sheet_grids: dict[str, list[list[Any]]] = {}
     for ws in wb.worksheets:
         sheets_gelesen.append(ws.title)
-
-        # Vollen Grid materialisieren (read_only laeuft sonst nur einmal)
         grid: list[list[Any]] = []
         for row in ws.iter_rows(values_only=True):
             grid.append(list(row))
+        sheet_grids[ws.title] = grid
 
-        # 1. Zell -> Slug-Label aus Nachbarschaft
-        cell_to_var: dict[str, str] = {}
+    # Pass 1 GLOBAL: jede Zahlen-Zelle ueber alle Sheets bekommt einen
+    # eindeutigen Variable-Namen (Label-basiert, mit Slug-Dedup ueber
+    # alle Sheets damit dieselbe "Preis"-Spalte aus 2 Sheets nicht
+    # kollidiert). Key-Format: "{Sheet}!{Cell}".
+    cell_to_var: dict[str, str] = {}
+    used_vars: set[str] = set()
+    for sheet_name, grid in sheet_grids.items():
         for row_idx, row in enumerate(grid):
             for col_idx, value in enumerate(row):
                 if value is None:
                     continue
-                # Spaltenbuchstaben fuer Excel-Notation
-                col_letters = _idx_to_col(col_idx)
-                ref = f"{col_letters}{row_idx + 1}"
                 if isinstance(value, (int, float)) and not isinstance(value, bool):
                     label = _label_for_cell(grid, col_idx, row_idx)
                     if label:
-                        # Bei Duplikat-Slug: numerieren
                         unique = label
                         n = 2
-                        while unique in cell_to_var.values():
+                        while unique in used_vars:
                             unique = f"{label}_{n}"
                             n += 1
-                        cell_to_var[ref] = unique
+                        col_letters = _idx_to_col(col_idx)
+                        ref = f"{col_letters}{row_idx + 1}"
+                        cell_to_var[f"{sheet_name}!{ref}"] = unique
+                        used_vars.add(unique)
 
-        # 2. Formel-Zellen verarbeiten
+    # Pass 2 pro Sheet — Formeln uebersetzen
+    for sheet_name, grid in sheet_grids.items():
+        ws_title = sheet_name  # Aliase damit der Rest des Codes unveraendert bleibt
         for row_idx, row in enumerate(grid):
             for col_idx, value in enumerate(row):
                 if not isinstance(value, str):
@@ -413,11 +474,22 @@ def extract_formulas_from_xlsx(
                 col_letters = _idx_to_col(col_idx)
                 ref = f"{col_letters}{row_idx + 1}"
 
+                # Skip-Filter VOR der Uebersetzung: Excel-String-Concat
+                # `&` schickt uns sonst nur in den ValueError-Pfad
+                # (Python-Parser kennt das nicht). Hunderte solcher
+                # Eintraege in Daniels Tabelle.
+                if _has_string_concat(value):
+                    technisch_extrahiert += 1
+                    _bump_skip(SKIP_REASON_STRING_OP)
+                    continue
+
                 try:
-                    py_formula = _translate_excel_formula(value, cell_to_var)
+                    py_formula = _translate_excel_formula(
+                        value, cell_to_var, current_sheet=ws_title,
+                    )
                 except ValueError as exc:
                     warnungen.append(
-                        f"{ws.title}!{ref}: {exc} (Original: {value})"
+                        f"{ws_title}!{ref}: {exc} (Original: {value})"
                     )
                     continue
 
@@ -431,7 +503,7 @@ def extract_formulas_from_xlsx(
                     variablen = parse_variables(py_formula)
                 except FormelError as exc:
                     warnungen.append(
-                        f"{ws.title}!{ref}: Formel ungueltig ({exc}). "
+                        f"{ws_title}!{ref}: Formel ungueltig ({exc}). "
                         f"Original: {value}"
                     )
                     continue
@@ -471,21 +543,30 @@ def extract_formulas_from_xlsx(
                 if name_counter[name_key] > 1:
                     pretty_name = f"{pretty_name} #{name_counter[name_key]}"
 
-                # Default-Werte aus den Quellzellen einsammeln
+                # Default-Werte aus den Quellzellen einsammeln. cell_to_var
+                # hat jetzt "Sheet!Cell"-Keys — wir muessen das Sheet aus
+                # dem Key parsen um in das richtige sheet_grids[s] zu greifen.
                 variable_defaults: dict[str, float] = {}
                 for var in variablen:
-                    # Reverse-Lookup: welche Cell gehoert zu var?
-                    for cref, vname in cell_to_var.items():
-                        if vname == var:
-                            try:
-                                ccol, crow = _split_cell_ref(cref)
-                                if crow < len(grid) and ccol < len(grid[crow]):
-                                    val = grid[crow][ccol]
-                                    if isinstance(val, (int, float)) and not isinstance(val, bool):
-                                        variable_defaults[var] = float(val)
-                            except (ValueError, IndexError):
-                                pass
+                    for cref_keyed, vname in cell_to_var.items():
+                        if vname != var:
+                            continue
+                        if "!" in cref_keyed:
+                            src_sheet, src_ref = cref_keyed.split("!", 1)
+                        else:
+                            src_sheet, src_ref = ws_title, cref_keyed
+                        src_grid = sheet_grids.get(src_sheet)
+                        if src_grid is None:
                             break
+                        try:
+                            ccol, crow = _split_cell_ref(src_ref)
+                            if crow < len(src_grid) and ccol < len(src_grid[crow]):
+                                val = src_grid[crow][ccol]
+                                if isinstance(val, (int, float)) and not isinstance(val, bool):
+                                    variable_defaults[var] = float(val)
+                        except (ValueError, IndexError):
+                            pass
+                        break
 
                 eintraege.append(
                     ExcelFormelEintrag(
@@ -494,7 +575,7 @@ def extract_formulas_from_xlsx(
                         variablen=variablen,
                         raw_excel=value,
                         cell=ref,
-                        sheet=ws.title,
+                        sheet=ws_title,
                         variable_defaults=variable_defaults,
                     )
                 )
@@ -531,20 +612,65 @@ def _idx_to_col(idx: int) -> str:
     return out
 
 
-def _pretty_label_for_cell(
-    grid: list[list[Any]],
-    col: int,
-    row: int,
+def _row_label_for_cell(
+    grid: list[list[Any]], col: int, row: int,
 ) -> str | None:
-    """Wie _label_for_cell, aber gibt das Original-Label zurueck (nicht Slug)."""
+    """Erste Text-Zelle LINKS in der gleichen Zeile (Zeilen-Beschriftung)."""
     for c in range(col - 1, -1, -1):
         if row < len(grid) and c < len(grid[row]):
             v = grid[row][c]
             if isinstance(v, str) and v.strip() and not v.startswith("="):
                 return v.strip()
-    for r in range(row - 1, -1, -1):
+    return None
+
+
+def _column_header_for_cell(
+    grid: list[list[Any]], col: int, row: int,
+) -> str | None:
+    """Erste Text-Zelle OBEN in der gleichen Spalte (Spalten-Header).
+
+    Sucht von Zeile 0 abwaerts statt direkt-darueber, damit der echte
+    Header (typisch Zeile 1 oder 2) gefunden wird, nicht ein anderer
+    Wert der zufaellig in einer Block-Tabelle ueber der Formel-Zelle steht.
+    """
+    for r in range(row):
         if r < len(grid) and col < len(grid[r]):
             v = grid[r][col]
             if isinstance(v, str) and v.strip() and not v.startswith("="):
                 return v.strip()
     return None
+
+
+def _pretty_label_for_cell(
+    grid: list[list[Any]],
+    col: int,
+    row: int,
+) -> str | None:
+    """Kombiniert Spalten-Header und Zeilen-Label fuer Block-Tabellen.
+
+    Block-Layout-Beispiel (Daniels Treppen-Kalkulation):
+        |          | Standard | Komfort | Premium |   <- Zeile 1 = Spalten-Header
+        | Material |   100    |   150   |   200   |
+        | Summe    | =B2*1.2  | =C2*1.2 | =D2*1.2 |
+
+    Vorher: jede Summen-Zelle nahm nur das LINKS-Label "Summe" — alle
+    drei waren "Summe", "Summe #2", "Summe #3" und der Handwerker
+    wusste nicht welche zu welcher Treppen-Variante gehoert.
+
+    Jetzt: pretty_name = "Spalten-Header — Zeilen-Label" wenn beide da:
+    "Standard — Summe", "Komfort — Summe", "Premium — Summe".
+
+    Wenn nur einer existiert: nur den nehmen. Wenn keiner: None
+    (Caller faellt zurueck auf Cell-Ref wie "B5").
+    """
+    row_label = _row_label_for_cell(grid, col, row)
+    col_header = _column_header_for_cell(grid, col, row)
+
+    # Wenn Header und Row-Label gleich sind (kann passieren bei
+    # diagonal-Layout), nur einen nehmen.
+    if row_label and col_header and row_label.lower() == col_header.lower():
+        return row_label
+
+    if row_label and col_header:
+        return f"{col_header} — {row_label}"
+    return row_label or col_header
