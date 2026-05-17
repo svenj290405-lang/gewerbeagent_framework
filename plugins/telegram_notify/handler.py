@@ -812,6 +812,12 @@ async def _handle_help_command(chat_id=None):
             "den /briefing_xxxx-Befehl pro Eintrag zeigt Briefing, "
             "TODOs, Notizen und den Drive-Ordner.",
         ))
+        kunden_items_active.append((
+            "/neue_termine",
+            "Nur Kalender-Termine die seit dem letzten Aufruf NEU "
+            "dazugekommen sind (max 7 Tage voraus). Jeder Eintrag "
+            "mit Link direkt zum Outlook-/Google-Calendar-Event.",
+        ))
     # /kunde ist always_on (kunde_lookup-Feature)
     kunden_items_active.append((
         "/kunde [name | email]",
@@ -2660,9 +2666,9 @@ async def _dispatch_update(payload):
         if reply_or_none is None:
             return {"ok": True}
         reply = reply_or_none
-    elif text == "/termine":
+    elif text == "/neue_termine":
         await _clear_state(chat_id)
-        reply = await _handle_termine_command(chat_id)
+        reply = await _handle_neue_termine_command(chat_id)
     elif text.startswith("/briefing_"):
         # Detail-Ansicht eines einzelnen Termins per ID-Prefix
         await _clear_state(chat_id)
@@ -4859,28 +4865,71 @@ async def _handle_briefing_command(chat_id):
 
 
 # ----------------------------------------------------------------------
-# /termine — naechste Tage als Liste mit Link in den Kalender
+# /neue_termine — Diff zum letzten Aufruf
 # ----------------------------------------------------------------------
-# Bewusst getrennt von /briefing (heute + heutige Gespraeche). /termine
-# ist die "kalender-zentrische" Sicht: nur Kalender-Events, ueber einen
-# laengeren Zeitraum, jeder Eintrag verlinkt direkt zum Outlook-/Google-
-# Calendar-Web-UI damit Daniel mit einem Klick zum Termin springen kann.
+# Bewusst getrennt von /briefing (heute + heutige Gespraeche). Hier
+# zeigen wir ausschliesslich Kalender-Events ueber 7 Tage, gefiltert
+# auf "was war beim letzten Aufruf noch nicht da" — perfekt fuer den
+# Workflow "ich schaue alle paar Stunden ob jemand neu gebucht hat".
+# Pro Eintrag ein direkter Link zum Outlook-/Google-Calendar-Web-UI.
 
 TERMINE_DEFAULT_DAYS = 7
 TERMINE_MAX_ENTRIES = 20
 
 
-async def _handle_termine_command(chat_id):
-    """Zeigt die naechsten Termine (Default 7 Tage) mit Link zum Kalender.
+async def _get_termine_seen_event_ids(chat_id: int) -> set[str]:
+    """Liefert die Liste der zuletzt gesehenen event_ids fuer diesen Chat.
 
-    Pro Eintrag: Wochentag/Datum/Uhrzeit, Subject, Ort (wenn vorhanden),
-    klickbarer Link "Im Kalender oeffnen" der direkt das Outlook-Web
-    bzw. Google-Calendar-Web-UI fuer diesen Event aufruft.
+    Leeres Set fuer den ersten Aufruf -> Caller zeigt dann alle.
+    """
+    from core.models.telegram_termine_seen import TelegramTermineSeen
+    async with AsyncSessionLocal() as s:
+        row = (await s.execute(
+            select(TelegramTermineSeen).where(
+                TelegramTermineSeen.chat_id == chat_id,
+            )
+        )).scalar_one_or_none()
+        if row is None or not row.event_ids:
+            return set()
+        return set(row.event_ids)
 
-    Phase-4-Multi-Mitarbeiter: jeder Mitarbeiter sieht den eigenen
-    Kalender (current_emp.id). Default-Employee sieht seinen Default-
-    Kalender — Cross-Employee-Listing ist eine andere Funktion (Storno
-    via /storno macht das schon ueber alle Mitarbeiter).
+
+async def _set_termine_seen_event_ids(chat_id: int, event_ids: list[str]) -> None:
+    """Speichert die aktuelle Liste der event_ids als 'jetzt gesehen'.
+
+    Upsert: bei vorhandener Row UPDATE, sonst INSERT. JSONB-Liste wird
+    via direkter Zuweisung gemerkt.
+    """
+    from core.models.telegram_termine_seen import TelegramTermineSeen
+    async with AsyncSessionLocal() as s:
+        row = (await s.execute(
+            select(TelegramTermineSeen).where(
+                TelegramTermineSeen.chat_id == chat_id,
+            )
+        )).scalar_one_or_none()
+        if row is None:
+            row = TelegramTermineSeen(chat_id=chat_id, event_ids=list(event_ids))
+            s.add(row)
+        else:
+            row.event_ids = list(event_ids)
+        await s.commit()
+
+
+async def _handle_neue_termine_command(chat_id):
+    """Zeigt seit dem letzten Aufruf NEU hinzugekommene Kalender-Events.
+
+    Logik:
+    - Holt Events der naechsten 7 Tage vom verbundenen Kalender
+    - Vergleicht event_ids mit der Liste vom letzten Aufruf (in DB)
+    - Zeigt nur Events deren event_id NICHT in der letzten Liste war
+    - Speichert die aktuelle Voll-Liste der event_ids als neue Baseline
+
+    Erste Nutzung (noch keine Baseline): zeigt alle Events und macht
+    daraus die Baseline. Folge-Aufrufe sind dann inkrementell.
+
+    Multi-Mitarbeiter: jeder Mitarbeiter hat seine eigene Chat-ID
+    (telegram_chat_id im Employee) und damit seine eigene Baseline-Row.
+    Daniel + Mitarbeiter Max sehen jeweils ihren eigenen Diff.
     """
     from datetime import datetime, timezone, timedelta
 
@@ -4904,8 +4953,7 @@ async def _handle_termine_command(chat_id):
     today = now_local.date()
     wochentage = ["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"]
 
-    # Naechste N Tage durchgehen — pro Tag 1 API-Call. Bei 7 Tagen
-    # ueberschaubar, der User klickt nicht im Sekundentakt.
+    # Aktuelle Termine im Fenster sammeln
     all_events: list[dict] = []
     provider_label = None
     for offset in range(TERMINE_DEFAULT_DAYS):
@@ -4918,28 +4966,58 @@ async def _handle_termine_command(chat_id):
         for ev in evs:
             all_events.append(ev)
 
-    if not all_events:
+    current_ids = [ev["event_id"] for ev in all_events if ev.get("event_id")]
+
+    # Baseline vom letzten Aufruf holen
+    seen_ids = await _get_termine_seen_event_ids(chat_id)
+    is_first_call = not seen_ids  # leere Baseline = erstmaliger Aufruf
+
+    # Diff: nur Events deren event_id NEU ist
+    if is_first_call:
+        new_events = all_events
+    else:
+        new_events = [
+            ev for ev in all_events
+            if ev.get("event_id") and ev["event_id"] not in seen_ids
+        ]
+
+    # Baseline aktualisieren — auch wenn nichts neu ist, damit
+    # entfernte Termine nicht beim naechsten Mal als "neu"
+    # zurueckkommen.
+    await _set_termine_seen_event_ids(chat_id, current_ids)
+
+    if not new_events:
         prov_part = f" ({provider_label}-Kalender)" if provider_label else ""
         return (
-            f"📅 <b>Keine Termine in den naechsten "
-            f"{TERMINE_DEFAULT_DAYS} Tagen</b>{prov_part}.\n\n"
-            f"<i>Falls Termine fehlen: pruefe ob der richtige Kalender "
-            f"via /kalender_verbinden verbunden ist.</i>"
+            f"📅 <b>Keine neuen Termine seit dem letzten Aufruf</b>"
+            f"{prov_part}.\n\n"
+            f"<i>Es werden nur Termine angezeigt, die seit dem letzten "
+            f"Aufruf von /neue_termine neu hinzugekommen sind. Fuer die "
+            f"komplette Tagesuebersicht /briefing.</i>"
         )
 
     # Chronologisch sortieren + auf MAX limitieren
-    all_events.sort(key=lambda e: e["start_dt"])
-    truncated = len(all_events) > TERMINE_MAX_ENTRIES
-    all_events = all_events[:TERMINE_MAX_ENTRIES]
+    new_events.sort(key=lambda e: e["start_dt"])
+    truncated = len(new_events) > TERMINE_MAX_ENTRIES
+    new_events = new_events[:TERMINE_MAX_ENTRIES]
 
     prov_part = f" <i>({provider_label}-Kalender)</i>" if provider_label else ""
-    lines = [
-        f"📅 <b>Naechste Termine</b> — {TERMINE_DEFAULT_DAYS} Tage{prov_part}\n"
-    ]
-    for ev in all_events:
+    if is_first_call:
+        header = (
+            f"📅 <b>Termine — naechste {TERMINE_DEFAULT_DAYS} Tage</b>"
+            f"{prov_part}\n"
+            f"<i>(Erster Aufruf — alle aktuellen Termine. Beim naechsten "
+            f"Mal zeige ich nur was neu dazugekommen ist.)</i>\n"
+        )
+    else:
+        header = (
+            f"📅 <b>Neue Termine seit dem letzten Aufruf</b>{prov_part}\n"
+            f"<i>(Nur Termine die beim letzten /neue_termine noch nicht "
+            f"da waren. Fuer alles /briefing.)</i>\n"
+        )
+    lines = [header]
+    for ev in new_events:
         s_dt = ev["start_dt"]
-        # naive datetime -> mit local_tz versehen damit strftime in der
-        # richtigen Sicht ausgibt (kommt aus list_events_for_day naive).
         if s_dt.tzinfo is None:
             s_dt_local = s_dt.replace(tzinfo=local_tz)
         else:
@@ -4957,13 +5035,12 @@ async def _handle_termine_command(chat_id):
             f"{_h_safe(subject)}{ort_suffix}"
         )
         if web_link:
-            # HTML-Tag-Anchor — Telegram rendert das als Hyperlink
             lines.append(f'  🔗 <a href="{_h_safe(web_link)}">Im Kalender oeffnen</a>')
         lines.append("")
 
     if truncated:
         lines.append(
-            f"<i>… weitere Termine ausgeblendet (Limit "
+            f"<i>… weitere neue Termine ausgeblendet (Limit "
             f"{TERMINE_MAX_ENTRIES}). Direkt im Kalender pruefen.</i>"
         )
     return "\n".join(lines)
@@ -10555,6 +10632,7 @@ async def _onboarding_send_done(chat_id, tenant):
         "  • <b>/angebot</b> — Angebot diktieren\n"
         "  • <b>/auftraege</b> — laufende Projekte\n"
         "  • <b>/briefing</b> — Tagestermine\n"
+        "  • <b>/neue_termine</b> — neu gebuchte Termine (Diff)\n"
         "  • <b>/aufnahme</b> — Kundengespraech analysieren\n"
         "  • <b>/help</b> — alle Befehle\n"
         "  • <b>/status</b> — was ist verbunden\n\n"

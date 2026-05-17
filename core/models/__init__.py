@@ -6,6 +6,7 @@ from core.models.email_conversation import (
     STATE_CLOSED,
 )
 from core.models.oauth_state import OAuthState
+from core.models.telegram_termine_seen import TelegramTermineSeen
 from core.models.telegram_state import (
     TelegramState,
     STATE_WISSEN_KATEGORIE,
@@ -241,6 +242,7 @@ __all__ = [
     "OAuthToken",
     "OAuthState",
     "TelegramState",
+    "TelegramTermineSeen",
     "STATE_WISSEN_KATEGORIE",
     "STATE_WISSEN_TEXT",
     "STATE_WISSEN_LOESCHEN",
