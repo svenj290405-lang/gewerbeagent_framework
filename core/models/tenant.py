@@ -74,6 +74,14 @@ class Tenant(Base):
         String(30), nullable=True, unique=True, index=True
     )
 
+    # Cached Google-Drive-Root-Folder-ID. Wird einmal beim ersten Upload
+    # gesetzt (search-by-Name + Fallback create), danach via files.get
+    # benutzt. Verhindert Naming-Drift wenn company_name oder die
+    # Naming-Konvention im Code spaeter geaendert werden.
+    drive_root_folder_id: Mapped[str | None] = mapped_column(
+        String(200), nullable=True
+    )
+
     # Werkstatt-Adresse — Heimat-Punkt fuer Smart-Termin-Routing.
     # Migration k4f1a8b2d6e3. Pro Tenant ueber /werkstatt-Wizard gepflegt.
     heimat_strasse: Mapped[str | None] = mapped_column(String(255), nullable=True)

@@ -211,42 +211,94 @@ async def _ensure_root_folder(
 ) -> str:
     """Findet oder erstellt den Tenant-Root-Ordner. Returns folder_id.
 
-    Cache-Strategie: wir suchen nach Folder mit dem Namen — wenn nicht
-    gefunden, erstellen. Damit ueberlebt das auch wenn der Tenant den
-    DB-Mapping verliert (selten).
+    Drei-stufige Strategie:
+    1. **DB-Cache (`tenants.drive_root_folder_id`)** — schnellster Weg
+       und Naming-Drift-sicher. Wird via files.get validiert; wenn der
+       gecachte Ordner geloescht wurde, falls-through.
+    2. **Suche-by-Name** mit allen bekannten Namens-Varianten (Em-Dash,
+       Unterstrich, ASCII-Minus) — uebernimmt einen existierenden Ordner
+       und cached die ID, damit ab jetzt Schritt 1 greift.
+    3. **Erstellen** mit dem aktuellen kanonischen Namen + cachen.
+
+    So entsteht garantiert nur EIN Root-Ordner pro Tenant, auch wenn
+    company_name oder die Naming-Konvention spaeter geaendert werden.
     """
-    root_name = _root_folder_name(tenant)
+    canonical_name = _root_folder_name(tenant)
+    # Naming-Varianten die historisch verwendet wurden — werden bei
+    # Suche-by-Name probiert um Waisen aus alten Code-Versionen zu
+    # uebernehmen statt einen neuen Duplikat-Ordner zu erstellen.
+    legacy_names = [
+        canonical_name,                                # "Gewerbeagent — X"
+        canonical_name.replace(" — ", "_ "),           # "Gewerbeagent_ X"
+        canonical_name.replace(" — ", " - "),          # "Gewerbeagent - X"
+    ]
 
-    def _sync_find_or_create():
-        # Suche nach existierendem Root.
-        # In Drive-Query muss ' escaped werden. Wir nutzen str.replace
-        # vor dem f-String weil f-Strings keine Backslashes erlauben.
-        escaped_name = root_name.replace("'", "\\'")
-        q = (
-            f"name='{escaped_name}' "
-            f"and mimeType='{DRIVE_FOLDER_MIME}' "
-            f"and trashed=false"
-        )
+    def _sync_validate_cached(folder_id: str) -> bool:
+        """Prueft ob ein gecachter Folder noch existiert + nicht im Trash."""
         try:
-            res = service.files().list(
-                q=q, spaces="drive",
-                fields="files(id, name, parents)",
-                pageSize=10,
+            meta = service.files().get(
+                fileId=folder_id, fields="id, trashed",
             ).execute()
-            files = res.get("files", [])
-            if files:
-                return files[0]["id"]
-        except Exception as e:
-            logger.warning(f"Root-Folder-Suche failed (egal, create): {e}")
+            return not meta.get("trashed", False)
+        except Exception:
+            return False
 
-        # Nicht da: erstellen
-        meta = {"name": root_name, "mimeType": DRIVE_FOLDER_MIME}
-        created = service.files().create(
-            body=meta, fields="id",
-        ).execute()
+    def _sync_find_by_names() -> str | None:
+        for name in legacy_names:
+            escaped = name.replace("'", "\\'")
+            q = (
+                f"name='{escaped}' "
+                f"and mimeType='{DRIVE_FOLDER_MIME}' "
+                f"and trashed=false"
+            )
+            try:
+                res = service.files().list(
+                    q=q, spaces="drive",
+                    fields="files(id, name)",
+                    pageSize=10,
+                ).execute()
+                files = res.get("files", [])
+                if files:
+                    return files[0]["id"]
+            except Exception as e:
+                logger.warning(f"Root-Folder-Suche '{name}' failed: {e}")
+        return None
+
+    def _sync_create() -> str:
+        meta = {"name": canonical_name, "mimeType": DRIVE_FOLDER_MIME}
+        created = service.files().create(body=meta, fields="id").execute()
         return created["id"]
 
-    return await asyncio.to_thread(_sync_find_or_create)
+    # 1. DB-Cache
+    cached_id = getattr(tenant, "drive_root_folder_id", None)
+    if cached_id:
+        if await asyncio.to_thread(_sync_validate_cached, cached_id):
+            return cached_id
+        logger.info(
+            f"Cached Drive-Root-Folder {cached_id} fuer tenant={tenant.slug} "
+            "ist weg (trashed/deleted) — suche/erstelle neu."
+        )
+
+    # 2. Suche-by-Name (alle Naming-Varianten)
+    found_id = await asyncio.to_thread(_sync_find_by_names)
+    if not found_id:
+        # 3. Erstellen
+        found_id = await asyncio.to_thread(_sync_create)
+        logger.info(
+            f"Drive-Root-Folder '{canonical_name}' neu erstellt "
+            f"(id={found_id}) fuer tenant={tenant.slug}"
+        )
+
+    # Cache in DB schreiben damit Schritt 1 ab jetzt greift
+    async with AsyncSessionLocal() as s:
+        db_tenant = (await s.execute(
+            select(Tenant).where(Tenant.id == tenant.id)
+        )).scalar_one_or_none()
+        if db_tenant is not None and db_tenant.drive_root_folder_id != found_id:
+            db_tenant.drive_root_folder_id = found_id
+            await s.commit()
+
+    return found_id
 
 
 async def get_or_create_kunde_folder(
