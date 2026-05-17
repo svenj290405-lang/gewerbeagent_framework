@@ -79,6 +79,32 @@ class CalendarAdapter(ABC):
     async def delete_event(self, event_id: str) -> bool:
         """Loeschen. True bei Erfolg oder schon-weg."""
 
+    @abstractmethod
+    async def find_events(
+        self, *,
+        time_min: dt.datetime,
+        time_max: dt.datetime,
+        kunde_telefon_normalized: str | None = None,
+        kunde_email: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Sucht Events nach Telefon ODER Email im Zeitraum.
+
+        Strategy beider Provider:
+        1. PRIMAERE Metadaten-Suche ueber extendedProperties — exakt,
+           findet alle Events die nach dem create_event-Refactor
+           angelegt wurden.
+        2. FALLBACK Volltext-Suche auf description fuer Bestands-Events
+           ohne Metadaten. Treffer wird nochmal verifiziert (Telefon-
+           Suffix-Match in description / Email-Substring), um zufaellige
+           Sub-String-Treffer auszuschliessen.
+
+        Returns: Liste von dicts mit Keys:
+          - event_id, start_dt, end_dt (naive Lokal-Zeit)
+          - summary, description, location
+          - kunde_telefon_match (bool), kunde_email_match (bool)
+          - match_source: "metadata" | "fulltext"
+        """
+
 
 # =====================================================================
 # GOOGLE Calendar Adapter
@@ -157,6 +183,13 @@ class GoogleCalendarAdapter(CalendarAdapter):
                 "start_dt": _p.isoparse(s_iso).replace(tzinfo=None),
                 "end_dt": _p.isoparse(e_iso).replace(tzinfo=None),
                 "location": (ev.get("location") or "").strip(),
+                # Konsistent zur Microsoft-Variante: subject/event_id/
+                # body_preview durchreichen damit Caller wie /briefing
+                # oder find_events nicht extra eine zweite API-Runde
+                # brauchen.
+                "subject": (ev.get("summary") or "").strip(),
+                "event_id": ev.get("id") or "",
+                "body_preview": (ev.get("description") or "")[:300].strip(),
             })
         return events
 
@@ -215,6 +248,125 @@ class GoogleCalendarAdapter(CalendarAdapter):
                 return True
             logger.warning(f"Google delete_event({event_id}) failed: {exc}")
             return False
+
+    async def find_events(
+        self, *, time_min, time_max,
+        kunde_telefon_normalized=None, kunde_email=None,
+    ):
+        from dateutil import parser as _p  # type: ignore
+        from plugins.kalender.event_match import (
+            verify_fulltext_phone_match, verify_fulltext_email_match,
+        )
+        service = await self._get_service()
+        tz = self._tz_offset()
+        t_min = time_min.isoformat() + tz
+        t_max = time_max.isoformat() + tz
+
+        results: dict[str, dict[str, Any]] = {}
+
+        def _ingest(items, *, source, phone_match, email_match):
+            for ev in items or []:
+                s = ev.get("start", {})
+                e = ev.get("end", {})
+                s_iso = s.get("dateTime") or s.get("date")
+                e_iso = e.get("dateTime") or e.get("date")
+                if not s_iso or not e_iso:
+                    continue
+                eid = ev.get("id") or ""
+                if not eid:
+                    continue
+                # Erst-Treffer gewinnt; bei zweitem Treffer flag-Merge
+                # damit "via metadata + via fulltext" beides sichtbar
+                # ist (match_source bleibt aber der zuerst gefundene).
+                if eid in results:
+                    if phone_match:
+                        results[eid]["kunde_telefon_match"] = True
+                    if email_match:
+                        results[eid]["kunde_email_match"] = True
+                    continue
+                results[eid] = {
+                    "event_id": eid,
+                    "start_dt": _p.isoparse(s_iso).replace(tzinfo=None),
+                    "end_dt": _p.isoparse(e_iso).replace(tzinfo=None),
+                    "summary": (ev.get("summary") or "").strip(),
+                    "description": (ev.get("description") or "").strip(),
+                    "location": (ev.get("location") or "").strip(),
+                    "kunde_telefon_match": bool(phone_match),
+                    "kunde_email_match": bool(email_match),
+                    "match_source": source,
+                }
+
+        # ----- PRIMAER: extendedProperties.private (exakt) -----
+        # Google's privateExtendedProperty-Param: mehrere Werte werden
+        # AND-verknuepft. Fuer ODER-Semantik zwei separate Aufrufe.
+        if kunde_telefon_normalized:
+            try:
+                resp = service.events().list(
+                    calendarId=self.calendar_id,
+                    timeMin=t_min, timeMax=t_max,
+                    singleEvents=True, orderBy="startTime",
+                    privateExtendedProperty=f"kunde_telefon={kunde_telefon_normalized}",
+                ).execute()
+                _ingest(resp.get("items", []), source="metadata",
+                        phone_match=True, email_match=False)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"Google find_events phone-metadata failed: {exc}")
+        if kunde_email:
+            try:
+                resp = service.events().list(
+                    calendarId=self.calendar_id,
+                    timeMin=t_min, timeMax=t_max,
+                    singleEvents=True, orderBy="startTime",
+                    privateExtendedProperty=f"kunde_email={kunde_email}",
+                ).execute()
+                _ingest(resp.get("items", []), source="metadata",
+                        phone_match=False, email_match=True)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"Google find_events email-metadata failed: {exc}")
+
+        # ----- FALLBACK: Volltext via q= (mit Verifikation) -----
+        # Fuer Legacy-Events ohne extendedProperties. Google's q-Param
+        # matcht summary/description/location/attendees. Wir verifizieren
+        # nochmal lokal um Random-Treffer auszuschliessen ("0123" matched
+        # auch in einer Adresse "Hauptstr. 0123").
+        if kunde_telefon_normalized:
+            try:
+                resp = service.events().list(
+                    calendarId=self.calendar_id,
+                    timeMin=t_min, timeMax=t_max,
+                    singleEvents=True, orderBy="startTime",
+                    q=kunde_telefon_normalized[-8:] if len(kunde_telefon_normalized) >= 8 else kunde_telefon_normalized,
+                ).execute()
+                verified = [
+                    ev for ev in resp.get("items", [])
+                    if verify_fulltext_phone_match(
+                        kunde_telefon_normalized, ev.get("description") or "",
+                    )
+                ]
+                _ingest(verified, source="fulltext",
+                        phone_match=True, email_match=False)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"Google find_events phone-fulltext failed: {exc}")
+        if kunde_email:
+            try:
+                resp = service.events().list(
+                    calendarId=self.calendar_id,
+                    timeMin=t_min, timeMax=t_max,
+                    singleEvents=True, orderBy="startTime",
+                    q=kunde_email,
+                ).execute()
+                verified = [
+                    ev for ev in resp.get("items", [])
+                    if verify_fulltext_email_match(
+                        kunde_email, ev.get("description") or "",
+                    )
+                ]
+                _ingest(verified, source="fulltext",
+                        phone_match=False, email_match=True)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"Google find_events email-fulltext failed: {exc}")
+
+        return list(results.values())
 
 
 # =====================================================================
@@ -289,6 +441,19 @@ class MicrosoftCalendarAdapter(CalendarAdapter):
         from core.integrations.microsoft_calendar import delete_event
         return await delete_event(
             self.tenant_id, event_id, employee_id=self.employee_id,
+        )
+
+    async def find_events(
+        self, *, time_min, time_max,
+        kunde_telefon_normalized=None, kunde_email=None,
+    ):
+        from core.integrations.microsoft_calendar import find_events
+        return await find_events(
+            self.tenant_id,
+            time_min=time_min, time_max=time_max,
+            kunde_telefon_normalized=kunde_telefon_normalized,
+            kunde_email=kunde_email,
+            employee_id=self.employee_id,
         )
 
 

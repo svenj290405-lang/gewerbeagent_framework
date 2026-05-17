@@ -125,6 +125,8 @@ class Plugin(BasePlugin):
             return await self._find_free_slots(payload)
         elif endpoint == "cancel_appointment":
             return await self._cancel_appointment(payload)
+        elif endpoint == "find_events":
+            return await self._find_events(payload)
         return {"error": f"Unbekannter Endpunkt: {endpoint}"}
 
     # ---- Endpoints ----
@@ -624,6 +626,95 @@ class Plugin(BasePlugin):
         meta["kunde_lat"] = kunde_geo.lat
         meta["kunde_lon"] = kunde_geo.lon
         return enriched, meta
+
+    async def _find_events(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Sucht Termine nach Telefon ODER Email ueber ALLE Mitarbeiter-Kalender.
+
+        Storno-Pipeline-Eintrittspunkt: Voice-Anrufer / Mail-Storno /
+        Telegram-Wizard rufen das hier auf, kriegen eine deduplizierte
+        Liste passender Events ueber alle aktiven Mitarbeiter zurueck.
+
+        Payload:
+          - kunde_telefon (str, optional): wird hier normalisiert
+          - kunde_email (str, optional)
+          - time_min (ISO-String, optional, Default: jetzt)
+          - time_max (ISO-String, optional, Default: jetzt + 30 Tage)
+
+        Response:
+          {"erfolg": True, "anzahl": N, "termine": [...]}
+          Pro Termin: event_id, employee_id (welcher Kalender),
+          start_dt/end_dt (ISO), summary, description, location,
+          kunde_telefon_match, kunde_email_match, match_source.
+        """
+        try:
+            telefon_raw = (payload.get("kunde_telefon") or "").strip()
+            email_raw = (payload.get("kunde_email") or "").strip()
+            telefon_norm = normalize_phone(telefon_raw) or None
+            email_norm = email_raw.lower() or None
+            if not telefon_norm and not email_norm:
+                return {
+                    "erfolg": False,
+                    "nachricht": "kunde_telefon oder kunde_email erforderlich",
+                }
+
+            # Zeitraum default: jetzt → +30 Tage
+            from dateutil import parser as _p  # type: ignore
+            now = datetime.now()
+            time_min_raw = payload.get("time_min")
+            time_max_raw = payload.get("time_max")
+            time_min = _p.isoparse(time_min_raw).replace(tzinfo=None) if time_min_raw else now
+            time_max = _p.isoparse(time_max_raw).replace(tzinfo=None) if time_max_raw else now + timedelta(days=30)
+
+            # Alle aktiven Mitarbeiter durchgehen — jeder hat eigenen
+            # Kalender. Default-Employee zuerst (Reihenfolge aus
+            # get_employees_for_tenant ist is_default DESC, slug ASC).
+            from core.models.employee import get_employees_for_tenant
+            employees = await get_employees_for_tenant(self.tenant_id, active_only=True)
+            if not employees:
+                return {"erfolg": True, "anzahl": 0, "termine": []}
+
+            termine: list[dict[str, Any]] = []
+            seen_event_ids: set[str] = set()  # gegen Cross-Kalender-Dupes (selten)
+            for emp in employees:
+                try:
+                    adapter = await get_calendar_adapter(
+                        self.tenant_id, employee_id=emp.id,
+                        fallback_calendar_id=self.config["calendar_id"],
+                    )
+                    found = await adapter.find_events(
+                        time_min=time_min, time_max=time_max,
+                        kunde_telefon_normalized=telefon_norm,
+                        kunde_email=email_norm,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(f"find_events: emp={emp.slug} crash: {exc}")
+                    continue
+                for ev in found:
+                    eid = ev.get("event_id") or ""
+                    if not eid or eid in seen_event_ids:
+                        continue
+                    seen_event_ids.add(eid)
+                    termine.append({
+                        "event_id": eid,
+                        "employee_id": str(emp.id),
+                        "employee_slug": emp.slug,
+                        "start_dt": ev["start_dt"].isoformat(),
+                        "end_dt": ev["end_dt"].isoformat(),
+                        "summary": ev.get("summary", ""),
+                        "description": ev.get("description", ""),
+                        "location": ev.get("location", ""),
+                        "kunde_telefon_match": ev.get("kunde_telefon_match", False),
+                        "kunde_email_match": ev.get("kunde_email_match", False),
+                        "match_source": ev.get("match_source", ""),
+                    })
+
+            # Chronologisch sortieren — naechster Termin oben
+            termine.sort(key=lambda t: t["start_dt"])
+            return {"erfolg": True, "anzahl": len(termine), "termine": termine}
+
+        except Exception as e:
+            logger.exception(f"find_events crashed: {e}")
+            return {"erfolg": False, "nachricht": f"Fehler bei Termin-Suche: {str(e)}"}
 
     async def _cancel_appointment(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Loescht einen Termin (provider-agnostisch via Adapter)."""

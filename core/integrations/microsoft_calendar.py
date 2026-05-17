@@ -244,6 +244,211 @@ async def create_event(
 
 
 # ---------------------------------------------------------------------
+# EVENT-FIND (kunde_telefon / kunde_email — Storno-Suche)
+# ---------------------------------------------------------------------
+
+async def find_events(
+    tenant_id: UUID,
+    *,
+    time_min: dt.datetime,
+    time_max: dt.datetime,
+    kunde_telefon_normalized: str | None = None,
+    kunde_email: str | None = None,
+    employee_id: UUID | None = None,
+) -> list[dict[str, Any]]:
+    """Sucht Events nach Telefon ODER Email im Zeitraum.
+
+    Strategie:
+    1. Metadaten-Suche: /me/calendarView mit $filter ueber
+       singleValueExtendedProperties (Property-Set GA_PROPSET_GUID).
+       Wir machen pro Kriterium einen Request (kein OR im $filter
+       weil $expand-Klausel sonst kollidiert).
+    2. Volltext-Fallback: /me/events?$search="..." (mit
+       ConsistencyLevel: eventual). Manuelles Datum-Filtering weil
+       $search und $filter nicht kombinierbar sind.
+
+    Returns: Liste von dicts wie im Adapter dokumentiert.
+    """
+    from plugins.kalender.event_match import (
+        verify_fulltext_phone_match, verify_fulltext_email_match,
+    )
+    token = await get_microsoft_token(tenant_id, employee_id=employee_id)
+    start_iso = _iso_no_tz(time_min)
+    end_iso = _iso_no_tz(time_max)
+
+    results: dict[str, dict[str, Any]] = {}
+
+    def _parse_dt(s: str) -> dt.datetime:
+        return dt.datetime.fromisoformat(s).replace(tzinfo=None)
+
+    def _ingest(items, *, source, phone_match, email_match):
+        for ev in items or []:
+            eid = ev.get("id") or ""
+            if not eid:
+                continue
+            try:
+                s_dt = _parse_dt(ev["start"]["dateTime"])
+                e_dt = _parse_dt(ev["end"]["dateTime"])
+            except (KeyError, ValueError):
+                continue
+            if eid in results:
+                if phone_match:
+                    results[eid]["kunde_telefon_match"] = True
+                if email_match:
+                    results[eid]["kunde_email_match"] = True
+                continue
+            results[eid] = {
+                "event_id": eid,
+                "start_dt": s_dt,
+                "end_dt": e_dt,
+                "summary": (ev.get("subject") or "").strip(),
+                "description": _strip_html(
+                    (ev.get("body") or {}).get("content") or ""
+                ) or (ev.get("bodyPreview") or "").strip(),
+                "location": (
+                    (ev.get("location") or {}).get("displayName") or ""
+                ).strip(),
+                "kunde_telefon_match": bool(phone_match),
+                "kunde_email_match": bool(email_match),
+                "match_source": source,
+            }
+
+    async def _query_metadata(prop_name: str, prop_value: str,
+                              phone_match: bool, email_match: bool):
+        prop_id = ga_prop_id(prop_name)
+        # $filter erfordert ConsistencyLevel: eventual fuer extended
+        # property queries (Graph "advanced query parameters").
+        params = {
+            "startDateTime": start_iso,
+            "endDateTime": end_iso,
+            "$filter": (
+                f"singleValueExtendedProperties/any("
+                f"ep:ep/id eq '{prop_id}' and ep/value eq '{prop_value}')"
+            ),
+            "$expand": (
+                f"singleValueExtendedProperties($filter=id eq '{prop_id}')"
+            ),
+            "$top": 100,
+        }
+        try:
+            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS) as client:
+                resp = await client.get(
+                    f"{GRAPH_API_BASE}/me/calendarView",
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "ConsistencyLevel": "eventual",
+                        "Prefer": f'outlook.timezone="{DEFAULT_TIMEZONE}"',
+                    },
+                    params=params,
+                )
+                if resp.status_code != 200:
+                    logger.warning(
+                        f"Outlook find_events metadata {prop_name} "
+                        f"{resp.status_code}: {resp.text[:200]}"
+                    )
+                    return
+                data = resp.json()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"Outlook find_events metadata {prop_name} crash: {exc}")
+            return
+        _ingest(data.get("value", []), source="metadata",
+                phone_match=phone_match, email_match=email_match)
+
+    async def _query_fulltext(search_value: str, verify_needle: str,
+                              phone_match: bool,
+                              email_match: bool, verify_fn):
+        # $search braucht Quotes um den Wert und ConsistencyLevel: eventual.
+        # $search und $filter nicht kombinierbar — Datum lokal filtern.
+        # search_value = der String der an die API geht (z.B. Telefon-
+        # Suffix); verify_needle = der String der lokal gegen die
+        # description verifiziert wird (z.B. die volle normalisierte
+        # Nummer) — phone-Verifier rechnet daraus den Suffix-Match-Key.
+        try:
+            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS) as client:
+                resp = await client.get(
+                    f"{GRAPH_API_BASE}/me/events",
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "ConsistencyLevel": "eventual",
+                        "Prefer": f'outlook.timezone="{DEFAULT_TIMEZONE}"',
+                    },
+                    params={
+                        "$search": f'"{search_value}"',
+                        "$top": 100,
+                    },
+                )
+                if resp.status_code != 200:
+                    logger.warning(
+                        f"Outlook find_events fulltext "
+                        f"{resp.status_code}: {resp.text[:200]}"
+                    )
+                    return
+                data = resp.json()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"Outlook find_events fulltext crash: {exc}")
+            return
+        # Manuell Datum + Verifikation filtern
+        verified = []
+        for ev in data.get("value", []):
+            try:
+                s_dt = _parse_dt(ev["start"]["dateTime"])
+            except (KeyError, ValueError):
+                continue
+            if not (time_min <= s_dt <= time_max):
+                continue
+            body_text = _strip_html(
+                (ev.get("body") or {}).get("content") or ""
+            )
+            if verify_fn(verify_needle, body_text):
+                verified.append(ev)
+        _ingest(verified, source="fulltext",
+                phone_match=phone_match, email_match=email_match)
+
+    if kunde_telefon_normalized:
+        await _query_metadata(
+            "kunde_telefon", kunde_telefon_normalized,
+            phone_match=True, email_match=False,
+        )
+    if kunde_email:
+        await _query_metadata(
+            "kunde_email", kunde_email,
+            phone_match=False, email_match=True,
+        )
+    if kunde_telefon_normalized:
+        suffix = (
+            kunde_telefon_normalized[-8:]
+            if len(kunde_telefon_normalized) >= 8
+            else kunde_telefon_normalized
+        )
+        await _query_fulltext(
+            search_value=suffix,
+            verify_needle=kunde_telefon_normalized,
+            phone_match=True, email_match=False,
+            verify_fn=verify_fulltext_phone_match,
+        )
+    if kunde_email:
+        await _query_fulltext(
+            search_value=kunde_email,
+            verify_needle=kunde_email,
+            phone_match=False, email_match=True,
+            verify_fn=verify_fulltext_email_match,
+        )
+
+    return list(results.values())
+
+
+def _strip_html(html: str) -> str:
+    """Minimaler HTML-Stripper fuer body.content — entfernt Tags ohne
+    Library-Dependency. Reicht weil wir nur Substring-Matching wollen."""
+    if not html:
+        return ""
+    import re
+    text = re.sub(r"<[^>]+>", " ", html)
+    text = text.replace("&nbsp;", " ").replace("&amp;", "&")
+    return " ".join(text.split()).strip()
+
+
+# ---------------------------------------------------------------------
 # EVENT-DELETE
 # ---------------------------------------------------------------------
 

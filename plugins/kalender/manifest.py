@@ -23,5 +23,6 @@ MANIFEST = PluginManifest(
         {"path": "/book_appointment", "method": "POST"},
         {"path": "/find_free_slots", "method": "POST"},
         {"path": "/cancel_appointment", "method": "POST"},
+        {"path": "/find_events", "method": "POST"},
     ],
 )
