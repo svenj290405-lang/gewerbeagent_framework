@@ -40,6 +40,13 @@ class AnfrageToken(Base):
     )
     kunde_email: Mapped[str] = mapped_column(String(255), nullable=False)
     kunde_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # Voice-Session-Lookup: bei Anrufen pflanzen wir die normalisierte
+    # Telefonnummer des Anrufers hier hinein, damit _handle_buche_termin
+    # die kunde_email per Telefon-Match wiederfinden und ans Kalender-
+    # Event haengen kann. NULL bei Mail-getriebenen Tokens.
+    # Index (tenant_id, kunde_telefon) WHERE NOT NULL — siehe Migration
+    # a9k2m4n6p8q1.
+    kunde_telefon: Mapped[str | None] = mapped_column(String(50), nullable=True)
     anfrage_typ: Mapped[str] = mapped_column(String(50), nullable=False, default=ANFRAGE_TYP_ALLGEMEIN)
     original_subject: Mapped[str | None] = mapped_column(String(500), nullable=True)
     original_message_id: Mapped[str | None] = mapped_column(String(500), nullable=True)
