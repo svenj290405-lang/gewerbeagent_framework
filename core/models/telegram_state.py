@@ -22,20 +22,6 @@ STATE_WISSEN_KATEGORIE = "wissen_kategorie"
 STATE_WISSEN_TEXT = "wissen_text"
 STATE_WISSEN_LOESCHEN = "wissen_loeschen"
 
-# Kalkulations-Wizard (mathematische Formeln fuers Angebot)
-STATE_KALK_KATEGORIE = "kalk_kategorie"
-STATE_KALK_NAME = "kalk_name"
-STATE_KALK_FORMEL = "kalk_formel"
-STATE_KALK_EINHEIT = "kalk_einheit"
-STATE_KALK_BESCHREIBUNG = "kalk_beschreibung"
-STATE_KALK_LOESCHEN = "kalk_loeschen"
-STATE_KALK_EXCEL_WAITING = "kalk_excel_waiting"
-STATE_KALK_EXCEL_CONFIRM = "kalk_excel_confirm"
-# Per-Entry-Wizard nach "einzeln" im Excel-Confirm: stept jede Formel
-# einzeln durch (/ja, /nein, /skip). State-Data fuehrt eintraege +
-# index + entscheidungen mit.
-STATE_KALK_EXCEL_PER_ENTRY = "kalk_excel_per_entry"
-
 # Visualisierung-Wizard
 STATE_VIZ_WAITING_PHOTO = "viz_waiting_photo"
 STATE_VIZ_WAITING_DESCRIPTION = "viz_waiting_description"

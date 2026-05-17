@@ -103,16 +103,6 @@ FEATURES: dict[str, Feature] = {
             "/material", "/material_neu",
         ),
     ),
-    "kalkulation": Feature(
-        key="kalkulation",
-        label="Kalkulations-Engine",
-        description="Mathematische Formeln fuer Angebots-Erstellung.",
-        telegram_commands=(
-            "/kalkulation", "/kalkulation_anzeigen",
-            "/kalkulation_loeschen", "/kalkulation_excel",
-        ),
-    ),
-
     # --- Enterprise-Tier ---
     # 'voice_init' matcht den existierenden tool_name (Plugin
     # voice_init bei ElevenLabs-Webhook).
@@ -193,7 +183,6 @@ PACKAGES: dict[str, frozenset[str]] = {
         "anfrage_formular",
         "lexware",
         "material",
-        "kalkulation",
         "werkstatt",
     }),
     PACKAGE_ENTERPRISE: frozenset({
@@ -203,7 +192,6 @@ PACKAGES: dict[str, frozenset[str]] = {
         "anfrage_formular",
         "lexware",
         "material",
-        "kalkulation",
         "werkstatt",
         "voice_init",
         "drive_archiv",

@@ -102,7 +102,7 @@ async def test_config_does_not_contain_daily_workflow_commands():
     for forbidden in ("/aufnahme", "/briefing", "/neue_termine",
                       "/angebot", "/auftraege", "/beleg",
                       "/rechnung", "/material", "/wissen",
-                      "/kalkulation", "/visualisierung",
+                      "/visualisierung",
                       "/storno", "/kunde"):
         assert forbidden not in text, (
             f"/config unexpectedly contains daily command {forbidden}"

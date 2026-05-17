@@ -16,20 +16,6 @@ from core.database import AsyncSessionLocal
 from core.models import (
     ALLE_KATEGORIEN,
     KATEGORIE_LABELS,
-    TenantKalkulation,
-    ALLE_KALK_KATEGORIEN,
-    KALK_KATEGORIE_LABELS,
-    KALK_SOURCE_MANUAL,
-    KALK_SOURCE_EXCEL,
-    STATE_KALK_KATEGORIE,
-    STATE_KALK_NAME,
-    STATE_KALK_FORMEL,
-    STATE_KALK_EINHEIT,
-    STATE_KALK_BESCHREIBUNG,
-    STATE_KALK_LOESCHEN,
-    STATE_KALK_EXCEL_WAITING,
-    STATE_KALK_EXCEL_CONFIRM,
-    STATE_KALK_EXCEL_PER_ENTRY,
     STATE_BELEG_CONFIRMING,
     STATE_BELEG_WAITING_PHOTO,
     STATE_LEXWARE_SETUP_TOKEN,
@@ -851,10 +837,9 @@ async def _handle_help_command(chat_id=None):
     if _is_on("lexware"):
         blocks.append(("💰", "Buchhaltung — Belege & Rechnungen", [
             ("/angebot",
-             "Angebot per Text oder Sprache diktieren — Bot wendet "
-             "deine /kalkulation-Formeln an, legt das Angebot in Lexware "
-             "an, schickt PDF per Mail an den Kunden und bereitet eine "
-             "passende Rechnung als Lexware-Draft vor."),
+             "Angebot per Text oder Sprache diktieren — Bot legt das "
+             "Angebot in Lexware an, schickt PDF per Mail an den Kunden "
+             "und bereitet eine passende Rechnung als Lexware-Draft vor."),
             ("/auftraege",
              "Uebersicht laufender Projekte — pro Auftrag siehst du den "
              "Lifecycle (Angenommen, Arbeit laeuft, Fertig). Bei 🏁 Fertig "
@@ -896,19 +881,6 @@ async def _handle_help_command(chat_id=None):
              "Alle Eintraege gruppiert nach Kategorie."),
             ("/wissen_loeschen",
              "Einen Eintrag entfernen."),
-        ], False))
-
-    if _is_on("kalkulation"):
-        blocks.append(("🧮", "Kalkulation (fuer Angebote)", [
-            ("/kalkulation",
-             "Neue Formel anlegen — z.B. m²-Preis, Pauschale, "
-             "Aufschlag-%."),
-            ("/kalkulation_anzeigen",
-             "Alle Formeln gruppiert nach Kategorie."),
-            ("/kalkulation_loeschen",
-             "Eine Formel entfernen."),
-            ("/kalkulation_excel",
-             "Formel-Set aus .xlsx-Datei importieren."),
         ], False))
 
     if _is_on("anfrage_formular"):
@@ -1667,773 +1639,6 @@ async def _handle_storno_confirm_input(chat_id, text, state_data):
     )
 
 
-async def _apply_kalkulationen(tenant_id, extracted: dict) -> dict:
-    """
-    Hybrid-Berechnung: Wenn Gemini fuer eine Position eine `kalkulation`
-    mit regel_name + Variablen-Werten geliefert hat, suchen wir die
-    passende Regel in der DB und berechnen den Preis deterministisch
-    in Python aus Formel + Variablen.
-
-    Schreibt das Ergebnis in `position["preis_brutto_eur"]` und legt
-    `position["kalkulation"]["wert"]` fuer die Anzeige ab. Wenn die
-    Berechnung fehlschlaegt (Regel nicht gefunden, Variable fehlt),
-    bleibt der Original-Preis stehen und wir loggen die Warnung.
-    """
-    if not extracted or not isinstance(extracted, dict):
-        return extracted
-    positionen = extracted.get("positionen") or []
-    if not positionen:
-        return extracted
-
-    # Frueh aussteigen falls keine Position eine Regel referenziert
-    if not any(
-        isinstance(p.get("kalkulation"), dict) and p["kalkulation"].get("regel_name")
-        for p in positionen
-    ):
-        return extracted
-
-    # Regeln des Tenants laden (alle aktiven; Match per name case-insensitive)
-    async with AsyncSessionLocal() as s:
-        regeln = (await s.execute(
-            select(TenantKalkulation)
-            .where(TenantKalkulation.tenant_id == tenant_id)
-            .where(TenantKalkulation.aktiv.is_(True))
-        )).scalars().all()
-    by_name = {r.name.strip().lower(): r for r in regeln}
-
-    from core.ai.kalkulation import (
-        FormelError,
-        safe_eval_formel,
-    )
-
-    new_gesamt = 0.0
-    has_changes = False
-    for pos in positionen:
-        kalk = pos.get("kalkulation")
-        if not isinstance(kalk, dict):
-            continue
-        regel_name = (kalk.get("regel_name") or "").strip().lower()
-        if not regel_name or regel_name not in by_name:
-            logger.info(
-                "Kalkulation: Regel %r nicht gefunden, skip Position %r",
-                regel_name,
-                pos.get("name"),
-            )
-            continue
-        regel = by_name[regel_name]
-        vars_dict = kalk.get("variablen") or {}
-        if not isinstance(vars_dict, dict):
-            continue
-        try:
-            wert = safe_eval_formel(regel.formel, vars_dict)
-        except FormelError as exc:
-            logger.warning(
-                "Kalkulation '%s' fehlgeschlagen (%s) - Original-Preis bleibt",
-                regel.name, exc,
-            )
-            continue
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "Kalkulation '%s' Ausnahme: %s - Original-Preis bleibt",
-                regel.name, exc, exc_info=True,
-            )
-            continue
-
-        # Position aktualisieren - Preis pro Einheit auf den Formel-Wert
-        # setzen, Menge auf 1, damit menge*preis = berechneter Wert.
-        pos["preis_brutto_eur"] = round(wert, 2)
-        pos["menge"] = 1.0
-        if not pos.get("einheit") or pos.get("einheit") == "Stueck":
-            pos["einheit"] = regel.einheit or "Pauschal"
-        # Kalkulations-Hinweis fuer die Preview-Anzeige zurueckschreiben
-        kalk["wert"] = round(wert, 2)
-        kalk["formel"] = regel.formel
-        has_changes = True
-        logger.info(
-            "Kalkulation '%s' angewandt: %s -> %.2f EUR (Position '%s')",
-            regel.name, vars_dict, wert, pos.get("name"),
-        )
-        new_gesamt += wert
-
-    if has_changes:
-        # Gesamtbetrag neu errechnen aus allen Positionen
-        try:
-            extracted["gesamtbetrag_brutto_eur"] = round(
-                sum(
-                    float(p.get("menge") or 1) * float(p.get("preis_brutto_eur") or 0)
-                    for p in positionen
-                ),
-                2,
-            )
-        except (TypeError, ValueError):
-            pass
-    return extracted
-
-
-# ===========================================================================
-# Kalkulation-Wizard (mathematische Formeln fuers Angebot)
-# ===========================================================================
-#
-# Schwester-Konzept zu /wissen, aber mit numerischen Formeln statt Freitext.
-# - /kalkulation                : Wizard Kategorie -> Name -> Formel -> Einheit
-# - /kalkulation_anzeigen       : Liste, gruppiert nach Kategorie
-# - /kalkulation_loeschen       : Eintrag entfernen
-# - /kalkulation_excel          : Excel-Datei hochladen (Formeln werden importiert)
-#
-# Beim Aufnahme-Wizard und Voice-Call werden alle aktiven Formeln des
-# Tenants in den Gemini-Prompt eingespeist; der eigentliche Preis wird
-# anschliessend deterministisch in Python berechnet (siehe core.ai.kalkulation).
-
-KALK_FORMEL_MAX_LEN = 1000
-KALK_NAME_MAX_LEN = 100
-KALK_BESCHREIBUNG_MAX_LEN = 500
-KALK_EXCEL_MAX_BYTES = 4 * 1024 * 1024  # 4 MB - Excel-Files sind selten groesser
-
-
-async def _handle_kalkulation_command(chat_id):
-    tenant = await _get_tenant_by_chat(chat_id)
-    if not tenant:
-        return ("Dieser Chat ist noch keinem Betrieb zugeordnet.\n"
-                "Bitte zuerst Aktivierungs-QR-Code scannen.")
-    await _save_state(chat_id, STATE_KALK_KATEGORIE, {})
-    msg = "<b>🧮 Neue Kalkulationsregel</b>\n\n"
-    msg += "Welche Kategorie passt?\n\n"
-    for i, key in enumerate(ALLE_KALK_KATEGORIEN, start=1):
-        label = KALK_KATEGORIE_LABELS.get(key, key)
-        msg += f"{i}) {label}\n"
-    msg += (
-        f"\nAntworten Sie mit der Nummer (1-{len(ALLE_KALK_KATEGORIEN)})"
-        " oder /abbrechen.\n\n"
-        "💡 Mit /kalkulation_excel koennen Sie auch eine .xlsx-Datei "
-        "hochladen, dann werden alle Formeln automatisch uebernommen."
-    )
-    return msg
-
-
-async def _handle_kalk_kategorie_input(chat_id, text):
-    text = text.strip()
-    if not text.isdigit():
-        return (
-            f"Bitte mit einer Nummer von 1 bis {len(ALLE_KALK_KATEGORIEN)}"
-            " antworten oder /abbrechen."
-        )
-    idx = int(text) - 1
-    if idx < 0 or idx >= len(ALLE_KALK_KATEGORIEN):
-        return (
-            f"Nur Nummern 1 bis {len(ALLE_KALK_KATEGORIEN)} sind gueltig."
-            " Bitte erneut waehlen."
-        )
-    kategorie = ALLE_KALK_KATEGORIEN[idx]
-    label = KALK_KATEGORIE_LABELS.get(kategorie, kategorie)
-    await _save_state(chat_id, STATE_KALK_NAME, {"kategorie": kategorie})
-    msg = f"Kategorie: <b>{label}</b>\n\n"
-    msg += "Wie heisst diese Regel? (Kurzer Name)\n\n"
-    msg += "<i>Beispiele:</i>\n"
-    msg += "<i>- Anfahrtspauschale</i>\n"
-    msg += "<i>- Notfall-Zuschlag</i>\n"
-    msg += "<i>- Material-Aufschlag</i>\n\n"
-    msg += "/abbrechen um abzubrechen."
-    return msg
-
-
-async def _handle_kalk_name_input(chat_id, text, state_data):
-    name = text.strip()
-    if len(name) < 3:
-        return "Der Name ist zu kurz (mind. 3 Zeichen). Bitte nochmal."
-    if len(name) > KALK_NAME_MAX_LEN:
-        return f"Der Name ist zu lang (max {KALK_NAME_MAX_LEN}). Bitte kuerzen."
-    state_data = dict(state_data or {})
-    state_data["name"] = name
-    await _save_state(chat_id, STATE_KALK_FORMEL, state_data)
-    msg = f"<b>{name}</b>\n\n"
-    msg += "Wie wird der Wert berechnet? Schreibe die Formel als Text.\n\n"
-    msg += "<b>Erlaubt:</b>\n"
-    msg += "- Variablen (kleinbuchstaben mit Unterstrich, z.B. <code>entfernung_km</code>)\n"
-    msg += "- Operatoren: + − × (oder *) ÷ (oder /), ** fuer Potenz\n"
-    msg += "- Funktionen: <code>min</code>, <code>max</code>, <code>round</code>, <code>abs</code>, <code>ceil</code>, <code>floor</code>\n"
-    msg += "- Bedingung: <code>x if bedingung else y</code>\n\n"
-    msg += "<b>Beispiele:</b>\n"
-    msg += "<code>entfernung_km * 0.50</code>\n"
-    msg += "<code>max(50, stunden * 75)</code>\n"
-    msg += "<code>einkaufspreis * 1.30 + 5</code>\n\n"
-    msg += "/abbrechen um abzubrechen."
-    return msg
-
-
-async def _handle_kalk_formel_input(chat_id, text, state_data):
-    # Formel-Engine erst hier importieren, damit der Modul-Import nicht
-    # zur Startup-Zeit knallt falls jemand die Datei kopiert.
-    from core.ai.kalkulation import FormelError, parse_variables
-
-    formel = text.strip()
-    if len(formel) > KALK_FORMEL_MAX_LEN:
-        return f"Die Formel ist zu lang (max {KALK_FORMEL_MAX_LEN} Zeichen)."
-    # Komfort: × und ÷ akzeptieren wir und uebersetzen
-    formel_norm = formel.replace("×", "*").replace("·", "*").replace("÷", "/")
-    try:
-        variablen = parse_variables(formel_norm)
-    except FormelError as exc:
-        return (
-            f"❌ Formel ungueltig: {exc}\n\n"
-            "Bitte korrigieren oder /abbrechen.\n"
-            "Tipp: Variablen mit kleinbuchstaben + Unterstrich, z.B."
-            " <code>entfernung_km</code>."
-        )
-
-    state_data = dict(state_data or {})
-    state_data["formel"] = formel_norm
-    state_data["variablen"] = variablen
-    await _save_state(chat_id, STATE_KALK_EINHEIT, state_data)
-
-    if variablen:
-        var_text = ", ".join(f"<code>{v}</code>" for v in variablen)
-    else:
-        var_text = "<i>(keine - konstanter Wert)</i>"
-    msg = "✅ Formel verstanden.\n\n"
-    msg += f"Variablen: {var_text}\n\n"
-    msg += (
-        "Welche Einheit hat das Ergebnis? Z.B. <code>EUR</code>, "
-        "<code>EUR/Stunde</code>, <code>%</code>.\n\n"
-        "Antworte mit <code>-</code> wenn keine Einheit."
-    )
-    return msg
-
-
-async def _handle_kalk_einheit_input(chat_id, text, state_data):
-    einheit = text.strip()
-    if einheit == "-" or einheit == "":
-        einheit = None
-    elif len(einheit) > 50:
-        return "Einheit ist zu lang (max 50 Zeichen)."
-    state_data = dict(state_data or {})
-    state_data["einheit"] = einheit
-    await _save_state(chat_id, STATE_KALK_BESCHREIBUNG, state_data)
-    msg = "Wann soll diese Regel greifen?\n\n"
-    msg += "Schreibe einen kurzen Satz fuer die KI, z.B.\n"
-    msg += "<i>'Bei jedem Auftrag mit Anfahrt zu Kundenadresse anwenden.'</i>\n\n"
-    msg += f"Mit <code>-</code> ueberspringen (max {KALK_BESCHREIBUNG_MAX_LEN} Zeichen)."
-    return msg
-
-
-async def _handle_kalk_beschreibung_input(chat_id, text, state_data):
-    beschreibung = text.strip()
-    if beschreibung == "-" or beschreibung == "":
-        beschreibung = None
-    elif len(beschreibung) > KALK_BESCHREIBUNG_MAX_LEN:
-        return (
-            f"Beschreibung zu lang (max {KALK_BESCHREIBUNG_MAX_LEN} Zeichen)."
-            " Bitte kuerzen."
-        )
-    data = dict(state_data or {})
-    kategorie = data.get("kategorie")
-    name = data.get("name")
-    formel = data.get("formel")
-    variablen = data.get("variablen") or []
-    einheit = data.get("einheit")
-    if not kategorie or not name or not formel:
-        await _clear_state(chat_id)
-        return "Etwas ging schief. Bitte mit /kalkulation neu starten."
-
-    tenant = await _get_tenant_by_chat(chat_id)
-    if not tenant:
-        await _clear_state(chat_id)
-        return "Tenant nicht gefunden. Bitte erneut /start ausfuehren."
-
-    async with AsyncSessionLocal() as s:
-        entry = TenantKalkulation(
-            tenant_id=tenant.id,
-            kategorie=kategorie,
-            name=name,
-            formel=formel,
-            variablen=variablen,
-            einheit=einheit,
-            beschreibung=beschreibung,
-            source=KALK_SOURCE_MANUAL,
-        )
-        s.add(entry)
-        await s.commit()
-
-    await _clear_state(chat_id)
-    label = KALK_KATEGORIE_LABELS.get(kategorie, kategorie)
-    msg = f"✅ Gespeichert in <b>{label}</b>:\n\n"
-    msg += f"<b>{name}</b>\n"
-    msg += f"<code>{formel}</code>"
-    if einheit:
-        msg += f"  →  {einheit}"
-    msg += "\n\n"
-    msg += "Diese Regel wird ab jetzt bei jedem neuen Angebot beachtet.\n\n"
-    msg += "/kalkulation - weitere Regel anlegen\n"
-    msg += "/kalkulation_anzeigen - alle ansehen"
-    return msg
-
-
-async def _handle_kalkulation_anzeigen(chat_id):
-    tenant = await _get_tenant_by_chat(chat_id)
-    if not tenant:
-        return "Dieser Chat ist keinem Betrieb zugeordnet."
-    async with AsyncSessionLocal() as s:
-        entries = (await s.execute(
-            select(TenantKalkulation)
-            .where(TenantKalkulation.tenant_id == tenant.id)
-            .where(TenantKalkulation.aktiv.is_(True))
-            .order_by(
-                TenantKalkulation.kategorie,
-                TenantKalkulation.sortierung,
-                TenantKalkulation.created_at,
-            )
-        )).scalars().all()
-    if not entries:
-        return (
-            "Noch keine Kalkulations-Regeln vorhanden.\n\n"
-            "Mit /kalkulation legst Du Deine erste Regel an, "
-            "oder mit /kalkulation_excel laedst Du eine Excel-Datei hoch."
-        )
-    by_kat: dict[str, list[TenantKalkulation]] = {}
-    for e in entries:
-        by_kat.setdefault(e.kategorie, []).append(e)
-
-    # Render-Reihenfolge: erst die bekannten Kategorien in definierter
-    # Reihenfolge (ALLE_KALK_KATEGORIEN), dann ALLE restlichen die
-    # in der DB irgendwie auftauchen. Sonst wuerden Eintraege mit
-    # alter/manuell-gesetzter Kategorie unsichtbar bleiben.
-    bekannt = [k for k in ALLE_KALK_KATEGORIEN if k in by_kat]
-    unbekannt = sorted(k for k in by_kat if k not in ALLE_KALK_KATEGORIEN)
-    render_order = bekannt + unbekannt
-
-    msg = f"<b>🧮 Kalkulationsregeln · {tenant.company_name}</b>\n\n"
-    total = 0
-    for kat in render_order:
-        label = KALK_KATEGORIE_LABELS.get(kat, kat or "Ohne Kategorie")
-        msg += f"<b>{label}</b>\n"
-        for e in by_kat[kat]:
-            tail = f"  →  {e.einheit}" if e.einheit else ""
-            src_tag = "  (Excel)" if e.source == KALK_SOURCE_EXCEL else ""
-            msg += f"  • <b>{e.name}</b>{src_tag}\n"
-            # Semantische Beschreibung (vom Gemini-Classifier oder
-            # manuellen Wizard) sichtbar machen — Daniel will am
-            # Telefon das vorlesen koennen.
-            if e.beschreibung:
-                msg += f"    <i>{e.beschreibung}</i>\n"
-            msg += f"    <code>{e.formel}</code>{tail}\n"
-            total += 1
-        msg += "\n"
-    msg += f"<i>Insgesamt {total} Regel(n).</i>\n"
-    msg += "Mit /kalkulation_loeschen kannst Du Eintraege entfernen."
-    return msg
-
-
-async def _handle_kalkulation_loeschen_command(chat_id):
-    tenant = await _get_tenant_by_chat(chat_id)
-    if not tenant:
-        return "Dieser Chat ist keinem Betrieb zugeordnet."
-    async with AsyncSessionLocal() as s:
-        entries = (await s.execute(
-            select(TenantKalkulation)
-            .where(TenantKalkulation.tenant_id == tenant.id)
-            .where(TenantKalkulation.aktiv.is_(True))
-            .order_by(
-                TenantKalkulation.kategorie,
-                TenantKalkulation.created_at,
-            )
-        )).scalars().all()
-    if not entries:
-        return "Es gibt keine Regeln zum Loeschen."
-    id_map = {}
-    msg = "<b>Welche Regel loeschen?</b>\n\n"
-    for i, e in enumerate(entries, start=1):
-        id_map[str(i)] = str(e.id)
-        label = KALK_KATEGORIE_LABELS.get(e.kategorie, e.kategorie)
-        msg += f"{i}) [{label}] <b>{e.name}</b>: <code>{e.formel}</code>\n"
-    msg += "\nAntworte mit der Nummer oder /abbrechen."
-    await _save_state(chat_id, STATE_KALK_LOESCHEN, {"id_map": id_map})
-    return msg
-
-
-async def _handle_kalk_loeschen_input(chat_id, text, state_data):
-    text = text.strip()
-    id_map = (state_data or {}).get("id_map") or {}
-    if text not in id_map:
-        return "Ungueltige Nummer. Bitte eine angezeigte Nummer eingeben oder /abbrechen."
-    entry_id = id_map[text]
-    async with AsyncSessionLocal() as s:
-        entry = (await s.execute(
-            select(TenantKalkulation).where(
-                TenantKalkulation.id == uuid.UUID(entry_id)
-            )
-        )).scalar_one_or_none()
-        if entry is None:
-            await _clear_state(chat_id)
-            return "Regel nicht mehr vorhanden (eventuell schon geloescht)."
-        name = entry.name
-        await s.delete(entry)
-        await s.commit()
-    await _clear_state(chat_id)
-    return f"✅ Regel <b>{name}</b> geloescht."
-
-
-async def _handle_kalkulation_excel_command(chat_id):
-    tenant = await _get_tenant_by_chat(chat_id)
-    if not tenant:
-        return "Dieser Chat ist keinem Betrieb zugeordnet."
-    await _save_state(chat_id, STATE_KALK_EXCEL_WAITING, {})
-    msg = "<b>📊 Excel-Datei hochladen</b>\n\n"
-    msg += "Schicke jetzt eine <b>.xlsx</b>-Datei mit Deinen Formeln.\n\n"
-    msg += "Ich lese alle Zellen mit Formeln (z.B. <code>=B2*0,5</code>) "
-    msg += "und uebernehme sie als Kalkulationsregeln. Den Namen lese ich "
-    msg += "aus der Beschriftung links bzw. oberhalb der Zelle.\n\n"
-    msg += "Unterstuetzt: arithmetische Formeln, WENN/IF, MIN, MAX, RUNDEN.\n"
-    msg += "Nicht unterstuetzt: SVERWEIS, INDIREKT, INDEX, Zellbereiche (B2:B5).\n\n"
-    msg += "/abbrechen um abzubrechen."
-    return msg
-
-
-async def _handle_kalk_excel_received(chat_id, document, bot_token):
-    """Verarbeitet eine via Telegram hochgeladene .xlsx-Datei."""
-    if not document:
-        return ("Bitte schicke eine <b>.xlsx</b>-Datei (kein Foto).")
-
-    file_name = (document.get("file_name") or "").lower()
-    file_size = int(document.get("file_size") or 0)
-    file_id = document.get("file_id")
-
-    if not file_id:
-        return "Datei ohne ID empfangen - bitte nochmal."
-    if not file_name.endswith(".xlsx"):
-        return (
-            "Nur <b>.xlsx</b>-Dateien werden unterstuetzt. "
-            "Bitte als Excel-2007+-Format speichern."
-        )
-    if file_size > KALK_EXCEL_MAX_BYTES:
-        return (
-            f"Datei zu gross ({file_size // 1024} KB). "
-            f"Maximum: {KALK_EXCEL_MAX_BYTES // 1024} KB."
-        )
-
-    # Datei laden
-    file_path = await _telegram_get_file_path(bot_token, file_id)
-    if not file_path:
-        return "Konnte die Datei nicht von Telegram abholen."
-    try:
-        file_bytes = await _telegram_download_file(bot_token, file_path)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Excel-Download fehlgeschlagen: %s", exc)
-        return "Download fehlgeschlagen - bitte nochmal."
-
-    # Parsen
-    from core.integrations.excel_kalkulation import (
-        SKIP_REASON_LABELS,
-        ExcelImportError,
-        extract_formulas_from_xlsx,
-    )
-
-    try:
-        result = extract_formulas_from_xlsx(file_bytes)
-    except ExcelImportError as exc:
-        await _clear_state(chat_id)
-        return f"❌ Excel-Datei nicht lesbar: {exc}"
-
-    if not result.eintraege:
-        warn_text = ("\n\n" + "\n".join(result.warnungen[:5])) if result.warnungen else ""
-        skip_text = ""
-        if result.verworfen_counts:
-            parts = [
-                f"{n}× {SKIP_REASON_LABELS.get(reason, reason)}"
-                for reason, n in result.verworfen_counts.items()
-            ]
-            skip_text = "\n\nQuality-Filter verworfen: " + ", ".join(parts)
-        await _clear_state(chat_id)
-        return (
-            "⚠️ Keine brauchbaren Formeln gefunden.\n\n"
-            f"Sheets gelesen: {', '.join(result.sheets_gelesen)}"
-            f"{skip_text}"
-            f"{warn_text}"
-        )
-
-    # Gemini-Batch-Call: Kategorisierung + Beschreibung pro Eintrag.
-    # Fallback ist intern in classify_excel_eintraege (immer N Eintraege
-    # gleicher Laenge zurueck, im Worst-Case alle "sonstiges" + "").
-    tenant = await _get_tenant_by_chat(chat_id)
-    from core.ai.excel_classifier import classify_excel_eintraege
-    classifier_input = [
-        {
-            "name": e.name,
-            "formel": e.formel,
-            "variablen": e.variablen,
-            "sheet": e.sheet,
-        }
-        for e in result.eintraege
-    ]
-    classifications = await classify_excel_eintraege(
-        classifier_input,
-        tenant_id=str(tenant.id) if tenant else None,
-    )
-
-    # State auf "Confirm" setzen mit den gefundenen + klassifizierten Eintraegen
-    eintraege_serial = []
-    for e, cls in zip(result.eintraege, classifications):
-        eintraege_serial.append({
-            "name": e.name,
-            "formel": e.formel,
-            "variablen": e.variablen,
-            "raw_excel": e.raw_excel,
-            "cell": e.cell,
-            "sheet": e.sheet,
-            "kategorie": cls.get("kategorie") or "sonstiges",
-            "beschreibung": cls.get("beschreibung") or "",
-        })
-    await _save_state(
-        chat_id,
-        STATE_KALK_EXCEL_CONFIRM,
-        {
-            "eintraege": eintraege_serial,
-            "filename": document.get("file_name"),
-            "warnungen": result.warnungen[:10],
-        },
-    )
-
-    # Header: "X brauchbar von Y gefunden" — so sieht der Handwerker
-    # sofort wieviel der Tabelle wirklich uebernommen wird.
-    if result.technisch_extrahiert and result.technisch_extrahiert > len(result.eintraege):
-        msg = (
-            f"<b>📊 {len(result.eintraege)} brauchbare Formel(n)</b> "
-            f"<i>(von {result.technisch_extrahiert} gefundenen)</i>\n\n"
-        )
-    else:
-        msg = f"<b>📊 Gefunden: {len(result.eintraege)} Formel(n)</b>\n\n"
-
-    # Liste mit Kategorie + Beschreibung (statt nur Name+Formel)
-    from core.models.tenant_kalkulation import KALK_KATEGORIE_LABELS
-    for i, entry in enumerate(eintraege_serial[:15], start=1):
-        kat_label = KALK_KATEGORIE_LABELS.get(
-            entry["kategorie"], entry["kategorie"],
-        )
-        msg += f"{i}) <b>{entry['name']}</b> · <i>{kat_label}</i>\n"
-        if entry.get("beschreibung"):
-            msg += f"   {entry['beschreibung']}\n"
-        msg += f"   <code>{entry['formel']}</code>\n"
-    if len(eintraege_serial) > 15:
-        msg += f"\n... und {len(eintraege_serial) - 15} weitere.\n"
-
-    # Quality-Filter-Counts gruppiert (statt unleserliche 270 Einzel-
-    # Warnungen wie vorher) — damit ist klar warum Formeln rausgeflogen
-    # sind, ohne die Preview zu sprengen.
-    if result.verworfen_counts:
-        msg += "\n<b>🧹 Filter:</b>\n"
-        for reason, n in result.verworfen_counts.items():
-            label = SKIP_REASON_LABELS.get(reason, reason)
-            msg += f"• {n}× verworfen ({label})\n"
-
-    # Uebersetzungs-Warnungen separat — die zeigen welche Excel-Konstrukte
-    # der Parser gar nicht verstanden hat (z.B. SVERWEIS).
-    if result.warnungen:
-        msg += "\n<b>⚠️ Excel-Hinweise:</b>\n"
-        for w in result.warnungen[:3]:
-            msg += f"• {w}\n"
-        if len(result.warnungen) > 3:
-            msg += f"... und {len(result.warnungen) - 3} weitere.\n"
-
-    msg += (
-        "\n<b>Speichern?</b>\n"
-        "• <b>ja</b> = alle uebernehmen (mit Kategorien wie oben)\n"
-        "• <b>einzeln</b> = pro Formel entscheiden (Wizard)\n"
-        "• <b>/abbrechen</b> = verwerfen"
-    )
-    return msg
-
-
-# --------------------------------------------------------------------------
-# Per-Entry-Wizard nach "einzeln" im Excel-Confirm-Preview
-# --------------------------------------------------------------------------
-
-def _render_per_entry_prompt(entry: dict, idx: int, total: int) -> str:
-    """Formatiert eine einzelne Formel als Telegram-Frage."""
-    from core.models.tenant_kalkulation import KALK_KATEGORIE_LABELS
-    kat_label = KALK_KATEGORIE_LABELS.get(
-        entry.get("kategorie", "sonstiges"),
-        entry.get("kategorie", "Sonstiges"),
-    )
-    msg = f"<b>📊 Formel {idx + 1}/{total}</b>\n\n"
-    msg += f"<b>{entry.get('name', '?')}</b>\n"
-    msg += f"<i>Kategorie:</i> {kat_label}\n"
-    if entry.get("beschreibung"):
-        msg += f"<i>{entry['beschreibung']}</i>\n"
-    msg += f"<code>{entry.get('formel', '?')}</code>\n\n"
-    msg += (
-        "Behalten?\n"
-        "• <b>ja</b> = speichern\n"
-        "• <b>nein</b> oder <b>skip</b> = ueberspringen\n"
-        "• <b>/abbrechen</b> = Wizard beenden (vorher Bestaetigte werden gespeichert)"
-    )
-    return msg
-
-
-async def _start_kalk_excel_per_entry_wizard(chat_id, state_data):
-    """Wechselt vom Confirm-State in den Per-Entry-Wizard, zeigt Formel 1."""
-    data = state_data or {}
-    eintraege = data.get("eintraege") or []
-    if not eintraege:
-        await _clear_state(chat_id)
-        return "Keine Eintraege im State - bitte nochmal /kalkulation_excel."
-    new_state = {
-        "eintraege": eintraege,
-        "filename": data.get("filename"),
-        "index": 0,
-        "decisions": [],  # bool pro Index — True = behalten, False = skip
-    }
-    await _save_state(chat_id, STATE_KALK_EXCEL_PER_ENTRY, new_state)
-    return _render_per_entry_prompt(eintraege[0], 0, len(eintraege))
-
-
-async def _finish_kalk_excel_per_entry(chat_id, state_data):
-    """Speichert die als 'behalten' markierten Eintraege, beendet den Wizard."""
-    data = state_data or {}
-    eintraege = data.get("eintraege") or []
-    decisions = data.get("decisions") or []
-    filename = data.get("filename")
-
-    tenant = await _get_tenant_by_chat(chat_id)
-    if not tenant:
-        await _clear_state(chat_id)
-        return "Tenant nicht gefunden. Bitte /start erneut ausfuehren."
-
-    saved = 0
-    skipped = 0
-    async with AsyncSessionLocal() as s:
-        for entry, keep in zip(eintraege, decisions):
-            if keep:
-                row = _build_kalk_entry_for_db(entry, filename)
-                row.tenant_id = tenant.id
-                s.add(row)
-                saved += 1
-            else:
-                skipped += 1
-        # Falls Wizard vorzeitig abgebrochen wurde, gibt es noch unentschiedene
-        # Eintraege — die werden als "skip" behandelt (sicheres Default).
-        skipped += max(0, len(eintraege) - len(decisions))
-        await s.commit()
-
-    await _clear_state(chat_id)
-    msg = f"✅ <b>{saved} Formel(n) gespeichert</b>"
-    if skipped:
-        msg += f", {skipped} uebersprungen"
-    msg += ".\n\nMit /kalkulation_anzeigen siehst Du alle Regeln."
-    return msg
-
-
-async def _handle_kalk_excel_per_entry_input(chat_id, text, state_data):
-    """Ja/Nein/Skip-Loop fuer den Per-Entry-Wizard."""
-    raw = text.strip().lower()
-    data = state_data or {}
-    eintraege = data.get("eintraege") or []
-    decisions = list(data.get("decisions") or [])
-    idx = int(data.get("index") or 0)
-    total = len(eintraege)
-
-    if not eintraege or idx >= total:
-        return await _finish_kalk_excel_per_entry(chat_id, data)
-
-    if raw in {"ja", "j", "yes", "ok", "behalten", "+"}:
-        decisions.append(True)
-    elif raw in {"nein", "n", "no", "skip", "s", "-"}:
-        decisions.append(False)
-    else:
-        return (
-            "Bitte <b>ja</b> (behalten), <b>nein</b>/<b>skip</b> "
-            "(ueberspringen) oder /abbrechen."
-        )
-
-    idx += 1
-    if idx >= total:
-        # Letzte Formel war gerade dran → speichern + beenden
-        data["decisions"] = decisions
-        return await _finish_kalk_excel_per_entry(chat_id, data)
-
-    # Naechste Formel zeigen, State updaten
-    await _save_state(chat_id, STATE_KALK_EXCEL_PER_ENTRY, {
-        "eintraege": eintraege,
-        "filename": data.get("filename"),
-        "index": idx,
-        "decisions": decisions,
-    })
-    return _render_per_entry_prompt(eintraege[idx], idx, total)
-
-
-def _build_kalk_entry_for_db(entry: dict, filename: str | None) -> TenantKalkulation:
-    """Baut den TenantKalkulation-Row aus einem State-Entry (Excel-Import).
-
-    beschreibung kommt vom Gemini-Classifier (semantisch); falls leer,
-    fallback auf die technische Excel-Herkunft (filename + sheet!cell +
-    original-Formel) damit der Eintrag in /kalkulation_anzeigen nie
-    ganz nackt steht.
-    """
-    semantic = (entry.get("beschreibung") or "").strip()
-    technical = (
-        f"Aus {filename} ({entry.get('sheet')}!{entry.get('cell')}, "
-        f"Original: {entry.get('raw_excel')})"
-    )
-    beschreibung = semantic or technical
-    return TenantKalkulation(
-        kategorie=entry.get("kategorie") or "sonstiges",
-        name=entry.get("name") or "ohne Namen",
-        formel=entry.get("formel") or "",
-        variablen=entry.get("variablen") or [],
-        source=KALK_SOURCE_EXCEL,
-        excel_filename=filename,
-        beschreibung=beschreibung,
-    )
-
-
-async def _handle_kalk_excel_confirm_input(chat_id, text, state_data):
-    """Behandelt die Antwort auf den Preview.
-
-    Drei Optionen:
-    - "ja"      -> alle Eintraege speichern (Bulk-Import)
-    - "einzeln" -> Per-Entry-Wizard starten (Teil E)
-    - sonst     -> Hilfetext
-    """
-    raw = text.strip().lower()
-    if raw in {"einzeln", "e", "pro", "step"}:
-        return await _start_kalk_excel_per_entry_wizard(chat_id, state_data)
-    if raw not in {"ja", "j", "yes", "ok", "alle"}:
-        return (
-            "Antworte mit <b>ja</b> (alle uebernehmen), "
-            "<b>einzeln</b> (pro Formel entscheiden), "
-            "oder /abbrechen um zu verwerfen."
-        )
-
-    data = state_data or {}
-    eintraege = data.get("eintraege") or []
-    filename = data.get("filename")
-    if not eintraege:
-        await _clear_state(chat_id)
-        return "Keine Eintraege im State - bitte nochmal /kalkulation_excel."
-
-    tenant = await _get_tenant_by_chat(chat_id)
-    if not tenant:
-        await _clear_state(chat_id)
-        return "Tenant nicht gefunden. Bitte /start erneut ausfuehren."
-
-    saved = 0
-    async with AsyncSessionLocal() as s:
-        for entry in eintraege:
-            row = _build_kalk_entry_for_db(entry, filename)
-            row.tenant_id = tenant.id
-            s.add(row)
-            saved += 1
-        await s.commit()
-
-    await _clear_state(chat_id)
-    msg = f"✅ <b>{saved} Formel(n) gespeichert.</b>\n\n"
-    msg += "Mit /kalkulation_anzeigen siehst Du alle Regeln. "
-    msg += "Mit /kalkulation_loeschen kannst Du einzelne entfernen.\n\n"
-    msg += "💡 Du kannst die Kategorien spaeter pro Eintrag anpassen, "
-    msg += "indem Du sie loeschst und mit /kalkulation neu anlegst."
-    return msg
-
-
-# ===========================================================================
-# Ende Kalkulation-Wizard
-# ===========================================================================
 
 
 # Befehle, die ein laufender Wizard nicht abschalten darf — sonst
@@ -2652,7 +1857,6 @@ async def _dispatch_update(payload):
         if state and state.state_key in (
             STATE_VIZ_WAITING_PHOTO,
             STATE_BELEG_WAITING_PHOTO,
-            STATE_KALK_EXCEL_WAITING,
         ):
             bot_token = await _load_global_bot_token()
             if not bot_token:
@@ -2677,11 +1881,6 @@ async def _dispatch_update(payload):
             reply = await _handle_beleg_photo_received(
                 chat_id, photo_array, document, bot_token
             )
-            await _send_to_chat(chat_id, reply)
-            return {"ok": True}
-
-        if state and state.state_key == STATE_KALK_EXCEL_WAITING:
-            reply = await _handle_kalk_excel_received(chat_id, document, bot_token)
             await _send_to_chat(chat_id, reply)
             return {"ok": True}
 
@@ -2869,15 +2068,6 @@ async def _dispatch_update(payload):
         reply = await _handle_wissen_loeschen_command(chat_id)
     elif text == "/storno":
         reply = await _handle_storno_command(chat_id)
-    elif text == "/kalkulation":
-        reply = await _handle_kalkulation_command(chat_id)
-    elif text == "/kalkulation_anzeigen":
-        await _clear_state(chat_id)
-        reply = await _handle_kalkulation_anzeigen(chat_id)
-    elif text == "/kalkulation_loeschen":
-        reply = await _handle_kalkulation_loeschen_command(chat_id)
-    elif text == "/kalkulation_excel":
-        reply = await _handle_kalkulation_excel_command(chat_id)
     elif text == "/visualisierung":
         reply = await _handle_visualisierung_command(chat_id)
     elif text == "/lexware_setup":
@@ -3076,24 +2266,6 @@ async def _dispatch_update(payload):
             reply = await _handle_storno_choice_input(chat_id, text, state.state_data)
         elif state.state_key == STATE_STORNO_AWAIT_CONFIRM:
             reply = await _handle_storno_confirm_input(chat_id, text, state.state_data)
-        elif state.state_key == STATE_KALK_KATEGORIE:
-            reply = await _handle_kalk_kategorie_input(chat_id, text)
-        elif state.state_key == STATE_KALK_NAME:
-            reply = await _handle_kalk_name_input(chat_id, text, state.state_data)
-        elif state.state_key == STATE_KALK_FORMEL:
-            reply = await _handle_kalk_formel_input(chat_id, text, state.state_data)
-        elif state.state_key == STATE_KALK_EINHEIT:
-            reply = await _handle_kalk_einheit_input(chat_id, text, state.state_data)
-        elif state.state_key == STATE_KALK_BESCHREIBUNG:
-            reply = await _handle_kalk_beschreibung_input(chat_id, text, state.state_data)
-        elif state.state_key == STATE_KALK_LOESCHEN:
-            reply = await _handle_kalk_loeschen_input(chat_id, text, state.state_data)
-        elif state.state_key == STATE_KALK_EXCEL_WAITING:
-            reply = "Bitte schicke eine .xlsx-Datei (kein Text). Oder /abbrechen."
-        elif state.state_key == STATE_KALK_EXCEL_CONFIRM:
-            reply = await _handle_kalk_excel_confirm_input(chat_id, text, state.state_data)
-        elif state.state_key == STATE_KALK_EXCEL_PER_ENTRY:
-            reply = await _handle_kalk_excel_per_entry_input(chat_id, text, state.state_data)
         elif state.state_key == STATE_VIZ_WAITING_PHOTO:
             reply = "Bitte schicken Sie ein Foto (kein Text). Oder /abbrechen."
         elif state.state_key == STATE_VIZ_POST_ACTION:
@@ -5931,16 +5103,6 @@ def _format_aufnahme_preview(extracted: dict) -> str:
             else:
                 ohne_preis += 1
                 msg += f"  {i}. {name}: {menge} {einheit} (Preis offen)\n"
-            # Hinweis falls Preis aus Kalkulationsregel berechnet wurde
-            kalk = p.get("kalkulation")
-            if isinstance(kalk, dict) and kalk.get("formel"):
-                vars_str = ", ".join(
-                    f"{k}={v}" for k, v in (kalk.get("variablen") or {}).items()
-                )
-                msg += f"     🧮 <i>{kalk.get('regel_name')}: {kalk['formel']}"
-                if vars_str:
-                    msg += f"  ({vars_str})"
-                msg += "</i>\n"
         if gesamt > 0:
             msg += f"  <b>Summe (genannte Preise): {gesamt:.2f}€</b>\n"
         if ohne_preis > 0:
@@ -6000,9 +5162,9 @@ async def _handle_aufnahme_audio_received(chat_id, voice_dict, bot_token=None):
     # Audio-Dauer aus voice_dict (Telegram liefert "duration" in Sekunden)
     audio_dauer = voice_dict.get("duration")
 
-    # Gemini-Analyse - mit Kalkulationsregeln des Tenants als Kontext.
-    # Gemini fuellt pro Position das `kalkulation`-Feld; wir berechnen den
-    # finalen Preis gleich darunter deterministisch in Python.
+    # Gemini-Analyse — der Handwerker liefert fertige Preise per
+    # Sprachnotiz (z.B. "Standard-Treppe 12 Stufen 4500 Euro"),
+    # die Werte gehen direkt ins Angebot ohne Formel-Hybrid-Logik.
     try:
         extracted = await analyse_kundengespraech_from_audio(
             audio_bytes,
@@ -6013,9 +5175,6 @@ async def _handle_aufnahme_audio_received(chat_id, voice_dict, bot_token=None):
         logger.error(f"analyse_kundengespraech fehler: {e}", exc_info=True)
         await _clear_state(chat_id)
         return f"❌ Fehler bei Analyse: {e}\n\nBitte erneut versuchen."
-
-    # Hybrid-Berechnung: Preise aus Kalkulationsregeln einsetzen
-    extracted = await _apply_kalkulationen(tenant.id, extracted)
 
     # Pflicht: kunde_name muss da sein
     if not extracted.get("kunde_name"):
@@ -6495,12 +5654,12 @@ async def _handle_angebot_command(chat_id):
     await _save_state(chat_id, STATE_ANGEBOT_WAITING_INPUT, {})
     return (
         "📋 <b>Neues Angebot</b>\n\n"
-        "Diktiere oder schreibe was du anbieten willst — z.B.:\n"
+        "Diktiere oder schreibe was du anbieten willst — mit Preisen.\n"
+        "Beispiel:\n"
         "<i>«Angebot fuer Frau Mueller, Hauptstr 5 Trier, mueller@example.com:\n"
-        "100 qm Parkett verlegen plus Anfahrt»</i>\n\n"
-        "Ich nutze deine /kalkulation-Formeln fuer die Preise und lege das "
-        "Angebot direkt in Lexware an, sende es per Mail an den Kunden und "
-        "bereite eine passende Rechnung als Lexware-Draft vor.\n\n"
+        "100 qm Parkett verlegen 4500 Euro inkl. Material, Anfahrt 80 Euro»</i>\n\n"
+        "Ich lege das Angebot direkt in Lexware an, sende es per Mail an den "
+        "Kunden und bereite eine passende Rechnung als Lexware-Draft vor.\n\n"
         "Mit /abbrechen beenden."
     )
 
@@ -6538,13 +5697,9 @@ def _format_angebot_preview(extracted: dict, *, anschreiben: str | None = None) 
         preis = float(pos.get("preis_brutto_eur") or 0)
         zeile_total = Decimal(str(round(menge * preis, 2)))
         gesamt += zeile_total
-        kalk = pos.get("kalkulation") or {}
-        kalk_hint = ""
-        if isinstance(kalk, dict) and kalk.get("regel_name"):
-            kalk_hint = f"  <i>(Formel: {_h_safe(kalk['regel_name'])})</i>"
         lines.append(
             f"<b>{i}.</b> {_h_safe(name)} — {menge:g} {_h_safe(einheit)} × "
-            f"{preis:.2f}€ = <b>{float(zeile_total):.2f}€</b>{kalk_hint}"
+            f"{preis:.2f}€ = <b>{float(zeile_total):.2f}€</b>"
         )
         if pos.get("beschreibung"):
             lines.append(f"   <i>{_h_safe(pos['beschreibung'])}</i>")
@@ -6633,10 +5788,11 @@ async def _handle_angebot_input_received(
 ):
     """Verarbeitet Text- oder Voice-Input fuer ein neues Angebot.
 
-    1. Gemini-Extraction (mit Kalkulationsregeln im Prompt)
-    2. _apply_kalkulationen (deterministische Formel-Anwendung)
-    3. Angebot + AngebotPositions in DB anlegen
-    4. Preview senden mit Confirm-Buttons
+    1. Gemini-Extraction (Kunde + Positionen mit Preisen aus dem
+       Diktat; der Handwerker spricht die Preise selbst rein, keine
+       Formel-Hybrid-Logik mehr)
+    2. Angebot + AngebotPositions in DB anlegen
+    3. Preview senden mit Confirm-Buttons
     """
     tenant = await _get_tenant_by_chat(chat_id)
     if not tenant:
@@ -6669,10 +5825,7 @@ async def _handle_angebot_input_received(
             "Bitte mit /angebot erneut starten und Kunde + Leistungen klar nennen."
         )
 
-    # 2) Kalkulation anwenden — gleiche Funktion wie /aufnahme nutzt
-    extracted = await _apply_kalkulationen(tenant.id, extracted)
-
-    # 3) Mindestens 1 Position mit Preis Pflicht
+    # 2) Mindestens 1 Position mit Preis Pflicht
     positionen = extracted.get("positionen") or []
     if not positionen or not any(
         p.get("preis_brutto_eur") for p in positionen
@@ -6680,13 +5833,12 @@ async def _handle_angebot_input_received(
         await _clear_state(chat_id)
         return (
             "❌ Konnte keine Positionen mit Preis erkennen.\n\n"
-            "Bitte erwaehne Leistungen explizit — z.B. <i>«Parkett verlegen, "
-            "100qm»</i>. Wenn du Kalkulations-Formeln nutzt, in /kalkulation "
-            "anzeigen mit /kalkulation_anzeigen.\n\n"
+            "Bitte erwaehne Leistungen + Preis explizit — z.B. "
+            "<i>«Parkett verlegen 100 qm fuer 4500 Euro»</i>.\n\n"
             "Mit /angebot neu starten."
         )
 
-    # 3b) Pflicht: voller Kunden-Name. Wenn nicht erkannt → State
+    # 3) Pflicht: voller Kunden-Name. Wenn nicht erkannt → State
     # AWAITING_KUNDE_NAME, der naechste Text-Input vom User wird als
     # vollstaendiger Name uebernommen und der Flow geht hier weiter.
     if not _is_full_kunde_name(extracted.get("kunde_name")):
