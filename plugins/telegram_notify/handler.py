@@ -72,6 +72,9 @@ from core.models import (
     STATE_URLAUB_AWAIT_START,
     STATE_URLAUB_AWAIT_END,
     STATE_KALENDER_PROVIDER_CHOICE,
+    STATE_STORNO_AWAIT_QUERY,
+    STATE_STORNO_AWAIT_CHOICE,
+    STATE_STORNO_AWAIT_CONFIRM,
     STATE_FORMULAR_TYP_WAEHLEN,
     STATE_FORMULAR_HAUPTMENU,
     STATE_FORMULAR_NEU_NAME,
@@ -1412,6 +1415,200 @@ async def _handle_wissen_loeschen_input(chat_id, text, state_data):
     return f"Eintrag in <b>{label}</b> geloescht."
 
 
+# ----------------------------------------------------------------------
+# STORNO-Wizard /storno (Termin per Telegram absagen — fuer Daniel & Co.)
+# ----------------------------------------------------------------------
+# Flow:
+#   1. /storno                            -> "Telefon oder Mail?"
+#   2. Eingabe Telefon/Mail               -> Trefferliste mit Nummern
+#   3. Nummer-Auswahl                     -> Bestaetigung (ja/nein)
+#   4. ja                                 -> Storno via kalender.cancel_appointment
+#
+# Datenfluss durch state_data:
+#   AWAIT_CHOICE: {"matches": [{event_id, employee_id, datum,
+#                              uhrzeit, summary, ort}, ...]}
+#   AWAIT_CONFIRM: {"match": {...}}  (exakt eines)
+async def _handle_storno_command(chat_id):
+    """Startet den /storno-Wizard."""
+    tenant = await _get_tenant_by_chat(chat_id)
+    if not tenant:
+        return "Dieser Chat ist keinem Betrieb zugeordnet."
+    await _save_state(chat_id, STATE_STORNO_AWAIT_QUERY, {})
+    return (
+        "<b>Termin stornieren</b>\n\n"
+        "Bitte Telefonnummer ODER E-Mail-Adresse des Kunden eingeben.\n"
+        "Beispiele:\n"
+        "  <code>+49 30 1234567</code>\n"
+        "  <code>kunde@example.de</code>\n\n"
+        "Oder /abbrechen."
+    )
+
+
+async def _handle_storno_query_input(chat_id, text):
+    """Step 2: User hat Telefon oder Mail eingegeben -> Trefferliste."""
+    from core.plugin_system import get_plugin_for_tenant
+
+    raw = (text or "").strip()
+    if not raw:
+        return "Bitte Telefonnummer oder Mail eingeben (oder /abbrechen)."
+
+    tenant = await _get_tenant_by_chat(chat_id)
+    if not tenant:
+        await _clear_state(chat_id)
+        return "Dieser Chat ist keinem Betrieb zugeordnet."
+
+    # Heuristik: enthaelt @ -> Mail, sonst Telefon
+    find_payload: dict = {}
+    if "@" in raw:
+        find_payload["kunde_email"] = raw
+    else:
+        find_payload["kunde_telefon"] = raw
+
+    kalender = await get_plugin_for_tenant(tenant.slug, "kalender")
+    if kalender is None:
+        await _clear_state(chat_id)
+        return (
+            "Der Kalender ist fuer diesen Betrieb nicht eingerichtet. "
+            "Erst /kalender_verbinden ausfuehren."
+        )
+
+    try:
+        res = await kalender.on_webhook("find_events", find_payload)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception(f"/storno find_events crash: {exc}")
+        await _clear_state(chat_id)
+        return "Fehler bei der Termin-Suche. Bitte spaeter erneut versuchen."
+
+    if not res.get("erfolg"):
+        await _clear_state(chat_id)
+        return res.get("nachricht") or "Suche fehlgeschlagen."
+
+    termine = res.get("termine", [])
+    if not termine:
+        await _clear_state(chat_id)
+        return (
+            f"Keine Termine fuer <code>{_h_safe(raw)}</code> gefunden.\n\n"
+            "Hinweis: Es werden nur Termine in den naechsten 30 Tagen "
+            "durchsucht. Bei Telefonnummern verschiedene Schreibweisen "
+            "probieren (z.B. mit/ohne +49). Bei Alttermin ohne "
+            "Metadaten ggf. direkt im Kalender loeschen."
+        )
+
+    # Treffer-Liste bauen — voice-/wizard-freundliche Felder
+    from dateutil import parser as _p  # type: ignore
+    wochentage = ["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"]
+    matches: list[dict] = []
+    msg_lines = ["<b>Welchen Termin stornieren?</b>\n"]
+    for i, ev in enumerate(termine, start=1):
+        try:
+            sdt = _p.isoparse(ev["start_dt"])
+        except Exception:  # noqa: BLE001
+            continue
+        m = {
+            "event_id": ev["event_id"],
+            "employee_id": ev.get("employee_id"),
+            "employee_slug": ev.get("employee_slug", ""),
+            "datum": sdt.strftime("%d.%m.%Y"),
+            "wochentag": wochentage[sdt.weekday()],
+            "uhrzeit": sdt.strftime("%H:%M"),
+            "summary": ev.get("summary", "(ohne Titel)"),
+            "ort": ev.get("location", ""),
+            "match_source": ev.get("match_source", ""),
+        }
+        matches.append(m)
+        ort_suffix = f" · {_h_safe(m['ort'])}" if m["ort"] else ""
+        emp_suffix = f" · Kal: {_h_safe(m['employee_slug'])}" if m["employee_slug"] else ""
+        match_hint = " <i>(Volltext)</i>" if m["match_source"] == "fulltext" else ""
+        msg_lines.append(
+            f"{i}) <b>{m['wochentag']} {m['datum']} {m['uhrzeit']}</b> "
+            f"· {_h_safe(m['summary'])}{ort_suffix}{emp_suffix}{match_hint}"
+        )
+    msg_lines.append("\nAntworten Sie mit der Nummer oder /abbrechen.")
+    await _save_state(
+        chat_id, STATE_STORNO_AWAIT_CHOICE, {"matches": matches},
+    )
+    return "\n".join(msg_lines)
+
+
+async def _handle_storno_choice_input(chat_id, text, state_data):
+    """Step 3: User hat Nummer ausgewaehlt -> Bestaetigungs-Prompt."""
+    text = (text or "").strip()
+    matches = (state_data or {}).get("matches") or []
+    try:
+        idx = int(text) - 1
+    except (ValueError, TypeError):
+        return (
+            "Bitte die Nummer eines Eintrags (1, 2, …) eingeben "
+            "oder /abbrechen."
+        )
+    if not (0 <= idx < len(matches)):
+        return f"Es gibt nur {len(matches)} Treffer. Bitte gueltige Nummer."
+
+    m = matches[idx]
+    await _save_state(
+        chat_id, STATE_STORNO_AWAIT_CONFIRM, {"match": m},
+    )
+    ort_suffix = f"\n<b>Ort:</b> {_h_safe(m['ort'])}" if m["ort"] else ""
+    return (
+        f"<b>Wirklich stornieren?</b>\n\n"
+        f"<b>Wann:</b> {m['wochentag']} {m['datum']} {m['uhrzeit']} Uhr\n"
+        f"<b>Titel:</b> {_h_safe(m['summary'])}"
+        f"{ort_suffix}\n\n"
+        f"Antworten Sie mit <b>ja</b> oder <b>nein</b>."
+    )
+
+
+async def _handle_storno_confirm_input(chat_id, text, state_data):
+    """Step 4: ja -> Storno durchfuehren. Sonst -> abbrechen."""
+    from core.plugin_system import get_plugin_for_tenant
+
+    decision = (text or "").strip().lower()
+    if decision not in ("ja", "y", "yes", "j", "nein", "n", "no"):
+        return "Bitte mit <b>ja</b> oder <b>nein</b> antworten."
+    if decision in ("nein", "n", "no"):
+        await _clear_state(chat_id)
+        return "Abgebrochen — kein Termin storniert."
+
+    match = (state_data or {}).get("match") or {}
+    event_id = match.get("event_id")
+    if not event_id:
+        await _clear_state(chat_id)
+        return "Keine Termin-ID im Wizard-State. Bitte /storno erneut starten."
+
+    tenant = await _get_tenant_by_chat(chat_id)
+    if not tenant:
+        await _clear_state(chat_id)
+        return "Dieser Chat ist keinem Betrieb zugeordnet."
+    kalender = await get_plugin_for_tenant(tenant.slug, "kalender")
+    if kalender is None:
+        await _clear_state(chat_id)
+        return "Kalender nicht eingerichtet."
+
+    cancel_payload: dict = {"event_id": event_id}
+    emp_id_str = match.get("employee_id")
+    if emp_id_str:
+        try:
+            cancel_payload["employee_id"] = uuid.UUID(emp_id_str)
+        except (ValueError, TypeError):
+            pass
+
+    try:
+        res = await kalender.on_webhook("cancel_appointment", cancel_payload)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception(f"/storno cancel crash: {exc}")
+        await _clear_state(chat_id)
+        return "Fehler beim Stornieren. Termin koennte teilweise geloescht sein."
+
+    await _clear_state(chat_id)
+    if not res.get("erfolg"):
+        return f"Storno fehlgeschlagen: {res.get('nachricht') or 'unbekannter Fehler'}"
+    return (
+        f"Termin storniert.\n\n"
+        f"<b>{match['wochentag']} {match['datum']} {match['uhrzeit']}</b> "
+        f"— {_h_safe(match['summary'])}"
+    )
+
+
 async def _apply_kalkulationen(tenant_id, extracted: dict) -> dict:
     """
     Hybrid-Berechnung: Wenn Gemini fuer eine Position eine `kalkulation`
@@ -2391,6 +2588,8 @@ async def _dispatch_update(payload):
         reply = await _handle_wissen_anzeigen(chat_id)
     elif text == "/wissen_loeschen":
         reply = await _handle_wissen_loeschen_command(chat_id)
+    elif text == "/storno":
+        reply = await _handle_storno_command(chat_id)
     elif text == "/kalkulation":
         reply = await _handle_kalkulation_command(chat_id)
     elif text == "/kalkulation_anzeigen":
@@ -2585,6 +2784,12 @@ async def _dispatch_update(payload):
             reply = await _handle_wissen_text_input(chat_id, text, state.state_data)
         elif state.state_key == STATE_WISSEN_LOESCHEN:
             reply = await _handle_wissen_loeschen_input(chat_id, text, state.state_data)
+        elif state.state_key == STATE_STORNO_AWAIT_QUERY:
+            reply = await _handle_storno_query_input(chat_id, text)
+        elif state.state_key == STATE_STORNO_AWAIT_CHOICE:
+            reply = await _handle_storno_choice_input(chat_id, text, state.state_data)
+        elif state.state_key == STATE_STORNO_AWAIT_CONFIRM:
+            reply = await _handle_storno_confirm_input(chat_id, text, state.state_data)
         elif state.state_key == STATE_KALK_KATEGORIE:
             reply = await _handle_kalk_kategorie_input(chat_id, text)
         elif state.state_key == STATE_KALK_NAME:

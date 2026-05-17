@@ -109,6 +109,11 @@ STATE_BESTELLEN_MENGE = "bestellen_menge"
 # Archiv-Wizard (Google-Drive-Upload pro Kunde)
 STATE_ARCHIV_WAITING_FILES = "archiv_waiting_files"
 
+# Storno-Wizard (Termin per Telegram absagen)
+STATE_STORNO_AWAIT_QUERY = "storno_await_query"
+STATE_STORNO_AWAIT_CHOICE = "storno_await_choice"
+STATE_STORNO_AWAIT_CONFIRM = "storno_await_confirm"
+
 # Formular-Editor-Wizard
 STATE_FORMULAR_TYP_WAEHLEN = "formular_typ_waehlen"
 STATE_FORMULAR_HAUPTMENU = "formular_hauptmenu"
