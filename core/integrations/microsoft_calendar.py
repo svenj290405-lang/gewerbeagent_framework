@@ -42,6 +42,22 @@ logger = logging.getLogger(__name__)
 DEFAULT_TIMEZONE = "Europe/Berlin"
 HTTP_TIMEOUT_SECONDS = 20.0
 
+# Mailbox-TZ-Strings die der Outlook-Client als Berlin-Zeit anzeigt.
+# Graph liefert per default Windows-style ("W. Europe Standard Time"),
+# bei Accounts die explizit auf IANA umgestellt sind ggf. den IANA-Namen.
+# Wir akzeptieren alle Western/Central-European-TZs mit gleichem Offset
+# damit wir keine User aus Wien/Zuerich faelschlich warnen.
+BERLIN_COMPATIBLE_MAILBOX_TIMEZONES = frozenset({
+    "W. Europe Standard Time",         # Windows: DE/AT/CH/IT/NL/...
+    "Central European Standard Time",  # Windows: Warschau/Prag-Region
+    "Romance Standard Time",           # Windows: Paris/Madrid (selber Offset)
+    "Europe/Berlin",                   # IANA
+    "Europe/Vienna",                   # IANA
+    "Europe/Zurich",                   # IANA
+    "Europe/Amsterdam",                # IANA
+    "Europe/Paris",                    # IANA
+})
+
 # Property-Set-GUID fuer Gewerbeagent-Metadaten (kunde_telefon,
 # kunde_email, ga_ref). Eigene Namespace-UUID damit unsere Properties
 # nicht mit Outlook-internen oder anderen Add-Ins kollidieren. Wird
@@ -59,6 +75,71 @@ def ga_prop_id(name: str) -> str:
 def _iso_no_tz(d: dt.datetime) -> str:
     """ISO-String ohne Timezone-Suffix (Microsoft will das so wenn timeZone-Header gesetzt)."""
     return d.replace(microsecond=0).isoformat(timespec="seconds")
+
+
+# ---------------------------------------------------------------------
+# MAILBOX-TIMEZONE (Onboarding-Check)
+# ---------------------------------------------------------------------
+
+async def get_mailbox_timezone(
+    tenant_id: UUID, employee_id: UUID | None = None,
+) -> str | None:
+    """Liefert die Outlook-Mailbox-Default-Timezone des verbundenen Accounts.
+
+    Wird beim /kalender_verbinden direkt nach erfolgreichem OAuth
+    aufgerufen — wenn die TZ nicht Berlin-kompatibel ist, warnt der
+    OAuth-Callback per Telegram dass Termine 2h verschoben angezeigt
+    werden (siehe BERLIN_COMPATIBLE_MAILBOX_TIMEZONES).
+
+    Returns: Timezone-String wie Microsoft ihn meldet
+    (z.B. "W. Europe Standard Time" oder "UTC"), oder None bei
+    fehlendem Scope / API-Fehler. Caller sollte None defensive
+    behandeln (bedeutet "wissen wir nicht" — nicht warnen).
+
+    Braucht OAuth-Scope MailboxSettings.Read. Bei alten Tokens ohne
+    diesen Scope liefert die API 403 — wir loggen das einmal und
+    geben None zurueck.
+    """
+    try:
+        token = await get_microsoft_token(tenant_id, employee_id=employee_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"get_mailbox_timezone: no token: {exc}")
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS) as client:
+            resp = await client.get(
+                f"{GRAPH_API_BASE}/me/mailboxSettings/timeZone",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"get_mailbox_timezone HTTP crash: {exc}")
+        return None
+    if resp.status_code != 200:
+        logger.info(
+            f"get_mailbox_timezone tenant={tenant_id} HTTP {resp.status_code} "
+            f"(scope MailboxSettings.Read evtl. nicht granted): {resp.text[:150]}"
+        )
+        return None
+    # Graph liefert den Wert als JSON-String mit Quotes: "\"W. Europe Standard Time\""
+    try:
+        value = resp.json()
+    except Exception:
+        return resp.text.strip().strip('"') or None
+    # Bei JSON-String kommt z.B. "W. Europe Standard Time" raus
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        return value.get("value")
+    return None
+
+
+def is_berlin_compatible_timezone(tz: str | None) -> bool:
+    """True wenn die Mailbox-TZ Termine in Berlin-Zeit anzeigt.
+
+    None -> True (wir wissen es nicht, also nicht falsch warnen)."""
+    if tz is None:
+        return True
+    return tz in BERLIN_COMPATIBLE_MAILBOX_TIMEZONES
 
 
 # ---------------------------------------------------------------------

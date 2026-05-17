@@ -54,6 +54,10 @@ MICROSOFT_SCOPES = [
     # Outlook-Calendar (analog Google Calendar): lesen+schreiben+loeschen
     # plus FreeBusy-Check fuer Slot-Suche
     "Calendars.ReadWrite",
+    # Mailbox-Timezone (read-only) — wir warnen beim Onboarding wenn
+    # die Outlook-Mailbox auf UTC steht, weil sonst Termine 2h
+    # verschoben angezeigt werden (siehe _handle_callback_microsoft).
+    "MailboxSettings.Read",
 ]
 
 
@@ -370,6 +374,52 @@ async def _handle_callback_microsoft(
         f"Microsoft-OAuth-Token gespeichert: tenant={tenant_slug}"
         f"{('/'+employee_slug) if employee_slug else ''} email={account_email}"
     )
+
+    # Onboarding-Check (Option 2): Mailbox-Timezone abfragen und warnen
+    # wenn nicht Berlin-kompatibel. Outlook-Web/-Desktop zeigt Termine in
+    # der Mailbox-Default-TZ — bei UTC-Mailboxen werden 11:00-Termine als
+    # 09:00 angezeigt (siehe Incident vom 2026-05-17). Best-effort: ein
+    # Fehler hier blockiert NICHT die Token-Speicherung.
+    try:
+        from core.integrations.microsoft_calendar import (
+            get_mailbox_timezone, is_berlin_compatible_timezone,
+        )
+        mailbox_tz = await get_mailbox_timezone(tenant.id, employee_id=employee_id)
+        if mailbox_tz is not None and not is_berlin_compatible_timezone(mailbox_tz):
+            logger.warning(
+                f"Outlook-Onboarding {account_email}: mailbox-TZ "
+                f"{mailbox_tz!r} ist nicht Berlin-kompatibel — Termine "
+                f"werden im Outlook-Client verschoben angezeigt."
+            )
+            try:
+                from plugins.telegram_notify.handler import TelegramNotifier
+                warn = (
+                    "⚠️ <b>Outlook-Kalender verbunden — aber Zeitzone pruefen!</b>\n\n"
+                    f"Account: <code>{account_email}</code>\n"
+                    f"Deine Outlook-Mailbox steht auf <b>{mailbox_tz}</b>. "
+                    f"Termine die wir um 11:00 buchen werden im Outlook-Client "
+                    f"deshalb verschoben angezeigt (meist 2h frueher).\n\n"
+                    f"<b>So aenderst du das (einmalig, 30 Sek):</b>\n"
+                    f"Outlook-Web -> Settings (Zahnrad oben rechts) -> "
+                    f"<b>Calendar -> View</b> -> Time zone: "
+                    f"<code>(UTC+01:00) Amsterdam, Berlin, Bern, Rom, Stockholm, Wien</code>\n\n"
+                    f"Danach passt die Anzeige. Unsere Buchungen sind "
+                    f"unabhaengig davon im Hintergrund korrekt — nur die "
+                    f"Outlook-Anzeige ist betroffen."
+                )
+                await TelegramNotifier.send_for_employee(
+                    tenant.id, warn, employee_id=employee_id,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"TZ-Warning-Push failed: {exc}")
+        elif mailbox_tz is not None:
+            logger.info(
+                f"Outlook-Onboarding {account_email}: mailbox-TZ "
+                f"{mailbox_tz!r} ist Berlin-kompatibel — keine Warnung."
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"Mailbox-TZ-Check fehlgeschlagen (kein Blocker): {exc}")
+
     return oauth_token
 
 
