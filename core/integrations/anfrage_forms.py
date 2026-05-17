@@ -384,6 +384,7 @@ async def create_anfrage_token(
     original_subject: Optional[str] = None,
     original_message_id: Optional[str] = None,
     valid_days: int = 3,
+    kunde_telefon: Optional[str] = None,
 ) -> AnfrageToken:
     """Erstellt einen neuen Anfrage-Token fuer einen Kunden.
 
@@ -394,14 +395,25 @@ async def create_anfrage_token(
     Postfach landet, ist das Zeitfenster fuer Termin-Spoofing kuerzer.
     Caller (Mail-Antwort-Generator) kann ueberschreiben wenn ein
     laengerer Zeitraum bewusst gewollt ist.
+
+    kunde_telefon (optional): rohe Telefonnummer des Anrufers. Wird
+    automatisch normalisiert (Ziffern-only via core.utils.phone) bevor
+    sie gespeichert wird, damit der spaetere phone-basierte Lookup
+    aus _handle_buche_termin matcht. Bei Mail-Pipeline NULL lassen.
     """
+    from core.utils.phone import normalize_phone
+
     expires_at = datetime.now(timezone.utc) + timedelta(days=valid_days)
+    telefon_norm = normalize_phone(kunde_telefon) if kunde_telefon else None
+    if telefon_norm == "":
+        telefon_norm = None
 
     async with AsyncSessionLocal() as session:
         token_obj = AnfrageToken(
             tenant_id=tenant_id,
             kunde_email=kunde_email.lower(),
             kunde_name=kunde_name,
+            kunde_telefon=telefon_norm,
             anfrage_typ=anfrage_typ,
             original_subject=original_subject,
             original_message_id=original_message_id,
@@ -422,6 +434,57 @@ def build_anfrage_url(token: str) -> str:
     """Baut die oeffentliche URL fuer das Formular."""
     base = settings.public_url.rstrip("/")
     return f"{base}/anfrage/{token}"
+
+
+# Voice-Session-Lebensdauer: Wie lange nach _handle_save_contact darf
+# ein Token noch fuer den email-Lookup beim _handle_buche_termin gelten?
+# 2h deckt typische Verkaufsgespraeche + Bedenkzeit ab, ohne Tokens aus
+# vergangenen Tagen zu matchen (Kunde aendert seine Buchungs-Wuensche,
+# ruft am naechsten Tag wieder an — wir wollen den NEUEN Token, der
+# erst nach erneutem speichere_kontakt entsteht).
+VOICE_SESSION_LOOKUP_SECONDS = 2 * 3600
+
+
+async def lookup_recent_anfrage_by_phone(
+    tenant_id: UUID,
+    phone_normalized: str,
+    max_age_seconds: int = VOICE_SESSION_LOOKUP_SECONDS,
+) -> Optional[AnfrageToken]:
+    """Sucht den juengsten AnfrageToken fuer (tenant, normalisierte Tel-Nr).
+
+    Wird vom Voice-Plugin in _handle_buche_termin aufgerufen, um die
+    in _handle_save_contact gespeicherte kunde_email zu finden und ans
+    Kalender-Event zu haengen.
+
+    Lookup-Kriterien:
+    - tenant_id matched (Mandanten-Isolation)
+    - kunde_telefon == phone_normalized (NOT NULL, exact match auf der
+      via core.utils.phone normalisierten Form)
+    - created_at >= now - max_age_seconds (2h Default — Voice-Session-
+      Lebensdauer)
+
+    Bei mehreren Treffern: der juengste. Bei keinem: None (Caller-
+    Fallback greift, z.B. payload-kunde_email oder gar keine).
+
+    Hinweis: Wir filtern NICHT auf submitted_at IS NULL — auch ein
+    bereits ausgefuelltes Anfrage-Formular ist eine valide Source-of-
+    Truth fuer die Kunden-Mail im Storno-Lookup.
+    """
+    if not phone_normalized:
+        return None
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=max_age_seconds)
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            select(AnfrageToken)
+            .where(
+                AnfrageToken.tenant_id == tenant_id,
+                AnfrageToken.kunde_telefon == phone_normalized,
+                AnfrageToken.created_at >= cutoff,
+            )
+            .order_by(AnfrageToken.created_at.desc())
+            .limit(1)
+        )
+        return result.scalar_one_or_none()
 
 
 async def get_token_with_tenant(token_str: str) -> tuple[Optional[AnfrageToken], Optional[Tenant]]:

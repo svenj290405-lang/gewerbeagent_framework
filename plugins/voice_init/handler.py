@@ -992,6 +992,7 @@ class Plugin(BasePlugin):
                 branche=tenant_branche,
                 kunde_name=name,
                 kunde_email=email,
+                kunde_telefon=phone,
                 anliegen=anliegen,
             )
 
@@ -1044,7 +1045,7 @@ class Plugin(BasePlugin):
     async def _send_anfrage_mail(
         self, *, tenant_id, tenant_telegram, company_name, contact_name,
         contact_email, contact_phone, branche, kunde_name, kunde_email,
-        anliegen,
+        anliegen, kunde_telefon=None,
     ):
         """Erzeugt einen Anfrage-Token und mailt dem Kunden den Formular-Link.
 
@@ -1077,6 +1078,7 @@ class Plugin(BasePlugin):
                 tenant_id=tenant_id,
                 kunde_email=kunde_email,
                 kunde_name=kunde_name,
+                kunde_telefon=kunde_telefon,
                 anfrage_typ=anfrage_typ,
             )
             form_url = build_anfrage_url(token_obj.token)
