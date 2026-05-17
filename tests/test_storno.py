@@ -626,6 +626,32 @@ async def test_voice_storniere_termin_unknown_token(monkeypatch):
 # Rueckwaertskompat: Legacy-Event ohne Metadaten kommt via Fulltext-Verifier
 # =====================================================================
 
+def test_outlook_attendee_email_match_positive():
+    """Outlook-typisch: Kunde als Meeting-Attendee — Mail nirgends im Body."""
+    from core.integrations.microsoft_calendar import email_in_attendees
+    ev = {
+        "subject": "Beratung",
+        "body": {"content": "<html><body>Termin mit Kunde</body></html>"},
+        "attendees": [
+            {"emailAddress": {"address": "Kunde@Example.de", "name": "K"}},
+            {"emailAddress": {"address": "mitarbeiter@firma.de", "name": "M"}},
+        ],
+    }
+    # case-insensitiv
+    assert email_in_attendees(ev, "kunde@example.de") is True
+
+
+def test_outlook_attendee_email_match_negative_and_empty():
+    """Keine Attendees / falsche Mail -> False, kein Crash."""
+    from core.integrations.microsoft_calendar import email_in_attendees
+    assert email_in_attendees({}, "x@y.de") is False
+    assert email_in_attendees({"attendees": []}, "x@y.de") is False
+    ev = {"attendees": [{"emailAddress": {"address": "other@x.de"}}]}
+    assert email_in_attendees(ev, "x@y.de") is False
+    # malformed attendees-Eintrag darf nicht crashen
+    assert email_in_attendees({"attendees": [{}]}, "x@y.de") is False
+
+
 def test_legacy_event_findable_via_fulltext_verifier():
     """Bestands-Event-description (vor Metadaten-Phase) -> Verifier matched."""
     legacy_desc = (

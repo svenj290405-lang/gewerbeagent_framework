@@ -354,55 +354,79 @@ async def find_events(
         _ingest(data.get("value", []), source="metadata",
                 phone_match=phone_match, email_match=email_match)
 
-    async def _query_fulltext(search_value: str, verify_needle: str,
-                              phone_match: bool,
-                              email_match: bool, verify_fn):
-        # $search braucht Quotes um den Wert und ConsistencyLevel: eventual.
-        # $search und $filter nicht kombinierbar — Datum lokal filtern.
-        # search_value = der String der an die API geht (z.B. Telefon-
-        # Suffix); verify_needle = der String der lokal gegen die
-        # description verifiziert wird (z.B. die volle normalisierte
-        # Nummer) — phone-Verifier rechnet daraus den Suffix-Match-Key.
+    # Volltext-Fallback ueber calendarView: Graph's `$search` ist auf
+    # `/me/events` schlicht nicht supported (HTTP 501 "SearchEvents:
+    # The parameter $search is not currently supported on the Events
+    # resource"). Stattdessen holen wir EINMAL alle Events im Zeitraum
+    # und filtern lokal — gegen body/content (verify_fn) UND attendees[]
+    # (typisch Outlook: Kunde als Meeting-Attendee eingeladen, Mail im
+    # body steht dann nirgends).
+    fulltext_cache: list[list[dict]] = []  # mutable closure-Wrapper
+
+    async def _fetch_all_events_in_range() -> list[dict]:
+        if fulltext_cache:
+            return fulltext_cache[0]
+        params = {
+            "startDateTime": start_iso,
+            "endDateTime": end_iso,
+            "$select": "id,subject,start,end,location,body,bodyPreview,attendees",
+            "$top": 250,
+            "$orderby": "start/dateTime",
+        }
         try:
             async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS) as client:
                 resp = await client.get(
-                    f"{GRAPH_API_BASE}/me/events",
+                    f"{GRAPH_API_BASE}/me/calendarView",
                     headers={
                         "Authorization": f"Bearer {token}",
-                        "ConsistencyLevel": "eventual",
                         "Prefer": f'outlook.timezone="{DEFAULT_TIMEZONE}"',
                     },
-                    params={
-                        "$search": f'"{search_value}"',
-                        "$top": 100,
-                    },
+                    params=params,
                 )
                 if resp.status_code != 200:
                     logger.warning(
-                        f"Outlook find_events fulltext "
+                        f"Outlook find_events fulltext-list "
                         f"{resp.status_code}: {resp.text[:200]}"
                     )
-                    return
+                    fulltext_cache.append([])
+                    return []
                 data = resp.json()
         except Exception as exc:  # noqa: BLE001
-            logger.warning(f"Outlook find_events fulltext crash: {exc}")
-            return
-        # Manuell Datum + Verifikation filtern
+            logger.warning(f"Outlook find_events fulltext-list crash: {exc}")
+            fulltext_cache.append([])
+            return []
+        events = data.get("value", [])
+        fulltext_cache.append(events)
+        return events
+
+    async def _query_fulltext_phone(verify_needle: str):
+        events = await _fetch_all_events_in_range()
+        verified = [
+            ev for ev in events
+            if verify_fulltext_phone_match(
+                verify_needle,
+                _strip_html((ev.get("body") or {}).get("content") or ""),
+            )
+        ]
+        _ingest(verified, source="fulltext",
+                phone_match=True, email_match=False)
+
+    async def _query_fulltext_email(needle_email_lower: str):
+        events = await _fetch_all_events_in_range()
         verified = []
-        for ev in data.get("value", []):
-            try:
-                s_dt = _parse_dt(ev["start"]["dateTime"])
-            except (KeyError, ValueError):
-                continue
-            if not (time_min <= s_dt <= time_max):
-                continue
+        for ev in events:
             body_text = _strip_html(
                 (ev.get("body") or {}).get("content") or ""
             )
-            if verify_fn(verify_needle, body_text):
+            if verify_fulltext_email_match(needle_email_lower, body_text):
+                verified.append(ev)
+                continue
+            # Outlook-spezifisch: Kunde als Attendee eingeladen
+            # (Mail steht dann oft NICHT im Body).
+            if email_in_attendees(ev, needle_email_lower):
                 verified.append(ev)
         _ingest(verified, source="fulltext",
-                phone_match=phone_match, email_match=email_match)
+                phone_match=False, email_match=True)
 
     if kunde_telefon_normalized:
         await _query_metadata(
@@ -415,24 +439,9 @@ async def find_events(
             phone_match=False, email_match=True,
         )
     if kunde_telefon_normalized:
-        suffix = (
-            kunde_telefon_normalized[-8:]
-            if len(kunde_telefon_normalized) >= 8
-            else kunde_telefon_normalized
-        )
-        await _query_fulltext(
-            search_value=suffix,
-            verify_needle=kunde_telefon_normalized,
-            phone_match=True, email_match=False,
-            verify_fn=verify_fulltext_phone_match,
-        )
+        await _query_fulltext_phone(kunde_telefon_normalized)
     if kunde_email:
-        await _query_fulltext(
-            search_value=kunde_email,
-            verify_needle=kunde_email,
-            phone_match=False, email_match=True,
-            verify_fn=verify_fulltext_email_match,
-        )
+        await _query_fulltext_email(kunde_email)
 
     return list(results.values())
 
@@ -446,6 +455,24 @@ def _strip_html(html: str) -> str:
     text = re.sub(r"<[^>]+>", " ", html)
     text = text.replace("&nbsp;", " ").replace("&amp;", "&")
     return " ".join(text.split()).strip()
+
+
+def email_in_attendees(event: dict, email_lower: str) -> bool:
+    """True wenn der Outlook-Event den Kunden als Attendee mit der
+    gesuchten Mailadresse listet.
+
+    Wird vom find_events-Volltext-Pfad genutzt: in Outlook-Terminen
+    steht die Kunden-Mail haeufig NICHT im Body, sondern nur in
+    attendees[].emailAddress.address (Meeting-Einladung). Pure dict-
+    Lookup-Logik damit testbar ohne HTTP-Mock.
+    """
+    if not email_lower or not event:
+        return False
+    for att in (event.get("attendees") or []):
+        addr = ((att.get("emailAddress") or {}).get("address") or "").lower()
+        if addr == email_lower:
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------
