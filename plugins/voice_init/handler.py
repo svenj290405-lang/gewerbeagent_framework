@@ -445,6 +445,7 @@ class Plugin(BasePlugin):
             "anliegen": "Kuechenmontage",
             "kunde_name": "Frau Mueller",
             "kunde_telefon": "+49 ...",          # optional
+            "kunde_email": "kunde@...",          # optional (Storno-Lookup)
             "kunde_adresse": "...",              # optional
             "tenant_slug": "demo"
           }
@@ -503,6 +504,11 @@ class Plugin(BasePlugin):
         adresse = (payload.get("kunde_adresse") or "").strip()
         anliegen = (payload.get("anliegen") or "").strip()
         telefon = (payload.get("kunde_telefon") or "").strip()
+        # kunde_email optional — wird vom ElevenLabs-Tool durchgereicht
+        # wenn Q die Adresse fuer Bestaetigungs-Mail abgefragt hat. Wird
+        # an kalender.book_appointment als kunde_email weitergereicht,
+        # damit der Termin via Mail spaeter storno-findbar ist.
+        kunde_email = (payload.get("kunde_email") or "").strip()
 
         # employee_id: bevorzugt aus dem Payload (Voice-Agent reicht die
         # checke_kalender-Routing-Entscheidung weiter). Fehlt sie, machen
@@ -542,6 +548,8 @@ class Plugin(BasePlugin):
         }
         if telefon:
             book_payload["telefon"] = telefon
+        if kunde_email:
+            book_payload["kunde_email"] = kunde_email
         if adresse:
             book_payload["adresse"] = adresse
         if employee_id is not None:

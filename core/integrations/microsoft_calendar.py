@@ -42,6 +42,19 @@ logger = logging.getLogger(__name__)
 DEFAULT_TIMEZONE = "Europe/Berlin"
 HTTP_TIMEOUT_SECONDS = 20.0
 
+# Property-Set-GUID fuer Gewerbeagent-Metadaten (kunde_telefon,
+# kunde_email, ga_ref). Eigene Namespace-UUID damit unsere Properties
+# nicht mit Outlook-internen oder anderen Add-Ins kollidieren. Wird
+# beim create_event als singleValueExtendedProperties gesetzt und
+# beim find_events via $filter abgefragt. NIE aendern — sonst sind
+# alle bestehenden Termin-Metadaten unauffindbar.
+GA_PROPSET_GUID = "66f5a359-4659-4830-9070-00047ec6ac6e"
+
+
+def ga_prop_id(name: str) -> str:
+    """Baut die singleValueExtendedProperty-Id im Graph-Format."""
+    return f"String {{{GA_PROPSET_GUID}}} Name {name}"
+
 
 def _iso_no_tz(d: dt.datetime) -> str:
     """ISO-String ohne Timezone-Suffix (Microsoft will das so wenn timeZone-Header gesetzt)."""
@@ -184,10 +197,18 @@ async def create_event(
     start: dt.datetime,
     end: dt.datetime,
     employee_id: UUID | None = None,
+    kunde_telefon_normalized: str | None = None,
+    kunde_email: str | None = None,
+    idempotency_key: str | None = None,
 ) -> dict[str, Any]:
-    """Erstellt einen Termin. Returns: {"id": ..., "html_link": ...}"""
+    """Erstellt einen Termin. Returns: {"id": ..., "html_link": ...}.
+
+    Strukturierte Metadaten landen als singleValueExtendedProperties
+    am Event — exakt durchsuchbar via /me/events?$filter ueber den
+    GA_PROPSET_GUID-Namespace (siehe find_events).
+    """
     token = await get_microsoft_token(tenant_id, employee_id=employee_id)
-    body = {
+    body: dict[str, Any] = {
         "subject": summary,
         "body": {"contentType": "HTML", "content": description.replace("\n", "<br>")},
         "start": {"dateTime": _iso_no_tz(start), "timeZone": DEFAULT_TIMEZONE},
@@ -195,6 +216,18 @@ async def create_event(
         "location": {"displayName": location} if location else None,
     }
     body = {k: v for k, v in body.items() if v is not None}
+
+    # Strukturierte Metadaten: nur Keys mit Wert. Graph akzeptiert
+    # leere Listen problemlos, aber Eintraege mit value=None geben 400.
+    ext_props: list[dict[str, str]] = []
+    if kunde_telefon_normalized:
+        ext_props.append({"id": ga_prop_id("kunde_telefon"), "value": kunde_telefon_normalized})
+    if kunde_email:
+        ext_props.append({"id": ga_prop_id("kunde_email"), "value": kunde_email})
+    if idempotency_key:
+        ext_props.append({"id": ga_prop_id("ga_ref"), "value": idempotency_key})
+    if ext_props:
+        body["singleValueExtendedProperties"] = ext_props
 
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS) as client:
         resp = await client.post(

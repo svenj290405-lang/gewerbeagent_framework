@@ -29,6 +29,7 @@ from core.integrations.geo import (
 )
 from core.models import Tenant
 from core.plugin_system import BasePlugin
+from core.utils.phone import normalize_phone
 from plugins.kalender.adapters import get_calendar_adapter
 from plugins.kalender.manifest import MANIFEST
 from plugins.telegram_notify.handler import TelegramNotifier
@@ -216,6 +217,15 @@ class Plugin(BasePlugin):
             anliegen = payload.get("anliegen", "")
             adresse = payload.get("adresse") or "Adresse nicht angegeben"
             telefon = payload.get("telefon")
+            # kunde_email kommt aus Mail-Pipeline immer, aus Voice optional
+            # (Phase 1: nur wenn Q die Mail aktiv erfragt hat). Lowercase-
+            # normalisiert damit Storno-Suche per Mail spaeter exakt matched.
+            kunde_email_raw = payload.get("kunde_email") or ""
+            kunde_email = kunde_email_raw.strip().lower() or None
+            # Telefon-Normalisierung: Voice gibt "+49 30 1234" rein,
+            # Storno-Suche kommt vielleicht als "030 1234" — beide muessen
+            # auf den selben Key mappen damit die Suche findet.
+            kunde_telefon_normalized = normalize_phone(telefon) or None
             datum = payload.get("datum", "")
             uhrzeit = payload.get("uhrzeit", "")
             dauer = payload.get(
@@ -283,6 +293,9 @@ class Plugin(BasePlugin):
                     start=start,
                     end=ende,
                     timezone=self.config["zeitzone"],
+                    kunde_telefon_normalized=kunde_telefon_normalized,
+                    kunde_email=kunde_email,
+                    idempotency_key=idempotency_key,
                 )
 
             # Telegram-Push an den fuer den Termin zustaendigen Mitarbeiter

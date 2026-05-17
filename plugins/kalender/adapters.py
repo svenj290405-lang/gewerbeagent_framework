@@ -60,8 +60,20 @@ class CalendarAdapter(ABC):
         start: dt.datetime,
         end: dt.datetime,
         timezone: str,
+        kunde_telefon_normalized: str | None = None,
+        kunde_email: str | None = None,
+        idempotency_key: str | None = None,
     ) -> dict[str, Any]:
-        """Anlegen. Returns: {"id": ..., "html_link": ...}."""
+        """Anlegen. Returns: {"id": ..., "html_link": ...}.
+
+        Strukturierte Metadaten (kunde_telefon_normalized, kunde_email,
+        idempotency_key) werden zusaetzlich zu summary/description als
+        provider-spezifische extendedProperties abgelegt. Damit kann
+        spaeter `find_events` exakt nach Telefon/Mail suchen statt
+        Volltext-Match auf description. Alle drei sind optional —
+        Legacy-Caller die nichts mitgeben kriegen ein Event ohne
+        Metadaten (Backward-Compat).
+        """
 
     @abstractmethod
     async def delete_event(self, event_id: str) -> bool:
@@ -148,7 +160,11 @@ class GoogleCalendarAdapter(CalendarAdapter):
             })
         return events
 
-    async def create_event(self, *, summary, description, location, start, end, timezone):
+    async def create_event(
+        self, *, summary, description, location, start, end, timezone,
+        kunde_telefon_normalized=None, kunde_email=None,
+        idempotency_key=None,
+    ):
         service = await self._get_service()
         body = {
             "summary": summary,
@@ -164,6 +180,20 @@ class GoogleCalendarAdapter(CalendarAdapter):
                 ],
             },
         }
+        # Strukturierte Metadaten: Google's extendedProperties.private
+        # ist exakt durchsuchbar via events.list(privateExtendedProperty=
+        # "kunde_telefon=..."). Wir setzen nur Keys mit Wert — Google
+        # akzeptiert keine None/leeren Strings sauber.
+        private_props: dict[str, str] = {}
+        if kunde_telefon_normalized:
+            private_props["kunde_telefon"] = kunde_telefon_normalized
+        if kunde_email:
+            private_props["kunde_email"] = kunde_email
+        if idempotency_key:
+            private_props["ga_ref"] = idempotency_key
+        if private_props:
+            body["extendedProperties"] = {"private": private_props}
+
         result = service.events().insert(
             calendarId=self.calendar_id, body=body,
         ).execute()
@@ -236,7 +266,11 @@ class MicrosoftCalendarAdapter(CalendarAdapter):
             self.tenant_id, target_date, employee_id=self.employee_id,
         )
 
-    async def create_event(self, *, summary, description, location, start, end, timezone):
+    async def create_event(
+        self, *, summary, description, location, start, end, timezone,
+        kunde_telefon_normalized=None, kunde_email=None,
+        idempotency_key=None,
+    ):
         # Microsoft nutzt fixe Tenant-Default-TZ via Helper; timezone-
         # Param wird in zukuenftiger Version genutzt.
         _ = timezone
@@ -246,6 +280,9 @@ class MicrosoftCalendarAdapter(CalendarAdapter):
             summary=summary, description=description,
             location=location, start=start, end=end,
             employee_id=self.employee_id,
+            kunde_telefon_normalized=kunde_telefon_normalized,
+            kunde_email=kunde_email,
+            idempotency_key=idempotency_key,
         )
 
     async def delete_event(self, event_id):
