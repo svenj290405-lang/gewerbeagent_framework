@@ -29,6 +29,7 @@ from core.models import (
     STATE_KALK_LOESCHEN,
     STATE_KALK_EXCEL_WAITING,
     STATE_KALK_EXCEL_CONFIRM,
+    STATE_KALK_EXCEL_PER_ENTRY,
     STATE_BELEG_CONFIRMING,
     STATE_BELEG_WAITING_PHOTO,
     STATE_LEXWARE_SETUP_TOKEN,
@@ -2228,6 +2229,123 @@ async def _handle_kalk_excel_received(chat_id, document, bot_token):
     return msg
 
 
+# --------------------------------------------------------------------------
+# Per-Entry-Wizard nach "einzeln" im Excel-Confirm-Preview
+# --------------------------------------------------------------------------
+
+def _render_per_entry_prompt(entry: dict, idx: int, total: int) -> str:
+    """Formatiert eine einzelne Formel als Telegram-Frage."""
+    from core.models.tenant_kalkulation import KALK_KATEGORIE_LABELS
+    kat_label = KALK_KATEGORIE_LABELS.get(
+        entry.get("kategorie", "sonstiges"),
+        entry.get("kategorie", "Sonstiges"),
+    )
+    msg = f"<b>📊 Formel {idx + 1}/{total}</b>\n\n"
+    msg += f"<b>{entry.get('name', '?')}</b>\n"
+    msg += f"<i>Kategorie:</i> {kat_label}\n"
+    if entry.get("beschreibung"):
+        msg += f"<i>{entry['beschreibung']}</i>\n"
+    msg += f"<code>{entry.get('formel', '?')}</code>\n\n"
+    msg += (
+        "Behalten?\n"
+        "• <b>ja</b> = speichern\n"
+        "• <b>nein</b> oder <b>skip</b> = ueberspringen\n"
+        "• <b>/abbrechen</b> = Wizard beenden (vorher Bestaetigte werden gespeichert)"
+    )
+    return msg
+
+
+async def _start_kalk_excel_per_entry_wizard(chat_id, state_data):
+    """Wechselt vom Confirm-State in den Per-Entry-Wizard, zeigt Formel 1."""
+    data = state_data or {}
+    eintraege = data.get("eintraege") or []
+    if not eintraege:
+        await _clear_state(chat_id)
+        return "Keine Eintraege im State - bitte nochmal /kalkulation_excel."
+    new_state = {
+        "eintraege": eintraege,
+        "filename": data.get("filename"),
+        "index": 0,
+        "decisions": [],  # bool pro Index — True = behalten, False = skip
+    }
+    await _save_state(chat_id, STATE_KALK_EXCEL_PER_ENTRY, new_state)
+    return _render_per_entry_prompt(eintraege[0], 0, len(eintraege))
+
+
+async def _finish_kalk_excel_per_entry(chat_id, state_data):
+    """Speichert die als 'behalten' markierten Eintraege, beendet den Wizard."""
+    data = state_data or {}
+    eintraege = data.get("eintraege") or []
+    decisions = data.get("decisions") or []
+    filename = data.get("filename")
+
+    tenant = await _get_tenant_by_chat(chat_id)
+    if not tenant:
+        await _clear_state(chat_id)
+        return "Tenant nicht gefunden. Bitte /start erneut ausfuehren."
+
+    saved = 0
+    skipped = 0
+    async with AsyncSessionLocal() as s:
+        for entry, keep in zip(eintraege, decisions):
+            if keep:
+                row = _build_kalk_entry_for_db(entry, filename)
+                row.tenant_id = tenant.id
+                s.add(row)
+                saved += 1
+            else:
+                skipped += 1
+        # Falls Wizard vorzeitig abgebrochen wurde, gibt es noch unentschiedene
+        # Eintraege — die werden als "skip" behandelt (sicheres Default).
+        skipped += max(0, len(eintraege) - len(decisions))
+        await s.commit()
+
+    await _clear_state(chat_id)
+    msg = f"✅ <b>{saved} Formel(n) gespeichert</b>"
+    if skipped:
+        msg += f", {skipped} uebersprungen"
+    msg += ".\n\nMit /kalkulation_anzeigen siehst Du alle Regeln."
+    return msg
+
+
+async def _handle_kalk_excel_per_entry_input(chat_id, text, state_data):
+    """Ja/Nein/Skip-Loop fuer den Per-Entry-Wizard."""
+    raw = text.strip().lower()
+    data = state_data or {}
+    eintraege = data.get("eintraege") or []
+    decisions = list(data.get("decisions") or [])
+    idx = int(data.get("index") or 0)
+    total = len(eintraege)
+
+    if not eintraege or idx >= total:
+        return await _finish_kalk_excel_per_entry(chat_id, data)
+
+    if raw in {"ja", "j", "yes", "ok", "behalten", "+"}:
+        decisions.append(True)
+    elif raw in {"nein", "n", "no", "skip", "s", "-"}:
+        decisions.append(False)
+    else:
+        return (
+            "Bitte <b>ja</b> (behalten), <b>nein</b>/<b>skip</b> "
+            "(ueberspringen) oder /abbrechen."
+        )
+
+    idx += 1
+    if idx >= total:
+        # Letzte Formel war gerade dran → speichern + beenden
+        data["decisions"] = decisions
+        return await _finish_kalk_excel_per_entry(chat_id, data)
+
+    # Naechste Formel zeigen, State updaten
+    await _save_state(chat_id, STATE_KALK_EXCEL_PER_ENTRY, {
+        "eintraege": eintraege,
+        "filename": data.get("filename"),
+        "index": idx,
+        "decisions": decisions,
+    })
+    return _render_per_entry_prompt(eintraege[idx], idx, total)
+
+
 def _build_kalk_entry_for_db(entry: dict, filename: str | None) -> TenantKalkulation:
     """Baut den TenantKalkulation-Row aus einem State-Entry (Excel-Import).
 
@@ -2962,6 +3080,8 @@ async def _dispatch_update(payload):
             reply = "Bitte schicke eine .xlsx-Datei (kein Text). Oder /abbrechen."
         elif state.state_key == STATE_KALK_EXCEL_CONFIRM:
             reply = await _handle_kalk_excel_confirm_input(chat_id, text, state.state_data)
+        elif state.state_key == STATE_KALK_EXCEL_PER_ENTRY:
+            reply = await _handle_kalk_excel_per_entry_input(chat_id, text, state.state_data)
         elif state.state_key == STATE_VIZ_WAITING_PHOTO:
             reply = "Bitte schicken Sie ein Foto (kein Text). Oder /abbrechen."
         elif state.state_key == STATE_VIZ_POST_ACTION:
