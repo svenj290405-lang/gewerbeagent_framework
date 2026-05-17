@@ -107,12 +107,12 @@ def test_token_url_not_visible_as_text(basic_ctx):
     assert f">{basic_ctx['form_url']}<" not in html
 
 
-def test_display_domain_is_shown(basic_ctx):
-    """Domain als 'auf gewerbeagent.de'-Hint sichtbar."""
+def test_domain_hint_no_longer_shown(basic_ctx):
+    """Domain-Hint wurde durch Website-Button ersetzt — kein 'auf X.Y'
+    mehr im Display-Text (User-Feedback: zu prominent)."""
     html = build_kunde_reply_html(**basic_ctx)
-    assert "gewerbeagent.de" in html
-    # Sollte als 'auf X.Y' formatiert sein (nicht nur in href)
-    assert "auf " in html
+    # 'auf gewerbeagent.de' war der alte Hint — darf nicht mehr da sein
+    assert "auf gewerbeagent.de" not in html
 
 
 def test_contact_name_visible_in_header(basic_ctx):
@@ -139,11 +139,15 @@ def test_initials_avatar_uses_first_letters_of_contact(basic_ctx):
     assert match.group(1) == "DT"
 
 
-def test_trust_signals_present(basic_ctx):
+def test_no_unkept_promises_in_body(basic_ctx):
+    """KEINE Versprechen die wir technisch nicht garantieren koennen:
+    nicht 'DSGVO-konform' (rechtliche Behauptung), nicht
+    'Antwort innerhalb 24h' (operatives Versprechen)."""
     html = build_kunde_reply_html(**basic_ctx)
-    assert "DSGVO" in html or "DSGVO-konform" in html
-    assert "24" in html  # "Antwort innerhalb 24 h"
-    assert "Persoenlich" in html or "persoenlich" in html.lower()
+    assert "DSGVO-konform" not in html
+    assert "innerhalb 24" not in html
+    assert "24 h" not in html
+    assert "24h" not in html
 
 
 def test_personal_greeting_uses_first_name(basic_ctx):
@@ -200,9 +204,26 @@ def test_contact_phone_in_footer(basic_ctx):
     assert "+49 30 1234 56" in html
 
 
-def test_contact_email_in_footer_as_mailto(basic_ctx):
+def test_no_website_button(basic_ctx):
+    """Website-Button wurde entfernt (Iteration 3, User-Feedback): Mail
+    sollte nur den Formular-Button haben, keinen zweiten Button."""
     html = build_kunde_reply_html(**basic_ctx)
-    assert "mailto:daniel@pura-tischler.de" in html
+    assert "Zur Website" not in html
+    # contact_website darf auch nicht im href irgendwo auftauchen
+    assert "pura-tischler.de" not in html.replace("daniel@pura-tischler.de", "")
+
+
+def test_no_raw_urls_visible_in_body(basic_ctx):
+    """Kein 'https://'-String als Display-Text — nur in href-Attributes.
+    Das schliesst Form-URL und Website ein."""
+    html = build_kunde_reply_html(**basic_ctx)
+    # Schneide alle href-Werte raus, der Rest darf kein https:// enthalten
+    import re
+    html_no_hrefs = re.sub(r'href="[^"]*"', 'href=""', html)
+    # Auch keinen sichtbaren mailto-Link
+    html_no_hrefs = re.sub(r'href="mailto:[^"]*"', 'href=""', html_no_hrefs)
+    assert "https://" not in html_no_hrefs
+    assert "http://" not in html_no_hrefs
 
 
 def test_no_contact_extras_doesnt_crash(basic_ctx):

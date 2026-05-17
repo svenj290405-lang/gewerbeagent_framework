@@ -4,14 +4,18 @@ Nutzt Tabellen-Layout (E-Mail-Standard, kompatibel mit Outlook + Gmail
 + Apple Mail) statt flexbox/grid. Inline-CSS weil die meisten Mail-
 Clients <style>-Tags ignorieren oder strippen.
 
-Anti-Scam-Massnahmen (2026-05-17 Refactor):
-- URL wird im Text NICHT als roher Token-Link gezeigt
-  (`https://...anfrage/AbC123XyZ`), sondern nur als Domain-Hint
-  ("auf gewerbeagent.de"). Der eigentliche Token-Link sitzt im
-  Button-href + im Hover-Preview, das genuegt fuer Transparenz.
-- Trust-Box mit drei Vertrauens-Signalen unter dem CTA-Button.
-- Sichtbarer Inhaber-Name oben + im Footer (kein anonymes "Support-Team").
-- Datenschutz-Hinweis + Antwortzeit-Versprechen im Footer.
+Anti-Scam-Massnahmen:
+- URLs nur in Button-hrefs, NIE als Display-Text. Keine
+  "https://..."-Strings im sichtbaren Body.
+- Sichtbarer Inhaber-Name + Firma im Header (kein anonymes
+  "Support-Team").
+- Wenn der Tenant eine Website hat: zweiter Button "Zur Website"
+  daneben/darunter, sodass der Empfaenger ueber die offizielle
+  Domain den Absender verifizieren kann.
+
+KEINE Versprechen die wir nicht halten koennen — also keine
+"DSGVO-konform"-Behauptung im Body und keine "Antwort innerhalb
+24 Stunden"-Zusage (was wir nicht garantieren koennen).
 
 Workflow:
 - build_kunde_reply_html(kontext) -> str (komplettes HTML)
@@ -124,7 +128,7 @@ def build_kunde_reply_html(
             text_lines = text_lines[1:]
     # Falls Gemini eine Signatur am Ende hat - rausschneiden weil wir eigene haben
     while text_lines and _re.match(
-        r"^(viele gruesse|mit freundlichen|beste gruesse|liebe gruesse|gruesse|gruss|mfg|lg)",
+        r"^(viele (gruesse|grüße)|mit freundlichen|beste (gruesse|grüße)|liebe (gruesse|grüße)|(gruesse|grüße)|gruss|gruß|mfg|lg)",
         text_lines[-1].strip().lower(),
     ):
         text_lines = text_lines[:-1]
@@ -154,35 +158,17 @@ def build_kunde_reply_html(
     )[:2] or "·"
 
     safe_form_url = _html.escape(form_url, quote=True)
-    display_domain = _extract_display_domain(form_url)
-    safe_display_domain = _html.escape(display_domain)
     safe_company = _html.escape(company_name)
     safe_contact = _html.escape(contact_name or "")
     safe_initials = _html.escape(initials)
 
-    # Footer-Kontakt-Zeile (Telefon / Mail / Website) — nur was da ist
-    contact_chips = []
-    if contact_phone:
-        contact_chips.append(
-            f'<span style="color: #6b7280;">📞 {_html.escape(contact_phone)}</span>'
-        )
-    if contact_email:
-        contact_chips.append(
-            f'<a href="mailto:{_html.escape(contact_email, quote=True)}" '
-            f'style="color: #6b7280; text-decoration: none;">'
-            f'✉ {_html.escape(contact_email)}</a>'
-        )
-    if contact_website:
-        # http(s) prefix falls fehlt damit Link klickbar bleibt
-        href = contact_website if contact_website.startswith(("http://", "https://")) \
-            else f"https://{contact_website}"
-        contact_chips.append(
-            f'<a href="{_html.escape(href, quote=True)}" '
-            f'style="color: #6b7280; text-decoration: none;">'
-            f'🌐 {_html.escape(contact_website)}</a>'
-        )
-    contact_row = (
-        '<br>' + ' &middot; '.join(contact_chips) if contact_chips else ""
+    # Footer-Telefon (unauffällig, optional). contact_website wird
+    # bewusst NICHT verlinkt — der Empfänger sieht den Tenant-Namen
+    # und kann selbst nach der offiziellen Website googeln. Ein Button
+    # "Zur Website" macht die Mail überladen (User-Feedback 2026-05-17).
+    phone_row = (
+        f'<br><span style="color: #a1a1aa;">{_html.escape(contact_phone)}</span>'
+        if contact_phone else ""
     )
 
     html = f"""<!doctype html>
@@ -196,7 +182,7 @@ def build_kunde_reply_html(
 
 <!-- Preheader: in der Inbox-Vorschau sichtbar, im Body unsichtbar -->
 <div style="display: none; max-height: 0; overflow: hidden; visibility: hidden; mso-hide: all; font-size: 1px; line-height: 1px; color: #f4f4f5;">
-  Dein Anfrage-Formular von {safe_company} &mdash; bitte kurz ausfuellen damit {safe_contact} dir ein passendes Angebot machen kann.
+  Dein Anfrage-Formular von {safe_company} &mdash; bitte kurz ausfüllen damit {safe_contact} dir ein passendes Angebot machen kann.
 </div>
 
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color: #f4f4f5; padding: 28px 12px;">
@@ -239,35 +225,18 @@ def build_kunde_reply_html(
               {body_html}
             </div>
 
-            <!-- CTA-Block -->
+            <!-- CTA-Block: ein Button zum Formular. -->
             <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin: 28px 0 8px 0;">
               <tr>
                 <td align="center" style="background-color: #fafafa; border: 1px solid #e4e4e7; border-radius: 10px; padding: 28px 24px;">
-                  <p style="margin: 0 0 8px 0; font-size: 16px; color: #18181b; font-weight: 600;">
-                    Dein Anfrage-Formular
-                  </p>
                   <p style="margin: 0 0 20px 0; font-size: 14px; color: #52525b;">
                     Ein paar kurze Angaben damit ich dir ein<br>
                     passendes Angebot vorbereiten kann.
                   </p>
                   <a href="{safe_form_url}"
                      style="display: inline-block; background-color: #1e3a8a; color: #ffffff; padding: 14px 36px; border-radius: 8px; text-decoration: none; font-weight: 600; font-size: 15px;">
-                    Formular oeffnen
+                    Formular ausfüllen
                   </a>
-                  <p style="margin: 14px 0 0 0; font-size: 12px; color: #71717a;">
-                    auf <strong style="color: #3f3f46;">{safe_display_domain}</strong>
-                  </p>
-                </td>
-              </tr>
-            </table>
-
-            <!-- Trust-Box: drei kurze Vertrauens-Signale -->
-            <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin: 0 0 8px 0;">
-              <tr>
-                <td align="center" style="padding: 6px 0; font-size: 12px; color: #71717a;">
-                  &#10003; Persoenlich fuer dich &nbsp;&middot;&nbsp;
-                  &#10003; DSGVO-konform &nbsp;&middot;&nbsp;
-                  &#10003; Antwort innerhalb 24 h
                 </td>
               </tr>
             </table>
@@ -279,24 +248,19 @@ def build_kunde_reply_html(
         <tr>
           <td style="padding: 0 32px 28px 32px;">
             <p style="margin: 0 0 4px 0; font-size: 15px; color: #3f3f46;">
-              Bei Rueckfragen einfach auf diese Mail antworten &ndash;
-            </p>
-            <p style="margin: 0 0 4px 0; font-size: 15px; color: #3f3f46;">
-              {safe_contact} liest mit.
+              Bei Rückfragen einfach auf diese Mail antworten.
             </p>
             <p style="margin: 14px 0 0 0; font-size: 13px; color: #71717a;">
-              {safe_company}{contact_row}
+              {safe_contact} &middot; {safe_company}{phone_row}
             </p>
           </td>
         </tr>
 
-        <!-- Footer / Disclaimer -->
+        <!-- Footer / Disclaimer (kurz, kein Versprechen) -->
         <tr>
-          <td style="background-color: #fafafa; padding: 16px 32px; border-top: 1px solid #f1f5f9;">
+          <td style="background-color: #fafafa; padding: 14px 32px; border-top: 1px solid #f1f5f9;">
             <p style="margin: 0; font-size: 11px; color: #a1a1aa; line-height: 1.5;">
-              Diese Antwort wurde mit Hilfe von <strong style="color: #71717a;">Q</strong>, dem digitalen Assistenten von
-              {safe_company}, erstellt. {safe_contact} liest jede Antwort mit.
-              Deine Daten werden ausschliesslich zur Beantwortung deiner Anfrage verwendet.
+              Verfasst mit Hilfe von <strong style="color: #71717a;">Q</strong>, dem digitalen Assistenten von {safe_company}.
             </p>
           </td>
         </tr>
