@@ -190,10 +190,6 @@ async def notify_tenant_anfrage_submitted(token_str: str, antworten: dict) -> No
                 ],
             ],
         }
-        msg += (
-            f"\n\n<i>Status: {_h('🆕 Neu')} — markiere unten "
-            f"sobald du dich gekuemmert hast.</i>"
-        )
 
     try:
         if keyboard:
