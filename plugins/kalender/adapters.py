@@ -184,12 +184,13 @@ class GoogleCalendarAdapter(CalendarAdapter):
                 "end_dt": _p.isoparse(e_iso).replace(tzinfo=None),
                 "location": (ev.get("location") or "").strip(),
                 # Konsistent zur Microsoft-Variante: subject/event_id/
-                # body_preview durchreichen damit Caller wie /briefing
-                # oder find_events nicht extra eine zweite API-Runde
-                # brauchen.
+                # body_preview/web_link durchreichen damit Caller wie
+                # /briefing, /termine oder find_events nicht extra eine
+                # zweite API-Runde brauchen.
                 "subject": (ev.get("summary") or "").strip(),
                 "event_id": ev.get("id") or "",
                 "body_preview": (ev.get("description") or "")[:300].strip(),
+                "web_link": (ev.get("htmlLink") or "").strip(),
             })
         return events
 

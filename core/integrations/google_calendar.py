@@ -166,6 +166,7 @@ async def list_events_for_day(
                 "subject": (ev.get("summary") or "").strip(),
                 "event_id": ev.get("id") or "",
                 "body_preview": (ev.get("description") or "")[:300].strip(),
+                "web_link": (ev.get("htmlLink") or "").strip(),
             })
         except Exception as exc:
             logger.warning(f"Skipping malformed Google event: {exc}")

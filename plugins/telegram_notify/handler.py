@@ -2660,6 +2660,9 @@ async def _dispatch_update(payload):
         if reply_or_none is None:
             return {"ok": True}
         reply = reply_or_none
+    elif text == "/termine":
+        await _clear_state(chat_id)
+        reply = await _handle_termine_command(chat_id)
     elif text.startswith("/briefing_"):
         # Detail-Ansicht eines einzelnen Termins per ID-Prefix
         await _clear_state(chat_id)
@@ -4853,6 +4856,117 @@ async def _handle_briefing_command(chat_id):
         "\n\n<b>📋 Letztes Gespraech</b>\n",
         latest, tenant.id,
     )
+
+
+# ----------------------------------------------------------------------
+# /termine — naechste Tage als Liste mit Link in den Kalender
+# ----------------------------------------------------------------------
+# Bewusst getrennt von /briefing (heute + heutige Gespraeche). /termine
+# ist die "kalender-zentrische" Sicht: nur Kalender-Events, ueber einen
+# laengeren Zeitraum, jeder Eintrag verlinkt direkt zum Outlook-/Google-
+# Calendar-Web-UI damit Daniel mit einem Klick zum Termin springen kann.
+
+TERMINE_DEFAULT_DAYS = 7
+TERMINE_MAX_ENTRIES = 20
+
+
+async def _handle_termine_command(chat_id):
+    """Zeigt die naechsten Termine (Default 7 Tage) mit Link zum Kalender.
+
+    Pro Eintrag: Wochentag/Datum/Uhrzeit, Subject, Ort (wenn vorhanden),
+    klickbarer Link "Im Kalender oeffnen" der direkt das Outlook-Web
+    bzw. Google-Calendar-Web-UI fuer diesen Event aufruft.
+
+    Phase-4-Multi-Mitarbeiter: jeder Mitarbeiter sieht den eigenen
+    Kalender (current_emp.id). Default-Employee sieht seinen Default-
+    Kalender — Cross-Employee-Listing ist eine andere Funktion (Storno
+    via /storno macht das schon ueber alle Mitarbeiter).
+    """
+    from datetime import datetime, timezone, timedelta
+
+    res = await _get_current_employee(chat_id)
+    if res is None:
+        return "Dieser Chat ist noch keinem Betrieb zugeordnet."
+    tenant, current_emp = res
+
+    if not current_emp.calendar_provider:
+        return (
+            "Dein Kalender ist noch nicht verbunden. "
+            "Mit /kalender_verbinden Outlook oder Google verknuepfen."
+        )
+
+    try:
+        from zoneinfo import ZoneInfo
+        local_tz = ZoneInfo("Europe/Berlin")
+    except Exception:
+        local_tz = timezone.utc
+    now_local = datetime.now(local_tz)
+    today = now_local.date()
+    wochentage = ["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"]
+
+    # Naechste N Tage durchgehen — pro Tag 1 API-Call. Bei 7 Tagen
+    # ueberschaubar, der User klickt nicht im Sekundentakt.
+    all_events: list[dict] = []
+    provider_label = None
+    for offset in range(TERMINE_DEFAULT_DAYS):
+        target_date = today + timedelta(days=offset)
+        evs, prov = await _fetch_calendar_events_for_day(
+            tenant, current_emp, target_date,
+        )
+        if prov:
+            provider_label = prov
+        for ev in evs:
+            all_events.append(ev)
+
+    if not all_events:
+        prov_part = f" ({provider_label}-Kalender)" if provider_label else ""
+        return (
+            f"📅 <b>Keine Termine in den naechsten "
+            f"{TERMINE_DEFAULT_DAYS} Tagen</b>{prov_part}.\n\n"
+            f"<i>Falls Termine fehlen: pruefe ob der richtige Kalender "
+            f"via /kalender_verbinden verbunden ist.</i>"
+        )
+
+    # Chronologisch sortieren + auf MAX limitieren
+    all_events.sort(key=lambda e: e["start_dt"])
+    truncated = len(all_events) > TERMINE_MAX_ENTRIES
+    all_events = all_events[:TERMINE_MAX_ENTRIES]
+
+    prov_part = f" <i>({provider_label}-Kalender)</i>" if provider_label else ""
+    lines = [
+        f"📅 <b>Naechste Termine</b> — {TERMINE_DEFAULT_DAYS} Tage{prov_part}\n"
+    ]
+    for ev in all_events:
+        s_dt = ev["start_dt"]
+        # naive datetime -> mit local_tz versehen damit strftime in der
+        # richtigen Sicht ausgibt (kommt aus list_events_for_day naive).
+        if s_dt.tzinfo is None:
+            s_dt_local = s_dt.replace(tzinfo=local_tz)
+        else:
+            s_dt_local = s_dt.astimezone(local_tz)
+        wt = wochentage[s_dt_local.weekday()]
+        datum_str = s_dt_local.strftime("%d.%m.")
+        uhr_str = s_dt_local.strftime("%H:%M")
+        subject = ev.get("subject") or "(ohne Titel)"
+        ort = ev.get("location") or ""
+        web_link = ev.get("web_link") or ""
+
+        ort_suffix = f"  ·  📍 {_h_safe(ort)}" if ort else ""
+        lines.append(
+            f"<b>{wt} {datum_str} {uhr_str}</b> · "
+            f"{_h_safe(subject)}{ort_suffix}"
+        )
+        if web_link:
+            # HTML-Tag-Anchor — Telegram rendert das als Hyperlink
+            lines.append(f'  🔗 <a href="{_h_safe(web_link)}">Im Kalender oeffnen</a>')
+        lines.append("")
+
+    if truncated:
+        lines.append(
+            f"<i>… weitere Termine ausgeblendet (Limit "
+            f"{TERMINE_MAX_ENTRIES}). Direkt im Kalender pruefen.</i>"
+        )
+    return "\n".join(lines)
 
 
 async def _handle_briefing_show_command(chat_id, id_prefix: str):

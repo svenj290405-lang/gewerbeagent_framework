@@ -238,7 +238,7 @@ async def list_events_for_day(
             params={
                 "startDateTime": _iso_no_tz(day_start),
                 "endDateTime": _iso_no_tz(day_end),
-                "$select": "id,subject,start,end,location,bodyPreview",
+                "$select": "id,subject,start,end,location,bodyPreview,webLink",
                 "$top": 200,
                 "$orderby": "start/dateTime",
             },
@@ -259,6 +259,7 @@ async def list_events_for_day(
                 "subject": (ev.get("subject") or "").strip(),
                 "event_id": ev.get("id") or "",
                 "body_preview": (ev.get("bodyPreview") or "").strip(),
+                "web_link": (ev.get("webLink") or "").strip(),
             })
         except (KeyError, ValueError) as exc:
             logger.warning(f"Skipping malformed event: {exc}")
