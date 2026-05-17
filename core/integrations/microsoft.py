@@ -21,7 +21,6 @@ from core.database import AsyncSessionLocal
 from core.models import OAuthToken
 from core.security.oauth_flow import (
     MICROSOFT_TOKEN_URL,
-    MICROSOFT_SCOPES,
     _load_microsoft_config,
 )
 
@@ -67,6 +66,14 @@ async def _refresh_access_token(oauth_token: OAuthToken) -> tuple[str, datetime]
         # Wir muessen tatsaechlich refreshen. Lock bleibt bis Commit.
         cfg = await _load_microsoft_config()
 
+        # Beim Refresh KEIN `scope`-Param senden — per OAuth-RFC 6749 §6
+        # nutzt Microsoft dann automatisch die urspruenglich gegranteten
+        # Scopes. Wuerden wir die globale MICROSOFT_SCOPES-Liste mitsenden
+        # und dort waere ein Scope dazugekommen, der beim urspruenglichen
+        # Consent nicht dabei war, gibt es AADSTS70000 invalid_grant
+        # (Incident 2026-05-17 nach MailboxSettings.Read-Erweiterung).
+        # Bestehende Tokens refreshen jetzt sauber; neue OAuth-Flows
+        # kriegen die volle Scope-Liste via /authorize.
         try:
             async with httpx.AsyncClient(timeout=20.0) as client:
                 resp = await client.post(
@@ -76,7 +83,6 @@ async def _refresh_access_token(oauth_token: OAuthToken) -> tuple[str, datetime]
                         "client_secret": cfg["client_secret"],
                         "refresh_token": locked_token.refresh_token,
                         "grant_type": "refresh_token",
-                        "scope": " ".join(MICROSOFT_SCOPES),
                     },
                     headers={"Accept": "application/json"},
                 )
