@@ -81,7 +81,10 @@ FEATURES: dict[str, Feature] = {
         key="anfrage_formular",
         label="Anfrage-Formular",
         description="Web-Formular fuer Kunden-Anfragen mit Datei-Upload.",
-        telegram_commands=("/formular", "/formular_anzeigen", "/formular_zuruecksetzen"),
+        telegram_commands=(
+            "/formular", "/formular_anzeigen", "/formular_zuruecksetzen",
+            "/formulare", "/formulare_offen", "/formular_eingang_<id>",
+        ),
     ),
     "lexware": Feature(
         key="lexware",

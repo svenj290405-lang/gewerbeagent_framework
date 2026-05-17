@@ -25,9 +25,37 @@ ANFRAGE_TYP_TISCHLER = "tischler"
 ANFRAGE_TYP_ALLGEMEIN = "allgemein"
 
 
+# Bearbeitungs-Status fuer eingegangene Formulare (AnfrageResponse).
+# Wird vom Handwerker per Inline-Button im Telegram-Push gesetzt.
+# Heartbeat-Cron pingt morgens nach wenn Antworten > 12h auf 'neu' /
+# 'in_bearbeitung' stehen.
+FORMULAR_STATUS_NEU = "neu"
+FORMULAR_STATUS_IN_BEARBEITUNG = "in_bearbeitung"
+FORMULAR_STATUS_ERLEDIGT = "erledigt"
+FORMULAR_STATUS_ABGELEHNT = "abgelehnt"
+FORMULAR_STATUS_OFFEN = {FORMULAR_STATUS_NEU, FORMULAR_STATUS_IN_BEARBEITUNG}
+FORMULAR_STATUS_VALID = {
+    FORMULAR_STATUS_NEU,
+    FORMULAR_STATUS_IN_BEARBEITUNG,
+    FORMULAR_STATUS_ERLEDIGT,
+    FORMULAR_STATUS_ABGELEHNT,
+}
+FORMULAR_STATUS_LABEL = {
+    FORMULAR_STATUS_NEU: "🆕 Neu",
+    FORMULAR_STATUS_IN_BEARBEITUNG: "📝 In Bearbeitung",
+    FORMULAR_STATUS_ERLEDIGT: "✅ Erledigt",
+    FORMULAR_STATUS_ABGELEHNT: "❌ Abgelehnt",
+}
+
+
 def _new_token() -> str:
-    """Generiert URL-sicheren Token (43 Zeichen ASCII)."""
-    return secrets.token_urlsafe(32)
+    """Generiert URL-sicheren Token (22 Zeichen ASCII).
+
+    16 Bytes Entropie = 128 Bit, sicher gegen Brute-Force, deutlich
+    kuerzer im URL-Display. Kunden-feedback 2026-05-17: vorherige
+    43-Zeichen-Tokens sahen in der Adressleiste zu lang/scammig aus.
+    """
+    return secrets.token_urlsafe(16)
 
 
 class AnfrageToken(Base):
@@ -81,6 +109,24 @@ class AnfrageResponse(Base):
         UUID(as_uuid=True),
         ForeignKey("employees.id", ondelete="SET NULL"),
         nullable=True, index=True,
+    )
+
+    # Bearbeitungs-Status (siehe FORMULAR_STATUS_* Konstanten oben).
+    # Default 'neu' beim Insert. Per Inline-Button am Telegram-Push
+    # oder ueber /formular_eingang_<id>-Detail-View aktualisiert.
+    # Partial-Index ix_anfrage_response_offen deckt status IN
+    # ('neu','in_bearbeitung') fuer den Heartbeat-Cron.
+    bearbeitungs_status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default=FORMULAR_STATUS_NEU,
+        server_default=FORMULAR_STATUS_NEU,
+    )
+    bearbeitet_at: Mapped["dt.datetime | None"] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+    bearbeitet_by_employee_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("employees.id", ondelete="SET NULL"),
+        nullable=True,
     )
 
     token: Mapped["AnfrageToken"] = relationship("AnfrageToken", back_populates="responses")

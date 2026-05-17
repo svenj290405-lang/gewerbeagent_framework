@@ -307,6 +307,13 @@ from core.models.anfrage import (
     AnfrageResponse,
     ANFRAGE_TYP_TISCHLER,
     ANFRAGE_TYP_ALLGEMEIN,
+    FORMULAR_STATUS_NEU,
+    FORMULAR_STATUS_IN_BEARBEITUNG,
+    FORMULAR_STATUS_ERLEDIGT,
+    FORMULAR_STATUS_ABGELEHNT,
+    FORMULAR_STATUS_OFFEN,
+    FORMULAR_STATUS_VALID,
+    FORMULAR_STATUS_LABEL,
 )
 from core.models.tenant_anfrage_schema import TenantAnfrageSchema
 from core.models.admin import (

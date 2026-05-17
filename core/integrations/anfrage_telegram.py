@@ -164,8 +164,45 @@ async def notify_tenant_anfrage_submitted(token_str: str, antworten: dict) -> No
 
     msg += "\nMit /angebot kannst du jetzt direkt ein Lexware-Angebot anlegen."
 
+    # Inline-Status-Buttons: erst die response-id holen damit der Callback
+    # weiss welche Antwort er aktualisieren soll. Wenn die Response (warum
+    # auch immer) nicht gefunden wird, wird der Push trotzdem gesendet —
+    # nur ohne Buttons.
+    from core.integrations.formular_eingang import (
+        get_response_for_token, short_id as _short_id,
+    )
+    keyboard = None
+    response_pair = await get_response_for_token(token_str)
+    if response_pair:
+        response, _ = response_pair
+        sid = _short_id(response.id)
+        keyboard = {
+            "inline_keyboard": [
+                [
+                    {"text": "📝 In Bearbeitung",
+                     "callback_data": f"formeing:status:in_bearbeitung:{sid}"},
+                ],
+                [
+                    {"text": "✅ Erledigt",
+                     "callback_data": f"formeing:status:erledigt:{sid}"},
+                    {"text": "❌ Abgelehnt",
+                     "callback_data": f"formeing:status:abgelehnt:{sid}"},
+                ],
+            ],
+        }
+        msg += (
+            f"\n\n<i>Status: {_h('🆕 Neu')} — markiere unten "
+            f"sobald du dich gekuemmert hast.</i>"
+        )
+
     try:
-        await TelegramNotifier._send_raw(bot_token, chat_id, f"{prefix}{msg}")
+        if keyboard:
+            from plugins.telegram_notify.handler import _send_with_keyboard
+            await _send_with_keyboard(
+                chat_id, f"{prefix}{msg}", keyboard, bot_token,
+            )
+        else:
+            await TelegramNotifier._send_raw(bot_token, chat_id, f"{prefix}{msg}")
         logger.info(f"Anfrage-Push an Tenant {tenant.slug} gesendet")
     except Exception as e:
         logger.exception(f"Telegram-Push fehler: {e}")
