@@ -269,18 +269,22 @@ async def poll_microsoft_inbox(
             logger.debug(f"spam-throttle Check failed (egal): {e}")
             spam_throttled = False
 
-        # Klassifikation - Subject + Sender + Preview als Hilfe
-        # Hinweis: Wir geben Preview auch mit damit Gemini bessere Entscheidung trifft
+        # Klassifikation - Subject + Sender + Preview als Hilfe.
+        # body_preview separat (statt in den Subject-String einzubetten)
+        # damit classify_mail_subject das Keyword-Backup fuer Intent
+        # darauf anwenden kann.
         try:
             cls_result = await classify_mail_subject(
-                subject=f"{subject} [Preview: {body_preview[:200]}]",
+                subject=subject,
                 sender=sender_email,
                 tenant_company=tenant_company,
                 tenant_branche=tenant_branche,
+                body_preview=body_preview,
             )
             classification = cls_result.get("classification") or "UNSICHER"
             confidence = cls_result.get("confidence") or "low"
             reason = cls_result.get("reason") or ""
+            intent = cls_result.get("intent") or "sonstiges"
             # Erfolg — Failure-Window fuer diesen Tenant zuruecksetzen.
             try:
                 from core.integrations.failure_counter import (
@@ -297,6 +301,7 @@ async def poll_microsoft_inbox(
             classification = "UNSICHER"
             confidence = "low"
             reason = f"Fehler: {e}"
+            intent = "sonstiges"
             # Failure-Counter: nach 3 Fehlern pro 24h → Sven-Alert.
             try:
                 from core.integrations.failure_counter import (

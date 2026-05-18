@@ -765,15 +765,77 @@ async def analyse_kundengespraech_from_audio(
 # Schnelle Pre-Filterung: relevant fuer Bot oder nicht?
 # =====================================================================
 
+# ----------------------------------------------------------------------
+# Intent-Konstanten — orthogonal zur Kategorie-Klassifikation.
+# classification (RELEVANT_KUNDE/...) sagt WER schreibt; intent sagt
+# WAS sie wollen. Verwendet vom Microsoft-Inbox-Handler in Teil D
+# fuer Routing (Storno -> Kalender-Cancel, Verschiebung -> Rueckfrage,
+# Rechnungsanfrage -> nur Telegram-Push, Neuanfrage -> Auto-Reply +
+# Formular).
+# ----------------------------------------------------------------------
+INTENT_NEU_ANFRAGE = "neu_anfrage"
+INTENT_TERMINBESTAETIGUNG = "terminbestaetigung"
+INTENT_TERMIN_VERSCHIEBEN = "termin_verschieben"
+INTENT_TERMIN_STORNIEREN = "termin_stornieren"
+INTENT_RUECKFRAGE = "rueckfrage_offener_vorgang"
+INTENT_RECHNUNGSANFRAGE = "rechnungsanfrage"
+INTENT_SONSTIGES = "sonstiges"
+
+ALLE_INTENTS = (
+    INTENT_NEU_ANFRAGE, INTENT_TERMINBESTAETIGUNG,
+    INTENT_TERMIN_VERSCHIEBEN, INTENT_TERMIN_STORNIEREN,
+    INTENT_RUECKFRAGE, INTENT_RECHNUNGSANFRAGE, INTENT_SONSTIGES,
+)
+
+
+# Keyword-Backup fuer D.3: portiert aus plugins/mail_intake/handler.py
+# (extract_termin_aus_mail-Prompt). Wenn Gemini die Intent-Klassifikation
+# uneindeutig zurueckgibt (z.B. neu_anfrage trotz "muss leider absagen"
+# im Body), uebersteuern wir das hier auf der sicheren Seite.
+# Match-Logik: case-insensitive substring auf subject+body_preview.
+_INTENT_STORNO_KEYWORDS = (
+    "absagen", "stornieren", "muss leider absagen",
+    "schaffe es doch nicht", "nicht mehr noetig", "nicht mehr nötig",
+    "hat sich erledigt", "doch keinen termin", "abbrechen",
+    "termin loeschen", "termin löschen", "krankheitsbedingt absagen",
+)
+_INTENT_VERSCHIEBEN_KEYWORDS = (
+    "verschieben", "umbuchen", "verlegen", "passt doch nicht",
+    "umlegen", "stattdessen", "anstatt", "frueher machen",
+    "früher machen", "spaeter machen", "später machen", "anderer tag",
+)
+
+
+def _detect_intent_keywords(subject: str, body_preview: str) -> str | None:
+    """Sucht starke Intent-Trigger im subject+body.
+
+    Returns: INTENT_TERMIN_STORNIEREN / INTENT_TERMIN_VERSCHIEBEN / None.
+
+    Storno und Verschiebung koennen ueberlappen ("ich muss absagen,
+    koennen wir verschieben?"). Auch der Brevo-Prompt-Kommentar in
+    handler.py:362-378 sagt: bei Verschiebungs-Wunsch IM Storno-Text
+    bevorzugt VERSCHIEBUNG. Deswegen Verschiebungs-Check VOR Storno —
+    wenn beides matched, gewinnt Verschiebung.
+    """
+    blob = f"{subject or ''}\n{body_preview or ''}".lower()
+    if any(kw in blob for kw in _INTENT_VERSCHIEBEN_KEYWORDS):
+        return INTENT_TERMIN_VERSCHIEBEN
+    if any(kw in blob for kw in _INTENT_STORNO_KEYWORDS):
+        return INTENT_TERMIN_STORNIEREN
+    return None
+
+
 CLASSIFY_PROMPT = """Du klassifizierst eingehende Mails fuer einen Handwerker.
 
 Mail-Daten:
 - Betreff: {subject}
 - Absender: {sender}
+- Body-Auszug: {body_preview}
 - Tenant: {tenant_company}, Branche: {tenant_branche}
 
 Antworte als JSON mit:
 - classification: EINER von: RELEVANT_KUNDE, RELEVANT_GESCHAEFT, NICHT_RELEVANT, PRIVAT, UNSICHER
+- intent: EINER von: neu_anfrage, terminbestaetigung, termin_verschieben, termin_stornieren, rueckfrage_offener_vorgang, rechnungsanfrage, sonstiges
 - confidence: low / medium / high
 - reason: 1 Satz Begruendung
 
@@ -783,6 +845,19 @@ Kategorien:
 - NICHT_RELEVANT: Newsletter, Spam, Werbung, Auto-Notifications
 - PRIVAT: Privat-Mail (Familie, Steuerberater, Bank, Versicherung)
 - UNSICHER: nicht eindeutig zuzuordnen
+
+Intent-Bedeutung:
+- neu_anfrage: neue Kundenanfrage ohne Bezug zu bestehendem Termin
+- terminbestaetigung: Kunde bestaetigt einen vereinbarten Termin ("passt!")
+- termin_verschieben: Kunde will einen bestehenden Termin verschieben
+- termin_stornieren: Kunde will einen bestehenden Termin komplett absagen
+- rueckfrage_offener_vorgang: Frage zu laufender Sache (Status, Detail)
+- rechnungsanfrage: Frage zu Rechnung/Mahnung/Bezahlung
+- sonstiges: alles andere
+
+Bei classification=NICHT_RELEVANT, PRIVAT oder UNSICHER ist intent=sonstiges
+ueblich (das Intent-Feld interessiert dann nicht). Bei classification=
+RELEVANT_KUNDE waehle das passendste Intent.
 
 Wenn Absender bekannt-privat (Banken, Versicherungen, Steuerberater): PRIVAT
 Wenn typische Werbung-Subjects oder noreply-Adressen: NICHT_RELEVANT
@@ -801,6 +876,10 @@ CLASSIFY_RESPONSE_SCHEMA = {
             "type": "string",
             "enum": ["RELEVANT_KUNDE", "RELEVANT_GESCHAEFT", "NICHT_RELEVANT", "PRIVAT", "UNSICHER"],
         },
+        "intent": {
+            "type": "string",
+            "enum": list(ALLE_INTENTS),
+        },
         "confidence": {"type": "string", "enum": ["low", "medium", "high"]},
         "reason": {"type": "string"},
     },
@@ -813,11 +892,18 @@ async def classify_mail_subject(
     sender: str,
     tenant_company: str = "Handwerksbetrieb",
     tenant_branche: str = "Handwerk",
+    body_preview: str = "",
 ) -> dict:
-    """Klassifiziert eine Mail anhand Subject + Sender. Sehr schnell, sehr billig.
+    """Klassifiziert eine Mail anhand Subject + Sender + Body-Auszug.
 
-    Returns: {classification, confidence, reason}
-    Bei Fehler: classification=UNSICHER, confidence=low
+    Sehr schnell, sehr billig (subject + 200 Zeichen body).
+
+    body_preview ist optional fuer Rueckwaerts-Kompatibilitaet — wenn
+    leer, klassifiziert Gemini ohne Body-Kontext und das Keyword-Backup
+    fuer Intent kann nur am Subject matchen.
+
+    Returns: {classification, intent, confidence, reason}
+    Bei Fehler: classification=UNSICHER, intent=sonstiges, confidence=low
     """
     import json as _json
     import re as _re
@@ -825,11 +911,22 @@ async def classify_mail_subject(
     prompt = CLASSIFY_PROMPT.format(
         subject=(subject or "(kein Betreff)")[:200],
         sender=(sender or "unbekannt")[:200],
+        body_preview=(body_preview or "(kein Auszug)")[:300],
         tenant_company=tenant_company[:100],
         tenant_branche=tenant_branche[:50],
     )
     prompt += "\n\nAntworte AUSSCHLIESSLICH mit gueltigem JSON (kein Markdown, keine Erklaerung), z.B.:\n"
-    prompt += '{"classification": "RELEVANT_KUNDE", "confidence": "high", "reason": "Klare Anfrage"}'
+    prompt += (
+        '{"classification": "RELEVANT_KUNDE", "intent": "neu_anfrage", '
+        '"confidence": "high", "reason": "Klare Anfrage"}'
+    )
+
+    # Default-Intent passend zur Kategorie — fuer den Fall dass Gemini
+    # das Feld nicht zurueckliefert oder die response gar nicht parsen
+    # konnten. RELEVANT_KUNDE bekommt neu_anfrage (loest existierenden
+    # Auto-Reply-Pfad aus, Verhalten vor Teil D), sonst sonstiges.
+    def _default_intent_for(cls_value: str) -> str:
+        return INTENT_NEU_ANFRAGE if cls_value == "RELEVANT_KUNDE" else INTENT_SONSTIGES
 
     try:
         text = await call_gemini(
@@ -863,18 +960,49 @@ async def classify_mail_subject(
             conf = "low"
         reason = (result.get("reason") or "")[:500]
 
+        # Intent extrahieren + validieren mit Default-Fallback fuer alte
+        # Caller-Mocks oder Gemini-Antworten ohne intent-Feld.
+        intent = result.get("intent") or _default_intent_for(cls)
+        if intent not in ALLE_INTENTS:
+            intent = _default_intent_for(cls)
+
+        # D.3 Keyword-Backup: starke Storno-/Verschiebungs-Trigger
+        # uebersteuern Gemini wenn die Kategorie als RELEVANT_KUNDE
+        # erkannt wurde aber das Intent nicht Termin-aenderung sagt.
+        # Schuetzt vor dem Audit-Bug "Mail 'Termin absagen' geht durch
+        # als neu_anfrage und kriegt Formular-Link".
+        if cls == "RELEVANT_KUNDE":
+            kw_intent = _detect_intent_keywords(subject or "", body_preview or "")
+            if kw_intent and intent not in (
+                INTENT_TERMIN_STORNIEREN, INTENT_TERMIN_VERSCHIEBEN,
+            ):
+                logger.info(
+                    f"classify_mail_subject: keyword-override "
+                    f"gemini_intent={intent} -> keyword_intent={kw_intent} "
+                    f"(subject={subject[:60]!r})"
+                )
+                intent = kw_intent
+
         logger.info(
-            "classify_mail_subject: subject=%r sender=%r -> %s (%s) %s",
+            "classify_mail_subject: subject=%r sender=%r -> %s/%s (%s) %s",
             subject[:60] if subject else "",
             sender[:40] if sender else "",
-            cls, conf, reason[:80],
+            cls, intent, conf, reason[:80],
         )
-        return {"classification": cls, "confidence": conf, "reason": reason}
+        return {
+            "classification": cls, "intent": intent,
+            "confidence": conf, "reason": reason,
+        }
 
     except Exception as e:
         logger.warning(f"classify_mail_subject fehler: {e}")
+        # Auch im Fehler-Pfad das Keyword-Backup fuer Intent versuchen —
+        # wenn der Subject sagt "absagen", soll das Routing das wissen
+        # selbst wenn Gemini gerade tot ist.
+        kw_intent = _detect_intent_keywords(subject or "", body_preview or "")
         return {
             "classification": "UNSICHER",
+            "intent": kw_intent or INTENT_SONSTIGES,
             "confidence": "low",
             "reason": f"Klassifikation fehlgeschlagen: {e}",
         }
