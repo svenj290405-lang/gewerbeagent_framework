@@ -892,6 +892,10 @@ async def _handle_help_command(chat_id=None):
              "Aktuelles Schema mit allen Feldern + Pflichtangaben."),
             ("/formular_zuruecksetzen",
              "Auf Tischler- oder Allgemein-Default zuruecksetzen."),
+            ("/formulare",
+             "Status-Cockpit: gesendet / ausgefuellt / abgelaufen."),
+            ("/formulare_offen",
+             "Nur die Anfragen die noch nicht ausgefuellt sind."),
         ], False))
 
     viz_items = [
@@ -2111,6 +2115,12 @@ async def _dispatch_update(payload):
         reply = await _handle_formular_anzeigen_command(chat_id)
     elif text == "/formular_zuruecksetzen":
         reply = await _handle_formular_zuruecksetzen_command(chat_id)
+    elif text == "/formulare":
+        await _clear_state(chat_id)
+        reply = await _handle_formulare_command(chat_id, only_open=False)
+    elif text == "/formulare_offen" or text == "/formulare offen":
+        await _clear_state(chat_id)
+        reply = await _handle_formulare_command(chat_id, only_open=True)
     elif text == "/material":
         await _clear_state(chat_id)
         reply = await _handle_material_list_command(chat_id)
@@ -8471,6 +8481,116 @@ async def _handle_formular_callback(chat_id, callback_data, callback_query_id, b
         return
 
     await _answer_callback_query(callback_query_id, "Unbekannt", bot_token)
+
+
+# =====================================================================
+# Formular-Status-Cockpit ( /formulare  /formulare_offen )
+# =====================================================================
+# Ersetzt den frueher gewollten Push-pro-Submission: der Handwerker
+# zieht den Status ueber /formulare ab statt von jedem Eingang
+# unterbrochen zu werden. Drei Buckets aus AnfrageToken-Spalten —
+# siehe core.integrations.anfrage_status.
+
+
+def _relative_time(when: "dt.datetime") -> str:
+    """'vor 2h', 'vor 3d', 'gerade eben'. Aus UTC-Datetime."""
+    from datetime import datetime as _dt, timezone as _tz
+    now = _dt.now(_tz.utc)
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=_tz.utc)
+    delta = now - when
+    secs = int(delta.total_seconds())
+    if secs < 60:
+        return "gerade eben"
+    if secs < 3600:
+        return f"vor {secs // 60}min"
+    if secs < 86400:
+        return f"vor {secs // 3600}h"
+    return f"vor {secs // 86400}d"
+
+
+def _formulare_render_row(row, base_url: str) -> str:
+    """Eine Zeile fuer die /formulare-Liste, HTML-escaped."""
+    from html import escape as _e
+    from core.integrations.anfrage_status import (
+        STATUS_ICON, STATUS_AUSGEFUELLT, STATUS_OFFEN,
+    )
+    icon = STATUS_ICON.get(row.status, "•")
+    kunde = _e(row.kunde_name or row.kunde_email or "—")
+    when = _relative_time(row.created_at)
+    if row.status == STATUS_AUSGEFUELLT:
+        sub_when = _relative_time(row.submitted_at) if row.submitted_at else "?"
+        tail = f"<i>ausgefuellt {_e(sub_when)}</i> · /archiv {kunde}"
+    elif row.status == STATUS_OFFEN:
+        reminded = " · ⏰ erinnert" if row.reminder_sent_at else ""
+        tail = (
+            f"<i>gesendet {_e(when)}{reminded}</i>\n"
+            f"   <a href=\"{base_url}/anfrage/{_e(row.token)}\">Formular-Link</a>"
+        )
+    else:  # ABGELAUFEN
+        tail = f"<i>abgelaufen, nie ausgefuellt</i>"
+    return f"{icon} <b>{kunde}</b>\n   {tail}"
+
+
+async def _handle_formulare_command(chat_id, *, only_open: bool) -> str:
+    """/formulare oder /formulare_offen — Status-Cockpit fuer Anfragen.
+
+    Header mit 3 Counts (letzte 30 Tage), darunter die letzten 10
+    relevanten Tokens als Liste mit Tap-Link auf den Formular-URL bzw.
+    /archiv-Befehl bei ausgefuellten.
+    """
+    from core.integrations.anfrage_status import (
+        count_status_for_tenant, list_recent_for_tenant,
+        STATUS_ICON, STATUS_OFFEN, STATUS_AUSGEFUELLT, STATUS_ABGELAUFEN,
+    )
+    from core.integrations.anfrage_forms import build_anfrage_url
+    from urllib.parse import urlparse
+
+    tenant = await _get_tenant_by_chat(chat_id)
+    if not tenant:
+        return "Dieser Chat ist noch keinem Betrieb zugeordnet."
+
+    counts = await count_status_for_tenant(tenant.id)
+    rows = await list_recent_for_tenant(
+        tenant.id, limit=10, only_open=only_open,
+    )
+
+    parts: list[str] = []
+    title = "Offene Formulare" if only_open else "Formulare — Status"
+    parts.append(f"📋 <b>{title}</b>")
+    parts.append(
+        f"<i>letzte 30 Tage:</i>  "
+        f"{STATUS_ICON[STATUS_OFFEN]} {counts[STATUS_OFFEN]} offen   "
+        f"{STATUS_ICON[STATUS_AUSGEFUELLT]} {counts[STATUS_AUSGEFUELLT]} ausgefuellt   "
+        f"{STATUS_ICON[STATUS_ABGELAUFEN]} {counts[STATUS_ABGELAUFEN]} abgelaufen"
+    )
+    parts.append("")
+
+    if not rows:
+        if only_open:
+            parts.append(
+                "Keine offenen Formulare — alle Kunden haben ausgefuellt "
+                "oder die Links sind abgelaufen."
+            )
+        else:
+            parts.append(
+                "Noch keine Formulare versendet. Sobald ein Anruf rein "
+                "kommt oder eine Mail beantwortet wird, taucht der "
+                "Vorgang hier auf."
+            )
+        return "\n".join(parts)
+
+    # base_url aus build_anfrage_url ableiten (verwendet env PUBLIC_URL).
+    sample_url = build_anfrage_url("x")
+    base_url = sample_url.rsplit("/anfrage/", 1)[0] if "/anfrage/" in sample_url else ""
+
+    for r in rows:
+        parts.append(_formulare_render_row(r, base_url))
+        parts.append("")
+
+    if not only_open:
+        parts.append("<i>/formulare_offen zeigt nur die unerledigten.</i>")
+    return "\n".join(parts)
 
 
 # =====================================================================

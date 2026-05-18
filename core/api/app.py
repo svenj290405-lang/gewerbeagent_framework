@@ -37,6 +37,9 @@ from core.integrations.db_maintenance_cron import cron_loop as db_maintenance_cr
 from core.integrations.absence_redistribution import (
     cron_loop as absence_redistribution_cron_loop,
 )
+from core.integrations.anfrage_reminder_cron import (
+    cron_loop as anfrage_reminder_cron_loop,
+)
 
 logger = logging.getLogger(__name__)
 # Phase B1: strukturiertes Logging mit Tenant-/Employee-Context.
@@ -83,9 +86,13 @@ async def lifespan(app: FastAPI):
         absence_task = asyncio.create_task(absence_redistribution_cron_loop())
         logger.info("Absence-Redistribution-Cron (taegl. 06:00) gestartet")
 
+        anfrage_reminder_task = asyncio.create_task(anfrage_reminder_cron_loop())
+        logger.info("Anfrage-Reminder-Cron (stuendlich, 24h vor Termin) gestartet")
+
         cron_tasks = (
             cron_task, payment_task, summary_task, dsgvo_task,
             mail_retry_task, db_maintenance_task, absence_task,
+            anfrage_reminder_task,
         )
     else:
         logger.warning(

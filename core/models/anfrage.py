@@ -80,6 +80,13 @@ class AnfrageToken(Base):
     original_message_id: Mapped[str | None] = mapped_column(String(500), nullable=True)
     expires_at: Mapped["dt.datetime"] = mapped_column(DateTime(timezone=True), nullable=False)
     submitted_at: Mapped["dt.datetime | None"] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Vom 24h-Reminder-Cron gesetzt sobald die Erinnerungs-Mail an den
+    # Kunden raus ist. NULL = noch nicht erinnert. Wenn submitted_at
+    # vor reminder_sent_at gesetzt wird, ist das Rennen voellig ok —
+    # der Cron skippt eh wenn eine Response existiert.
+    reminder_sent_at: Mapped["dt.datetime | None"] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
     created_at: Mapped["dt.datetime"] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

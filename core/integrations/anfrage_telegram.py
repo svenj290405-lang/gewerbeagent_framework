@@ -1,9 +1,12 @@
-"""Telegram-Push + Drive-Archiv wenn Kunde Anfrage-Formular abschickt."""
+"""Drive-Archiv wenn Kunde Anfrage-Formular abschickt.
+
+Kein Telegram-Push mehr — siehe notify_tenant_anfrage_submitted-Docstring
+fuer die Begruendung.
+"""
 from __future__ import annotations
 
 import logging
 from datetime import datetime
-from html import escape as _h
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
@@ -16,26 +19,11 @@ logger = logging.getLogger(__name__)
 _BERLIN_TZ = ZoneInfo("Europe/Berlin")
 
 
-def _format_value(value) -> str:
-    """Formatiert einen Antwort-Wert + escaped HTML.
-
-    Wichtig: alle Kunden-Antworten landen in einer Telegram-HTML-
-    Nachricht (parse_mode="HTML"). Ohne Escape koennte ein Angreifer
-    mit boesartigem Form-Input fremde Bot-Antworten injizieren oder
-    falsch verschachteltes HTML generieren.
-    """
-    if isinstance(value, list):
-        if value and all(isinstance(v, dict) and v.get("filename") for v in value):
-            return f"📎 {len(value)} Datei(en)"
-        return _h(", ".join(str(v) for v in value if v))
-    return _h(str(value or ""))
-
-
 def _format_value_plain(value) -> str:
-    """Plain-Text-Variante von _format_value (kein HTML-Escape).
+    """Plain-Text-Renderer fuer Antwort-Werte (fuer Drive-.txt-Export).
 
-    Wird fuer den Drive-Text-File-Export gebraucht — dort soll der
-    Handwerker den Originaltext lesen, nicht '&lt;'-Sequenzen.
+    Listen aus File-Dicts werden zu '1 Datei(en): foto.jpg' kompakt;
+    sonstige Listen werden Comma-joined; Skalare werden zu str().
     """
     if isinstance(value, list):
         if value and all(isinstance(v, dict) and v.get("filename") for v in value):
@@ -60,34 +48,6 @@ def _extract_files(antworten: dict) -> list[dict]:
                     "base64": v["base64"],
                 })
     return files
-
-
-async def _send_file_to_telegram(
-    *, bot_token: str, chat_id, file_obj: dict,
-) -> bool:
-    """Sendet eine einzelne Datei an Telegram via sendPhoto oder sendDocument."""
-    import base64 as _b64
-    import httpx
-    try:
-        raw = _b64.b64decode(file_obj["base64"])
-    except Exception:
-        return False
-    ct = (file_obj.get("content_type") or "").lower()
-    name = file_obj.get("filename") or "datei"
-    is_image = ct.startswith("image/")
-    endpoint = "sendPhoto" if is_image else "sendDocument"
-    field_name = "photo" if is_image else "document"
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            r = await client.post(
-                f"https://api.telegram.org/bot{bot_token}/{endpoint}",
-                data={
-                    "chat_id": chat_id,
-                    "caption": f"{file_obj.get('field','')}: {name[:160]}",
-                },
-                files={field_name: (name, raw, ct)},
-            )
-            return r.status_code == 200
     except Exception as e:
         logger.warning(f"_send_file_to_telegram failed: {e}")
         return False
@@ -214,18 +174,18 @@ def _anliegen_text_from_antworten(antworten: dict) -> str:
 
 
 async def notify_tenant_anfrage_submitted(token_str: str, antworten: dict) -> None:
-    """Verarbeitet eine Formular-Submission: Drive-Archiv + Telegram-Push.
+    """Verarbeitet eine Formular-Submission: schreibt alles ins Drive-Archiv.
 
-    Routing-Quelle (in dieser Reihenfolge):
-    1. `AnfrageToken.assigned_employee_id` — sticky, falls die Anfrage
-       aus einer bereits zugewiesenen Mail-Conversation kommt.
+    Kein Telegram-Push mehr — die Eingaenge sammeln sich im Kunden-Drive-
+    Ordner an, der Handwerker pruefen via /formulare (Status-Liste)
+    oder direkt im Drive ueber /archiv <kunde>. So fluten viele
+    parallele Anfragen nicht mehr den Chat.
+
+    Routing fuer den Drive-Owner (welcher Mitarbeiter Drive-Credentials
+    nutzt) — in dieser Reihenfolge:
+    1. `AnfrageToken.assigned_employee_id` — sticky.
     2. `choose_employee()` ueber den aggregierten Antwort-Text.
-
-    Drive-Save passiert VOR dem Telegram-Push — so bleibt das Archiv
-    vollstaendig auch wenn das Telegram-Routing scheitert (z.B.
-    Mitarbeiter ohne aktivierte chat_id).
     """
-    from plugins.telegram_notify.handler import TelegramNotifier
     from core.routing.employee_router import choose_employee
 
     async with AsyncSessionLocal() as session:
@@ -254,58 +214,7 @@ async def notify_tenant_anfrage_submitted(token_str: str, antworten: dict) -> No
             logger.warning(f"anfrage_telegram: choose_employee failed: {e}")
 
     now_berlin = datetime.now(_BERLIN_TZ)
-    drive_folder_url = await _save_submission_to_drive(
+    await _save_submission_to_drive(
         tenant=tenant, token_obj=token_obj, antworten=antworten,
         employee_id=employee_id, now_berlin=now_berlin,
     )
-
-    bot_token, chat_id, prefix = await TelegramNotifier.resolve_employee_push_target(
-        tenant.id, employee_id,
-    )
-    if not bot_token or not chat_id:
-        logger.warning(
-            f"Tenant {tenant.slug} hat kein Telegram-Ziel — anfrage-Push skip"
-        )
-        return
-
-    kunde = token_obj.kunde_name or token_obj.kunde_email
-    msg = (
-        f"<b>Neue Anfrage von {_h(kunde)}</b>\n"
-        f"<i>{_h(token_obj.kunde_email)}</i>\n\n"
-    )
-    if token_obj.original_subject:
-        msg += f"<b>Original-Betreff:</b> {_h(token_obj.original_subject)}\n\n"
-
-    msg += "<b>Antworten:</b>\n"
-    for key, value in antworten.items():
-        if not value:
-            continue
-        label = _h(key.replace("_", " ").title())
-        msg += f"<b>{label}:</b> {_format_value(value)}\n"
-
-    if drive_folder_url:
-        msg += (
-            f"\n📁 <a href=\"{_h(drive_folder_url)}\">"
-            f"Alles im Drive-Ordner</a> — oder via /archiv "
-            f"{_h(kunde or '')}"
-        )
-    msg += "\n\nMit /angebot kannst du jetzt direkt ein Lexware-Angebot anlegen."
-
-    try:
-        await TelegramNotifier._send_raw(bot_token, chat_id, f"{prefix}{msg}")
-        logger.info(f"Anfrage-Push an Tenant {tenant.slug} gesendet")
-    except Exception as e:
-        logger.exception(f"Telegram-Push fehler: {e}")
-        return
-
-    # Files zusaetzlich an Telegram damit der Handwerker sie direkt
-    # sehen kann ohne Drive zu oeffnen. Die liegen ja auch schon im
-    # Drive-Ordner archiviert.
-    try:
-        files = _extract_files(antworten)
-        for f in files:
-            await _send_file_to_telegram(
-                bot_token=bot_token, chat_id=chat_id, file_obj=f,
-            )
-    except Exception as e:
-        logger.warning(f"Anfrage-Files-Forward failed (non-fatal): {e}")
