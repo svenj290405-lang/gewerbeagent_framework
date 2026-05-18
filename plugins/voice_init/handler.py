@@ -696,7 +696,124 @@ class Plugin(BasePlugin):
             f"emp={employee_id} name={name!r} erfolg={result.get('erfolg')} "
             f"{email_log}"
         )
+
+        # Teil E.1: Bestaetigungs-Mail an Kunde (best-effort, blockiert
+        # die Buchungs-Response nicht). Nur wenn Buchung erfolgreich
+        # UND wir eine Mail-Adresse haben (telefonisch-only-Kunden
+        # kriegen keine Mail).
+        if (
+            isinstance(result, dict)
+            and result.get("erfolg")
+            and kunde_email
+        ):
+            await self._send_buche_confirmation_mail(
+                tenant=tenant,
+                kunde_email=kunde_email,
+                kunde_name=name,
+                datum=datum,
+                uhrzeit=uhrzeit,
+                anliegen=anliegen,
+                employee_id=employee_id,
+                event_id=result.get("event_id"),
+            )
+
         return result
+
+    async def _send_buche_confirmation_mail(
+        self,
+        *,
+        tenant: Tenant,
+        kunde_email: str,
+        kunde_name: str,
+        datum: str,
+        uhrzeit: str,
+        anliegen: str,
+        employee_id: UUID | None,
+        event_id: str | None,
+    ) -> None:
+        """Versendet Voice-Buchungs-Bestaetigung + persistiert
+        EmailConversation fuer Reply-Threading (E.3).
+
+        Best-effort: fanged alle Fehler ab, weil der Termin schon
+        gebucht ist und der Voice-Caller das Erfolgs-Result kriegen
+        soll, auch wenn die Mail mal nicht raus geht.
+        """
+        try:
+            from core.integrations.mail_pipeline import (
+                send_buche_confirmation, create_conversation,
+                record_outbound_q_reply,
+            )
+            from core.integrations.mail_template import extract_first_name
+            from core.models import STATE_BOOKED
+            from core.models.employee import Employee
+            import datetime as _dt
+
+            employee_name: str | None = None
+            if employee_id is not None:
+                async with AsyncSessionLocal() as s:
+                    r = await s.execute(
+                        select(Employee).where(Employee.id == employee_id)
+                    )
+                    emp = r.scalar_one_or_none()
+                    if emp:
+                        employee_name = emp.name
+
+            termin_datum = None
+            for fmt in ("%d.%m.%Y", "%Y-%m-%d"):
+                try:
+                    termin_datum = _dt.datetime.strptime(datum, fmt).date()
+                    break
+                except Exception:
+                    pass
+
+            kunde_anrede = extract_first_name(kunde_name or "") or ""
+            company_name = tenant.company_name or "Handwerksbetrieb"
+            contact_phone = getattr(tenant, "contact_phone", "") or ""
+
+            sent_meta = await send_buche_confirmation(
+                tenant_id=tenant.id, to_email=kunde_email,
+                kunde_anrede=kunde_anrede, company_name=company_name,
+                datum_label=datum, uhrzeit=uhrzeit,
+                employee_name=employee_name, anliegen=anliegen,
+                contact_phone=contact_phone, employee_id=employee_id,
+            )
+            if not sent_meta.get("success"):
+                logger.warning(
+                    f"buche-confirmation-mail: send failed "
+                    f"tenant={tenant.slug} kunde={kunde_email}: "
+                    f"{sent_meta.get('error')}"
+                )
+                return
+
+            conv = await create_conversation(
+                tenant_id=tenant.id, sender_email=kunde_email,
+                sender_name=kunde_name, subject=None,
+                assigned_employee_id=employee_id,
+                gcal_event_id=event_id, termin_datum=termin_datum,
+                state=STATE_BOOKED,
+            )
+            reply_subject = (
+                f"Ihre Terminbestaetigung — {datum} um {uhrzeit} Uhr"
+            )
+            await record_outbound_q_reply(
+                conv.id,
+                internet_message_id=sent_meta.get("internet_message_id"),
+                microsoft_conversation_id=sent_meta.get("conversation_id"),
+                q_reply_text=(
+                    f"[Voice-Buchungs-Bestaetigung: {anliegen}]"
+                ),
+                subject=reply_subject,
+            )
+            logger.info(
+                f"buche-confirmation-mail: sent tenant={tenant.slug} "
+                f"kunde={kunde_email} conv_id={conv.id} "
+                f"event={(event_id or '')[:20]}"
+            )
+        except Exception as e:
+            logger.exception(
+                f"buche-confirmation-mail: crashed (Buchung steht trotzdem): "
+                f"{e}"
+            )
 
     async def _handle_finde_termine(self, payload):
         """Webhook von ElevenLabs wenn Q das Tool 'finde_termine' aufruft.
@@ -900,7 +1017,88 @@ class Plugin(BasePlugin):
             f"storniere_termin: tenant={tenant_slug} event={event_id[:12]}… "
             f"emp={employee_id_str} erfolg={result.get('erfolg')}"
         )
+
+        # Teil E.2: Storno-Bestaetigungs-Mail an Kunden (best-effort).
+        # Nur wenn Cancel erfolgreich UND wir die Mail-Adresse aus einer
+        # frueheren EmailConversation auflosen koennen (via gcal_event_id).
+        # Voice-only Kunden ohne Mail-Adresse zur Buchzeit kriegen keine
+        # Mail — Telegram-Push an MA hat aber schon stattgefunden.
+        if isinstance(result, dict) and result.get("erfolg"):
+            await self._send_voice_storno_confirmation_mail(
+                tenant=tenant, event_id=event_id, employee_id=emp_uuid,
+            )
+
         return result
+
+    async def _send_voice_storno_confirmation_mail(
+        self,
+        *,
+        tenant: Tenant,
+        event_id: str,
+        employee_id: UUID | None,
+    ) -> None:
+        """Findet die zur event_id zugehoerige EmailConversation, schickt
+        die Storno-Bestaetigung und setzt State auf STORNIERT.
+
+        Wenn keine Konversation existiert (voice-only Kunde): no-op.
+        Best-effort: fanged alle Fehler ab — Cancel ist schon durch,
+        Voice-Caller bekommt sein Erfolgs-Result.
+        """
+        try:
+            from core.integrations.mail_pipeline import (
+                find_conversation_by_event_id, send_storno_confirmation,
+                record_outbound_q_reply, set_conversation_state,
+            )
+            from core.integrations.mail_template import extract_first_name
+            from core.models import STATE_STORNIERT
+
+            conv = await find_conversation_by_event_id(tenant.id, event_id)
+            if conv is None or not conv.kunde_email:
+                logger.info(
+                    f"voice-storno-mail: keine EmailConversation fuer "
+                    f"event={event_id[:20]} — kein Mail-Versand "
+                    f"(voice-only Kunde ohne Mail-Adresse)"
+                )
+                return
+
+            company_name = tenant.company_name or "Handwerksbetrieb"
+            kunde_anrede = extract_first_name(conv.kunde_name or "") or ""
+            original_subject = conv.last_subject or "Ihre Terminbuchung"
+
+            sent_meta = await send_storno_confirmation(
+                tenant_id=tenant.id, to_email=conv.kunde_email,
+                kunde_anrede=kunde_anrede, company_name=company_name,
+                original_subject=original_subject, cancelled_count=1,
+                employee_id=employee_id,
+            )
+            if not sent_meta.get("success"):
+                logger.warning(
+                    f"voice-storno-mail: send failed tenant={tenant.slug} "
+                    f"kunde={conv.kunde_email}: {sent_meta.get('error')}"
+                )
+                return
+
+            reply_subject = (
+                f"Re: {original_subject}"
+                if not original_subject.lower().startswith("re:")
+                else original_subject
+            )
+            await record_outbound_q_reply(
+                conv.id,
+                internet_message_id=sent_meta.get("internet_message_id"),
+                microsoft_conversation_id=sent_meta.get("conversation_id"),
+                q_reply_text="[Voice-Storno-Bestaetigung: 1 Termin storniert]",
+                subject=reply_subject,
+            )
+            await set_conversation_state(conv.id, STATE_STORNIERT)
+            logger.info(
+                f"voice-storno-mail: sent tenant={tenant.slug} "
+                f"kunde={conv.kunde_email} conv_id={conv.id}"
+            )
+        except Exception as e:
+            logger.exception(
+                f"voice-storno-mail: crashed (Cancel steht trotzdem): {e}"
+            )
 
 
     async def _handle_save_contact(self, payload):

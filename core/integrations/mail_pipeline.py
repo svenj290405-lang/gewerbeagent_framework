@@ -154,11 +154,20 @@ async def create_conversation(
     *,
     microsoft_conversation_id: str | None = None,
     assigned_employee_id: uuid.UUID | None = None,
+    gcal_event_id: str | None = None,
+    termin_datum=None,  # datetime.date oder None
+    state: str | None = None,
 ) -> EmailConversation:
-    """Legt eine neue Konversation an (state=AWAITING_CONFIRMATION).
+    """Legt eine neue Konversation an.
+
+    Default-state: AWAITING_CONFIRMATION (Mail-Pipeline-Eingang). Voice-
+    Booking-Pfad uebergibt state=BOOKED + gcal_event_id + termin_datum.
 
     Wird vom Microsoft-Inbox-Handler aufgerufen wenn KEIN bestehender
-    Thread gefunden wurde — also typischer Neukunde-Fall.
+    Thread gefunden wurde, und vom Voice-Buchung-Handler (Teil E) um
+    eine telefonisch entstandene Konversation an die Mail-Adresse zu
+    haengen — damit spaetere Folge-Mails (Storno-Antwort, Frage zum
+    Termin) zur richtigen Konv. gematcht werden.
 
     Returns: persistierte EmailConversation (expunged).
     """
@@ -169,8 +178,10 @@ async def create_conversation(
             kunde_name=(sender_name or None),
             last_subject=(subject or None) and subject[:500],
             microsoft_conversation_id=microsoft_conversation_id,
-            state=STATE_AWAITING_CONFIRMATION,
+            state=state or STATE_AWAITING_CONFIRMATION,
             assigned_employee_id=assigned_employee_id,
+            gcal_event_id=gcal_event_id,
+            termin_datum=termin_datum,
         )
         s.add(conv)
         await s.commit()
@@ -179,9 +190,43 @@ async def create_conversation(
     logger.info(
         f"mail_pipeline: neue Konversation angelegt id={conv.id} "
         f"tenant={tenant_id} kunde={conv.kunde_email} "
-        f"ms_conv_id={(microsoft_conversation_id or '')[:30]}"
+        f"state={conv.state} ms_conv_id={(microsoft_conversation_id or '')[:30]} "
+        f"event_id={(gcal_event_id or '')[:20]}"
     )
     return conv
+
+
+async def find_conversation_by_event_id(
+    tenant_id: uuid.UUID, gcal_event_id: str,
+) -> EmailConversation | None:
+    """Sucht eine Konversation anhand der Kalender-event_id.
+
+    Wird vom Voice-Storno-Handler (Teil E.2) aufgerufen: nach erfolg-
+    reichem cancel_appointment haben wir die event_id, aber nicht
+    direkt die Kunden-Mail. Wenn der Termin urspruenglich ueber das
+    Voice-Booking-Setup angelegt wurde (Teil E.1), existiert eine
+    Konversation mit gcal_event_id=diese ID, und wir koennen die
+    Storno-Bestaetigungs-Mail an conv.kunde_email schicken.
+
+    Bei voice-only Kunden ohne Mail-Adresse zur Buchzeit gibt es
+    keine Konversation — None ist dann normal.
+    """
+    if not gcal_event_id:
+        return None
+    async with AsyncSessionLocal() as s:
+        r = await s.execute(
+            select(EmailConversation)
+            .where(
+                EmailConversation.tenant_id == tenant_id,
+                EmailConversation.gcal_event_id == gcal_event_id,
+            )
+            .order_by(EmailConversation.updated_at.desc())
+            .limit(1)
+        )
+        conv = r.scalar_one_or_none()
+        if conv:
+            s.expunge(conv)
+        return conv
 
 
 async def record_inbound(
@@ -619,6 +664,101 @@ async def send_verschiebung_request(
         tenant_id=tenant_id,
         to_email=to_email,
         subject=reply_subject,
+        body_html=body_html,
+        employee_id=employee_id,
+    )
+
+
+# --------------------------------------------------------------------
+# Voice-Booking-Confirmation (Teil E.1 + E.2)
+# --------------------------------------------------------------------
+
+def _build_buche_confirmation_html(
+    *,
+    kunde_anrede: str,
+    company_name: str,
+    datum_label: str,
+    uhrzeit: str,
+    employee_name: str | None,
+    anliegen: str,
+    contact_phone: str,
+) -> str:
+    """Bestaetigungs-Mail nach erfolgreichem Voice-Booking.
+
+    Bewusst KEIN Storno-Link mit Token — der Kunde antwortet einfach
+    auf die Mail mit "absagen" oder "verschieben", die Microsoft-
+    Pipeline (Teil D Intent-Erkennung) catched das automatisch und
+    triggert die Storno-/Verschiebungs-Handler. Eine extra Token-URL
+    waere doppelte Infrastruktur ohne Mehrwert.
+    """
+    from html import escape as _h
+
+    anrede = f"Hallo {_h(kunde_anrede)}," if kunde_anrede else "Hallo,"
+    durch_wen = (
+        f"<p>{_h(employee_name)} kommt am vereinbarten Termin.</p>"
+        if employee_name else ""
+    )
+    phone_line = (
+        f'<p>Rueckruf-Nummer: <a href="tel:{_h(contact_phone)}">'
+        f'{_h(contact_phone)}</a></p>'
+        if contact_phone else ""
+    )
+    return (
+        f'<html><body style="font-family:Arial,Helvetica,sans-serif;'
+        f'font-size:14px;color:#222">'
+        f"<p>{anrede}</p>"
+        f"<p>vielen Dank fuer Ihren Anruf. Wir haben Ihren Termin "
+        f"eingetragen:</p>"
+        f"<p>"
+        f"<b>Termin:</b> {_h(datum_label)} um {_h(uhrzeit)} Uhr<br>"
+        f"<b>Anliegen:</b> {_h(anliegen)}"
+        f"</p>"
+        f"{durch_wen}"
+        f"<p>Falls Sie den Termin verschieben oder absagen moechten, "
+        f"antworten Sie einfach auf diese Mail — wir kuemmern uns "
+        f"drum.</p>"
+        f"{phone_line}"
+        f"<p>Viele Gruesse,<br>{_h(company_name)}</p>"
+        f"</body></html>"
+    )
+
+
+async def send_buche_confirmation(
+    *,
+    tenant_id: uuid.UUID,
+    to_email: str,
+    kunde_anrede: str,
+    company_name: str,
+    datum_label: str,
+    uhrzeit: str,
+    employee_name: str | None,
+    anliegen: str,
+    contact_phone: str,
+    employee_id: uuid.UUID | None = None,
+) -> dict:
+    """Versendet Buchungs-Bestaetigung via send_tracked_mail aus dem
+    Postfach des zustaendigen Mitarbeiters (oder Tenant-Default).
+
+    Returns: sent_meta-Dict {success, message_id, internet_message_id,
+    conversation_id, error}. Caller persistiert das in
+    record_outbound_q_reply (E.3 Threading).
+    """
+    from core.integrations.microsoft import send_tracked_mail
+
+    body_html = _build_buche_confirmation_html(
+        kunde_anrede=kunde_anrede,
+        company_name=company_name,
+        datum_label=datum_label,
+        uhrzeit=uhrzeit,
+        employee_name=employee_name,
+        anliegen=anliegen,
+        contact_phone=contact_phone,
+    )
+    subject = f"Ihre Terminbestaetigung — {datum_label} um {uhrzeit} Uhr"
+    return await send_tracked_mail(
+        tenant_id=tenant_id,
+        to_email=to_email,
+        subject=subject,
         body_html=body_html,
         employee_id=employee_id,
     )
