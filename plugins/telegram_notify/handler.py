@@ -892,6 +892,13 @@ async def _handle_help_command(chat_id=None):
              "Aktuelles Schema mit allen Feldern + Pflichtangaben."),
             ("/formular_zuruecksetzen",
              "Auf Tischler- oder Allgemein-Default zuruecksetzen."),
+            ("/formulare",
+             "Letzte 10 eingegangenen Antworten mit Status."),
+            ("/formulare_offen",
+             "Nur unerledigte Anfragen (neu + in Bearbeitung)."),
+            ("/formular_eingang_<id>",
+             "Eine Antwort im Detail + Status-Buttons "
+             "(falls der Push verloren ging)."),
         ], False))
 
     viz_items = [
