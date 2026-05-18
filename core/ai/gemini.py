@@ -888,7 +888,7 @@ async def classify_mail_subject(
 
 REPLY_PROMPT = """Du bist Q, ein freundlicher Assistent fuer den Handwerker {tenant_company} (Branche: {tenant_branche}).
 
-Du beantwortest eingehende Kunden-Mails im Namen von {tenant_owner_first_name}.
+Du beantwortest eingehende Kunden-Mails im Namen von {im_namen_von}.
 
 Kontext-Wissen ueber den Betrieb:
 {wissensbasis}
@@ -907,8 +907,8 @@ Schreib eine kurze, freundliche, persoenliche Antwort. Beachte:
 1. Geh konkret auf das Anliegen ein (nicht generisch)
 2. Wenn die Wissensbasis Antworten enthaelt (Preise, Lieferzeiten), nutze sie
 3. Bitte am Ende um Ausfuellen des Anfrage-Formulars mit dem Link {form_url}
-4. Schreib auf Deutsch, hoeflich aber nicht foermlich (Du-Form falls Kunde Du verwendet, sonst Sie)
-5. Unterzeichne mit "{tenant_owner_first_name} (via Q)"
+4. Antworte in derselben Sprache wie die eingehende Mail. Wenn unklar: Deutsch. Hoeflich aber nicht foermlich; Du-Form falls Kunde Du verwendet, sonst Sie.
+5. Unterzeichne mit "{signer}"
 6. KEIN Marketing-Geschwafel, KEINE Floskeln wie "Vielen Dank fuer ihre Anfrage"
 7. Sei direkt und ehrlich
 
@@ -921,19 +921,37 @@ async def generate_anfrage_reply(
     sender_email: str,
     body: str,
     form_url: str,
-    tenant_company: str = "Handwerksbetrieb",
+    tenant_company: str,
+    tenant_owner_first_name: str | None,
     tenant_branche: str = "Handwerk",
-    tenant_owner_first_name: str = "Daniel",
     wissensbasis: str = "(keine spezifischen Infos hinterlegt)",
 ) -> str:
     """Generiert eine persoenliche Antwort auf eine Kunden-Mail.
 
+    tenant_company + tenant_owner_first_name sind Pflicht-Parameter (kein
+    Default) damit kein versehentlicher Halluzinations-Name wie "Daniel"
+    durchrutscht wenn der Caller den Tenant nicht sauber aufloest.
+
+    tenant_owner_first_name: Vorname des Inhabers (z.B. aus extract_first_name
+    auf tenant.contact_name). None oder leer -> Q unterschreibt mit
+    "Ihr Team von {tenant_company} (via Q)" statt mit Personen-Name.
+
     Returns: Plain-Text Antwort (kein HTML), bereit fuer send_mail_as_user.
     """
+    owner_first = (tenant_owner_first_name or "").strip()
+    company = (tenant_company or "").strip() or "dem Betrieb"
+    if owner_first:
+        signer = f"{owner_first[:50]} (via Q)"
+        im_namen_von = owner_first[:50]
+    else:
+        signer = f"Ihr Team von {company[:80]} (via Q)"
+        im_namen_von = f"Ihr Team von {company[:80]}"
+
     prompt = REPLY_PROMPT.format(
-        tenant_company=tenant_company[:100],
+        tenant_company=company[:100],
         tenant_branche=tenant_branche[:50],
-        tenant_owner_first_name=tenant_owner_first_name[:50],
+        im_namen_von=im_namen_von,
+        signer=signer,
         wissensbasis=wissensbasis[:3000],
         subject=(subject or "(kein Betreff)")[:200],
         sender_name=(sender_name or "Kunde")[:100],

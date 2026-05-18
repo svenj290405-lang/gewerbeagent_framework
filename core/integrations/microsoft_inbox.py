@@ -784,7 +784,11 @@ async def process_relevant_kunde_mail(
 
     tenant_company = tenant.company_name or "Handwerksbetrieb"
     tenant_branche = getattr(tenant, "branche", None) or "Handwerk"
-    tenant_owner = (tenant.company_name or "der Betrieb").split()[0]
+    # Inhaber-Vorname aus tenant.contact_name extrahieren statt company_name
+    # zu splitten — "Tischlerei Dietz".split()[0] gibt "Tischlerei", was als
+    # Personen-Name in Anrede/Signatur peinlich ist. Bei leerem Vorname
+    # signiert generate_anfrage_reply mit "Ihr Team von {tenant_company}".
+    tenant_owner_first = extract_first_name(tenant.contact_name or "") or None
 
     # Wissensbasis als Text laden (best-effort)
     wissensbasis_text = "(noch keine spezifischen Infos hinterlegt)"
@@ -838,7 +842,7 @@ async def process_relevant_kunde_mail(
             form_url=form_url,
             tenant_company=tenant_company,
             tenant_branche=tenant_branche,
-            tenant_owner_first_name=tenant_owner,
+            tenant_owner_first_name=tenant_owner_first,
             wissensbasis=wissensbasis_text,
         )
     except Exception as e:
@@ -859,7 +863,7 @@ async def process_relevant_kunde_mail(
         reply_text=reply_text,
         form_url=form_url,
         company_name=tenant_company,
-        contact_name=getattr(tenant, "contact_name", "") or tenant_owner,
+        contact_name=getattr(tenant, "contact_name", "") or "",
         contact_email=getattr(tenant, "contact_email", "") or "",
         contact_phone=getattr(tenant, "contact_phone", "") or "",
     )
