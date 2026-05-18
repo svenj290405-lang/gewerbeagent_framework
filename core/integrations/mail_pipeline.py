@@ -764,6 +764,72 @@ async def send_buche_confirmation(
     )
 
 
+async def push_tenant_new_anfrage_notification(
+    tenant: Tenant,
+    *,
+    sender_email: str,
+    sender_name: str,
+    subject: str,
+    body_preview: str,
+    web_link: str | None = None,
+    anfrage_url: str | None = None,
+    employee_id: uuid.UUID | None = None,
+) -> bool:
+    """Telegram-Push an MA bei neuer RELEVANT_KUNDE-Anfrage (Teil F.1).
+
+    Schickt eine strukturierte Notification mit:
+      - 📧 Header + Sender-Name/-Mail
+      - Subject + Preview (max 200 Zeichen body_preview pro Spec)
+      - Klickbarer "Im Outlook oeffnen"-Link (Microsoft Graph webLink)
+      - Optional Anfrage-Formular-URL falls verfuegbar (Q hat ja schon
+        einen Formular-Link in seiner Antwort verschickt, fuer den MA
+        ist es trotzdem hilfreich den direkten Link zu sehen)
+
+    Telegram inline-keyboards werden NICHT benutzt — HTML-<a>-Tags im
+    Message-Body sind unter parse_mode=HTML komplett ausreichend und
+    benoetigen kein reply_markup-Plumbing.
+
+    Bewusst getrennt von push_tenant_followup_mail (Teil C) — Neuanfrage
+    vs Folge-Mail haben sehr unterschiedliche UX-Bedeutung fuer den MA
+    (Neuanfrage = "Kunde gewonnen!", Folge = "Bitte schauen, evtl. handeln").
+
+    Returns: True wenn Push abgeschickt, False bei Fehler.
+    """
+    from html import escape as _h
+
+    preview_short = (body_preview or "").strip()[:200]
+    outlook_line = (
+        f'<a href="{_h(web_link)}">🔗 Im Outlook oeffnen</a>\n'
+        if web_link else ""
+    )
+    formular_line = (
+        f'<a href="{_h(anfrage_url)}">📝 Formular-Link (an Kunde versendet)</a>\n'
+        if anfrage_url else ""
+    )
+
+    text = (
+        f"📧 <b>Neue Kundenanfrage</b>\n"
+        f"<b>Von:</b> {_h(sender_name)} ({_h(sender_email)})\n"
+        f"<b>Betreff:</b> {_h(subject[:80])}\n"
+        f"<b>Preview:</b> {_h(preview_short)}\n"
+        f"{outlook_line}"
+        f"{formular_line}"
+    )
+
+    try:
+        from plugins.telegram_notify.handler import TelegramNotifier
+        ok = await TelegramNotifier.send_for_tenant(
+            tenant.id, text, employee_id=employee_id,
+        )
+        return bool(ok)
+    except Exception as e:
+        logger.warning(
+            f"push_tenant_new_anfrage_notification tenant={tenant.slug} "
+            f"kunde={sender_email}: {e}"
+        )
+        return False
+
+
 async def push_tenant_intent_event(
     tenant: Tenant,
     *,

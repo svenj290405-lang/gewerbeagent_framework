@@ -624,12 +624,14 @@ async def fetch_full_message(
 
     # conversationId fuer Threading. internetMessageHeaders um In-Reply-To
     # als RFC-Fallback fuer find_open_conversation zu lesen — Graph
-    # liefert die nur wenn explizit angefordert.
+    # liefert die nur wenn explizit angefordert. webLink fuer den
+    # "Im Outlook oeffnen"-Deep-Link in der Tenant-Telegram-Push-
+    # Notification (Teil F).
     params = {
         "$select": (
             "id,subject,from,toRecipients,body,bodyPreview,receivedDateTime,"
             "isRead,internetMessageId,conversationId,internetMessageHeaders,"
-            "hasAttachments"
+            "hasAttachments,webLink"
         ),
     }
 
@@ -1541,6 +1543,35 @@ async def process_relevant_kunde_mail(
             logger.exception(
                 f"Threading-Persistenz fehler (Mail wurde gesendet, "
                 f"conv nicht angelegt): {e}"
+            )
+
+        # Teil F.1: Tenant-Telegram-Push "Neue Kundenanfrage" — der
+        # Mitarbeiter weiss sonst nur ueber den Outlook-Ordner dass eine
+        # neue Anfrage reinkam (Q hat die Mail dorthin verschoben). Push
+        # macht "Kunde gewonnen"-Signal sichtbar + bietet einen direkten
+        # Klick zur Mail im Outlook (webLink).
+        # Anhang-Forward folgt darunter (F.2: pruefen + konsolidieren —
+        # laeuft, nichts zu aendern).
+        try:
+            from core.integrations.mail_pipeline import (
+                push_tenant_new_anfrage_notification,
+            )
+            await push_tenant_new_anfrage_notification(
+                tenant=tenant,
+                sender_email=sender_email,
+                sender_name=sender_name,
+                subject=subject,
+                body_preview=(full.get("bodyPreview") or "")[:200],
+                web_link=full.get("webLink"),
+                anfrage_url=form_url,
+                employee_id=employee_id,
+            )
+        except Exception as e:
+            # Push-Fehler darf weder Mail-Versand-Erfolg noch Anhang-
+            # Forward killen.
+            logger.warning(
+                f"Tenant-Push 'Neue Kundenanfrage' fehlgeschlagen "
+                f"(non-fatal): {e}"
             )
 
     # 6) Original-Mail aufraeumen (nur wenn Send erfolgreich)
