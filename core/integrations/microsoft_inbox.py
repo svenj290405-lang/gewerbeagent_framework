@@ -360,8 +360,73 @@ async def poll_microsoft_inbox(
         # Auto-Verarbeitung NUR bei RELEVANT_KUNDE und nicht throttled.
         # Confidence-Gate: bei "low" eskalieren statt blind auto-antworten,
         # damit Q nicht auf falsch verstandene Mails halluziniert.
+        #
+        # Dispatch-Reihenfolge (Teil D.2):
+        #   1. intent == termin_stornieren  → Storno-Handler (auch ohne
+        #      bestehende Konversation: Kunde koennte telefonisch gebucht
+        #      und jetzt erstmals gemailt haben)
+        #   2. intent == termin_verschieben → Verschiebungs-Handler
+        #   3. intent == rechnungsanfrage   → nur Telegram-Push
+        #   4. existing_conv != None        → Folge-Mail (Teil C)
+        #   5. spam_throttled               → Outlook-Kategorie, kein Reply
+        #   6. confidence == low            → Outlook-Kategorie, kein Reply
+        #   7. sonst (neu_anfrage default)  → process_relevant_kunde_mail
         process_result = None
-        if classification == "RELEVANT_KUNDE" and existing_conv is not None:
+        if classification == "RELEVANT_KUNDE" and intent == "termin_stornieren":
+            try:
+                process_result = await _handle_storno_intent(
+                    tenant=tenant, tenant_id=tenant_id,
+                    message_id=msg.get("id"),
+                    sender_email=sender_email, sender_name=sender_name,
+                    subject=subject, body_preview=body_preview,
+                    existing_conv=existing_conv,
+                    employee_id=employee_id,
+                    ms_conversation_id=msg.get("conversationId"),
+                    classification=classification, confidence=confidence,
+                    reason=reason, categories=msg.get("categories") or [],
+                )
+            except Exception as e:
+                logger.exception(
+                    f"poll: Storno-Handler crashed sender={sender_email}: {e}"
+                )
+                process_result = {"success": False, "error": str(e)}
+        elif classification == "RELEVANT_KUNDE" and intent == "termin_verschieben":
+            try:
+                process_result = await _handle_verschiebung_intent(
+                    tenant=tenant, tenant_id=tenant_id,
+                    message_id=msg.get("id"),
+                    sender_email=sender_email, sender_name=sender_name,
+                    subject=subject, body_preview=body_preview,
+                    existing_conv=existing_conv,
+                    employee_id=employee_id,
+                    ms_conversation_id=msg.get("conversationId"),
+                    classification=classification, confidence=confidence,
+                    reason=reason, categories=msg.get("categories") or [],
+                )
+            except Exception as e:
+                logger.exception(
+                    f"poll: Verschiebungs-Handler crashed sender={sender_email}: {e}"
+                )
+                process_result = {"success": False, "error": str(e)}
+        elif classification == "RELEVANT_KUNDE" and intent == "rechnungsanfrage":
+            try:
+                process_result = await _handle_rechnungsanfrage_intent(
+                    tenant=tenant, tenant_id=tenant_id,
+                    message_id=msg.get("id"),
+                    sender_email=sender_email, sender_name=sender_name,
+                    subject=subject, body_preview=body_preview,
+                    existing_conv=existing_conv,
+                    employee_id=employee_id,
+                    ms_conversation_id=msg.get("conversationId"),
+                    classification=classification, confidence=confidence,
+                    reason=reason, categories=msg.get("categories") or [],
+                )
+            except Exception as e:
+                logger.exception(
+                    f"poll: Rechnungs-Handler crashed sender={sender_email}: {e}"
+                )
+                process_result = {"success": False, "error": str(e)}
+        elif classification == "RELEVANT_KUNDE" and existing_conv is not None:
             # FOLGE-MAIL auf bestehenden Vorgang
             logger.info(
                 f"poll: Folge-Mail erkannt sender={sender_email} "
@@ -864,6 +929,390 @@ async def move_to_gewerbeagent(
     except Exception as e:
         logger.exception(f"move_to_gewerbeagent Exception: {e}")
         return False
+
+
+# =====================================================================
+# Intent-Handler — Storno / Verschiebung / Rechnungsanfrage (Teil D.2)
+# =====================================================================
+# Werden vom poll_microsoft_inbox-Dispatch aufgerufen wenn intent !=
+# neu_anfrage. Jeder Handler ist idempotent-light: bei Fehler in
+# einzelnen Sub-Steps (z.B. mark_as_read) wird nur gewarnt — der
+# Mail-Versand selbst ist das wichtige Outcome.
+
+def _derive_kunde_anrede(sender_name: str, sender_email: str) -> str:
+    """Vorname fuer "Hallo X,"-Anrede. Empty wenn nur Mail-Adresse
+    erkennbar (kein echter Display-Name)."""
+    if sender_name and "@" not in sender_name and sender_name != sender_email:
+        return extract_first_name(sender_name)
+    return ""
+
+
+async def _mark_and_categorize_message(
+    *, tenant_id: UUID, message_id: str | None,
+    categories: list, target_category: str | None,
+    employee_id: UUID | None, action_label: str, sender_email: str,
+) -> None:
+    """Kleiner Helper: Outlook-Kategorie setzen + mark_as_read.
+    Schluckt Fehler mit Warning, weil der Hauptzweck (Mail bearbeitet)
+    bereits erreicht wurde."""
+    try:
+        if target_category and message_id:
+            await set_message_categories(
+                tenant_id=tenant_id, message_id=message_id,
+                categories=(categories or []) + [target_category],
+                employee_id=employee_id,
+            )
+    except Exception as e:
+        logger.warning(
+            f"poll: Outlook-Kategorie auf {action_label} "
+            f"sender={sender_email}: {e}"
+        )
+    try:
+        if message_id:
+            await mark_as_read(tenant_id, message_id, employee_id=employee_id)
+    except Exception as e:
+        logger.warning(
+            f"poll: mark_as_read auf {action_label} sender={sender_email}: {e}"
+        )
+
+
+async def _handle_storno_intent(
+    *,
+    tenant: Tenant, tenant_id: UUID, message_id: str | None,
+    sender_email: str, sender_name: str,
+    subject: str, body_preview: str,
+    existing_conv,  # EmailConversation | None
+    employee_id: UUID | None,
+    ms_conversation_id: str | None,
+    classification: str, confidence: str, reason: str,
+    categories: list,
+) -> dict:
+    """Stornier-Intent: Kalender-Cancel + Bestaetigungs-Mail + Push.
+
+    Returns: process_result-Dict.
+    """
+    from core.integrations.mail_pipeline import (
+        cancel_kunde_termine, send_storno_confirmation,
+        push_tenant_intent_event, create_conversation, record_inbound,
+        record_outbound_q_reply, set_conversation_state,
+    )
+    from core.models import STATE_STORNIERT
+
+    # 1. Termine stornieren (auch wenn KEINE conv existiert — Kunde
+    # koennte per Telefon gebucht haben und jetzt erstmals mailen)
+    try:
+        cancelled = await cancel_kunde_termine(
+            tenant, sender_email, existing_conv,
+        )
+    except Exception as e:
+        logger.exception(
+            f"storno-intent: cancel_kunde_termine crash tenant={tenant.slug} "
+            f"kunde={sender_email}: {e}"
+        )
+        cancelled = []
+
+    # 2. Conversation anlegen falls neu
+    conv = existing_conv
+    if conv is None:
+        try:
+            conv = await create_conversation(
+                tenant_id=tenant_id, sender_email=sender_email,
+                sender_name=sender_name, subject=subject,
+                microsoft_conversation_id=ms_conversation_id,
+            )
+        except Exception as e:
+            logger.exception(
+                f"storno-intent: create_conversation crash: {e}"
+            )
+
+    # 3. Record_inbound
+    if conv is not None:
+        try:
+            await record_inbound(
+                conv.id, last_user_message=body_preview,
+                classification=classification,
+                classification_confidence=confidence,
+                classification_reason=reason,
+                microsoft_conversation_id=ms_conversation_id,
+            )
+        except Exception as e:
+            logger.warning(f"storno-intent: record_inbound: {e}")
+
+    # 4. Storno-Bestaetigungs-Mail
+    company_name = tenant.company_name or "Handwerksbetrieb"
+    kunde_anrede = _derive_kunde_anrede(sender_name, sender_email)
+    sent_meta: dict = {}
+    try:
+        sent_meta = await send_storno_confirmation(
+            tenant_id=tenant_id, to_email=sender_email,
+            kunde_anrede=kunde_anrede, company_name=company_name,
+            original_subject=subject, cancelled_count=len(cancelled),
+            employee_id=employee_id,
+        )
+    except Exception as e:
+        logger.exception(f"storno-intent: send_storno_confirmation: {e}")
+
+    # 5. Outbound-Mail persistieren (fuer Threading)
+    if conv is not None and sent_meta.get("success"):
+        try:
+            reply_subject = (
+                f"Re: {subject}" if not subject.lower().startswith("re:") else subject
+            )
+            await record_outbound_q_reply(
+                conv.id,
+                internet_message_id=sent_meta.get("internet_message_id"),
+                microsoft_conversation_id=sent_meta.get("conversation_id"),
+                q_reply_text=(
+                    f"[Storno-Bestaetigung: {len(cancelled)} Termin(e) storniert]"
+                ),
+                subject=reply_subject,
+            )
+        except Exception as e:
+            logger.warning(f"storno-intent: record_outbound_q_reply: {e}")
+        # State auf STORNIERT — auch wenn cancelled=0 ist die Konversation
+        # de-facto beendet (Kunde hat erklaert nicht zu wollen).
+        try:
+            await set_conversation_state(conv.id, STATE_STORNIERT)
+        except Exception as e:
+            logger.warning(f"storno-intent: set_conversation_state: {e}")
+
+    # 6. Tenant-Push
+    detail = (
+        f"{len(cancelled)} Termin(e) storniert" if cancelled
+        else "kein passender Termin gefunden — Rueckfrage-Mail versendet"
+    )
+    try:
+        await push_tenant_intent_event(
+            tenant=tenant, sender_email=sender_email, sender_name=sender_name,
+            subject=subject, body_preview=body_preview,
+            label="Storno verarbeitet", detail=detail, employee_id=employee_id,
+        )
+    except Exception as e:
+        logger.warning(f"storno-intent: tenant-push: {e}")
+
+    # 7. Outlook + read
+    await _mark_and_categorize_message(
+        tenant_id=tenant_id, message_id=message_id,
+        categories=categories,
+        target_category=Q_CATEGORY_BY_CLASSIFICATION.get("RELEVANT_KUNDE"),
+        employee_id=employee_id, action_label="Storno-Mail",
+        sender_email=sender_email,
+    )
+
+    return {
+        "success": True, "skipped": False,
+        "reason": "storno-processed",
+        "intent": "termin_stornieren",
+        "cancelled_count": len(cancelled),
+        "conv_id": str(conv.id) if conv else None,
+        "mail_sent": bool(sent_meta.get("success")),
+    }
+
+
+async def _handle_verschiebung_intent(
+    *,
+    tenant: Tenant, tenant_id: UUID, message_id: str | None,
+    sender_email: str, sender_name: str,
+    subject: str, body_preview: str,
+    existing_conv, employee_id: UUID | None,
+    ms_conversation_id: str | None,
+    classification: str, confidence: str, reason: str,
+    categories: list,
+) -> dict:
+    """Verschiebungs-Intent: Termin finden + Rueckfrage-Mail + Push.
+    Stornieren tun wir NICHT — der Inhaber muss den neuen Termin
+    erst buchen, dann den alten loeschen.
+    """
+    from core.integrations.mail_pipeline import (
+        send_verschiebung_request, push_tenant_intent_event,
+        create_conversation, record_inbound, record_outbound_q_reply,
+    )
+    from core.plugin_system import get_plugin_for_tenant
+
+    # 1. Termine finden (read-only — kein cancel)
+    found_termine: list[dict] = []
+    try:
+        kalender = await get_plugin_for_tenant(tenant.slug, "kalender")
+        if kalender is not None:
+            find_res = await kalender.on_webhook(
+                "find_events", {"kunde_email": sender_email.lower()},
+            )
+            if find_res.get("erfolg"):
+                found_termine = list(find_res.get("termine", []))
+    except Exception as e:
+        logger.warning(
+            f"verschiebung-intent: find_events tenant={tenant.slug} "
+            f"kunde={sender_email}: {e}"
+        )
+
+    # 2. Conversation anlegen falls neu
+    conv = existing_conv
+    if conv is None:
+        try:
+            conv = await create_conversation(
+                tenant_id=tenant_id, sender_email=sender_email,
+                sender_name=sender_name, subject=subject,
+                microsoft_conversation_id=ms_conversation_id,
+            )
+        except Exception as e:
+            logger.exception(
+                f"verschiebung-intent: create_conversation: {e}"
+            )
+
+    # 3. Record_inbound
+    if conv is not None:
+        try:
+            await record_inbound(
+                conv.id, last_user_message=body_preview,
+                classification=classification,
+                classification_confidence=confidence,
+                classification_reason=reason,
+                microsoft_conversation_id=ms_conversation_id,
+            )
+        except Exception as e:
+            logger.warning(f"verschiebung-intent: record_inbound: {e}")
+
+    # 4. Rueckfrage-Mail
+    company_name = tenant.company_name or "Handwerksbetrieb"
+    kunde_anrede = _derive_kunde_anrede(sender_name, sender_email)
+    sent_meta: dict = {}
+    try:
+        sent_meta = await send_verschiebung_request(
+            tenant_id=tenant_id, to_email=sender_email,
+            kunde_anrede=kunde_anrede, company_name=company_name,
+            original_subject=subject, found_termine=found_termine,
+            employee_id=employee_id,
+        )
+    except Exception as e:
+        logger.exception(f"verschiebung-intent: send mail: {e}")
+
+    # 5. Outbound persistieren
+    if conv is not None and sent_meta.get("success"):
+        try:
+            reply_subject = (
+                f"Re: {subject}" if not subject.lower().startswith("re:") else subject
+            )
+            await record_outbound_q_reply(
+                conv.id,
+                internet_message_id=sent_meta.get("internet_message_id"),
+                microsoft_conversation_id=sent_meta.get("conversation_id"),
+                q_reply_text=(
+                    f"[Verschiebungs-Rueckfrage: {len(found_termine)} "
+                    f"Termin(e) gefunden, warte auf Wunschtermin]"
+                ),
+                subject=reply_subject,
+            )
+        except Exception as e:
+            logger.warning(f"verschiebung-intent: record_outbound: {e}")
+
+    # 6. Tenant-Push
+    detail = (
+        f"{len(found_termine)} Termin(e) gefunden, Rueckfrage raus"
+        if found_termine
+        else "kein Termin gefunden — Rueckfrage-Mail mit Bitte um Details"
+    )
+    try:
+        await push_tenant_intent_event(
+            tenant=tenant, sender_email=sender_email, sender_name=sender_name,
+            subject=subject, body_preview=body_preview,
+            label="Verschiebung erkannt", detail=detail,
+            employee_id=employee_id,
+        )
+    except Exception as e:
+        logger.warning(f"verschiebung-intent: tenant-push: {e}")
+
+    # 7. Outlook + read
+    await _mark_and_categorize_message(
+        tenant_id=tenant_id, message_id=message_id,
+        categories=categories,
+        target_category=Q_CATEGORY_BY_CLASSIFICATION.get("RELEVANT_KUNDE"),
+        employee_id=employee_id, action_label="Verschiebungs-Mail",
+        sender_email=sender_email,
+    )
+
+    return {
+        "success": True, "skipped": False,
+        "reason": "verschiebung-processed",
+        "intent": "termin_verschieben",
+        "found_count": len(found_termine),
+        "conv_id": str(conv.id) if conv else None,
+        "mail_sent": bool(sent_meta.get("success")),
+    }
+
+
+async def _handle_rechnungsanfrage_intent(
+    *,
+    tenant: Tenant, tenant_id: UUID, message_id: str | None,
+    sender_email: str, sender_name: str,
+    subject: str, body_preview: str,
+    existing_conv, employee_id: UUID | None,
+    ms_conversation_id: str | None,
+    classification: str, confidence: str, reason: str,
+    categories: list,
+) -> dict:
+    """Rechnungsanfrage: nur Telegram-Push, keine Auto-Antwort.
+
+    Rechnungen sind heikel (Mahnungen, Zahlungs-Disputes, Skonto,
+    Steuer). Q soll hier NICHT halluzinieren. Inhaber kriegt den
+    Push, antwortet manuell oder leitet an Lexware weiter.
+    """
+    from core.integrations.mail_pipeline import (
+        push_tenant_intent_event, create_conversation, record_inbound,
+    )
+
+    # 1. Konversation tracken (auch ohne outbound — fuer Audit)
+    conv = existing_conv
+    if conv is None:
+        try:
+            conv = await create_conversation(
+                tenant_id=tenant_id, sender_email=sender_email,
+                sender_name=sender_name, subject=subject,
+                microsoft_conversation_id=ms_conversation_id,
+            )
+        except Exception as e:
+            logger.exception(
+                f"rechnung-intent: create_conversation: {e}"
+            )
+    if conv is not None:
+        try:
+            await record_inbound(
+                conv.id, last_user_message=body_preview,
+                classification=classification,
+                classification_confidence=confidence,
+                classification_reason=reason,
+                microsoft_conversation_id=ms_conversation_id,
+            )
+        except Exception as e:
+            logger.warning(f"rechnung-intent: record_inbound: {e}")
+
+    # 2. Push
+    try:
+        await push_tenant_intent_event(
+            tenant=tenant, sender_email=sender_email, sender_name=sender_name,
+            subject=subject, body_preview=body_preview,
+            label="Rechnungsanfrage", detail="keine Auto-Antwort — manuell pruefen",
+            employee_id=employee_id,
+        )
+    except Exception as e:
+        logger.warning(f"rechnung-intent: tenant-push: {e}")
+
+    # 3. Outlook + read — als RELEVANT_GESCHAEFT (nicht KUNDE) damit der
+    # Inhaber in Outlook trennen kann zwischen Auftrags- und Rechnungs-
+    # Korrespondenz.
+    await _mark_and_categorize_message(
+        tenant_id=tenant_id, message_id=message_id,
+        categories=categories,
+        target_category=Q_CATEGORY_BY_CLASSIFICATION.get("RELEVANT_GESCHAEFT"),
+        employee_id=employee_id, action_label="Rechnungsanfrage",
+        sender_email=sender_email,
+    )
+
+    return {
+        "success": True, "skipped": False,
+        "reason": "rechnung-pushed",
+        "intent": "rechnungsanfrage",
+        "conv_id": str(conv.id) if conv else None,
+    }
 
 
 # =====================================================================
