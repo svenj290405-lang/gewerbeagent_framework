@@ -48,9 +48,6 @@ def _extract_files(antworten: dict) -> list[dict]:
                     "base64": v["base64"],
                 })
     return files
-    except Exception as e:
-        logger.warning(f"_send_file_to_telegram failed: {e}")
-        return False
 
 
 def _build_antworten_text_file(
