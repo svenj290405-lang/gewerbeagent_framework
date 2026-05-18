@@ -2,13 +2,18 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 from html import escape as _h
+from zoneinfo import ZoneInfo
+
 from sqlalchemy import select
 
 from core.database import AsyncSessionLocal
 from core.models import AnfrageToken, Tenant
 
 logger = logging.getLogger(__name__)
+
+_BERLIN_TZ = ZoneInfo("Europe/Berlin")
 
 
 def _format_value(value) -> str:
@@ -78,6 +83,89 @@ async def _send_file_to_telegram(
         return False
 
 
+def _format_value_plain(value) -> str:
+    """Plain-Text-Variante von _format_value (kein HTML-Escape).
+
+    Wird fuer den Drive-Text-File-Export gebraucht — dort soll der
+    Handwerker den Originaltext lesen, nicht '&lt;'-Sequenzen.
+    """
+    if isinstance(value, list):
+        if value and all(isinstance(v, dict) and v.get("filename") for v in value):
+            names = [v.get("filename", "?") for v in value]
+            return f"{len(value)} Datei(en): " + ", ".join(names)
+        return ", ".join(str(v) for v in value if v)
+    return str(value or "")
+
+
+def _build_antworten_text_file(
+    *, token_obj: AnfrageToken, antworten: dict, response_id,
+) -> tuple[str, bytes]:
+    """Baut den Drive-Text-File-Inhalt + Filename aus einer Submission.
+
+    Filename: anfrage_YYYY-MM-DD_HH-MM_<sid>.txt — sortiert chronologisch
+    im Drive-Ordner, der short_id-Suffix erlaubt eindeutige Zuordnung
+    zur DB-Response auch wenn mehrere Anfragen pro Minute reinkommen.
+    """
+    from core.integrations.formular_eingang import short_id as _short_id
+
+    now_berlin = datetime.now(_BERLIN_TZ)
+    sid = _short_id(response_id)
+    filename = f"anfrage_{now_berlin.strftime('%Y-%m-%d_%H-%M')}_{sid}.txt"
+
+    kunde = token_obj.kunde_name or token_obj.kunde_email or "Unbekannt"
+    lines = [
+        f"Anfrage von: {kunde}",
+        f"E-Mail: {token_obj.kunde_email or '—'}",
+        f"Eingegangen: {now_berlin.strftime('%Y-%m-%d %H:%M')} Europe/Berlin",
+    ]
+    if token_obj.original_subject:
+        lines.append(f"Original-Betreff: {token_obj.original_subject}")
+    lines.append("")
+    lines.append("Antworten")
+    lines.append("─" * 40)
+    for key, value in (antworten or {}).items():
+        if not value:
+            continue
+        label = key.replace("_", " ").title()
+        rendered = _format_value_plain(value)
+        if "\n" in rendered:
+            lines.append(f"{label}:")
+            lines.append(rendered)
+        else:
+            lines.append(f"{label}: {rendered}")
+        lines.append("")
+    return filename, ("\n".join(lines) + "\n").encode("utf-8")
+
+
+async def _save_antworten_to_drive(
+    *, tenant: Tenant, token_obj: AnfrageToken, antworten: dict,
+    response_id, employee_id,
+) -> None:
+    """Best-Effort: schreibt die Antworten als Text-Datei in den
+    Kunden-Drive-Ordner. Fehler werden geloggt aber nicht propagiert —
+    der Telegram-Push und die DB-Response sind die Source of Truth,
+    Drive ist ein zusaetzliches Archiv.
+    """
+    from core.integrations.google_drive import upload_file_to_kunde_folder
+
+    kunde_name = token_obj.kunde_name or token_obj.kunde_email or "Unbekannt"
+    filename, content = _build_antworten_text_file(
+        token_obj=token_obj, antworten=antworten, response_id=response_id,
+    )
+    result = await upload_file_to_kunde_folder(
+        tenant_id=tenant.id,
+        kunde_name=kunde_name,
+        file_bytes=content,
+        filename=filename,
+        mime_type="text/plain; charset=utf-8",
+        employee_id=employee_id,
+    )
+    logger.info(
+        f"Anfrage-Text in Drive abgelegt: tenant={tenant.slug} "
+        f"kunde={kunde_name} file={filename} url={result.get('web_link')}"
+    )
+
+
 def _anliegen_text_from_antworten(antworten: dict) -> str:
     """Aggregiert die Freitext-Antworten zu einem Skill-Routing-Input.
 
@@ -134,6 +222,23 @@ async def notify_tenant_anfrage_submitted(token_str: str, antworten: dict) -> No
         except Exception as e:  # noqa: BLE001
             logger.warning(f"anfrage_telegram: choose_employee failed: {e}")
 
+    # Drive-Archiv: Antworten als Text-Datei in den Kunden-Ordner ablegen.
+    # Laeuft VOR der Telegram-Push, damit ein Telegram-Routing-Fehler den
+    # Drive-Save nicht ueberspringt. Failsafe — eigene Fehler schluckt.
+    from core.integrations.formular_eingang import get_response_for_token
+    response_pair = await get_response_for_token(token_str)
+    try:
+        if response_pair:
+            response, _ = response_pair
+            await _save_antworten_to_drive(
+                tenant=tenant, token_obj=token_obj, antworten=antworten,
+                response_id=response.id, employee_id=employee_id,
+            )
+    except Exception as e:
+        logger.warning(
+            f"Anfrage-Drive-Save fehlgeschlagen (nicht kritisch): {e}"
+        )
+
     # Push-Ziel + Aktivierungs-Praefix aufloesen.
     bot_token, chat_id, prefix = await TelegramNotifier.resolve_employee_push_target(
         tenant.id, employee_id,
@@ -164,15 +269,11 @@ async def notify_tenant_anfrage_submitted(token_str: str, antworten: dict) -> No
 
     msg += "\nMit /angebot kannst du jetzt direkt ein Lexware-Angebot anlegen."
 
-    # Inline-Status-Buttons: erst die response-id holen damit der Callback
-    # weiss welche Antwort er aktualisieren soll. Wenn die Response (warum
-    # auch immer) nicht gefunden wird, wird der Push trotzdem gesendet —
-    # nur ohne Buttons.
-    from core.integrations.formular_eingang import (
-        get_response_for_token, short_id as _short_id,
-    )
+    # Inline-Status-Buttons: response_pair wurde oben schon fuer den
+    # Drive-Save geladen. Wenn keine Response existiert (warum auch
+    # immer), wird der Push trotzdem gesendet — nur ohne Buttons.
+    from core.integrations.formular_eingang import short_id as _short_id
     keyboard = None
-    response_pair = await get_response_for_token(token_str)
     if response_pair:
         response, _ = response_pair
         sid = _short_id(response.id)
