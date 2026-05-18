@@ -232,8 +232,15 @@ async def poll_microsoft_inbox(
             # Mail als gelesen markieren damit naechster Poll sie nicht erneut sieht
             try:
                 await mark_as_read(tenant_id, msg.get("id"), employee_id=employee_id)
-            except Exception:
-                pass
+            except Exception as e:
+                # Harmlos: Mail wird beim naechsten Poll erneut als BOUNCE
+                # durchlaufen, der Pre-Filter ist billig (kein Gemini-Call).
+                # Trotzdem loggen damit dauerhafte Permission-Issues sichtbar sind.
+                logger.warning(
+                    f"poll: mark_as_read fuer BOUNCE-Mail fehlgeschlagen "
+                    f"tenant={tenant_id} msg_id={(msg.get('id') or '')[:30]} "
+                    f"sender={sender_email}: {e}"
+                )
             continue
 
         # ---- PRE-FILTER 2: Spam-Throttle pro Sender ----
@@ -271,8 +278,11 @@ async def poll_microsoft_inbox(
                     MAIL_CLASSIFY_FAILURES,
                 )
                 MAIL_CLASSIFY_FAILURES.reset(key=str(tenant_id))
-            except Exception:
-                pass
+            except Exception as e:
+                # Reset ist Best-Effort housekeeping; wenn der Counter-Import
+                # oder Reset fehlschlaegt, beeintraechtigt das nur die
+                # naechste Sven-Alert-Berechnung. Debug-Level reicht.
+                logger.debug(f"failure_counter.reset fehlgeschlagen: {e}")
         except Exception as e:
             logger.warning(f"Klassifikation fehler fuer msg {msg.get('id')}: {e}")
             classification = "UNSICHER"
@@ -331,8 +341,15 @@ async def poll_microsoft_inbox(
                             categories=(msg.get("categories") or []) + [target_category],
                             employee_id=employee_id,
                         )
-                except Exception:
-                    pass
+                except Exception as e:
+                    # Kein Setzen → Mail bleibt ungelesen + un-kategorisiert →
+                    # naechster Poll re-klassifiziert sie mit voller Gemini-Cost.
+                    logger.warning(
+                        f"poll: Outlook-Kategorie UNSICHER setzen fehlgeschlagen "
+                        f"(spam-throttle-Pfad) tenant={tenant_id} "
+                        f"sender={sender_email} msg_id={(msg.get('id') or '')[:30]}: "
+                        f"{e} — Mail wird beim naechsten Poll erneut klassifiziert"
+                    )
             elif confidence == "low":
                 logger.info(
                     f"poll: Low-Confidence-RELEVANT_KUNDE (sender={sender_email}) - "
@@ -350,8 +367,16 @@ async def poll_microsoft_inbox(
                             categories=(msg.get("categories") or []) + [target_category],
                             employee_id=employee_id,
                         )
-                except Exception:
-                    pass
+                except Exception as e:
+                    # Kein Setzen → naechster Poll re-klassifiziert mit voller
+                    # Gemini-Cost; zusaetzlich verliert der Inhaber den
+                    # Unsicher-Hinweis im Outlook.
+                    logger.warning(
+                        f"poll: Outlook-Kategorie UNSICHER setzen fehlgeschlagen "
+                        f"(low-confidence-Pfad) tenant={tenant_id} "
+                        f"sender={sender_email} msg_id={(msg.get('id') or '')[:30]}: "
+                        f"{e} — Mail wird beim naechsten Poll erneut klassifiziert"
+                    )
             else:
                 try:
                     process_result = await process_relevant_kunde_mail(
@@ -498,8 +523,13 @@ async def _forward_attachments_to_telegram(
                     "parse_mode": "HTML",
                 },
             )
-    except Exception:
-        pass
+    except Exception as e:
+        # Preheader ist cosmetic — die eigentlichen Anhang-Uploads folgen
+        # darunter und haben eigene Fehler-Logs. Debug-Level reicht.
+        logger.debug(
+            f"Anhang-Forward: Preheader-Send failed (Anhaenge gehen "
+            f"trotzdem raus): {e}"
+        )
 
     sent = 0
     for att in attachments:
@@ -592,7 +622,14 @@ async def fetch_attachments(
             continue
         try:
             raw = _b64.b64decode(content_b64)
-        except Exception:
+        except Exception as e:
+            # Korruptes Attachment → skip, aber sichtbar im Log damit
+            # systematische Decode-Probleme (z.B. Encoding-Drift bei
+            # bestimmten Mail-Clients) auffallen.
+            logger.warning(
+                f"fetch_attachments: b64-decode failed fuer "
+                f"{(att.get('name') or '?')!r} ({size} bytes): {e}"
+            )
             continue
         out.append({
             "name": att.get("name") or "anhang",
