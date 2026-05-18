@@ -4,6 +4,8 @@ from core.models.email_conversation import (
     STATE_BOOKED,
     STATE_PROPOSING_SLOTS,
     STATE_CLOSED,
+    STATE_STORNIERT,
+    STATE_DELIVERY_FAILED,
 )
 from core.models.oauth_state import OAuthState
 from core.models.telegram_termine_seen import TelegramTermineSeen
@@ -255,6 +257,8 @@ __all__ = [
     "STATE_BOOKED",
     "STATE_PROPOSING_SLOTS",
     "STATE_CLOSED",
+    "STATE_STORNIERT",
+    "STATE_DELIVERY_FAILED",
     "AngebotPosition",
     "Kundengespraech",
     "STATE_AUFNAHME_WAITING_AUDIO",

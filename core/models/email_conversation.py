@@ -24,6 +24,10 @@ STATE_AWAITING_CONFIRMATION = "awaiting_confirmation"
 STATE_BOOKED = "booked"
 STATE_PROPOSING_SLOTS = "proposing_slots"
 STATE_CLOSED = "closed"
+# Zusatz-States fuer Microsoft-Pipeline (Teil D + G).
+# Kein Migrations-Aufwand — `state` ist String(50), kein DB-Enum.
+STATE_STORNIERT = "storniert"
+STATE_DELIVERY_FAILED = "zustellung_fehlgeschlagen"
 
 
 
@@ -49,6 +53,7 @@ class EmailConversation(Base):
         Index("ix_email_conv_tenant_kunde", "tenant_id", "kunde_email"),
         Index("ix_email_conv_message_id", "last_message_id"),
         Index("ix_email_conv_termin_datum", "termin_datum"),
+        Index("ix_email_conv_ms_conv_id", "microsoft_conversation_id"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -70,9 +75,21 @@ class EmailConversation(Base):
     gcal_event_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     termin_datum: Mapped[dt.date | None] = mapped_column(Date, nullable=True)
 
-    # Threading: letzte Mail-Message-ID (fuer In-Reply-To-Matching)
+    # Threading: letzte versendete Q-Mail-Message-ID (RFC-Format
+    # "<random@domain>"). Eingehende Replies haben In-Reply-To = dieser
+    # Wert → wir matchen darueber die Konversation. Siehe
+    # core/integrations/mail_pipeline.find_conversation_by_in_reply_to.
     last_message_id: Mapped[str | None] = mapped_column(String(500), nullable=True)
     last_subject: Mapped[str | None] = mapped_column(String(500), nullable=True)
+
+    # Microsoft Graph `conversationId` — Threading-Gruppen-Key auf
+    # Mail-Provider-Ebene. Komplement zu last_message_id (das matched
+    # 1:1 die letzte Q-Reply), nuetzlich fuer "alle Mails dieses
+    # Threads anzeigen" und fuer Fallback-Lookups wenn der Kunde
+    # In-Reply-To verschluckt (z.B. neu-erstellte Mail statt Reply).
+    microsoft_conversation_id: Mapped[str | None] = mapped_column(
+        String(255), nullable=True,
+    )
 
     # Konversations-Memory fuer Multi-Turn (Q weiss was er zuletzt fragte)
     last_q_reply: Mapped[str | None] = mapped_column(Text, nullable=True)
