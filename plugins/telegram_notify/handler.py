@@ -7,6 +7,7 @@ import datetime as dt
 import logging
 import uuid
 from decimal import Decimal
+from html import escape as _h
 from typing import Any
 
 import httpx
