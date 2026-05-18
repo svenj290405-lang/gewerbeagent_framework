@@ -116,9 +116,18 @@ async def fetch_unread_messages(
     not_q_marked = "not (" + " or ".join(q_filter_parts) + ")"
     full_filter = f"isRead eq false and {not_q_marked}"
 
+    # internetMessageId + conversationId zusaetzlich holen damit der
+    # Reply-Threading-Lookup in mail_pipeline.find_open_conversation
+    # ohne extra Graph-Call funktioniert. internetMessageHeaders (fuer
+    # In-Reply-To als RFC-Fallback) wird NICHT hier mitgeholt — Graph
+    # liefert die in der List-Variante haeufig nicht zuverlaessig; wir
+    # ziehen sie bei Bedarf in fetch_full_message.
     params = {
         "$filter": full_filter,
-        "$select": "id,subject,from,bodyPreview,categories,receivedDateTime,isRead",
+        "$select": (
+            "id,subject,from,bodyPreview,categories,receivedDateTime,isRead,"
+            "internetMessageId,conversationId"
+        ),
         "$orderby": "receivedDateTime desc",
         "$top": top,
     }
@@ -319,11 +328,101 @@ async def poll_microsoft_inbox(
 
         classified_counts[classification] = classified_counts.get(classification, 0) + 1
 
+        # Reply-Threading: vor der Auto-Verarbeitung pruefen ob fuer
+        # diesen Thread bereits eine offene Konversation existiert.
+        # Lookup via Microsoft conversationId (provider-native Thread-
+        # Gruppierung) + sender_email-Fallback. Wenn ja: KEIN Auto-Reply
+        # mit Formular-Link (waere peinliche Wiederholung), sondern
+        # Telegram-Push an den zustaendigen Mitarbeiter — der entscheidet
+        # manuell oder die kommende Storno-/Verschiebungs-Erkennung
+        # (Teil D) uebernimmt.
+        existing_conv = None
+        if classification == "RELEVANT_KUNDE":
+            try:
+                from core.integrations.mail_pipeline import (
+                    find_open_conversation,
+                )
+                existing_conv = await find_open_conversation(
+                    tenant_id=tenant_id,
+                    sender_email=sender_email,
+                    microsoft_conversation_id=msg.get("conversationId"),
+                )
+            except Exception as e:
+                logger.warning(
+                    f"poll: conv-lookup fehlgeschlagen sender={sender_email}: {e}"
+                )
+
         # Auto-Verarbeitung NUR bei RELEVANT_KUNDE und nicht throttled.
         # Confidence-Gate: bei "low" eskalieren statt blind auto-antworten,
         # damit Q nicht auf falsch verstandene Mails halluziniert.
         process_result = None
-        if classification == "RELEVANT_KUNDE":
+        if classification == "RELEVANT_KUNDE" and existing_conv is not None:
+            # FOLGE-MAIL auf bestehenden Vorgang
+            logger.info(
+                f"poll: Folge-Mail erkannt sender={sender_email} "
+                f"conv_id={existing_conv.id} state={existing_conv.state} "
+                f"— kein Auto-Reply, Telegram-Push an MA"
+            )
+            try:
+                from core.integrations.mail_pipeline import (
+                    record_inbound, push_tenant_followup_mail,
+                )
+                await record_inbound(
+                    existing_conv.id,
+                    last_user_message=body_preview,
+                    classification=classification,
+                    classification_confidence=confidence,
+                    classification_reason=reason,
+                    microsoft_conversation_id=msg.get("conversationId"),
+                )
+                await push_tenant_followup_mail(
+                    tenant=tenant,
+                    sender_email=sender_email,
+                    sender_name=sender_name,
+                    subject=subject,
+                    body_preview=body_preview,
+                    conv=existing_conv,
+                    employee_id=employee_id,
+                )
+                # Outlook-Kategorie setzen + mark-as-read damit naechster
+                # Poll diese Mail nicht erneut anfasst.
+                try:
+                    target_category = Q_CATEGORY_BY_CLASSIFICATION.get(
+                        "RELEVANT_KUNDE"
+                    )
+                    if target_category and msg.get("id"):
+                        await set_message_categories(
+                            tenant_id=tenant_id, message_id=msg.get("id"),
+                            categories=(msg.get("categories") or [])
+                            + [target_category],
+                            employee_id=employee_id,
+                        )
+                except Exception as e:
+                    logger.warning(
+                        f"poll: Outlook-Kategorie auf Folge-Mail "
+                        f"sender={sender_email}: {e}"
+                    )
+                try:
+                    await mark_as_read(
+                        tenant_id, msg.get("id"), employee_id=employee_id,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"poll: mark_as_read auf Folge-Mail "
+                        f"sender={sender_email}: {e}"
+                    )
+                process_result = {
+                    "success": True, "skipped": False,
+                    "reason": "followup-pushed",
+                    "conv_id": str(existing_conv.id),
+                }
+            except Exception as e:
+                logger.exception(
+                    f"poll: Folge-Mail-Handling fehlgeschlagen "
+                    f"sender={sender_email}: {e}"
+                )
+                process_result = {"success": False, "error": str(e)}
+        elif classification == "RELEVANT_KUNDE":
             if spam_throttled:
                 logger.warning(
                     f"poll: Spam-Throttle greift fuer {sender_email} "
@@ -453,10 +552,14 @@ async def fetch_full_message(
         logger.error(f"fetch_full_message Token-Fehler: {e}")
         return None
 
+    # conversationId fuer Threading. internetMessageHeaders um In-Reply-To
+    # als RFC-Fallback fuer find_open_conversation zu lesen — Graph
+    # liefert die nur wenn explizit angefordert.
     params = {
         "$select": (
             "id,subject,from,toRecipients,body,bodyPreview,receivedDateTime,"
-            "isRead,internetMessageId,hasAttachments"
+            "isRead,internetMessageId,conversationId,internetMessageHeaders,"
+            "hasAttachments"
         ),
     }
 
@@ -905,24 +1008,86 @@ async def process_relevant_kunde_mail(
         contact_phone=getattr(tenant, "contact_phone", "") or "",
     )
 
-    # Mail senden via Microsoft Graph (aus dem Postfach des Mitarbeiters)
+    # Mail via Microsoft Graph senden (aus dem Postfach des Mitarbeiters).
+    # send_tracked_mail (Draft-Create + Send) statt send_mail_as_user
+    # weil wir die internetMessageId + conversationId brauchen um die
+    # ausgehende Q-Antwort in der EmailConversation zu persistieren
+    # (Reply-Threading: naechste Kunden-Reply hat In-Reply-To =
+    # diese internetMessageId).
+    reply_subject = (
+        f"Re: {subject}" if not subject.lower().startswith("re:") else subject
+    )
+    sent_meta: dict = {}
     try:
-        sent_ok = await send_mail_as_user(
+        from core.integrations.microsoft import send_tracked_mail
+        sent_meta = await send_tracked_mail(
             tenant_id=tenant_id,
             to_email=sender_email,
-            subject=f"Re: {subject}" if not subject.lower().startswith("re:") else subject,
+            subject=reply_subject,
             body_html=body_html,
-            save_to_sent=True,
             employee_id=employee_id,
         )
-        result["sent"] = bool(sent_ok)
-        if not sent_ok:
-            result["error"] = "Mail-Versand fehlgeschlagen"
-            logger.warning(f"send_mail_as_user returnte False: tenant={tenant_id} to={sender_email}")
+        result["sent"] = bool(sent_meta.get("success"))
+        if not sent_meta.get("success"):
+            err = sent_meta.get("error") or "send_tracked_mail returnte success=False"
+            result["error"] = f"Mail-Versand: {err}"
+            logger.warning(
+                f"send_tracked_mail fehlgeschlagen: tenant={tenant_id} "
+                f"to={sender_email}: {err}"
+            )
     except Exception as e:
         logger.exception(f"Mail-Versand fehler: {e}")
         result["error"] = f"Mail-Versand: {e}"
         return result
+
+    # Threading-Persistenz: neue EmailConversation anlegen + ausgehende
+    # Q-Mail-IDs persistieren. Wir kommen hier nur an wenn KEIN
+    # bestehender Thread gefunden wurde (poll-Loop hat das geprueft) —
+    # also klassischer Neukunde-Fall.
+    if result["sent"]:
+        try:
+            from core.integrations.mail_pipeline import (
+                create_conversation, record_outbound_q_reply, record_inbound,
+            )
+            ms_conv_id = sent_meta.get("conversation_id")
+            outbound_imsg_id = sent_meta.get("internet_message_id")
+            new_conv = await create_conversation(
+                tenant_id=tenant_id,
+                sender_email=sender_email,
+                sender_name=sender_name,
+                subject=subject,
+                microsoft_conversation_id=ms_conv_id,
+            )
+            await record_inbound(
+                new_conv.id,
+                last_user_message=body_text[:4000] if body_text else None,
+                classification=(classification_result or {}).get(
+                    "classification"
+                ),
+                classification_confidence=(classification_result or {}).get(
+                    "confidence"
+                ),
+                classification_reason=(classification_result or {}).get(
+                    "reason"
+                ),
+            )
+            await record_outbound_q_reply(
+                new_conv.id,
+                internet_message_id=outbound_imsg_id,
+                microsoft_conversation_id=ms_conv_id,
+                q_reply_text=reply_text,
+                subject=reply_subject,
+            )
+            result["conv_id"] = str(new_conv.id)
+        except Exception as e:
+            # Persistierung darf den Mail-Versand-Erfolg nicht killen
+            # — Mail ist raus, Token existiert, Anhang-Forward folgt.
+            # Threading geht beim naechsten Reply halt nicht, das ist
+            # nicht schoen aber kein Datenverlust.
+            logger.exception(
+                f"Threading-Persistenz fehler (Mail wurde gesendet, "
+                f"conv nicht angelegt): {e}"
+            )
 
     # 6) Original-Mail aufraeumen (nur wenn Send erfolgreich)
     #    a) isRead=true setzen - Defense-in-Depth: selbst wenn der
