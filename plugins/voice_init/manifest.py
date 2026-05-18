@@ -23,6 +23,7 @@ MANIFEST = PluginManifest(
         {"path": "/buche_termin", "method": "POST"},
         {"path": "/finde_termine", "method": "POST"},
         {"path": "/storniere_termin", "method": "POST"},
+        {"path": "/wissensbasis", "method": "POST"},
         {"path": "/call_ended", "method": "POST"},
     ],
 )

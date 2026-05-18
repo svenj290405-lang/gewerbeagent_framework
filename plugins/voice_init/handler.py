@@ -342,6 +342,8 @@ class Plugin(BasePlugin):
             return await self._handle_finde_termine(payload)
         if endpoint == "storniere_termin":
             return await self._handle_storniere_termin(payload)
+        if endpoint == "wissensbasis":
+            return await self._handle_wissensbasis(payload)
         if endpoint == "call_ended":
             return await self._handle_call_ended(payload)
         return {"error": f"Unbekannter Endpunkt: {endpoint}"}
@@ -1206,6 +1208,178 @@ class Plugin(BasePlugin):
                 logger.warning(f"Lexware-API-Key Entschluesselung fehlgeschlagen: {e}")
                 return None
             return LexwareProvider(api_key=api_key)
+
+
+    async def _handle_wissensbasis(self, payload):
+        """Webhook von ElevenLabs wenn Q das Tool 'wissensbasis' aufruft.
+
+        Erlaubt dem Voice-Agent gezielt in der tenant-spezifischen Wissens-
+        basis nachzuschlagen — Alternative zum kompletten Knowledge-Block
+        im System-Prompt (siehe _handle_initiation). Sinnvoll wenn die
+        Wissensbasis waechst und der Prompt zu lang wird, oder wenn der
+        Agent explizit signalisieren soll dass er weiss was er nicht weiss.
+
+        Erwartet payload:
+          {
+            "tenant_slug": "demo",
+            "frage": "Was kostet eine Beratung?",  # optional
+            "kategorie": "preise"                   # optional, eine der
+                                                    # ALLE_KATEGORIEN
+          }
+        Mindestens eines von frage/kategorie muss gesetzt sein.
+
+        Matching-Logik:
+        1. kategorie gesetzt → alle Snippets dieser Kategorie zurueck
+        2. nur frage gesetzt → simple Keyword-Suche (lowercase substring
+           auf Tokens >=4 Zeichen, deutsche Stopwoerter raus). Bei 0
+           Treffern fallback auf Liste verfuegbarer Kategorien — damit
+           der Agent dem Anrufer sagen kann was er sonst weiss.
+
+        Response (fuer ElevenLabs-Tool):
+          {
+            "erfolg": True,
+            "antwort": "<voice-freundlicher Text, ~max 800 Zeichen>",
+            "anzahl_treffer": 3,
+            "kategorien_genutzt": ["preise", "leistungen"]
+          }
+
+        Keine Vektor-Suche — laut Model-Doku nur 5-30 Snippets pro Tenant.
+        Substring-Match auf Tokens reicht in der Praxis und ist deterministisch
+        (wichtig fuer Voice: keine Halluzinationen ueber nicht-existente
+        Snippets, weil wir nur exakte Snippet-Texte zurueckgeben).
+        """
+        tenant_slug = (payload.get("tenant_slug") or "").strip()
+        if not tenant_slug:
+            return {"erfolg": False, "antwort": "tenant_slug fehlt", "anzahl_treffer": 0}
+
+        frage = (payload.get("frage") or "").strip()
+        kategorie = (payload.get("kategorie") or "").strip().lower()
+        if not frage and not kategorie:
+            return {
+                "erfolg": False,
+                "antwort": "frage oder kategorie erforderlich",
+                "anzahl_treffer": 0,
+            }
+
+        async with AsyncSessionLocal() as s:
+            tenant = (await s.execute(
+                select(Tenant).where(Tenant.slug == tenant_slug)
+            )).scalar_one_or_none()
+        if tenant is None:
+            return {
+                "erfolg": False,
+                "antwort": f"Betrieb '{tenant_slug}' nicht gefunden",
+                "anzahl_treffer": 0,
+            }
+
+        by_kat = await _load_knowledge(tenant.id)
+        if not by_kat:
+            return {
+                "erfolg": True,
+                "antwort": (
+                    "Zu diesem Betrieb sind noch keine Informationen "
+                    "hinterlegt."
+                ),
+                "anzahl_treffer": 0,
+                "kategorien_genutzt": [],
+            }
+
+        # Strategie 1: explizite Kategorie
+        treffer: list[tuple[str, str]] = []  # (kategorie, text)
+        if kategorie:
+            if kategorie not in ALLE_KATEGORIEN:
+                erlaubt = ", ".join(ALLE_KATEGORIEN)
+                return {
+                    "erfolg": False,
+                    "antwort": (
+                        f"Kategorie '{kategorie}' unbekannt. Erlaubt: "
+                        f"{erlaubt}"
+                    ),
+                    "anzahl_treffer": 0,
+                }
+            for text in by_kat.get(kategorie, []):
+                treffer.append((kategorie, text))
+
+        # Strategie 2: Keyword-Match wenn frage da ist (und Kategorie
+        # entweder leer oder keine Treffer brachte)
+        if frage and not treffer:
+            stopwords = {
+                "der", "die", "das", "den", "dem", "des", "ein", "eine",
+                "einen", "einem", "eines", "und", "oder", "aber", "doch",
+                "wie", "was", "wer", "wann", "wo", "warum", "welche",
+                "welcher", "welches", "ist", "sind", "war", "waren",
+                "kann", "koennen", "sollte", "muesste", "ich", "du", "er",
+                "sie", "wir", "ihr", "mich", "dich", "uns", "euch",
+                "habt", "habe", "haben", "hat", "fuer", "bei", "mit",
+                "ohne", "auf", "aus", "von", "zum", "zur", "im", "am",
+            }
+            tokens = [
+                t for t in frage.lower().replace("?", " ").replace(".", " ").split()
+                if len(t) >= 4 and t not in stopwords
+            ]
+            scored: list[tuple[int, str, str]] = []
+            for kat, texts in by_kat.items():
+                for text in texts:
+                    tl = text.lower()
+                    score = sum(1 for t in tokens if t in tl)
+                    if score > 0:
+                        scored.append((score, kat, text))
+            scored.sort(key=lambda x: -x[0])
+            treffer = [(kat, text) for _, kat, text in scored]
+
+        # Strategie 3: kein Treffer → Kategorien-Uebersicht zurueck
+        if not treffer:
+            verfuegbar = [
+                KATEGORIE_LABELS.get(k, k) for k in ALLE_KATEGORIEN
+                if k in by_kat
+            ]
+            if not verfuegbar:
+                antwort = "Dazu liegen keine Informationen vor."
+            else:
+                antwort = (
+                    "Dazu habe ich keinen direkten Eintrag. Ich habe aber "
+                    "Informationen zu: " + ", ".join(verfuegbar) + "."
+                )
+            logger.info(
+                f"wissensbasis: tenant={tenant_slug} frage={frage!r} "
+                f"kategorie={kategorie!r} treffer=0"
+            )
+            return {
+                "erfolg": True,
+                "antwort": antwort,
+                "anzahl_treffer": 0,
+                "kategorien_genutzt": [],
+            }
+
+        # Voice-freundlicher Output: Snippets ohne Markdown,
+        # max ~800 Zeichen damit der TTS nicht 30s redet
+        MAX_CHARS = 800
+        parts: list[str] = []
+        kategorien_used: list[str] = []
+        total_len = 0
+        for kat, text in treffer:
+            if kat not in kategorien_used:
+                kategorien_used.append(kat)
+            chunk = text.strip()
+            if total_len + len(chunk) > MAX_CHARS:
+                if not parts:
+                    parts.append(chunk[: MAX_CHARS - 3] + "...")
+                break
+            parts.append(chunk)
+            total_len += len(chunk) + 2
+
+        antwort = " ".join(parts)
+        logger.info(
+            f"wissensbasis: tenant={tenant_slug} frage={frage!r} "
+            f"kategorie={kategorie!r} treffer={len(treffer)} "
+            f"kategorien={kategorien_used} antwort_len={len(antwort)}"
+        )
+        return {
+            "erfolg": True,
+            "antwort": antwort,
+            "anzahl_treffer": len(treffer),
+            "kategorien_genutzt": kategorien_used,
+        }
 
 
     async def _handle_call_ended(self, payload):
