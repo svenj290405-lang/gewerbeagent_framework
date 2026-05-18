@@ -100,7 +100,6 @@ async def seed() -> None:
             "telegram_bot",
             "telegram_notify",
             "kalender",
-            "mail_intake",
             "lexware",
             "voice_init",
         ]

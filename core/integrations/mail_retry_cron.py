@@ -56,12 +56,16 @@ ERROR_RETRY_SECONDS = 60
 
 
 async def _load_brevo_config_for_tenant(tenant_id) -> dict | None:
-    """Holt brevo_api_key + sender_email aus _global mail_intake config.
+    """Holt brevo_api_key + sender_email aus der zentralen Brevo-Config.
 
-    Note: aktuell ist Brevo zentral via _global Tenant konfiguriert
-    (siehe handler.py:2150 — alle Tenants teilen sich denselben Brevo-
-    Account fuer Visualisierungs- + Rechnungs-Mails). Wenn der spaeter
-    pro-Tenant wird, hier auf tenant_id umstellen.
+    Brevo-Credentials liegen historisch in der ToolConfig-Zeile mit
+    tool_name='mail_intake' im _global Tenant — der ehemalige Brevo-
+    Inbound-Plugin wurde im Mail-Pipeline-Refactor entfernt, die DB-
+    Zeile bleibt aber als Speicherort fuer Outbound-Credentials
+    (Visualisierungs- + Rechnungs-Mails via Brevo). Wenn der spaeter
+    pro-Tenant wird, hier auf tenant_id umstellen — und gleichzeitig
+    den Schluesselnamen umbenennen (Tech-Debt: 'mail_intake' ist
+    irrefuehrend, sollte 'brevo_outbound' o.ae. heissen).
     """
     from core.models import Tenant as _Tenant
     GLOBAL_TENANT_SLUG = "_global"

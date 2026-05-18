@@ -113,8 +113,9 @@ class Plugin(BasePlugin):
         self, endpoint: str, payload: dict[str, Any],
         headers: dict[str, str] | None = None,
     ) -> dict[str, Any]:
-        # Kalender wird nur intern aufgerufen (mail_intake.on_webhook
-        # → kalender.on_webhook), nicht von externen Webhooks.
+        # Kalender wird nur intern aufgerufen (voice_init-Handler +
+        # microsoft_inbox via mail_pipeline.cancel_kunde_termine), nicht
+        # von externen Webhooks.
         # Header-Verifikation entfaellt; Param fuer BasePlugin-Konformitaet.
         _ = headers  # noqa: F841
         if endpoint == "check_availability":

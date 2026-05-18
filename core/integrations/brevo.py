@@ -83,8 +83,7 @@ class BrevoMailer:
         tenant_id: str | None = None,
     ) -> dict:
         """
-        Verschickt eine Mail. Wirft BrevoError bei Fehler (im Gegensatz zur
-        send_reply_via_brevo-Funktion in mail_intake, die silent failt).
+        Verschickt eine Mail. Wirft BrevoError bei Fehler.
 
         Returns: Brevo-Response-JSON (enthaelt messageId).
         tenant_id (optional) wird fuer API-Usage-Tracking genutzt.

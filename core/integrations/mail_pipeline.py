@@ -5,9 +5,12 @@ Kapselt EmailConversation-Lookups, State-Uebergaenge und Tenant-
 Telegram-Pushes — die Bausteine fuer Reply-Threading + Follow-up-
 Routing in core/integrations/microsoft_inbox.py.
 
-Bewusst kein Code-Reuse mit plugins/mail_intake/handler.py (Brevo):
-die Brevo-Pipeline hat eigene Kopien und wird im Endspiel des Refactors
-komplett entfernt (Task A.4). Bis dahin laufen beide Pipelines parallel.
+Historie: dieses Modul ersetzt die fruehere Brevo-Inbound-Pipeline
+(plugins/mail_intake/, entfernt im Mail-Pipeline-Refactor). Die
+nuetzlichen Helper (find/upsert_conversation, Storno-Resolver,
+Slot-Helper, Tenant-Push) wurden hier neu implementiert — nicht 1:1
+portiert — damit sie sauber auf Microsoft Graph aufsetzen statt auf
+Brevos REST-API.
 
 Threading-Strategie (find_open_conversation):
 1. Primaer: Microsoft Graph conversationId — gruppiert Threads
@@ -462,15 +465,10 @@ async def push_tenant_followup_mail(
 #
 # Diese Funktionen kapseln die Microsoft-spezifische Storno-/Verschie-
 # bungs-Logik. Sie werden vom poll-Loop in microsoft_inbox.py aufgerufen,
-# nachdem das Intent (siehe core.ai.gemini) bestimmt wurde. Konzeptionell
-# parallel zur Brevo-Logik in plugins/mail_intake/handler.py
-# (_resolve_and_cancel_storno_events, _cancel_via_kalender,
-# _send_storno_reply) — aber:
-#   - Versand via Microsoft Graph (send_tracked_mail), nicht Brevo
-#   - Persistenz via mail_pipeline.create/record-Helper
-#   - Kalender-Aufruf via plugin-system (kalender.on_webhook)
+# nachdem das Intent (siehe core.ai.gemini) bestimmt wurde.
 #
-# Bewusst kein Code-Reuse: Brevo-Plugin wird in A.4 entfernt.
+# Versand: Microsoft Graph (send_tracked_mail). Persistenz: mail_pipeline-
+# create/record-Helper. Kalender: plugin-system (kalender.on_webhook).
 
 async def cancel_kunde_termine(
     tenant: Tenant,

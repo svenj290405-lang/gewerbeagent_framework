@@ -1,9 +1,12 @@
 """
 EmailConversation = Multi-Turn-Mail-Konversation mit einem Kunden.
 
-Wird vom mail_intake-Plugin gepflegt. Speichert State-Machine + aktuellen
-Termin pro (Tenant, Kunden-Mail) so dass das Plugin bei einer Reply
-weiss: gibt es schon einen Termin den der Kunde verschieben moechte?
+Gepflegt von core.integrations.mail_pipeline (Microsoft-Inbound +
+intent-Routing) und plugins/voice_init/handler.py (Voice-Buchungs- und
+Storno-Bestaetigungs-Mails). Speichert State-Machine, aktuellen Termin
+und Microsoft-Threading-IDs (last_message_id + microsoft_conversation_id)
+pro (Tenant, Kunden-Mail) — damit bei einer Reply gematcht werden kann
+ob schon ein Vorgang laeuft.
 
 Hard-Delete Cleanup: Konversationen bei denen termin_datum laenger als
 14 Tage zurueckliegt werden vom periodischen Cleanup-Job geloescht.
