@@ -196,6 +196,39 @@ async def create_conversation(
     return conv
 
 
+async def find_conversation_by_outbound_message_id(
+    tenant_id: uuid.UUID, outbound_message_id: str,
+) -> EmailConversation | None:
+    """Sucht eine Konversation anhand der internetMessageId der zuletzt
+    versendeten Q-Reply (= EmailConversation.last_message_id).
+
+    Wird vom Bounce-Handler (Teil G) gerufen: die bounce-Mail hat als
+    In-Reply-To die Message-ID unserer Q-Antwort. Wenn wir die Konv.
+    finden, koennen wir state=STATE_DELIVERY_FAILED setzen und den MA
+    informieren dass seine/Q's Antwort nicht angekommen ist.
+
+    Bewusst KEIN Filter auf state — auch bei Re-Bounce einer
+    bereits-bounced Konv. wollen wir die finden (z.B. um den Push zu
+    wiederholen oder das classification_reason zu erweitern).
+    """
+    if not outbound_message_id:
+        return None
+    async with AsyncSessionLocal() as s:
+        r = await s.execute(
+            select(EmailConversation)
+            .where(
+                EmailConversation.tenant_id == tenant_id,
+                EmailConversation.last_message_id == outbound_message_id,
+            )
+            .order_by(EmailConversation.updated_at.desc())
+            .limit(1)
+        )
+        conv = r.scalar_one_or_none()
+        if conv:
+            s.expunge(conv)
+        return conv
+
+
 async def find_conversation_by_event_id(
     tenant_id: uuid.UUID, gcal_event_id: str,
 ) -> EmailConversation | None:
@@ -762,6 +795,57 @@ async def send_buche_confirmation(
         body_html=body_html,
         employee_id=employee_id,
     )
+
+
+async def push_tenant_bounce_notification(
+    tenant: Tenant,
+    *,
+    conv: EmailConversation,
+    bounce_sender: str,
+    bounce_reason: str,
+    employee_id: uuid.UUID | None = None,
+) -> bool:
+    """Telegram-Push wenn unsere Q-Antwort gebounced ist (Teil G).
+
+    Format ist bewusst alarmierend (⚠️) — fuer den MA ist das
+    Action-Item: er sollte die Mail manuell nochmal versenden, die
+    Adresse korrigieren oder dem Kunden anders zurueckmelden.
+
+    Schickt an den der Konversation zugewiesenen Mitarbeiter falls
+    moeglich, sonst an den Tenant-Default.
+
+    Returns: True wenn Push abgeschickt, False bei Fehler.
+    """
+    from html import escape as _h
+
+    target_employee_id = employee_id or conv.assigned_employee_id
+
+    # Bounce-Reason auf 200 Zeichen begrenzen — DSN-Reports koennen
+    # mehrere Seiten Text enthalten.
+    reason_short = (bounce_reason or "")[:200]
+
+    text = (
+        f"⚠️ <b>Mail-Zustellung fehlgeschlagen</b>\n"
+        f"<b>An:</b> {_h(conv.kunde_email)}\n"
+        f"<b>Subject war:</b> {_h((conv.last_subject or '')[:80])}\n"
+        f"<b>Bounce von:</b> {_h(bounce_sender)}\n"
+        f"<b>Grund:</b> {_h(reason_short)}\n"
+        f"<i>Bitte manuell pruefen — die Antwort an den Kunden kam "
+        f"nicht an.</i>"
+    )
+
+    try:
+        from plugins.telegram_notify.handler import TelegramNotifier
+        ok = await TelegramNotifier.send_for_tenant(
+            tenant.id, text, employee_id=target_employee_id,
+        )
+        return bool(ok)
+    except Exception as e:
+        logger.warning(
+            f"push_tenant_bounce_notification tenant={tenant.slug} "
+            f"kunde={conv.kunde_email}: {e}"
+        )
+        return False
 
 
 async def push_tenant_new_anfrage_notification(

@@ -238,6 +238,65 @@ async def poll_microsoft_inbox(
                 "reason": bounce_reason,
                 "skipped": True,
             })
+
+            # Teil G: Bounce-Tracking — wenn diese Bounce eine Antwort
+            # auf eine Q-Reply ist (Bounce In-Reply-To = unsere
+            # internetMessageId), markieren wir die zugehoerige
+            # EmailConversation als zustellung_fehlgeschlagen und pushen
+            # an den MA. Sonst (z.B. OOO ohne In-Reply-To, oder Bounce
+            # auf eine nicht-trackbare Mail) nur loggen + skip wie bisher.
+            #
+            # Lazy: nur bei Bounce-Detection ziehen wir die Headers (1
+            # extra Graph-Call pro Bounce, bounces sind selten). Liste-
+            # Variante in fetch_unread_messages liefert
+            # internetMessageHeaders nicht zuverlaessig.
+            try:
+                from core.integrations.mail_pipeline import (
+                    extract_in_reply_to_from_headers,
+                    find_conversation_by_outbound_message_id,
+                    mark_delivery_failed,
+                    push_tenant_bounce_notification,
+                )
+                bounce_full = await fetch_full_message(
+                    tenant_id, msg.get("id"), employee_id=employee_id,
+                )
+                in_reply_to = extract_in_reply_to_from_headers(
+                    (bounce_full or {}).get("internetMessageHeaders")
+                )
+                if in_reply_to:
+                    conv = await find_conversation_by_outbound_message_id(
+                        tenant_id, in_reply_to,
+                    )
+                    if conv is not None:
+                        await mark_delivery_failed(
+                            conv.id,
+                            reason=f"bounce-from={sender_email} reason={bounce_reason}",
+                        )
+                        await push_tenant_bounce_notification(
+                            tenant, conv=conv,
+                            bounce_sender=sender_email,
+                            bounce_reason=bounce_reason,
+                            employee_id=employee_id,
+                        )
+                        logger.info(
+                            f"poll: bounce associated to conv_id={conv.id} "
+                            f"kunde={conv.kunde_email} — state=delivery_failed, "
+                            f"MA notified"
+                        )
+                    else:
+                        logger.info(
+                            f"poll: bounce mit In-Reply-To={in_reply_to[:60]} "
+                            f"aber keine matching Konversation "
+                            f"(Q-Reply zu alt oder nie persistiert?)"
+                        )
+            except Exception as e:
+                # Bounce-Tracking-Fehler darf das Pre-Filter-Verhalten
+                # (Skip + mark_as_read) nicht killen. Mail wird als Bounce
+                # behandelt, nur die Konv-Verknuepfung fehlt.
+                logger.warning(
+                    f"poll: bounce-tracking fehlgeschlagen sender={sender_email}: {e}"
+                )
+
             # Mail als gelesen markieren damit naechster Poll sie nicht erneut sieht
             try:
                 await mark_as_read(tenant_id, msg.get("id"), employee_id=employee_id)
