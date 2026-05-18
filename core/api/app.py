@@ -37,9 +37,6 @@ from core.integrations.db_maintenance_cron import cron_loop as db_maintenance_cr
 from core.integrations.absence_redistribution import (
     cron_loop as absence_redistribution_cron_loop,
 )
-from core.integrations.formular_heartbeat_cron import (
-    cron_loop as formular_heartbeat_cron_loop,
-)
 
 logger = logging.getLogger(__name__)
 # Phase B1: strukturiertes Logging mit Tenant-/Employee-Context.
@@ -86,13 +83,9 @@ async def lifespan(app: FastAPI):
         absence_task = asyncio.create_task(absence_redistribution_cron_loop())
         logger.info("Absence-Redistribution-Cron (taegl. 06:00) gestartet")
 
-        formular_hb_task = asyncio.create_task(formular_heartbeat_cron_loop())
-        logger.info("Formular-Heartbeat-Cron (taegl. 09:00) gestartet")
-
         cron_tasks = (
             cron_task, payment_task, summary_task, dsgvo_task,
             mail_retry_task, db_maintenance_task, absence_task,
-            formular_hb_task,
         )
     else:
         logger.warning(

@@ -7,7 +7,6 @@ import datetime as dt
 import logging
 import uuid
 from decimal import Decimal
-from html import escape as _h
 from typing import Any
 
 import httpx
@@ -893,10 +892,6 @@ async def _handle_help_command(chat_id=None):
              "Aktuelles Schema mit allen Feldern + Pflichtangaben."),
             ("/formular_zuruecksetzen",
              "Auf Tischler- oder Allgemein-Default zuruecksetzen."),
-            ("/formulare",
-             "Letzte 10 eingegangenen Antworten mit Status."),
-            ("/formulare_offen",
-             "Nur unerledigte Anfragen (neu + in Bearbeitung)."),
         ], False))
 
     viz_items = [
@@ -1822,10 +1817,6 @@ async def _dispatch_update(payload):
             await _handle_arbeitszeit_callback(cq_chat_id, cq_data, cq_id, bot_token)
         elif cq_data and cq_data.startswith("formular:"):
             await _handle_formular_callback(cq_chat_id, cq_data, cq_id, bot_token)
-        elif cq_data and cq_data.startswith("formeing:"):
-            await _handle_formular_eingang_callback(
-                cq_chat_id, cq_data, cq_id, bot_token,
-            )
         elif cq_data and cq_data.startswith("kal:"):
             await _handle_kalender_callback(cq_chat_id, cq_data, cq_id, bot_token)
         elif cq_data and cq_data.startswith("viz:"):
@@ -2120,19 +2111,6 @@ async def _dispatch_update(payload):
         reply = await _handle_formular_anzeigen_command(chat_id)
     elif text == "/formular_zuruecksetzen":
         reply = await _handle_formular_zuruecksetzen_command(chat_id)
-    elif text == "/formulare":
-        await _clear_state(chat_id)
-        reply = await _handle_formulare_command(chat_id, only_open=False)
-    elif text == "/formulare_offen" or text == "/formulare offen":
-        await _clear_state(chat_id)
-        reply = await _handle_formulare_command(chat_id, only_open=True)
-    elif text.startswith("/formular_eingang_"):
-        await _clear_state(chat_id)
-        sid = text[len("/formular_eingang_"):].strip().lower()
-        reply_or_none = await _handle_formular_eingang_show_command(chat_id, sid)
-        if reply_or_none is None:
-            return {"ok": True}
-        reply = reply_or_none
     elif text == "/material":
         await _clear_state(chat_id)
         reply = await _handle_material_list_command(chat_id)
@@ -8493,237 +8471,6 @@ async def _handle_formular_callback(chat_id, callback_data, callback_query_id, b
         return
 
     await _answer_callback_query(callback_query_id, "Unbekannt", bot_token)
-
-
-# =====================================================================
-# Formular-Eingang ( /formulare  /formulare_offen  /formular_eingang_<id> )
-# =====================================================================
-# Schwester-Familie zu /formular* (Schema-Editor): hier geht es um die
-# bereits eingegangenen Kunden-Antworten. Status wird per Inline-Button
-# am Push (oder am Detail-View) gesetzt; ein Daily-Heartbeat pingt
-# Antworten die > 12h auf 'neu'/'in_bearbeitung' liegen.
-
-
-_FORMULAR_STATUS_ICON = {
-    "neu": "🆕",
-    "in_bearbeitung": "📝",
-    "erledigt": "✅",
-    "abgelehnt": "❌",
-}
-
-
-def _formular_short_dt(value) -> str:
-    """'17.05. 14:32' im DE-Format. None-safe."""
-    if not value:
-        return "?"
-    return value.strftime("%d.%m. %H:%M")
-
-
-def _format_kunde_short(token_obj) -> str:
-    """Kunde fuer die Listen-Darstellung — Name wenn vorhanden, sonst Mail.
-
-    Geht defensiv mit token_obj um (kann SimpleNamespace im Test sein).
-    """
-    return getattr(token_obj, "kunde_name", None) or getattr(
-        token_obj, "kunde_email", None,
-    ) or "unbekannt"
-
-
-def _format_response_row(idx, response, token_obj) -> str:
-    """Eine Zeile fuer die /formulare-Liste:
-       '1. 🆕 vor 2h · Müller · /formular_eingang_a1b2c3d4'
-    """
-    from core.integrations.formular_eingang import short_id as _short_id
-
-    icon = _FORMULAR_STATUS_ICON.get(response.bearbeitungs_status, "❔")
-    when = _formular_short_dt(response.submitted_at)
-    kunde = _h(_format_kunde_short(token_obj))
-    sid = _short_id(response.id)
-    return (
-        f"{idx}. {icon} <code>{when}</code> · {kunde}\n"
-        f"   /formular_eingang_{sid}"
-    )
-
-
-async def _handle_formulare_command(chat_id, *, only_open: bool) -> str:
-    """/formulare: letzte 10 Antworten. /formulare_offen: nur neu+in_bearbeitung.
-
-    Liefert lesbare Liste als Text-String, damit der Caller im
-    Dispatcher den Standard-Sendpfad nutzen kann.
-    """
-    tenant = await _get_tenant_by_chat(chat_id)
-    if not tenant:
-        return "Dieser Chat ist noch keinem Betrieb zugeordnet."
-
-    from core.integrations.formular_eingang import list_recent_for_tenant
-    rows = await list_recent_for_tenant(
-        tenant.id, limit=10, only_open=only_open,
-    )
-
-    if not rows:
-        if only_open:
-            return (
-                "📋 <b>Keine offenen Formulare</b>\n\n"
-                "Alle eingegangenen Formulare sind erledigt oder abgelehnt."
-            )
-        return (
-            "📋 <b>Noch keine Formulare eingegangen</b>\n\n"
-            "Sobald ein Kunde dein Anfrage-Formular ausfuellt, taucht es hier auf.\n\n"
-            "<i>Mit /formular_anzeigen siehst du wie das Formular aussieht.</i>"
-        )
-
-    header = (
-        "📋 <b>Offene Formulare</b>" if only_open
-        else "📋 <b>Letzte Formular-Antworten</b>"
-    )
-    lines = [header, ""]
-    for i, (resp, tok) in enumerate(rows, 1):
-        lines.append(_format_response_row(i, resp, tok))
-
-    lines.append("")
-    if only_open:
-        lines.append("<i>Klick auf einen Link fuer Details + Status setzen.</i>")
-    else:
-        lines.append(
-            "<i>Mit /formulare_offen siehst du nur die unerledigten.</i>"
-        )
-    return "\n".join(lines)
-
-
-def _render_antworten_block(antworten: dict) -> str:
-    """Wiederholt die gleiche Format-Logik wie anfrage_telegram._format_value,
-    aber inline weil wir den ganzen Block hier zusammenbauen statt nur
-    einen Wert. Files werden NICHT erneut hochgeladen — der erste Push
-    hat das schon gemacht; in der Re-Show steht nur '📎 N Datei(en)'.
-    """
-    from core.integrations.anfrage_telegram import _format_value
-    lines = []
-    for key, value in (antworten or {}).items():
-        if not value:
-            continue
-        label = _h(key.replace("_", " ").title())
-        lines.append(f"<b>{label}:</b> {_format_value(value)}")
-    return "\n".join(lines)
-
-
-def _formular_eingang_keyboard(short_id_str: str) -> dict:
-    """Die drei Status-Buttons — identisch im Push und im Detail-View."""
-    return {
-        "inline_keyboard": [
-            [
-                {"text": "📝 In Bearbeitung",
-                 "callback_data": f"formeing:status:in_bearbeitung:{short_id_str}"},
-            ],
-            [
-                {"text": "✅ Erledigt",
-                 "callback_data": f"formeing:status:erledigt:{short_id_str}"},
-                {"text": "❌ Abgelehnt",
-                 "callback_data": f"formeing:status:abgelehnt:{short_id_str}"},
-            ],
-        ],
-    }
-
-
-async def _handle_formular_eingang_show_command(chat_id, short_id_arg):
-    """/formular_eingang_<8hex>: Re-Show einer einzelnen Antwort plus
-    Status-Buttons. Sendet selbst via _send_with_keyboard und gibt None
-    zurueck (Dispatcher returnt dann direkt)."""
-    tenant = await _get_tenant_by_chat(chat_id)
-    if not tenant:
-        return "Dieser Chat ist noch keinem Betrieb zugeordnet."
-
-    from core.integrations.formular_eingang import get_by_short_id
-    pair = await get_by_short_id(tenant.id, short_id_arg)
-    if not pair:
-        return (
-            "❌ Formular nicht gefunden.\n\n"
-            "Pruefe die ID nochmal — sie steht in der Liste hinter "
-            "/formular_eingang_…"
-        )
-    resp, tok = pair
-    from core.models import FORMULAR_STATUS_LABEL
-    status_label = FORMULAR_STATUS_LABEL.get(
-        resp.bearbeitungs_status, resp.bearbeitungs_status,
-    )
-
-    kunde = _h(tok.kunde_name or tok.kunde_email or "unbekannt")
-    msg = (
-        f"<b>📋 Formular von {kunde}</b>\n"
-        f"<i>{_h(tok.kunde_email)}</i>\n"
-        f"Eingegangen: <code>{_formular_short_dt(resp.submitted_at)}</code>\n"
-        f"Status: <b>{_h(status_label)}</b>\n\n"
-    )
-    if tok.original_subject:
-        msg += f"<b>Original-Betreff:</b> {_h(tok.original_subject)}\n\n"
-    msg += "<b>Antworten:</b>\n"
-    msg += _render_antworten_block(resp.antworten or {})
-
-    if resp.bearbeitet_at:
-        msg += (
-            f"\n\n<i>Status zuletzt geaendert: "
-            f"{_formular_short_dt(resp.bearbeitet_at)}</i>"
-        )
-
-    from core.integrations.formular_eingang import short_id as _short_id
-    keyboard = _formular_eingang_keyboard(_short_id(resp.id))
-    await _send_with_keyboard(chat_id, msg, keyboard)
-    return None
-
-
-async def _handle_formular_eingang_callback(
-    chat_id, callback_data, callback_query_id, bot_token,
-):
-    """Inline-Button im Push oder Detail-View: 'formeing:status:<status>:<sid>'.
-
-    Aktualisiert den Bearbeitungs-Status, schickt ein Toast und postet
-    eine kurze Bestaetigung in den Chat. Wir editieren bewusst nicht die
-    Ursprungsnachricht — der Verlauf zeigt dann sauber 'Push' → 'In
-    Bearbeitung' → 'Erledigt' als Historie statt nur den finalen Stand.
-    """
-    parts = callback_data.split(":")
-    if len(parts) != 4 or parts[1] != "status":
-        await _answer_callback_query(callback_query_id, "Ungueltig", bot_token)
-        return
-    _, _, status, sid = parts
-
-    from core.models import FORMULAR_STATUS_LABEL, FORMULAR_STATUS_VALID
-    if status not in FORMULAR_STATUS_VALID:
-        await _answer_callback_query(callback_query_id, "Status unbekannt", bot_token)
-        return
-
-    tenant = await _get_tenant_by_chat(chat_id)
-    if not tenant:
-        await _answer_callback_query(callback_query_id, "Tenant fehlt", bot_token)
-        return
-
-    from core.integrations.formular_eingang import get_by_short_id, set_status
-    pair = await get_by_short_id(tenant.id, sid)
-    if not pair:
-        await _answer_callback_query(
-            callback_query_id, "Formular nicht gefunden", bot_token,
-        )
-        return
-    resp, tok = pair
-
-    # Wer hat geklickt? employee_chat-Mapping fuer Audit-Feld.
-    # Bei Legacy-Chats (Tenant ohne Multi-Mitarbeiter) ist Employee None
-    # → bearbeitet_by_employee_id bleibt NULL, das ist OK.
-    employee_id = None
-    pair_emp = await _get_current_employee(chat_id)
-    if pair_emp:
-        _, emp = pair_emp
-        if emp:
-            employee_id = emp.id
-
-    await set_status(resp.id, status=status, employee_id=employee_id)
-    label = FORMULAR_STATUS_LABEL.get(status, status)
-    await _answer_callback_query(callback_query_id, label, bot_token)
-
-    kunde = _h(tok.kunde_name or tok.kunde_email or "Formular")
-    await _send_to_chat(
-        chat_id,
-        f"{label} — <b>{kunde}</b>",
-    )
 
 
 # =====================================================================

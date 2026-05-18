@@ -112,10 +112,10 @@ class AnfrageResponse(Base):
     )
 
     # Bearbeitungs-Status (siehe FORMULAR_STATUS_* Konstanten oben).
-    # Default 'neu' beim Insert. Per Inline-Button am Telegram-Push
-    # oder ueber /formular_eingang_<id>-Detail-View aktualisiert.
-    # Partial-Index ix_anfrage_response_offen deckt status IN
-    # ('neu','in_bearbeitung') fuer den Heartbeat-Cron.
+    # Default 'neu' beim Insert. Aktuell nicht aktiv gepflegt — die
+    # Eingangs-Tracking-Feature wurde rausgenommen zugunsten Drive-
+    # Archiv. Spalten bleiben in der DB damit historische Daten nicht
+    # verloren gehen; ggf. spaeter via eigener Migration entfernen.
     bearbeitungs_status: Mapped[str] = mapped_column(
         String(20), nullable=False, default=FORMULAR_STATUS_NEU,
         server_default=FORMULAR_STATUS_NEU,
