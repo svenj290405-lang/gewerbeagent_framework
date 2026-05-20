@@ -1511,22 +1511,30 @@ async def process_relevant_kunde_mail(
     # signiert generate_anfrage_reply mit "Ihr Team von {tenant_company}".
     tenant_owner_first = extract_first_name(tenant.contact_name or "") or None
 
-    # Wissensbasis als Text laden (best-effort)
+    # Wissensbasis als Text laden (best-effort). Quelle: TenantKnowledge,
+    # gepflegt via Telegram /wissen. Die Freitext-Spalte heisst .text —
+    # hier wurde frueher faelschlich .inhalt gelesen, wodurch die Wissens-
+    # basis in der Mail-Pipeline IMMER leer blieb (der Voice-Pfad las
+    # korrekt .text und antwortete deshalb auf Wissensfragen, die Mail nie).
     wissensbasis_text = "(noch keine spezifischen Infos hinterlegt)"
     try:
         from core.models import TenantKnowledge
+        from core.models.tenant_knowledge import KATEGORIE_LABELS
         async with AsyncSessionLocal() as session:
             k_res = await session.execute(
-                _sel(TenantKnowledge).where(TenantKnowledge.tenant_id == tenant_id)
+                _sel(TenantKnowledge)
+                .where(TenantKnowledge.tenant_id == tenant_id)
+                .order_by(TenantKnowledge.kategorie, TenantKnowledge.created_at)
             )
             entries = k_res.scalars().all()
             if entries:
                 lines = []
-                for e in entries[:20]:
+                for e in entries[:40]:
                     cat = getattr(e, "kategorie", "") or ""
-                    txt = getattr(e, "inhalt", "") or ""
+                    label = KATEGORIE_LABELS.get(cat, cat)
+                    txt = (getattr(e, "text", "") or "").strip()
                     if txt:
-                        lines.append(f"- [{cat}] {txt[:300]}")
+                        lines.append(f"- [{label}] {txt[:800]}")
                 if lines:
                     wissensbasis_text = "\n".join(lines)
     except ImportError:
