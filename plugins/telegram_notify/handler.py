@@ -805,9 +805,9 @@ async def _handle_help_command(chat_id=None):
     if _is_on("kalender"):
         kunden_items_active.append((
             "/briefing",
-            "Heutige Termine als Liste mit Uhrzeit + Kunde. Tap auf "
-            "den /briefing_xxxx-Befehl pro Eintrag zeigt Briefing, "
-            "TODOs, Notizen und den Drive-Ordner.",
+            "Heutige Termine als Liste mit Uhrzeit + Kunde + Ort. "
+            "Fuer Verlauf, Briefing + Drive-Ordner eines Kunden: "
+            "/kunde &lt;Name&gt;.",
         ))
         kunden_items_active.append((
             "/neue_termine",
@@ -2084,14 +2084,6 @@ async def _dispatch_update(payload):
     elif text == "/neue_termine":
         await _clear_state(chat_id)
         reply = await _handle_neue_termine_command(chat_id)
-    elif text.startswith("/briefing_"):
-        # Detail-Ansicht eines einzelnen Termins per ID-Prefix
-        await _clear_state(chat_id)
-        id_prefix = text[len("/briefing_"):].strip().lower()
-        reply_or_none = await _handle_briefing_show_command(chat_id, id_prefix)
-        if reply_or_none is None:
-            return {"ok": True}
-        reply = reply_or_none
     elif text == "/anrufe":
         await _clear_state(chat_id)
         reply = await _handle_anrufe_command(chat_id)
@@ -4059,8 +4051,10 @@ async def _handle_briefing_command(chat_id):
     Sonst zeigt der Eintrag nur die Kalender-Daten — der User kann
     via /kunde <name> manuell mehr Infos holen.
 
-    Wenn nichts heute: zeigt naechste 7 Tage aus den Kundengespraechen
-    als Trost-Block. Falls auch das leer: juengstes Gespraech.
+    Wenn nichts heute: saubere "Heute kein Termin"-Meldung (mit Live-
+    Hinweis "Kalender geprueft, keine Events") + ggf. die naechsten 7
+    Tage aus den Kundengespraechen. Kein Rueckfall mehr auf ein altes
+    Gespraech — fuer mehr Infos verweist die Meldung auf /kunde + Drive.
 
     Phase-4-Multi-Mitarbeiter: Default-Employee sieht alle Termine,
     Nicht-Default nur seine zugewiesenen.
@@ -4190,10 +4184,8 @@ async def _handle_briefing_command(chat_id):
             lines.append(
                 f"<b>{e['uhr']}</b>  ·  <b>{_h_safe(e['title'])}</b>{ort_suffix}"
             )
-            if e["matched_g"]:
-                lines.append(
-                    f"  Details: /briefing_{str(e['matched_g'].id)[:8]}"
-                )
+            if e["matched_g"] and e["matched_g"].kunde_name:
+                lines.append(f"  Mehr: /kunde {e['matched_g'].kunde_name}")
             elif e["source"] == "cal":
                 # Kalender-Event ohne gemerktes Gespraech — Tipp:
                 # Kunden-Lookup ueber /kunde
@@ -4207,9 +4199,8 @@ async def _handle_briefing_command(chat_id):
                 lines.append(f"  <i>{_h_safe(preview)}</i>")
             lines.append("")
         lines.append(
-            "<i>Tap auf /briefing_xxxxxxxx fuer Briefing + TODOs + "
-            "Drive-Ordner. Bei Kalender-Eintraegen ohne Gespraech: "
-            "/kunde &lt;Name&gt; fuer manuelle Suche.</i>"
+            "<i>Mehr zu einem Kunden: /kunde &lt;Name&gt; — Verlauf, "
+            "Briefing + Drive-Ordner.</i>"
         )
         if gespraeche_kommend:
             lines.append("")
@@ -4217,62 +4208,46 @@ async def _handle_briefing_command(chat_id):
             for g in gespraeche_kommend:
                 d = g.termin_datum.astimezone(local_tz).strftime("%a %d.%m %H:%M")
                 lines.append(
-                    f"  · {d} — <b>{_h_safe(g.kunde_name)}</b>  "
-                    f"/briefing_{str(g.id)[:8]}"
+                    f"  · {d} — <b>{_h_safe(g.kunde_name)}</b>"
                 )
         return "\n".join(lines)
 
-    # Kein Termin heute — Hinweis-Block
+    # Kein Termin heute — saubere Meldung. Bewusst KEIN Rueckfall mehr
+    # auf das letzte Gespraech (Sven-Feedback: das wirkte wie Stale-Data;
+    # /briefing soll heutige Termine bzw. ein klares "nichts heute" mit
+    # Live-Beweis zeigen). Diese Meldung wird IMMER zurueckgegeben — auch
+    # wenn keine kommenden Gespraeche existieren (frueher fiel der Code
+    # hier durch und verwarf die Meldung).
     lines = []
     if abwesenheit_header:
         lines.append(abwesenheit_header.rstrip())
-    lines.append("📅 <b>Heute kein Termin.</b>")
+    datum_str = today_start.strftime("%A, %d.%m.%Y")
+    lines.append(f"📅 <b>Heute kein Termin</b> — {datum_str}")
     if provider_label:
+        # Beweist, dass der Kalender live abgefragt wurde.
         lines.append(
-            f"<i>(Geprueft: {provider_label}-Kalender — keine Events heute)</i>\n"
+            f"<i>(Geprueft: {provider_label}-Kalender — keine Events heute)</i>"
         )
     else:
         lines.append(
             "<i>Kalender ist nicht verbunden. Mit /kalender_verbinden "
-            "Google oder Outlook anbinden — dann zeigt /briefing auch "
-            "die echten Termine.</i>\n"
+            "Google oder Outlook anbinden — dann zeigt /briefing die "
+            "echten Termine.</i>"
         )
     if gespraeche_kommend:
-        lines.append(f"<i>Naechste Tage aus /aufnahme:</i>")
+        lines.append("")
+        lines.append("<i>📅 Naechste Tage:</i>")
         for g in gespraeche_kommend:
             d = g.termin_datum.astimezone(local_tz).strftime("%a %d.%m %H:%M")
             lines.append(
-                f"  · {d} — <b>{_h_safe(g.kunde_name)}</b>  "
-                f"/briefing_{str(g.id)[:8]}"
+                f"  · {d} — <b>{_h_safe(g.kunde_name)}</b>"
             )
-        return "\n".join(lines)
-
-    # Nichts in Sicht — juengstes Gespraech als Fallback
-    async with AsyncSessionLocal() as s:
-        stmt2 = (
-            select(Kundengespraech)
-            .where(Kundengespraech.tenant_id == tenant.id)
-            .order_by(Kundengespraech.gespraech_datum.desc())
-            .limit(1)
-        )
-        if not current_emp.is_default:
-            stmt2 = stmt2.where(
-                Kundengespraech.assigned_employee_id == current_emp.id
-            )
-        latest = (await s.execute(stmt2)).scalar_one_or_none()
-
-    if not latest:
-        scope = "" if current_emp.is_default else " (auf dich zugewiesen)"
-        return (
-            f"\n\nNoch kein Kundengespraech{scope} erfasst.\n"
-            "Mit /aufnahme das erste anlegen."
-        )
-
-    return await _send_kundengespraech_with_drive(
-        chat_id,
-        "\n\n<b>📋 Letztes Gespraech</b>\n",
-        latest, tenant.id,
+    lines.append("")
+    lines.append(
+        "<i>Mehr zu einem Kunden: /kunde &lt;Name&gt; — Verlauf + "
+        "Drive-Ordner.</i>"
     )
+    return "\n".join(lines)
 
 
 # ----------------------------------------------------------------------
@@ -4455,46 +4430,6 @@ async def _handle_neue_termine_command(chat_id):
             f"{TERMINE_MAX_ENTRIES}). Direkt im Kalender pruefen.</i>"
         )
     return "\n".join(lines)
-
-
-async def _handle_briefing_show_command(chat_id, id_prefix: str):
-    """/briefing_<8hex> — Detail-Ansicht eines Gespraechs mit Drive-Link.
-
-    Klickbar aus dem /briefing-Listing. Findet das Gespraech per UUID-
-    Prefix-Match (8 Hex-Chars sind genug fuer eindeutige Auswahl).
-    """
-    res = await _get_current_employee(chat_id)
-    if res is None:
-        return "Dieser Chat ist noch keinem Betrieb zugeordnet."
-    tenant, current_emp = res
-
-    from sqlalchemy import cast, String as SAString
-    async with AsyncSessionLocal() as s:
-        stmt = (
-            select(Kundengespraech)
-            .where(
-                Kundengespraech.tenant_id == tenant.id,
-                cast(Kundengespraech.id, SAString).like(f"{id_prefix}%"),
-            )
-            .limit(2)
-        )
-        if not current_emp.is_default:
-            stmt = stmt.where(
-                Kundengespraech.assigned_employee_id == current_emp.id,
-            )
-        rows = (await s.execute(stmt)).scalars().all()
-
-    if not rows:
-        return (
-            f"Kein Gespraech mit ID-Prefix <code>{_h_safe(id_prefix)}</code> "
-            "gefunden. /briefing zeigt die heutigen Termine."
-        )
-    if len(rows) > 1:
-        return "Mehrdeutiger Prefix — bitte /briefing erneut aufrufen."
-
-    return await _send_kundengespraech_with_drive(
-        chat_id, "", rows[0], tenant.id,
-    )
 
 
 async def _handle_kunde_command(chat_id, args):
@@ -4688,7 +4623,7 @@ async def _handle_kunde_command(chat_id, args):
                 if len(briefing) > 200:
                     briefing = briefing[:180] + "..."
                 msg += f"<i>{briefing}</i>\n"
-            msg += f"  Details: /briefing_{str(g.id)[:8]}\n\n"
+            msg += "\n"
         if len(gespraeche) > 5:
             msg += f"<i>... und {len(gespraeche) - 5} weitere</i>\n\n"
 
