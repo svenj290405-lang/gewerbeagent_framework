@@ -414,3 +414,89 @@ def build_kunde_reply_html(
 </body>
 </html>"""
     return html
+
+
+def _clean_reply_lines(reply_text: str) -> list[str]:
+    """Schneidet eine vom LLM evtl. erzeugte Anrede/Signatur weg (wir
+    haben eigene). Gibt die bereinigten Zeilen zurueck — geteilt von
+    HTML- und Plain-Text-Rendering."""
+    text = (reply_text or "").strip()
+    lines = text.split("\n")
+    if lines and _re.match(
+        r"^(hallo|hi|sehr geehrte|guten tag)\b", lines[0].strip().lower()
+    ):
+        lines = lines[1:]
+        while lines and not lines[0].strip():
+            lines = lines[1:]
+    while lines and _re.match(
+        r"^(viele (gruesse|grüße)|mit freundlichen|beste (gruesse|grüße)|"
+        r"liebe (gruesse|grüße)|(gruesse|grüße)|gruss|gruß|mfg|lg)",
+        lines[-1].strip().lower(),
+    ):
+        lines = lines[:-1]
+    while lines and "(via q)" in lines[-1].lower():
+        lines = lines[:-1]
+    while lines and not lines[-1].strip():
+        lines = lines[:-1]
+    return lines
+
+
+def build_kunde_reply_text(
+    kunde_anrede_name: str,
+    reply_text: str,
+    form_url: str,
+    company_name: str,
+    contact_name: str,
+    contact_phone: str = "",
+    with_formular_button: bool = True,
+    slot_proposals: list[dict] | None = None,
+    booked_termin: dict | None = None,
+    storno_summary: dict | None = None,
+) -> str:
+    """Plain-Text-Variante von build_kunde_reply_html (multipart/alternative
+    Text-Teil). Sauber lesbar: keine HTML-Tags, nummerierte Listen, klare
+    Struktur. Spiegelt denselben CTA-Block wie das HTML.
+    """
+    greeting = f"Hallo {kunde_anrede_name}," if kunde_anrede_name else "Hallo,"
+    parts: list[str] = [greeting, ""]
+    parts.append("\n".join(_clean_reply_lines(reply_text)))
+
+    if booked_termin:
+        d = (booked_termin.get("datum") or "").strip()
+        u = (booked_termin.get("uhrzeit") or "").strip()
+        a = (booked_termin.get("anliegen") or "").strip()
+        line = f"Termin bestätigt: {d} um {u} Uhr"
+        if a:
+            line += f" — {a}"
+        parts += ["", line]
+    elif storno_summary:
+        cnt = int(storno_summary.get("cancelled_count") or 0)
+        if cnt == 0:
+            parts += ["", "Wir konnten keinen passenden Termin finden."]
+        elif cnt == 1:
+            parts += ["", "Dein Termin wurde storniert."]
+        else:
+            parts += ["", f"{cnt} Termine wurden storniert."]
+    elif slot_proposals:
+        parts += ["", "Mögliche Termine:"]
+        for idx, sl in enumerate(slot_proposals[:6], start=1):
+            wt = (sl.get("wochentag") or "").strip()
+            datum = (sl.get("datum") or "").strip()
+            uhr = (sl.get("uhrzeit") or "").strip()
+            label = (f"{wt}, " if wt else "") + f"{datum} um {uhr} Uhr"
+            parts.append(f"  {idx}. {label}")
+        parts += ["", "Bitte einfach auf diese Mail antworten, welcher passt."]
+    elif with_formular_button and form_url:
+        parts += [
+            "",
+            "Bitte fülle kurz unser Anfrage-Formular aus:",
+            form_url,
+        ]
+
+    parts += ["", "Bei Rückfragen einfach auf diese Mail antworten.", ""]
+    sig = f"{contact_name} · {company_name}" if contact_name else company_name
+    parts.append(sig)
+    if contact_phone:
+        parts.append(contact_phone)
+
+    return "\n".join(parts).strip() + "\n"

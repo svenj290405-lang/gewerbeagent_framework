@@ -132,11 +132,12 @@ def mail_send_capture(monkeypatch):
 
     async def fake_send_tracked(
         *, tenant_id, to_email, subject, body_html,
-        cc=None, attachments=None, employee_id=None,
+        cc=None, attachments=None, employee_id=None, body_text=None,
     ):
         calls.append({
             "tenant_id": tenant_id, "to_email": to_email,
             "subject": subject, "body_html": body_html,
+            "body_text": body_text,
             "employee_id": employee_id,
         })
         return {

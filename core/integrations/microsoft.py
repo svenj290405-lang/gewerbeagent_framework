@@ -192,6 +192,32 @@ def _build_attachment_payload(attachments: Optional[list[dict]]) -> list[dict]:
     return out
 
 
+def _build_mime_alternative_b64(
+    *, subject: str, to_email: str, body_html: str,
+    body_text: str, cc: Optional[list[str]] = None,
+) -> str:
+    """Baut eine multipart/alternative-MIME (text/plain + text/html) und
+    gibt sie base64-kodiert zurueck — fuer Graphs MIME-Versand.
+
+    Reihenfolge: text zuerst, html zuletzt (in multipart/alternative gilt
+    der LETZTE Teil als bevorzugt). Clients ohne HTML (oder beim Zitieren,
+    z.B. GMX-Mobile) nehmen den sauberen Text-Teil statt HTML-Muell.
+    Kein From-Header: Graph setzt den Absender automatisch aufs Postfach.
+    """
+    import base64
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.text import MIMEText
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["To"] = to_email
+    if cc:
+        msg["Cc"] = ", ".join(cc)
+    msg.attach(MIMEText(body_text or "", "plain", "utf-8"))
+    msg.attach(MIMEText(body_html or "", "html", "utf-8"))
+    return base64.b64encode(msg.as_bytes()).decode("ascii")
+
+
 async def send_mail_as_user(
     tenant_id: UUID,
     to_email: str,
@@ -201,6 +227,7 @@ async def send_mail_as_user(
     save_to_sent: bool = True,
     attachments: Optional[list[dict]] = None,
     employee_id: UUID | None = None,
+    body_text: str | None = None,
 ) -> bool:
     """Sendet Mail im Namen des verbundenen Microsoft-Users via Graph API.
 
@@ -218,6 +245,47 @@ async def send_mail_as_user(
     except Exception as e:
         logger.error(f"send_mail_as_user Token-Fehler: {e}")
         return False
+
+    # multipart/alternative (text + html) via MIME — bessere Client-/GMX-
+    # Kompatibilitaet. Nur ohne Attachments (Template-Mails haben keine).
+    if body_text and not attachments:
+        mime_b64 = _build_mime_alternative_b64(
+            subject=subject, to_email=to_email, body_html=body_html,
+            body_text=body_text, cc=cc,
+        )
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.post(
+                    f"{GRAPH_API_BASE}/me/sendMail",
+                    headers={
+                        "Authorization": f"Bearer {access_token}",
+                        "Content-Type": "text/plain",
+                    },
+                    content=mime_b64,
+                )
+            if resp.status_code in (200, 202):
+                logger.info(
+                    f"Microsoft-Mail (MIME multipart) gesendet: tenant={tenant_id} "
+                    f"to={to_email} subject={subject[:50]!r}"
+                )
+                try:
+                    from core.billing import track_mail_send
+                    await track_mail_send(
+                        "microsoft", tenant_id=tenant_id, operation="mail-send",
+                        recipient_count=1 + (len(cc) if cc else 0),
+                        recipient_email=to_email,
+                    )
+                except Exception as e:
+                    logger.debug(f"Microsoft-Tracking failed (egal): {e}")
+                return True
+            logger.error(
+                f"Microsoft sendMail (MIME) fehlgeschlagen: "
+                f"{resp.status_code} {resp.text[:300]}"
+            )
+            return False
+        except Exception as e:
+            logger.exception(f"send_mail_as_user MIME Exception: {e}")
+            return False
 
     message_obj = {
         "subject": subject,
@@ -280,6 +348,7 @@ async def send_tracked_mail(
     cc: Optional[list[str]] = None,
     attachments: Optional[list[dict]] = None,
     employee_id: UUID | None = None,
+    body_text: str | None = None,
 ) -> dict:
     """Versendet eine Mail im Two-Step-Modus (Draft-Create + Send) damit wir
     die Microsoft-IDs bekommen, ueber die wir spaeter Antworten zuordnen koennen.
@@ -328,14 +397,34 @@ async def send_tracked_mail(
         "Content-Type": "application/json",
     }
 
+    # MIME-Draft (multipart/alternative text+html) wenn body_text da ist
+    # und keine Attachments — bessere GMX-/Client-Kompatibilitaet. Der
+    # Draft-aus-MIME-Pfad liefert trotzdem internetMessageId + conversationId
+    # (Threading bleibt erhalten).
+    use_mime = bool(body_text) and not attachments
+
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             # 1) Draft anlegen
-            r1 = await client.post(
-                f"{GRAPH_API_BASE}/me/messages",
-                headers=headers,
-                json=draft_payload,
-            )
+            if use_mime:
+                mime_b64 = _build_mime_alternative_b64(
+                    subject=subject, to_email=to_email, body_html=body_html,
+                    body_text=body_text, cc=cc,
+                )
+                r1 = await client.post(
+                    f"{GRAPH_API_BASE}/me/messages",
+                    headers={
+                        "Authorization": f"Bearer {access_token}",
+                        "Content-Type": "text/plain",
+                    },
+                    content=mime_b64,
+                )
+            else:
+                r1 = await client.post(
+                    f"{GRAPH_API_BASE}/me/messages",
+                    headers=headers,
+                    json=draft_payload,
+                )
             if r1.status_code not in (200, 201):
                 out["error"] = f"Draft-Create {r1.status_code}: {r1.text[:300]}"
                 return out

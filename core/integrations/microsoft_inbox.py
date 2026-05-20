@@ -2056,6 +2056,20 @@ async def process_relevant_kunde_mail(
         booked_termin=booked_termin_for_template,
         storno_summary=storno_summary_for_template,
     )
+    # Plain-Text-Variante fuer multipart/alternative (GMX-Kompatibilitaet)
+    from core.integrations.mail_template import build_kunde_reply_text
+    body_text = build_kunde_reply_text(
+        kunde_anrede_name=kunde_anrede,
+        reply_text=reply_text,
+        form_url=form_url,
+        company_name=tenant_company,
+        contact_name=getattr(tenant, "contact_name", "") or "",
+        contact_phone=getattr(tenant, "contact_phone", "") or "",
+        with_formular_button=with_button,
+        slot_proposals=slot_proposals_for_template,
+        booked_termin=booked_termin_for_template,
+        storno_summary=storno_summary_for_template,
+    )
 
     # Mail via Microsoft Graph senden (aus dem Postfach des Mitarbeiters).
     # send_tracked_mail (Draft-Create + Send) statt send_mail_as_user
@@ -2074,6 +2088,7 @@ async def process_relevant_kunde_mail(
             to_email=sender_email,
             subject=reply_subject,
             body_html=body_html,
+            body_text=body_text,
             employee_id=employee_id,
         )
         result["sent"] = bool(sent_meta.get("success"))

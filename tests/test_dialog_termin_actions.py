@@ -146,10 +146,11 @@ def pipeline_mocks(monkeypatch, captured_state):
     monkeypatch.setattr(microsoft_inbox, "fetch_full_message", fake_fetch)
 
     async def fake_send_tracked(*, tenant_id, to_email, subject, body_html,
-                                cc=None, attachments=None, employee_id=None):
+                                cc=None, attachments=None, employee_id=None,
+                                body_text=None):
         captured_state["send_tracked_mail"].append({
             "to_email": to_email, "subject": subject,
-            "body_html": body_html,
+            "body_html": body_html, "body_text": body_text,
         })
         return {
             "success": True,

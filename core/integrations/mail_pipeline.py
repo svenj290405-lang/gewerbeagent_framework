@@ -755,6 +755,60 @@ def _build_verschiebung_html(
     )
 
 
+def _build_storno_text(
+    *, kunde_anrede: str, company_name: str, cancelled_count: int,
+) -> str:
+    """Plain-Text-Variante der Storno-Bestaetigung (multipart/alternative)."""
+    anrede = f"Hallo {kunde_anrede}," if kunde_anrede else "Hallo,"
+    if cancelled_count == 0:
+        body = (
+            "danke für die Nachricht. Wir können aktuell keinen bestehenden "
+            "Termin auf Ihre Adresse finden. Falls Sie einen konkreten Termin "
+            "meinen, antworten Sie bitte kurz mit Datum + Uhrzeit — dann "
+            "prüfen wir das nochmal manuell."
+        )
+    else:
+        plural = (
+            "Termin wurde" if cancelled_count == 1
+            else f"{cancelled_count} Termine wurden"
+        )
+        body = (
+            f"danke für Ihre Nachricht. Ihr {plural} storniert. Sie erhalten "
+            "dafür auch keine Rechnung.\n\nFalls Sie einen neuen Termin "
+            "möchten, antworten Sie einfach auf diese Mail oder rufen Sie uns an."
+        )
+    return f"{anrede}\n\n{body}\n\nViele Grüße,\n{company_name}\n"
+
+
+def _build_verschiebung_text(
+    *, kunde_anrede: str, company_name: str, found_termine: list[dict],
+) -> str:
+    """Plain-Text-Variante der Verschiebungs-Rueckfrage."""
+    anrede = f"Hallo {kunde_anrede}," if kunde_anrede else "Hallo,"
+    if not found_termine:
+        body = (
+            "danke für Ihre Nachricht. Wir können aktuell keinen bestehenden "
+            "Termin auf Ihre Adresse finden. Bitte antworten Sie kurz mit "
+            "Ihrem aktuellen Termin (Datum + Uhrzeit) und Ihrem Wunsch-"
+            "Ersatztermin, dann setzen wir das um."
+        )
+    else:
+        ev = found_termine[0]
+        datum = ev.get("datum", "")
+        uhrzeit = ev.get("uhrzeit", "")
+        termin_label = (
+            f"am {datum} um {uhrzeit} Uhr" if (datum or uhrzeit)
+            else "in unserem Kalender"
+        )
+        body = (
+            f"danke für Ihre Nachricht. Wir haben Ihren Termin {termin_label} "
+            "gefunden.\n\nBitte antworten Sie kurz mit Ihrem Wunsch-Ersatztermin "
+            "(z.B. \"Donnerstag 14:00\") oder rufen Sie uns an — dann buchen "
+            "wir um."
+        )
+    return f"{anrede}\n\n{body}\n\nViele Grüße,\n{company_name}\n"
+
+
 async def send_storno_confirmation(
     *, tenant_id: uuid.UUID,
     to_email: str, kunde_anrede: str, company_name: str,
@@ -775,6 +829,11 @@ async def send_storno_confirmation(
         cancelled_count=cancelled_count,
         original_subject=original_subject,
     )
+    body_text = _build_storno_text(
+        kunde_anrede=kunde_anrede,
+        company_name=company_name,
+        cancelled_count=cancelled_count,
+    )
     reply_subject = (
         f"Re: {original_subject}"
         if not (original_subject or "").lower().startswith("re:")
@@ -785,6 +844,7 @@ async def send_storno_confirmation(
         to_email=to_email,
         subject=reply_subject,
         body_html=body_html,
+        body_text=body_text,
         employee_id=employee_id,
     )
 
@@ -803,6 +863,11 @@ async def send_verschiebung_request(
         company_name=company_name,
         found_termine=found_termine,
     )
+    body_text = _build_verschiebung_text(
+        kunde_anrede=kunde_anrede,
+        company_name=company_name,
+        found_termine=found_termine,
+    )
     reply_subject = (
         f"Re: {original_subject}"
         if not (original_subject or "").lower().startswith("re:")
@@ -813,6 +878,7 @@ async def send_verschiebung_request(
         to_email=to_email,
         subject=reply_subject,
         body_html=body_html,
+        body_text=body_text,
         employee_id=employee_id,
     )
 
@@ -848,7 +914,9 @@ async def send_formular_dank_mail(
     Returns: sent_meta-Dict. Caller persistiert die Konversation.
     """
     from core.integrations.microsoft import send_tracked_mail
-    from core.integrations.mail_template import build_kunde_reply_html
+    from core.integrations.mail_template import (
+        build_kunde_reply_html, build_kunde_reply_text,
+    )
 
     if termin_besteht:
         reply_text = (
@@ -874,6 +942,15 @@ async def send_formular_dank_mail(
         contact_phone=contact_phone,
         with_formular_button=False,
     )
+    body_text = build_kunde_reply_text(
+        kunde_anrede_name=kunde_anrede,
+        reply_text=reply_text,
+        form_url="",
+        company_name=company_name,
+        contact_name=contact_name,
+        contact_phone=contact_phone,
+        with_formular_button=False,
+    )
     reply_subject = (
         f"Re: {original_subject}"
         if original_subject and not original_subject.lower().startswith("re:")
@@ -884,6 +961,7 @@ async def send_formular_dank_mail(
         to_email=to_email,
         subject=reply_subject,
         body_html=body_html,
+        body_text=body_text,
         employee_id=employee_id,
     )
 
@@ -942,6 +1020,38 @@ def _build_buche_confirmation_html(
     )
 
 
+def _build_buche_confirmation_text(
+    *,
+    kunde_anrede: str,
+    company_name: str,
+    datum_label: str,
+    uhrzeit: str,
+    employee_name: str | None,
+    anliegen: str,
+    contact_phone: str,
+) -> str:
+    """Plain-Text-Variante der Voice-Buchungs-Bestaetigung."""
+    anrede = f"Hallo {kunde_anrede}," if kunde_anrede else "Hallo,"
+    lines = [
+        anrede, "",
+        "vielen Dank für Ihren Anruf. Wir haben Ihren Termin eingetragen:",
+        "",
+        f"Termin: {datum_label} um {uhrzeit} Uhr",
+        f"Anliegen: {anliegen}",
+    ]
+    if employee_name:
+        lines.append(f"{employee_name} kommt am vereinbarten Termin.")
+    lines += [
+        "",
+        "Falls Sie den Termin verschieben oder absagen möchten, antworten "
+        "Sie einfach auf diese Mail — wir kümmern uns drum.",
+    ]
+    if contact_phone:
+        lines += ["", f"Rückruf-Nummer: {contact_phone}"]
+    lines += ["", f"Viele Grüße,\n{company_name}"]
+    return "\n".join(lines).strip() + "\n"
+
+
 async def send_buche_confirmation(
     *,
     tenant_id: uuid.UUID,
@@ -973,12 +1083,22 @@ async def send_buche_confirmation(
         anliegen=anliegen,
         contact_phone=contact_phone,
     )
+    body_text = _build_buche_confirmation_text(
+        kunde_anrede=kunde_anrede,
+        company_name=company_name,
+        datum_label=datum_label,
+        uhrzeit=uhrzeit,
+        employee_name=employee_name,
+        anliegen=anliegen,
+        contact_phone=contact_phone,
+    )
     subject = f"Ihre Terminbestätigung — {datum_label} um {uhrzeit} Uhr"
     return await send_tracked_mail(
         tenant_id=tenant_id,
         to_email=to_email,
         subject=subject,
         body_html=body_html,
+        body_text=body_text,
         employee_id=employee_id,
     )
 
