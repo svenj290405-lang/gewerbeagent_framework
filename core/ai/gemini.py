@@ -1034,8 +1034,13 @@ Aufgabe:
 Schreib eine kurze, freundliche, persoenliche Antwort. Beachte:
 1. Geh konkret auf das Anliegen ein (nicht generisch)
 2. Wenn die Wissensbasis Antworten enthaelt (Preise, Lieferzeiten), nutze sie
-3. Bitte am Ende um Ausfuellen des Anfrage-Formulars mit dem Link {form_url}
-4. Antworte in derselben Sprache wie die eingehende Mail. Wenn unklar: Deutsch. Hoeflich aber nicht foermlich; Du-Form falls Kunde Du verwendet, sonst Sie.
+3. Bitte am Ende mit EINEM kurzen Satz darum, dass der Kunde das
+   Anfrage-Formular kurz ausfuellt. WICHTIG: schreibe KEINEN Link,
+   KEINE URL und KEINEN "https://..."-String in den Text. Der Button
+   zum Formular wird automatisch unter deinem Text eingefuegt — der
+   Text darf den Button erwaehnen ("ueber den Button unten" o.ae.),
+   aber niemals eine URL enthalten.
+4. Antworte in derselben Sprache wie die eingehende Mail. Wenn unklar: Deutsch. Du-Form falls Kunde Du verwendet, sonst Sie. Innerhalb der Antwort MUSST du Du oder Sie konsequent durchziehen — nicht mischen.
 5. Unterzeichne mit "{signer}"
 6. KEIN Marketing-Geschwafel, KEINE Floskeln wie "Vielen Dank fuer ihre Anfrage"
 7. Sei direkt und ehrlich
@@ -1105,16 +1110,546 @@ async def generate_anfrage_reply(
         return text
     except Exception as e:
         logger.exception(f"generate_anfrage_reply fehler: {e}")
-        # Fallback-Antwort
+        # Fallback-Antwort — keine URL im Text, der Button kommt aus dem Template
         return (
             f"Hallo {sender_name or 'zusammen'},\n\n"
-            f"vielen Dank fuer deine Nachricht. Damit ich dir gut weiterhelfen kann, "
-            f"fuell bitte kurz das folgende Formular aus:\n\n"
-            f"{form_url}\n\n"
-            f"Dann melde ich mich schnell mit einem konkreten Angebot.\n\n"
+            f"danke fuer deine Nachricht. Damit ich dir gut weiterhelfen kann, "
+            f"fuell bitte kurz unser Anfrage-Formular ueber den Button unten aus. "
+            f"Danach melde ich mich schnell mit einem konkreten Angebot.\n\n"
             f"Viele Gruesse\n"
             f"{tenant_owner_first_name} (via Q)"
         )
+
+
+# =====================================================================
+# Dialog-Antwort (Phase 1 Mail-Pipeline): Multi-Turn-Konversation mit
+# strukturiertem Entscheidungs-Output. Q entscheidet pro Turn ob er
+# noch eine Rueckfrage stellt (ASK_MORE) oder das Anfrage-Formular
+# rausschickt (SEND_FORMULAR). Wissensbasis kommt als Kontext.
+# =====================================================================
+
+DIALOG_RESPONSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "reply_text": {
+            "type": "string",
+            "description": (
+                "Q's Antwort an den Kunden, Plain-Text mit \\n als "
+                "Zeilenumbruch. KEINE URLs, KEIN Markdown, kein "
+                "Schlussgruss (Signatur kommt vom Template). Bei "
+                "PROPOSE_SLOTS, BOOK_SLOT, CANCEL_TERMIN NICHT die "
+                "Slots/Daten im reply_text wiederholen — die rendert "
+                "das Template automatisch unter deinem Text."
+            ),
+        },
+        "next_action": {
+            "type": "string",
+            "enum": [
+                "ASK_MORE",
+                "SEND_FORMULAR",
+                "PROPOSE_SLOTS",
+                "BOOK_SLOT",
+                "BOOK_DIRECT",
+                "CANCEL_TERMIN",
+            ],
+            "description": (
+                "ASK_MORE = Q antwortet rein inhaltlich (Wissensfrage). "
+                "SEND_FORMULAR = Anfrage-Formular wird mitgeschickt. "
+                "PROPOSE_SLOTS = Kunde nennt nur einen Zeitraum/Tag — "
+                "wunsch_datum/wunsch_uhrzeit als Anker mitliefern, die "
+                "Pipeline ruft den Kalender und rendert die Vorschlaege. "
+                "BOOK_SLOT = Kunde bestaetigt einen vorher angebotenen "
+                "Slot aus der letzten Vorschlags-Runde — "
+                "chosen_slot_index 0-basiert mitliefern. BOOK_DIRECT = "
+                "Kunde nennt einen konkreten Termin direkt (z.B. "
+                "'22.05.26 um 14 Uhr', 'Donnerstag 10:30') — direct_datum "
+                "+ direct_uhrzeit setzen, Pipeline prueft Verfuegbarkeit "
+                "und bucht direkt wenn frei, sonst werden Alternativen "
+                "vorgeschlagen. CANCEL_TERMIN = Kunde moechte einen "
+                "bestehenden Termin absagen — Pipeline loescht alle "
+                "Termine zu dieser Mail-Adresse."
+            ),
+        },
+        "anrede_form": {
+            "type": "string",
+            "enum": ["DU", "SIE"],
+            "description": (
+                "Welche Anrede wurde gewaehlt. Bleibt fuer die "
+                "naechsten Turns sticky (siehe history)."
+            ),
+        },
+        "wunsch_datum": {
+            "type": "string",
+            "description": (
+                "Nur bei PROPOSE_SLOTS: Wunsch-Datum als TT.MM.JJJJ "
+                "wenn der Kunde eines genannt hat (z.B. 'naechsten "
+                "Donnerstag' -> konkretes Datum auflesen). Leer wenn "
+                "der Kunde gar kein Datum genannt hat — Pipeline "
+                "nimmt dann den naechsten Werktag."
+            ),
+        },
+        "wunsch_uhrzeit": {
+            "type": "string",
+            "description": (
+                "Nur bei PROPOSE_SLOTS: Wunsch-Uhrzeit als HH:MM "
+                "wenn der Kunde eine genannt hat ('vormittags' -> "
+                "09:00, 'nachmittags' -> 14:00, 'frueh' -> 08:00). "
+                "Leer wenn keine Praeferenz."
+            ),
+        },
+        "chosen_slot_index": {
+            "type": "integer",
+            "description": (
+                "Nur bei BOOK_SLOT: Index (0-basiert) des Slots aus "
+                "der letzten Vorschlags-Runde, den der Kunde bestaetigt "
+                "hat. Pipeline loest darueber den konkreten Termin auf."
+            ),
+        },
+        "direct_datum": {
+            "type": "string",
+            "description": (
+                "Nur bei BOOK_DIRECT: konkretes Datum aus dem Kunden-"
+                "wunsch als TT.MM.JJJJ. Beispiel: 'naechsten Mittwoch' "
+                "-> in das tatsaechliche Datum umrechnen relativ zum "
+                "heutigen Datum."
+            ),
+        },
+        "direct_uhrzeit": {
+            "type": "string",
+            "description": (
+                "Nur bei BOOK_DIRECT: konkrete Uhrzeit aus dem Kunden-"
+                "wunsch als HH:MM. Beispiel: '14 Uhr' -> '14:00'."
+            ),
+        },
+        "kunde_voller_name": {
+            "type": "string",
+            "description": (
+                "Der VOLLE Name des Kunden (Vor- + Nachname), so wie er "
+                "in der Mail, der Signatur oder im Verlauf steht. "
+                "PFLICHT-Voraussetzung fuer jede Termin-Aktion "
+                "(PROPOSE_SLOTS/BOOK_SLOT/BOOK_DIRECT). Der Absender-"
+                "Anzeigename zaehlt nur, wenn er aus Vor- UND Nachname "
+                "besteht. Leer lassen, wenn kein voller Name bekannt ist."
+            ),
+        },
+        "kunde_telefon": {
+            "type": "string",
+            "description": (
+                "Die Telefonnummer des Kunden, so wie sie in der Mail, "
+                "der Signatur oder im Verlauf steht (Roh-Format genuegt, "
+                "die Pipeline normalisiert). PFLICHT-Voraussetzung fuer "
+                "jede Termin-Aktion. Leer lassen, wenn keine Nummer "
+                "bekannt ist."
+            ),
+        },
+        "reason": {
+            "type": "string",
+            "description": (
+                "Ein-Satz-Begruendung warum next_action so gewaehlt "
+                "wurde (fuer Logging)."
+            ),
+        },
+    },
+    "required": ["reply_text", "next_action", "anrede_form"],
+}
+
+
+DIALOG_PROMPT = """Du bist Q, ein freundlicher AI-Assistent fuer den Handwerker {tenant_company} (Branche: {tenant_branche}).
+Du fuehrst eine Mail-Konversation im Namen von {im_namen_von} mit einem (potenziellen) Kunden.
+
+Dein Ziel: Dem Kunden konkret helfen — Auskunfts-Fragen aus der Wissensbasis beantworten, Termine selbststaendig vorschlagen/buchen/stornieren, und nur wenn wirklich keine Termin-Aktion passt das Anfrage-Formular schicken. Heutiges Datum: {today_date}.
+
+Kontext-Wissen ueber den Betrieb:
+{wissensbasis}
+
+{anfrage_status_block}{termin_block}{slots_block}{history_block}Neue Nachricht des Kunden:
+- Betreff: {subject}
+- Von: {sender_name} ({sender_email})
+- Inhalt:
+---
+{latest_message}
+---
+
+HARTES VOR-GATE — WICHTIG, PRUEFE ZUERST:
+
+(I) TERMIN-BUCHUNG BRAUCHT VOLLEN NAMEN + TELEFONNUMMER. Bevor du eine Termin-Aktion (PROPOSE_SLOTS / BOOK_SLOT / BOOK_DIRECT) waehlst, MUSST du zwei Dinge vom Kunden haben:
+  - seinen VOLLEN NAMEN (Vor- UND Nachname) — trag ihn in kunde_voller_name ein. Der Absender-Anzeigename zaehlt nur, wenn er aus Vor- und Nachname besteht.
+  - eine TELEFONNUMMER — trag sie in kunde_telefon ein (Roh-Format genuegt).
+  Beides steht oft in der Signatur oder im Mail-Text — lies es dort heraus. Fehlt eines von beiden und der Kunde will einen Termin: waehle **ASK_MORE** und frag im reply_text freundlich nach dem vollen Namen UND der Telefonnummer (kurz erklaeren: brauchst du fuer die Terminbestaetigung und Rueckfragen). Buche NICHTS, solange nicht beides vorliegt.
+
+(II) BESTEHT BEREITS EIN TERMIN (siehe "Bestehender Termin"-Block oben), schlage von dir aus KEINEN neuen Termin vor und buche keinen zweiten. Verweise im reply_text freundlich auf den bestehenden Termin und beantworte etwaige Fragen (ASK_MORE). Nur wenn der Kunde absagen/verschieben will -> CANCEL_TERMIN.
+
+(III) FORMULAR: Das Anfrage-Formular wird AUTOMATISCH nach einer erfolgreichen Buchung mitgeschickt — du musst es bei einer Buchung NICHT selbst anfordern. SEND_FORMULAR waehlst du nur, wenn der Kunde ein Angebot/einen Auftrag OHNE Terminbezug will und noch kein Formular offen/eingegangen ist. Hat der Kunde schon eines offen oder ausgefuellt: kein zweites schicken (-> ASK_MORE).
+
+ENTSCHEIDUNGS-REIHENFOLGE fuer next_action (PRUEFE IN DIESER REIHENFOLGE und nimm das erste was zutrifft):
+
+(1) Will der Kunde einen bestehenden Termin absagen/verschieben? ("absagen", "stornieren", "doch nicht koennen", "verschieben") -> **CANCEL_TERMIN**. Geht IMMER.
+
+(2) Besteht bereits ein Termin (Block oben) UND der Kunde will nicht absagen? -> KEINE neue Termin-Aktion. Auf den bestehenden Termin verweisen + Fragen beantworten -> **ASK_MORE**.
+
+(3) Bestaetigt der Kunde einen der oben aufgelisteten "Zuletzt vorgeschlagenen Termin-Slots"? ("der erste passt", "ja Donnerstag 14 Uhr aus deiner Liste") -> **BOOK_SLOT** mit chosen_slot_index = 0-basierter Index. NUR wenn voller Name + Telefon vorliegen (sonst ASK_MORE und nach den fehlenden Angaben fragen).
+
+(4) Nennt der Kunde einen KONKRETEN Termin mit Datum UND Uhrzeit? Beispiele: "22.05.26 um 14 Uhr", "Donnerstag 10:30" -> **BOOK_DIRECT** mit direct_datum + direct_uhrzeit. NUR wenn voller Name + Telefon vorliegen (sonst ASK_MORE und nachfragen).
+
+(5) Nennt der Kunde nur einen Tag/Zeitraum (ohne konkrete Uhrzeit)? Beispiele: "Montag passt mir", "diese Woche", "vormittags" -> **PROPOSE_SLOTS** mit wunsch_datum/wunsch_uhrzeit. NUR wenn voller Name + Telefon vorliegen (sonst ASK_MORE und nachfragen).
+
+(6) Will der Kunde ein Angebot / einen Auftrag OHNE Terminbezug? Beispiele: "koennt ihr ein Angebot machen?", "ich brauche eine Kueche" — und es ist noch kein Formular offen/eingegangen -> **SEND_FORMULAR**.
+
+(7) Hat der Kunde rein eine Wissensfrage gestellt (Oeffnungszeiten, Lieferzeiten) ohne Auftrag/Termin? -> **ASK_MORE** — direkt aus der Wissensbasis antworten.
+
+WICHTIGE LEITPLANKEN:
+
+- IMMER ZUERST DIE FRAGE BEANTWORTEN: Wenn der Kunde eine inhaltliche Frage stellt (Preise, Material, Ablauf, Lieferzeit, Oeffnungszeiten — alles was in der Wissensbasis steht), beantworte sie im reply_text konkret, BEVOR du auf Termin oder Formular verweist. Die Frage des Kunden darf nie unbeantwortet bleiben.
+- TERMINBUCHUNG OHNE VOLLEN NAMEN + TELEFONNUMMER IST VERBOTEN. Fehlt eines: ASK_MORE und freundlich danach fragen, statt zu buchen.
+- BESTEHT SCHON EIN TERMIN: nie von dir aus einen neuen vorschlagen — auf den bestehenden verweisen.
+- Anrede: konsistent Du oder Sie ueber die GESAMTE Antwort. Wenn ein vorheriger Turn eine Anrede gesetzt hat (siehe history), nimm DIESELBE wieder. Sonst: Du wenn der Kunde Du verwendet, sonst Sie.
+- KEIN Marketing-Geschwafel, KEINE Floskeln wie "vielen Dank fuer Ihre Anfrage", KEIN "ich freue mich".
+- Im reply_text NIEMALS eine URL/Link/"https://"-String einbauen. Bei SEND_FORMULAR darfst du den Button erwaehnen ("ueber den Button unten"), bei PROPOSE_SLOTS die Slot-Liste ("unten findest du Vorschlaege"), sonst keinen Verweis.
+- Bei einer Buchung (BOOK_SLOT/BOOK_DIRECT) rendert das Template automatisch eine "Termin bestaetigt"-Box UND den Formular-Button unter deinem Text — wiederhole Datum/Uhrzeit also nicht und fordere das Formular nicht selbst im Text an. Ein kurzer Satz wie "ich habe den Termin fuer dich eingetragen" genuegt.
+- KEINE eigene Begruessungszeile ("Hallo X,") und KEINE eigene Signatur — beides macht das Template.
+- Schreibe NUR den eigentlichen Mail-Text. Kurz, ehrlich, direkt.
+
+Antwort als JSON gemaess Schema (kein Markdown drumherum)."""
+
+
+async def handle_kunde_mail_dialog(
+    subject: str,
+    sender_name: str,
+    sender_email: str,
+    latest_message: str,
+    *,
+    history_turns: list[dict] | None = None,
+    tenant_company: str,
+    tenant_owner_first_name: str | None,
+    tenant_branche: str = "Handwerk",
+    wissensbasis: str = "(keine spezifischen Infos hinterlegt)",
+    previous_anrede_form: str | None = None,
+    previous_proposed_slots: list[dict] | None = None,
+    anfrage_status: dict | None = None,
+    existing_termin: dict | None = None,
+) -> dict:
+    """Multi-Turn-Dialog-Schritt fuer die Mail-Pipeline.
+
+    history_turns: [{"role": "kunde" | "q", "text": "..."}] in
+    chronologischer Reihenfolge. Letzter Eintrag ist nicht die aktuelle
+    Mail (die kommt separat in latest_message), sondern alles davor.
+
+    previous_anrede_form: "DU" oder "SIE" wenn aus einem vorherigen Turn
+    bekannt — damit Q nicht in der Mitte einer Konversation wechselt.
+
+    previous_proposed_slots: Liste der Slots, die Q in der letzten
+    Runde angeboten hat (aus EmailConversation.proposed_slots). Format:
+    [{"datum": "22.05.2026", "uhrzeit": "14:00", ...}, ...]. Wird im
+    Prompt aufgelistet, damit Q bei einer Bestaetigung "ja, der erste
+    passt" den richtigen chosen_slot_index waehlen kann. Ohne diesen
+    Block wuerde Q in einer Folge-Mail nicht wissen welche Slots
+    aktuell zur Auswahl stehen.
+
+    Returns: dict mit Schluesseln reply_text, next_action,
+    anrede_form, reason, plus optional wunsch_datum/wunsch_uhrzeit
+    (bei PROPOSE_SLOTS) bzw. chosen_slot_index (bei BOOK_SLOT). Bei
+    Fehler: SEND_FORMULAR-Fallback (loggt warning).
+    """
+    import datetime as _dt
+    import json as _json
+    from google.genai.types import GenerateContentConfig
+
+    owner_first = (tenant_owner_first_name or "").strip()
+    company = (tenant_company or "").strip() or "dem Betrieb"
+    im_namen_von = owner_first[:50] if owner_first else f"Ihr Team von {company[:80]}"
+
+    # History-Block bauen (oder leer lassen)
+    history_lines: list[str] = []
+    for turn in (history_turns or []):
+        role = (turn.get("role") or "").lower()
+        text = (turn.get("text") or "").strip()
+        if not text:
+            continue
+        speaker = "Q" if role in ("q", "model", "assistant") else "Kunde"
+        # je Turn auf 800 Zeichen begrenzen damit der Prompt nicht explodiert
+        history_lines.append(f"[{speaker}]: {text[:800]}")
+    if previous_anrede_form in ("DU", "SIE"):
+        history_lines.append(f"(Anrede in dieser Konversation: {previous_anrede_form})")
+    history_block = ""
+    if history_lines:
+        history_block = "Bisheriger Mail-Verlauf:\n" + "\n".join(history_lines) + "\n\n"
+
+    # Anfrage-Formular-Status-Block: wenn der Kunde das Formular schon
+    # ausgefuellt hat (oder eines offen ist), bekommt Q den Kontext.
+    # Verhindert dass Q noch ein Formular schickt nachdem der Kunde
+    # bereits eines ausgefuellt hat.
+    anfrage_status_block = ""
+    if anfrage_status:
+        status = anfrage_status.get("status")
+        if status == "submitted":
+            lines = ["Anfrage-Formular-Status:"]
+            submitted_at = anfrage_status.get("submitted_at")
+            if submitted_at:
+                try:
+                    lines.append(
+                        f"  Der Kunde hat das Anfrage-Formular am "
+                        f"{submitted_at.strftime('%d.%m.%Y um %H:%M')} "
+                        f"ausgefuellt eingereicht."
+                    )
+                except Exception:
+                    lines.append("  Das Formular wurde bereits ausgefuellt.")
+            antw = anfrage_status.get("antworten") or {}
+            if antw:
+                lines.append("  Daten aus dem Formular:")
+                for k, v in list(antw.items())[:8]:
+                    if v in (None, "", [], {}):
+                        continue
+                    v_str = str(v)[:200].replace("\n", " ")
+                    lines.append(f"    - {k}: {v_str}")
+            lines.append(
+                "  -> WICHTIG: Schicke das Formular NICHT nochmal. "
+                "Wenn der Kunde nach Termin fragt, mach einen Vorschlag "
+                "oder buche direkt (BOOK_DIRECT/PROPOSE_SLOTS)."
+            )
+            anfrage_status_block = "\n".join(lines) + "\n\n"
+        elif status == "open":
+            sent_at = anfrage_status.get("sent_at")
+            sent_str = ""
+            try:
+                if sent_at:
+                    sent_str = f" am {sent_at.strftime('%d.%m.%Y')}"
+            except Exception:
+                pass
+            anfrage_status_block = (
+                f"Anfrage-Formular-Status:\n"
+                f"  Ein Anfrage-Formular wurde dem Kunden{sent_str} "
+                f"per Mail geschickt, ist aber noch NICHT ausgefuellt. "
+                f"Du musst es nicht nochmal schicken — wenn relevant "
+                f"darfst du den Kunden einmal hoeflich daran erinnern, "
+                f"sonst geh inhaltlich auf seine Mail ein.\n\n"
+            )
+
+    # Bestehender-Termin-Block: ist fuer diese Konversation schon ein
+    # Termin gebucht, darf Q von sich aus keinen neuen vorschlagen —
+    # nur auf Kundenwunsch absagen/verschieben (CANCEL_TERMIN).
+    termin_block = ""
+    if existing_termin:
+        et_datum = (existing_termin.get("datum") or "").strip()
+        et_uhrzeit = (existing_termin.get("uhrzeit") or "").strip()
+        wann_parts = [p for p in (
+            et_datum, (f"um {et_uhrzeit} Uhr" if et_uhrzeit else "")
+        ) if p]
+        wann = " ".join(wann_parts).strip()
+        termin_block = (
+            "Bestehender Termin:\n"
+            "  Fuer diesen Kunden ist bereits ein Termin gebucht"
+            + (f" ({wann})" if wann else "")
+            + ".\n"
+            "  -> Schlage von dir aus KEINEN neuen Termin vor und buche "
+            "keinen zweiten. Verweise hoeflich auf den bestehenden Termin. "
+            "Nur wenn der Kunde absagen/verschieben will: CANCEL_TERMIN.\n\n"
+        )
+
+    # Slot-Block: nur wenn Q in der letzten Runde Slots vorgeschlagen
+    # hat. Damit Q bei einer Bestaetigung "ja Donnerstag um 14 Uhr"
+    # den richtigen Index in chosen_slot_index packen kann.
+    slots_block = ""
+    if previous_proposed_slots:
+        slot_lines = ["Zuletzt vorgeschlagene Termin-Slots:"]
+        for idx, sl in enumerate(previous_proposed_slots[:6]):
+            datum = (sl.get("datum") or "").strip()
+            uhrzeit = (sl.get("uhrzeit") or "").strip()
+            wochentag = (sl.get("wochentag") or "").strip()
+            label_parts = []
+            if wochentag:
+                label_parts.append(wochentag)
+            if datum:
+                label_parts.append(datum)
+            if uhrzeit:
+                label_parts.append(f"{uhrzeit} Uhr")
+            label = " ".join(label_parts) or f"Slot {idx}"
+            slot_lines.append(f"  [{idx}] {label}")
+        slot_lines.append(
+            "(Bei BOOK_SLOT chosen_slot_index = die Zahl in eckigen Klammern.)"
+        )
+        slots_block = "\n".join(slot_lines) + "\n\n"
+
+    signer = f"{owner_first} (via Q)" if owner_first else f"Ihr Team von {company[:80]} (via Q)"
+
+    today_str = _dt.date.today().strftime("%A, %d.%m.%Y")
+
+    prompt = DIALOG_PROMPT.format(
+        tenant_company=company[:100],
+        tenant_branche=tenant_branche[:50],
+        im_namen_von=im_namen_von[:80],
+        signer=signer[:80],
+        today_date=today_str,
+        wissensbasis=(wissensbasis or "(keine Infos)")[:3000],
+        anfrage_status_block=anfrage_status_block,
+        termin_block=termin_block,
+        slots_block=slots_block,
+        history_block=history_block,
+        subject=(subject or "(kein Betreff)")[:200],
+        sender_name=(sender_name or "Kunde")[:100],
+        sender_email=(sender_email or "")[:100],
+        latest_message=(latest_message or "(kein Inhalt)")[:4000],
+    )
+
+    config = GenerateContentConfig(
+        temperature=0.3,
+        max_output_tokens=4096,
+        response_mime_type="application/json",
+        response_schema=DIALOG_RESPONSE_SCHEMA,
+    )
+
+    def _sync_call():
+        client = _get_genai_client(location=GENAI_TEXT_LOCATION)
+        return client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+            config=config,
+        )
+
+    def _fallback(reason: str) -> dict:
+        return {
+            "reply_text": (
+                "danke fuer deine Nachricht. Damit wir gut weiterhelfen "
+                "koennen, fuell bitte kurz unser Anfrage-Formular ueber "
+                "den Button unten aus. Wir melden uns danach schnell."
+            ),
+            "next_action": "SEND_FORMULAR",
+            "anrede_form": previous_anrede_form or "DU",
+            "wunsch_datum": None,
+            "wunsch_uhrzeit": None,
+            "chosen_slot_index": None,
+            "direct_datum": None,
+            "direct_uhrzeit": None,
+            "kunde_voller_name": None,
+            "kunde_telefon": None,
+            "reason": f"fallback: {reason}",
+        }
+
+    try:
+        response = await asyncio.to_thread(_sync_call)
+
+        if not response.candidates:
+            logger.warning("handle_kunde_mail_dialog: Keine Candidates")
+            return _fallback("no_candidates")
+
+        candidate = response.candidates[0]
+        if not candidate.content or not candidate.content.parts:
+            logger.warning(
+                "handle_kunde_mail_dialog: Empty parts. "
+                f"finish_reason={getattr(candidate, 'finish_reason', '?')}"
+            )
+            return _fallback("empty_parts")
+
+        raw_text = "".join(p.text for p in candidate.content.parts if getattr(p, "text", None))
+        if not raw_text:
+            logger.warning("handle_kunde_mail_dialog: Kein Text in Response")
+            return _fallback("empty_text")
+
+        try:
+            data = _json.loads(raw_text)
+        except _json.JSONDecodeError as e:
+            logger.warning(f"handle_kunde_mail_dialog JSON parse fail: {e} | raw={raw_text[:300]!r}")
+            return _fallback("json_parse")
+
+        # Validate
+        reply_text = (data.get("reply_text") or "").strip()
+        next_action = data.get("next_action") or "SEND_FORMULAR"
+        if next_action not in (
+            "ASK_MORE",
+            "SEND_FORMULAR",
+            "PROPOSE_SLOTS",
+            "BOOK_SLOT",
+            "BOOK_DIRECT",
+            "CANCEL_TERMIN",
+        ):
+            next_action = "SEND_FORMULAR"
+        anrede_form = data.get("anrede_form") or previous_anrede_form or "DU"
+        if anrede_form not in ("DU", "SIE"):
+            anrede_form = "DU"
+
+        # BOOK_SLOT braucht einen gueltigen Index — sonst auf
+        # PROPOSE_SLOTS zurueckfallen, damit die Pipeline neu vorschlaegt
+        # statt willkuerlich zu buchen.
+        chosen_slot_index: int | None = None
+        if next_action == "BOOK_SLOT":
+            raw_idx = data.get("chosen_slot_index")
+            try:
+                chosen_slot_index = int(raw_idx) if raw_idx is not None else None
+            except (TypeError, ValueError):
+                chosen_slot_index = None
+            slot_count = len(previous_proposed_slots or [])
+            if (
+                chosen_slot_index is None
+                or chosen_slot_index < 0
+                or chosen_slot_index >= slot_count
+            ):
+                logger.warning(
+                    f"handle_kunde_mail_dialog: BOOK_SLOT mit ungueltigem "
+                    f"index={chosen_slot_index!r} (slots={slot_count}) -> "
+                    f"fallback PROPOSE_SLOTS"
+                )
+                next_action = "PROPOSE_SLOTS"
+                chosen_slot_index = None
+
+        # PROPOSE_SLOTS: Wunsch-Datum/-Uhrzeit normalisieren — leer ist OK,
+        # die Pipeline waehlt dann den naechsten Werktag.
+        wunsch_datum = (data.get("wunsch_datum") or "").strip()
+        wunsch_uhrzeit = (data.get("wunsch_uhrzeit") or "").strip()
+
+        # Kontaktdaten fuer die Buchung (Pflicht-Gate in der Pipeline):
+        # voller Name + Telefonnummer. Q liest sie aus Mail/Signatur.
+        kunde_voller_name = (data.get("kunde_voller_name") or "").strip()
+        kunde_telefon = (data.get("kunde_telefon") or "").strip()
+
+        # BOOK_DIRECT braucht direct_datum + direct_uhrzeit. Wenn eines
+        # fehlt, faellt der Pfad auf PROPOSE_SLOTS zurueck (mit dem
+        # vorhandenen Feld als Anker).
+        direct_datum = (data.get("direct_datum") or "").strip()
+        direct_uhrzeit = (data.get("direct_uhrzeit") or "").strip()
+        if next_action == "BOOK_DIRECT":
+            if not direct_datum or not direct_uhrzeit:
+                logger.warning(
+                    f"handle_kunde_mail_dialog: BOOK_DIRECT ohne "
+                    f"direct_datum/uhrzeit ({direct_datum!r}/{direct_uhrzeit!r}) "
+                    f"-> fallback PROPOSE_SLOTS"
+                )
+                next_action = "PROPOSE_SLOTS"
+                # Wenn nur eines fehlt, das vorhandene als Anker
+                # uebernehmen
+                if direct_datum and not wunsch_datum:
+                    wunsch_datum = direct_datum
+                if direct_uhrzeit and not wunsch_uhrzeit:
+                    wunsch_uhrzeit = direct_uhrzeit
+                direct_datum = ""
+                direct_uhrzeit = ""
+
+        if not reply_text:
+            logger.warning("handle_kunde_mail_dialog: reply_text leer, fallback")
+            return _fallback("empty_reply_text")
+
+        logger.info(
+            f"handle_kunde_mail_dialog: subject={subject[:60]!r} sender={sender_email!r} "
+            f"-> next_action={next_action} anrede={anrede_form} reply_len={len(reply_text)}"
+            + (f" idx={chosen_slot_index}" if chosen_slot_index is not None else "")
+            + (f" datum={wunsch_datum}" if wunsch_datum else "")
+            + (f" uhrzeit={wunsch_uhrzeit}" if wunsch_uhrzeit else "")
+        )
+
+        return {
+            "reply_text": reply_text,
+            "next_action": next_action,
+            "anrede_form": anrede_form,
+            "wunsch_datum": wunsch_datum or None,
+            "wunsch_uhrzeit": wunsch_uhrzeit or None,
+            "chosen_slot_index": chosen_slot_index,
+            "direct_datum": direct_datum or None,
+            "direct_uhrzeit": direct_uhrzeit or None,
+            "kunde_voller_name": kunde_voller_name or None,
+            "kunde_telefon": kunde_telefon or None,
+            "reason": (data.get("reason") or "")[:200],
+        }
+    except Exception as e:
+        logger.exception(f"handle_kunde_mail_dialog fehler: {e}")
+        return _fallback(f"exception:{type(e).__name__}")
 
 
 # =====================================================================

@@ -211,7 +211,108 @@ async def notify_tenant_anfrage_submitted(token_str: str, antworten: dict) -> No
             logger.warning(f"anfrage_telegram: choose_employee failed: {e}")
 
     now_berlin = datetime.now(_BERLIN_TZ)
-    await _save_submission_to_drive(
+    drive_folder_url = await _save_submission_to_drive(
         tenant=tenant, token_obj=token_obj, antworten=antworten,
         employee_id=employee_id, now_berlin=now_berlin,
     )
+
+    # Dankes-Mail an den Kunden + Konversation fuer Reply-Threading
+    # vorbereiten. Damit kann der Kunde direkt mit einem Wunschtermin
+    # antworten und die Mail-Pipeline laesst die Termin-Buchung zu
+    # (Formular-Status ist jetzt submitted). Best-effort — Drive-Save
+    # und Submission-Persistenz haengen nicht davon ab.
+    await _send_dank_mail_and_thread(
+        tenant=tenant, token_obj=token_obj, employee_id=employee_id,
+        drive_folder_url=drive_folder_url,
+    )
+
+
+async def _send_dank_mail_and_thread(
+    *, tenant: Tenant, token_obj: AnfrageToken, employee_id,
+    drive_folder_url: str | None,
+) -> None:
+    """Schickt die Dankes-Mail nach Formular-Eingang und legt/aktualisiert
+    die EmailConversation, damit Folge-Mails (Wunschtermin) ueber das
+    Reply-Threading in den Dialog-Pfad laufen.
+
+    drive_folder_url wird (falls vorhanden) an der Konversation vermerkt,
+    damit die spaetere Termin-Buchung den Link in die Kalender-Event-
+    Beschreibung schreiben kann.
+    """
+    kunde_email = (token_obj.kunde_email or "").strip()
+    if not kunde_email:
+        return
+    try:
+        from core.integrations.mail_pipeline import (
+            send_formular_dank_mail, find_open_conversation,
+            create_conversation, record_outbound_q_reply,
+            set_conversation_drive_url,
+        )
+        from core.integrations.mail_template import extract_first_name
+        from core.models import STATE_DIALOG, STATE_BOOKED
+
+        kunde_anrede = extract_first_name(token_obj.kunde_name or "") or ""
+        company_name = tenant.company_name or "Handwerksbetrieb"
+        contact_name = getattr(tenant, "contact_name", "") or ""
+        contact_phone = getattr(tenant, "contact_phone", "") or ""
+
+        # Konversation zuerst suchen — daraus ergibt sich, ob schon ein
+        # Termin besteht (neuer Flow: erst Termin, dann Formular). Davon
+        # haengt der Text der Dankes-Mail ab: bei bestehendem Termin wird
+        # NICHT erneut nach einem Wunschtermin gefragt.
+        conv = await find_open_conversation(tenant.id, kunde_email)
+        termin_besteht = bool(
+            conv is not None and (
+                getattr(conv, "state", None) == STATE_BOOKED
+                or getattr(conv, "gcal_event_id", None)
+            )
+        )
+
+        sent_meta = await send_formular_dank_mail(
+            tenant_id=tenant.id,
+            to_email=kunde_email,
+            kunde_anrede=kunde_anrede,
+            company_name=company_name,
+            contact_name=contact_name,
+            contact_phone=contact_phone,
+            original_subject=token_obj.original_subject,
+            employee_id=employee_id,
+            termin_besteht=termin_besteht,
+        )
+        if not sent_meta.get("success"):
+            logger.warning(
+                f"Dank-Mail nach Formular fehlgeschlagen tenant={tenant.slug} "
+                f"kunde={kunde_email}: {sent_meta.get('error')}"
+            )
+            return
+
+        # Konversation anlegen falls noch keine existiert (reiner Angebots-
+        # Pfad ohne vorherige Dialog-/Termin-Konv).
+        if conv is None:
+            conv = await create_conversation(
+                tenant_id=tenant.id,
+                sender_email=kunde_email,
+                sender_name=token_obj.kunde_name,
+                subject=token_obj.original_subject,
+                state=STATE_DIALOG,
+                assigned_employee_id=employee_id,
+            )
+        await record_outbound_q_reply(
+            conv.id,
+            internet_message_id=sent_meta.get("internet_message_id"),
+            microsoft_conversation_id=sent_meta.get("conversation_id"),
+            q_reply_text="[Dankes-Mail nach Formular-Eingang]",
+            subject=token_obj.original_subject,
+        )
+        if drive_folder_url:
+            await set_conversation_drive_url(conv.id, drive_folder_url)
+        logger.info(
+            f"Dank-Mail nach Formular gesendet tenant={tenant.slug} "
+            f"kunde={kunde_email} conv_id={conv.id} "
+            f"drive={'yes' if drive_folder_url else 'no'}"
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            f"_send_dank_mail_and_thread fehlgeschlagen "
+            f"tenant={tenant.slug}: {e}"
+        )

@@ -167,11 +167,20 @@ def test_button_uses_form_url_href(basic_ctx):
     assert f'href="{basic_ctx["form_url"]}"' in html
 
 
-def test_preheader_is_present_but_hidden(basic_ctx):
-    """Preheader-Text fuer Inbox-Vorschau, im Body unsichtbar."""
+def test_preheader_is_absent_anti_spam(basic_ctx):
+    """Preheader-Text wurde bewusst entfernt (Anti-Spam, Marketing-
+    Pattern triggert Filter). Inbox-Vorschau nimmt jetzt den ersten
+    Body-Satz statt eines versteckten Marketing-Strings."""
     html = build_kunde_reply_html(**basic_ctx)
-    assert "Dein Anfrage-Formular" in html
-    assert "display: none" in html  # Preheader-Hide-CSS
+    assert "Dein Anfrage-Formular" not in html
+
+
+def test_no_q_assistant_footer(basic_ctx):
+    """'Verfasst mit Hilfe von Q'-Footer wurde entfernt (Anti-Spam,
+    Auto-Bot-Marker). Layout bleibt sonst unveraendert."""
+    html = build_kunde_reply_html(**basic_ctx)
+    assert "Verfasst mit Hilfe von" not in html
+    assert "digitalen Assistenten" not in html
 
 
 def test_reply_text_anrede_is_stripped(basic_ctx):
@@ -226,6 +235,35 @@ def test_no_raw_urls_visible_in_body(basic_ctx):
     assert "http://" not in html_no_hrefs
 
 
+def test_reply_text_url_is_stripped(basic_ctx):
+    """Wenn der LLM trotz Prompt eine nackte URL in den Reply-Text
+    schreibt: muss vom Template rausgestrippt werden, sonst rendert
+    GMX die URL als grossen blauen Link der mit dem Button konkurriert.
+    """
+    basic_ctx["reply_text"] = (
+        "danke fuer deine Anfrage.\n"
+        "Bitte fuell das Formular aus: https://gewerbeagent.de/anfrage/EVIL_URL_LEAK\n"
+        "Dann melde ich mich."
+    )
+    html = build_kunde_reply_html(**basic_ctx)
+    # Nicht als sichtbarer Text — das Token aus dem Reply-Text darf nicht im Body auftauchen
+    assert "EVIL_URL_LEAK" not in html
+    # Form-URL aus basic_ctx bleibt im Button-href erhalten
+    assert 'href="https://gewerbeagent.de/anfrage/AbC123XyZ789-token-hash-secret"' in html
+
+
+def test_reply_text_inline_url_is_stripped(basic_ctx):
+    """Inline-URL mitten in einem Satz: URL raus, Resttext bleibt."""
+    basic_ctx["reply_text"] = (
+        "Hier ist der Link dazu: https://example.com/leaked sehr wichtig."
+    )
+    html = build_kunde_reply_html(**basic_ctx)
+    assert "example.com/leaked" not in html
+    # Der umgebende Text bleibt lesbar
+    assert "Hier ist der Link dazu" in html
+    assert "sehr wichtig" in html
+
+
 def test_no_contact_extras_doesnt_crash(basic_ctx):
     """Wenn phone/mail/web leer sind: Mail rendert trotzdem ohne Crash."""
     basic_ctx["contact_phone"] = ""
@@ -247,3 +285,121 @@ def test_html_is_valid_doctype(basic_ctx):
     html = build_kunde_reply_html(**basic_ctx)
     assert html.startswith("<!doctype html>")
     assert html.rstrip().endswith("</html>")
+
+
+# =====================================================================
+# build_kunde_reply_html — Phase-2 Termin-Aktionen
+# (slot_proposals / booked_termin / storno_summary)
+# =====================================================================
+
+def test_slot_proposals_render_numbered_list(basic_ctx):
+    """Bei slot_proposals wird eine durchnummerierte Box gerendert
+    und KEIN Formular-Button (auch wenn with_formular_button=True)."""
+    basic_ctx["with_formular_button"] = True
+    basic_ctx["slot_proposals"] = [
+        {"wochentag": "Do", "datum": "22.05.2026", "uhrzeit": "14:00"},
+        {"wochentag": "Fr", "datum": "23.05.2026", "uhrzeit": "09:00"},
+        {"wochentag": "Mo", "datum": "26.05.2026", "uhrzeit": "10:00"},
+    ]
+    html = build_kunde_reply_html(**basic_ctx)
+    assert "Mögliche Termine" in html
+    assert "22.05.2026" in html and "14:00" in html
+    # Durchnummeriert 1./2./3. (NICHT 0-basiert — fuer den Kunden)
+    assert "1." in html and "2." in html and "3." in html
+    # Formular-Button ist NICHT da, obwohl with_formular_button=True
+    assert "Formular ausfüllen" not in html
+
+
+def test_booked_termin_renders_confirmation_box(basic_ctx):
+    """booked_termin rendert eine 'Termin bestätigt'-Box."""
+    basic_ctx["with_formular_button"] = False
+    basic_ctx["booked_termin"] = {
+        "datum": "22.05.2026",
+        "uhrzeit": "14:00",
+        "anliegen": "Küchenmontage",
+    }
+    html = build_kunde_reply_html(**basic_ctx)
+    assert "Termin bestätigt" in html
+    assert "22.05.2026" in html and "14:00" in html
+    assert "Küchenmontage" in html
+
+
+def test_storno_summary_one_cancelled(basic_ctx):
+    basic_ctx["with_formular_button"] = False
+    basic_ctx["storno_summary"] = {"cancelled_count": 1}
+    html = build_kunde_reply_html(**basic_ctx)
+    assert "Termin storniert" in html
+
+
+def test_storno_summary_zero_cancelled_shows_not_found(basic_ctx):
+    basic_ctx["with_formular_button"] = False
+    basic_ctx["storno_summary"] = {"cancelled_count": 0}
+    html = build_kunde_reply_html(**basic_ctx)
+    assert "Termin nicht gefunden" in html
+    # Keine "0 Termine storniert"-Phrase (klingt absurd)
+    assert "0 Termine storniert" not in html
+
+
+def test_storno_summary_multiple_uses_plural(basic_ctx):
+    basic_ctx["with_formular_button"] = False
+    basic_ctx["storno_summary"] = {"cancelled_count": 3}
+    html = build_kunde_reply_html(**basic_ctx)
+    assert "3 Termine storniert" in html
+
+
+def test_booked_termin_with_button_shows_both(basic_ctx):
+    """Neuer Flow: nach der Buchung wird die Termin-Bestaetigung UND der
+    Formular-Button zusammen gerendert (erst Termin buchen, dann das
+    Anfrage-Formular gleich mitschicken)."""
+    basic_ctx["with_formular_button"] = True
+    basic_ctx["booked_termin"] = {
+        "datum": "22.05.2026", "uhrzeit": "14:00", "anliegen": "X",
+    }
+    html = build_kunde_reply_html(**basic_ctx)
+    assert "Termin bestätigt" in html
+    assert "Formular ausfüllen" in html
+
+
+def test_booked_termin_without_button_no_formular(basic_ctx):
+    """Buchung OHNE with_formular_button: nur die Termin-Bestaetigung,
+    kein Formular-Button (z.B. wenn schon ein Formular eingegangen ist)."""
+    basic_ctx["with_formular_button"] = False
+    basic_ctx["booked_termin"] = {
+        "datum": "22.05.2026", "uhrzeit": "14:00", "anliegen": "X",
+    }
+    html = build_kunde_reply_html(**basic_ctx)
+    assert "Termin bestätigt" in html
+    assert "Formular ausfüllen" not in html
+
+
+def test_no_termin_block_means_normal_formular_path(basic_ctx):
+    """Ohne slot/booked/storno -> default Verhalten unveraendert."""
+    html = build_kunde_reply_html(**basic_ctx)
+    assert "Formular ausfüllen" in html
+    assert "Mögliche Termine" not in html
+    assert "Termin bestätigt" not in html
+
+
+def test_slot_proposals_escape_xss(basic_ctx):
+    """Slot-Felder werden HTML-escaped (kommen aus dem kalender-Plugin,
+    aber defensive)."""
+    basic_ctx["with_formular_button"] = False
+    basic_ctx["slot_proposals"] = [
+        {"wochentag": "<script>", "datum": "22.05.2026", "uhrzeit": "14:00"},
+    ]
+    html = build_kunde_reply_html(**basic_ctx)
+    assert "<script>" not in html
+    assert "&lt;script&gt;" in html
+
+
+def test_slot_proposals_caps_at_six_entries(basic_ctx):
+    """Mehr als 6 Slots werden abgeschnitten (textlich unhandlich)."""
+    basic_ctx["with_formular_button"] = False
+    basic_ctx["slot_proposals"] = [
+        {"wochentag": "Mo", "datum": f"0{i}.06.2026", "uhrzeit": "10:00"}
+        for i in range(1, 10)
+    ]
+    html = build_kunde_reply_html(**basic_ctx)
+    # Erste 6 sind drin, der 7. nicht
+    assert "06.06.2026" in html
+    assert "07.06.2026" not in html

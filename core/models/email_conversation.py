@@ -31,6 +31,10 @@ STATE_CLOSED = "closed"
 # Kein Migrations-Aufwand — `state` ist String(50), kein DB-Enum.
 STATE_STORNIERT = "storniert"
 STATE_DELIVERY_FAILED = "zustellung_fehlgeschlagen"
+# Multi-Turn-Dialog: Q hat noch nicht genug Info gesammelt, asked
+# Rueckfragen statt direkt das Formular zu schicken. Wenn Q schliesslich
+# das Formular fuer fertig haelt, geht's nach AWAITING_CONFIRMATION.
+STATE_DIALOG = "dialog"
 
 
 
@@ -110,6 +114,14 @@ class EmailConversation(Base):
     # Wenn state=proposing_slots: welche Slots wurden vorgeschlagen?
     # Format: [{"datum": "30.04.2026", "uhrzeit": "14:00"}, ...]
     proposed_slots: Mapped[list | None] = mapped_column(JSONB, nullable=True)
+
+    # Link zum Kunden-Drive-Ordner mit den Anfrage-Formular-Daten +
+    # Uploads. Gesetzt sobald der Kunde das Formular ausgefuellt hat
+    # (Drive-Archiv). Wird beim Termin-Buchen in die Kalender-Event-
+    # Beschreibung geschrieben.
+    drive_folder_url: Mapped[str | None] = mapped_column(
+        String(1000), nullable=True,
+    )
 
     created_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False

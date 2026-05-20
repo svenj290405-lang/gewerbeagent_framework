@@ -487,6 +487,72 @@ async def lookup_recent_anfrage_by_phone(
         return result.scalar_one_or_none()
 
 
+async def get_latest_anfrage_status_for_email(
+    tenant_id: UUID,
+    kunde_email: str,
+    max_age_days: int = 30,
+) -> Optional[dict]:
+    """Liefert Status des juengsten Anfrage-Formulars fuer einen Kunden.
+
+    Wird vom Mail-Dialog-Pfad gerufen damit Q weiss, ob der Kunde
+    das Formular schon ausgefuellt hat (-> nie wieder SEND_FORMULAR
+    anbieten) oder ob ein Formular-Link noch offen ist (-> ggf. an
+    den Link erinnern).
+
+    Returns dict oder None (kein Token gefunden) mit:
+      - status: "submitted" | "open" | "expired"
+      - sent_at: datetime (created_at vom Token = Mail mit Link verschickt)
+      - submitted_at: datetime | None (wenn das Formular ausgefuellt)
+      - antworten: dict | None (Formular-Daten wenn submitted)
+      - anliegen: str | None (kurzes Anliegen aus den Antworten als
+        Anker fuer den Dialog-Kontext)
+    """
+    if not kunde_email:
+        return None
+    cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
+    email_norm = kunde_email.strip().lower()
+    async with AsyncSessionLocal() as session:
+        from sqlalchemy.orm import selectinload
+        result = await session.execute(
+            select(AnfrageToken)
+            .where(
+                AnfrageToken.tenant_id == tenant_id,
+                AnfrageToken.kunde_email == email_norm,
+                AnfrageToken.created_at >= cutoff,
+            )
+            .order_by(AnfrageToken.created_at.desc())
+            .options(selectinload(AnfrageToken.responses))
+            .limit(1)
+        )
+        token = result.scalar_one_or_none()
+        if token is None:
+            return None
+        antworten: dict | None = None
+        anliegen: str | None = None
+        if token.responses:
+            r0 = token.responses[0]
+            antworten = dict(r0.antworten or {})
+            # Heuristik fuer "anliegen": viele Schema-Varianten —
+            # haeufig 'anliegen', 'beschreibung', 'projekt', 'leistung'
+            for key in ("anliegen", "beschreibung", "projekt", "leistung", "details"):
+                if key in antworten and antworten[key]:
+                    anliegen = str(antworten[key])[:300]
+                    break
+        if token.submitted_at:
+            status = "submitted"
+        elif token.expires_at and token.expires_at < datetime.now(timezone.utc):
+            status = "expired"
+        else:
+            status = "open"
+        return {
+            "status": status,
+            "sent_at": token.created_at,
+            "submitted_at": token.submitted_at,
+            "antworten": antworten,
+            "anliegen": anliegen,
+        }
+
+
 async def get_token_with_tenant(token_str: str) -> tuple[Optional[AnfrageToken], Optional[Tenant]]:
     """Laedt Token + Tenant. Returns (None, None) wenn ungueltig/abgelaufen."""
     async with AsyncSessionLocal() as session:

@@ -220,6 +220,12 @@ class Plugin(BasePlugin):
             anliegen = payload.get("anliegen", "")
             adresse = payload.get("adresse") or "Adresse nicht angegeben"
             telefon = payload.get("telefon")
+            # Optionaler Link zum Kunden-Drive-Ordner (Anfrage-Formular-
+            # Daten + Fotos). Mail-Pipeline reicht das durch sobald der
+            # Kunde das Formular ausgefuellt hat; landet in der Event-
+            # Beschreibung damit der Handwerker direkt zu den Unterlagen
+            # springen kann.
+            drive_url = (payload.get("drive_url") or "").strip()
             # kunde_email kommt aus Mail-Pipeline immer, aus Voice optional
             # (Phase 1: nur wenn Q die Mail aktiv erfragt hat). Lowercase-
             # normalisiert damit Storno-Suche per Mail spaeter exakt matched.
@@ -277,14 +283,23 @@ class Plugin(BasePlugin):
 
                 betrieb_name = self.config["betrieb_name"]
                 telefon_text = f"\nTelefon: {telefon}" if telefon else ""
+                # Kunden-Mail sichtbar in die Beschreibung (nicht nur als
+                # extendedProperty fuer die Storno-Suche) — der Handwerker
+                # sieht so direkt, mit welcher Adresse korrespondiert wird.
+                email_text = f"\nE-Mail: {kunde_email}" if kunde_email else ""
 
                 summary = f"[{betrieb_name}] {anliegen} - {name}"
+                drive_line = (
+                    f"\nUnterlagen (Drive): {drive_url}" if drive_url else ""
+                )
                 description = (
                     f"Betrieb: {betrieb_name}\n"
                     f"Kunde: {name}\n"
                     f"Anliegen: {anliegen}\n"
                     f"Adresse: {adresse}"
-                    f"{telefon_text}\n\n"
+                    f"{telefon_text}"
+                    f"{email_text}"
+                    f"{drive_line}\n\n"
                     f"Eingetragen via KI-Agent Q (Gewerbeagent Framework)"
                 )
                 if idempotency_key:

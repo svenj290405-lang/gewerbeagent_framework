@@ -73,24 +73,61 @@ def extract_in_reply_to_from_headers(
 # Conversation-Lookup
 # ====================================================================
 
+# Wie lange darf der dritte (email-only) Fallback eine alte Konversation
+# als "noch offen" behandeln? Aelter -> als geschlossen werten und
+# stattdessen Neu-Anfrage starten. Verhindert dass eine Mail zu einem
+# voellig neuen Thema in eine Wochen-alte Test-Konv gerouted wird.
+EMAIL_FALLBACK_MAX_AGE_DAYS = 7
+
+
+def _subject_token_overlap(a: str | None, b: str | None) -> bool:
+    """Sehr lockerer Subject-Match: gibt es ein gemeinsames signifikantes
+    Wort? Ignoriert "Re:", "Fwd:", Whitespace, Kurzwoerter <4 Zeichen.
+
+    Wird im email-only Fallback genutzt: nur wenn das neue Subject
+    irgendeinen thematischen Bezug zum letzten Subject hat, gilt die
+    Konv noch als "selber Vorgang". Sonst -> Neu-Anfrage.
+    """
+    import re as _re
+    def _tokens(s: str | None) -> set[str]:
+        if not s:
+            return set()
+        # Re:/Fwd:/Aw: am Anfang strippen, dann auf Tokens splitten
+        s = _re.sub(r"^\s*((re|fwd|aw|wg)\s*:\s*)+", "", s, flags=_re.IGNORECASE)
+        return {
+            t for t in _re.findall(r"\w+", s.lower())
+            if len(t) >= 4
+        }
+    return bool(_tokens(a) & _tokens(b))
+
+
 async def find_open_conversation(
     tenant_id: uuid.UUID,
     sender_email: str,
     *,
     microsoft_conversation_id: str | None = None,
     in_reply_to: str | None = None,
+    current_subject: str | None = None,
 ) -> EmailConversation | None:
     """Sucht eine bestehende OFFENE Konversation (state != CLOSED).
 
-    Match-Reihenfolge: ms_conv_id > in_reply_to > sender_email-Fallback.
-    Siehe Modul-Docstring fuer Rationale.
+    Match-Reihenfolge:
+      1. ms_conv_id — provider-natives Threading
+      2. in_reply_to — RFC In-Reply-To gegen unsere letzte Q-Mail-ID
+      3. email-only Fallback MIT Constraints:
+         - updated_at innerhalb EMAIL_FALLBACK_MAX_AGE_DAYS (7d)
+         - Subject-Token-Bezug zum letzten Subject ODER kein
+           current_subject angegeben (fuer Legacy-Caller)
+         Sonst gilt die alte Konv als "nicht mehr derselbe Vorgang"
+         und wir starten eine Neu-Anfrage. Verhindert dass alte
+         Test-Konversationen neue Themen vom selben Absender kapern.
 
     Returns: EmailConversation (expunged aus der Session) oder None.
     """
     sender_email_norm = (sender_email or "").strip().lower()
 
     async with AsyncSessionLocal() as s:
-        # 1. Microsoft conversationId match
+        # 1. Microsoft conversationId match — provider-natives Threading
         if microsoft_conversation_id:
             r = await s.execute(
                 select(EmailConversation)
@@ -125,20 +162,41 @@ async def find_open_conversation(
                 s.expunge(conv)
                 return conv
 
-        # 3. Fallback per kunde_email
+        # 3. Fallback per kunde_email — mit Time-Window + Subject-Bezug
         if sender_email_norm:
+            import datetime as _dt
+            cutoff = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(
+                days=EMAIL_FALLBACK_MAX_AGE_DAYS,
+            )
             r = await s.execute(
                 select(EmailConversation)
                 .where(
                     EmailConversation.tenant_id == tenant_id,
                     EmailConversation.kunde_email == sender_email_norm,
                     EmailConversation.state != STATE_CLOSED,
+                    EmailConversation.updated_at >= cutoff,
                 )
                 .order_by(EmailConversation.updated_at.desc())
                 .limit(1)
             )
             conv = r.scalar_one_or_none()
             if conv:
+                # Subject-Bezug pruefen — wenn der Caller current_subject
+                # mitgibt und keine gemeinsamen Worte mit dem letzten
+                # Subject existieren, gilt die alte Konv als nicht
+                # mehr "derselbe Vorgang".
+                if current_subject is not None and not _subject_token_overlap(
+                    conv.last_subject, current_subject,
+                ):
+                    logger.info(
+                        f"find_open_conversation: email-fallback "
+                        f"tenant={tenant_id} kunde={sender_email_norm} "
+                        f"verworfen — subject-mismatch "
+                        f"alt={(conv.last_subject or '')[:40]!r} "
+                        f"neu={(current_subject or '')[:40]!r} "
+                        f"-> Neu-Anfrage"
+                    )
+                    return None
                 s.expunge(conv)
                 return conv
 
@@ -367,6 +425,65 @@ async def set_conversation_state(
             )
             return
         conv.state = state[:50]
+        await s.commit()
+
+
+async def set_proposed_slots(
+    conv_id: uuid.UUID,
+    slots: list[dict] | None,
+    *,
+    state: str | None = None,
+) -> None:
+    """Persistiert die Liste vorgeschlagener Slots an der Konversation.
+
+    Wird im PROPOSE_SLOTS-Pfad des Mail-Dialogs aufgerufen: nach der
+    Find-Free-Slots-Antwort vom kalender-Plugin schreiben wir die
+    Vorschlaege in conv.proposed_slots, damit Q im naechsten Turn
+    referenzieren kann ("ja der zweite passt" -> chosen_slot_index=1).
+
+    state: optional gleichzeitig state mitschreiben (typisch
+    STATE_PROPOSING_SLOTS) — spart eine zweite Transaktion.
+
+    slots=None loescht die alten Vorschlaege (z.B. nach erfolgreicher
+    Buchung, damit ein spaeterer BOOK_SLOT nicht auf abgelaufene
+    Slots zugreift).
+    """
+    async with AsyncSessionLocal() as s:
+        r = await s.execute(
+            select(EmailConversation).where(EmailConversation.id == conv_id)
+        )
+        conv = r.scalar_one_or_none()
+        if not conv:
+            logger.warning(
+                f"set_proposed_slots: Konversation {conv_id} nicht gefunden"
+            )
+            return
+        conv.proposed_slots = list(slots) if slots else None
+        if state:
+            conv.state = state[:50]
+        await s.commit()
+
+
+async def set_conversation_drive_url(
+    conv_id: uuid.UUID, drive_folder_url: str,
+) -> None:
+    """Vermerkt den Kunden-Drive-Ordner-Link an der Konversation.
+
+    Gesetzt nach Formular-Eingang (Drive-Archiv). Beim Termin-Buchen
+    liest der Pipeline-Pfad das Feld und schreibt den Link in die
+    Kalender-Event-Beschreibung.
+    """
+    async with AsyncSessionLocal() as s:
+        r = await s.execute(
+            select(EmailConversation).where(EmailConversation.id == conv_id)
+        )
+        conv = r.scalar_one_or_none()
+        if not conv:
+            logger.warning(
+                f"set_conversation_drive_url: Konversation {conv_id} nicht gefunden"
+            )
+            return
+        conv.drive_folder_url = drive_folder_url[:1000]
         await s.commit()
 
 
@@ -690,6 +807,77 @@ async def send_verschiebung_request(
         f"Re: {original_subject}"
         if not (original_subject or "").lower().startswith("re:")
         else original_subject
+    )
+    return await send_tracked_mail(
+        tenant_id=tenant_id,
+        to_email=to_email,
+        subject=reply_subject,
+        body_html=body_html,
+        employee_id=employee_id,
+    )
+
+
+# --------------------------------------------------------------------
+# Dankes-Mail nach Formular-Eingang
+# --------------------------------------------------------------------
+
+async def send_formular_dank_mail(
+    *,
+    tenant_id: uuid.UUID,
+    to_email: str,
+    kunde_anrede: str,
+    company_name: str,
+    contact_name: str,
+    contact_phone: str,
+    original_subject: str | None,
+    employee_id: uuid.UUID | None = None,
+    termin_besteht: bool = False,
+) -> dict:
+    """Dankes-Mail nachdem der Kunde das Anfrage-Formular ausgefuellt hat.
+
+    Bestaetigt den Eingang. Bewusst OHNE Formular-Button (Formular ist ja
+    durch) — nutzt build_kunde_reply_html mit with_formular_button=False.
+
+    termin_besteht: True, wenn fuer die Konversation bereits ein Termin
+    gebucht ist (neuer Flow: erst Termin, dann Formular). Dann wird NICHT
+    erneut nach einem Wunschtermin gefragt — nur bedankt + fuer Rueck-
+    fragen offen. False (reiner Angebots-Fall ohne Termin): Kunde darf
+    direkt einen Wunschtermin nennen, der ueber Reply-Threading in den
+    Dialog-Pfad laeuft.
+
+    Returns: sent_meta-Dict. Caller persistiert die Konversation.
+    """
+    from core.integrations.microsoft import send_tracked_mail
+    from core.integrations.mail_template import build_kunde_reply_html
+
+    if termin_besteht:
+        reply_text = (
+            "vielen Dank, deine Angaben sind bei mir angekommen — damit "
+            "kann ich deinen Termin gut vorbereiten. Wenn du noch Fragen "
+            "hast, antworte einfach auf diese Mail."
+        )
+    else:
+        reply_text = (
+            "vielen Dank, deine Angaben sind bei mir angekommen. "
+            "Wenn du noch Fragen hast, antworte einfach auf diese Mail. "
+            "Oder nenn mir direkt deinen Wunschtermin (z.B. \"Donnerstag "
+            "14 Uhr\" oder \"naechste Woche vormittags\") — dann schaue ich "
+            "nach einem passenden Termin fuer dich."
+        )
+    body_html = build_kunde_reply_html(
+        kunde_anrede_name=kunde_anrede,
+        kunde_email=to_email,
+        reply_text=reply_text,
+        form_url="",
+        company_name=company_name,
+        contact_name=contact_name,
+        contact_phone=contact_phone,
+        with_formular_button=False,
+    )
+    reply_subject = (
+        f"Re: {original_subject}"
+        if original_subject and not original_subject.lower().startswith("re:")
+        else (original_subject or "Ihre Anfrage ist eingegangen")
     )
     return await send_tracked_mail(
         tenant_id=tenant_id,
