@@ -231,6 +231,16 @@ async def get_employee_by_telegram_chat(
     """
     from core.database import AsyncSessionLocal
     from core.models.tenant import Tenant
+
+    # telegram_chat_id ist eine bigint-Spalte — eine String-Chat-ID (z.B.
+    # aus manchen Webhook-/Callback-Pfaden) wuerde "bigint = varchar"
+    # werfen und die Aufloesung still auf _global zuruckfallen lassen.
+    # Defensiv auf int casten; nicht-numerisch -> kein Treffer.
+    try:
+        chat_id = int(chat_id)
+    except (TypeError, ValueError):
+        return None
+
     async with AsyncSessionLocal() as session:
         # 1) Direkter Match auf employees.telegram_chat_id
         emp = (await session.execute(
