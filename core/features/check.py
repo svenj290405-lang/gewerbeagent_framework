@@ -64,6 +64,13 @@ def invalidate_feature_cache(tenant_id: uuid.UUID | None = None) -> None:
 # Public API
 # =====================================================================
 
+# Kill-Switch: hier gelistete Features sind fuer ALLE Tenants aus —
+# unabhaengig von ToolConfig/Paket. Code + DB-Felder bleiben dormant
+# (reversibel: einfach aus der Menge entfernen). 'werkstatt' (Smart-
+# Routing ueber Heimat-Adresse) wird momentan nicht benoetigt; die
+# Anschrift wird weiterhin im Onboarding fuers Impressum erfasst.
+GLOBALLY_DISABLED_FEATURES: frozenset[str] = frozenset({"werkstatt"})
+
 
 async def enabled_features_for_tenant(
     tenant_id: uuid.UUID,
@@ -88,7 +95,10 @@ async def enabled_features_for_tenant(
             .where(ToolConfig.enabled.is_(True))
         )).all()
 
-    enabled = frozenset(r[0] for r in rows) | always_on
+    enabled = (
+        (frozenset(r[0] for r in rows) | always_on)
+        - GLOBALLY_DISABLED_FEATURES
+    )
     _cache[tenant_id] = _CacheEntry(
         enabled_set=enabled,
         expires_at=now + _CACHE_TTL_SECONDS,

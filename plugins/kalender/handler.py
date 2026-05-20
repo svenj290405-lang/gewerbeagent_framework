@@ -532,7 +532,14 @@ class Plugin(BasePlugin):
         """
         meta = {"applied": False, "reason": None, "removed": 0}
 
-        if not slots:
+        # Werkstatt/Smart-Routing ist momentan deaktiviert (Feature-Kill-
+        # Switch in core/features/check.py). Hart aus, damit auch Tenants
+        # mit Alt-Heimat-Geo keine Fahrtzeit-Filterung mehr bekommen.
+        # Reversibel: diesen Block entfernen + Feature reaktivieren.
+        meta["reason"] = "werkstatt-disabled"
+        return slots, meta
+
+        if not slots:  # noqa: unreachable — bewusst, bis Werkstatt zurueckkommt
             meta["reason"] = "no-slots"
             return slots, meta
         if not kunde_adresse:

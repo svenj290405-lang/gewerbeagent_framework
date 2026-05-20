@@ -186,7 +186,6 @@ PACKAGES: dict[str, frozenset[str]] = {
         "anfrage_formular",
         "lexware",
         "material",
-        "werkstatt",
     }),
     PACKAGE_ENTERPRISE: frozenset({
         "kalender",
@@ -195,7 +194,6 @@ PACKAGES: dict[str, frozenset[str]] = {
         "anfrage_formular",
         "lexware",
         "material",
-        "werkstatt",
         "voice_init",
         "drive_archiv",
         "visualisierung",

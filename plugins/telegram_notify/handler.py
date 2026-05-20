@@ -7239,6 +7239,14 @@ async def _handle_werkstatt_command(chat_id):
         )
     tenant, employee = res
 
+    # Werkstatt/Smart-Routing ist derzeit deaktiviert (Feature-Kill-Switch).
+    from core.features import enabled_features_for_tenant
+    if "werkstatt" not in await enabled_features_for_tenant(tenant.id):
+        return (
+            "Die Werkstatt-/Standort-Funktion ist derzeit deaktiviert. "
+            "Deine Geschäftsadresse fürs Impressum gibst du beim Onboarding an."
+        )
+
     has_address = bool(employee.heimat_strasse and employee.heimat_ort)
 
     await _save_state(chat_id, STATE_WERKSTATT_WAITING_ADDRESS, {})
@@ -7290,7 +7298,10 @@ async def _handle_werkstatt_status_command(chat_id):
     res = await _get_current_employee(chat_id)
     if res is None:
         return "Dieser Chat ist noch keinem Betrieb zugeordnet."
-    _, employee = res
+    tenant, employee = res
+    from core.features import enabled_features_for_tenant
+    if "werkstatt" not in await enabled_features_for_tenant(tenant.id):
+        return "Die Werkstatt-/Standort-Funktion ist derzeit deaktiviert."
     label = "Heimat-Adresse" if not employee.is_default else "Werkstatt-Adresse"
     return _format_werkstatt_status(employee, label=label)
 
@@ -9905,13 +9916,12 @@ ONBOARDING_HELP = {
         "als Absender, nicht 'Schreinerei Mueller GbR'."
     ),
     "strasse": (
-        "Deine Werkstatt- oder Geschaeftsadresse (Strasse + Hausnummer). "
-        "Wird im Impressum + fuer Anfahrtszeit-Berechnung verwendet."
+        "Deine Geschaeftsadresse (Strasse + Hausnummer) — wird im "
+        "Impressum deiner Kunden-Mails verwendet."
     ),
     "plz_ort": (
         "PLZ + Ort, zusammen in einer Zeile — z.B. <i>54290 Trier</i>. "
-        "Wird via OpenRouteService geocoded fuer Smart-Termin-Routing "
-        "(Fahrtzeit von Werkstatt zum Kunden)."
+        "Fuer das Impressum."
     ),
     "telefon": (
         "Deine Telefonnummer fuers Impressum — mit Vorwahl, "
