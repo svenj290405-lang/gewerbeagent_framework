@@ -25,6 +25,7 @@ das automatisch refreshed.
 from __future__ import annotations
 
 import datetime as dt
+import html as _html
 import logging
 from typing import Any
 from uuid import UUID
@@ -41,6 +42,11 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_TIMEZONE = "Europe/Berlin"
 HTTP_TIMEOUT_SECONDS = 20.0
+
+# Footer-Marker aus kalender/handler.py _book_appointment — der Drive-Link
+# wird VOR diesen Footer eingefuegt (bei den Kundendaten, in der Vorschau
+# sichtbar) statt ans Body-Ende.
+GA_FOOTER_MARKER = "Eingetragen via KI-Agent Q"
 
 # Mailbox-TZ-Strings die der Outlook-Client als Berlin-Zeit anzeigt.
 # Graph liefert per default Windows-style ("W. Europe Standard Time"),
@@ -325,21 +331,25 @@ async def create_event(
     }
 
 
-async def append_to_event_body(
-    tenant_id: UUID, event_id: str, extra_text: str,
+async def attach_drive_link_to_event(
+    tenant_id: UUID, event_id: str, drive_url: str,
     *, employee_id: UUID | None = None,
 ) -> bool:
-    """Haengt eine Zeile an die (HTML-)Beschreibung eines bestehenden
-    Events. Idempotent: steht extra_text schon drin, passiert nichts.
+    """Traegt den Drive-Link KLICKBAR in den HTML-Body eines Outlook-Events
+    ein — vor dem GA-Footer (bei den Kundendaten, in der Kurzvorschau
+    sichtbar) statt ans Ende. Idempotent: ist die URL schon drin, passiert
+    nichts.
 
-    Genutzt um nach dem Formular-Eingang den Drive-Link nachzutragen
+    Genutzt um nach dem Formular-Eingang den Drive-Ordner-Link nachzutragen
     (im neuen Flow wird der Termin VOR dem Formular gebucht).
     """
-    extra = (extra_text or "").strip()
-    if not event_id or not extra:
-        return not extra  # nichts anzuhaengen = nichts zu tun
+    url = (drive_url or "").strip()
+    if not event_id or not url:
+        return not url  # nichts einzutragen = nichts zu tun
     token = await get_microsoft_token(tenant_id, employee_id=employee_id)
     headers = {"Authorization": f"Bearer {token}"}
+    safe = _html.escape(url, quote=True)
+    line = f'Unterlagen (Drive): <a href="{safe}">{safe}</a>'
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS) as client:
         try:
             gr = await client.get(
@@ -349,11 +359,21 @@ async def append_to_event_body(
             gr.raise_for_status()
             cur = ((gr.json().get("body") or {}).get("content")) or ""
         except Exception as exc:  # noqa: BLE001
-            logger.warning(f"append_to_event_body get({event_id}) failed: {exc}")
+            logger.warning(
+                f"attach_drive_link_to_event get({event_id}) failed: {exc}"
+            )
             return False
-        if extra in cur:
-            return True  # schon dran -> idempotent
-        new_content = f"{cur}<br>{extra}" if cur else extra
+        # Idempotenz: roh ODER HTML-escaped (Query-Params mit & werden
+        # beim Schreiben zu &amp; — beide Formen pruefen).
+        if url in cur or safe in cur:
+            return True
+        idx = cur.find(GA_FOOTER_MARKER)
+        if idx != -1:
+            new_content = cur[:idx] + f"{line}<br>\n" + cur[idx:]
+        elif "</body>" in cur:
+            new_content = cur.replace("</body>", f"{line}<br>\n</body>", 1)
+        else:
+            new_content = f"{cur}<br>{line}" if cur else line
         try:
             pr = await client.patch(
                 f"{GRAPH_API_BASE}/me/events/{event_id}",
@@ -363,7 +383,9 @@ async def append_to_event_body(
             pr.raise_for_status()
             return True
         except Exception as exc:  # noqa: BLE001
-            logger.warning(f"append_to_event_body patch({event_id}) failed: {exc}")
+            logger.warning(
+                f"attach_drive_link_to_event patch({event_id}) failed: {exc}"
+            )
             return False
 
 

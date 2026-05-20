@@ -30,6 +30,22 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
+# Footer-Marker aus kalender/handler.py _book_appointment. Der Drive-Link
+# wird VOR diesen Footer eingefuegt (statt ans Ende), damit er bei den
+# Kundendaten steht und auch in der Kalender-Kurzvorschau sichtbar ist.
+GA_FOOTER_MARKER = "Eingetragen via KI-Agent Q"
+
+
+def _insert_line_before_footer(desc: str, line: str) -> str:
+    """Fuegt `line` (Plain-Text) vor dem GA-Footer ein. Ohne Footer: ans Ende."""
+    idx = desc.find(GA_FOOTER_MARKER)
+    if idx == -1:
+        return f"{desc}\n{line}" if desc.strip() else line
+    head = desc[:idx].rstrip("\n")
+    tail = desc[idx:]
+    return f"{head}\n{line}\n\n{tail}"
+
+
 class CalendarAdapter(ABC):
     """Provider-unabhaengiges Calendar-Interface."""
 
@@ -105,15 +121,15 @@ class CalendarAdapter(ABC):
           - match_source: "metadata" | "fulltext"
         """
 
-    async def append_to_description(
-        self, event_id: str, extra_text: str,
-    ) -> bool:
-        """Haengt eine Zeile an die Beschreibung eines bestehenden Events.
+    async def attach_drive_link(self, event_id: str, drive_url: str) -> bool:
+        """Traegt den Drive-Link in ein bestehendes Event ein — VOR dem
+        GA-Footer (damit er bei den Kundendaten steht und in der Kalender-
+        Kurzvorschau sichtbar ist), in Outlook als klickbarer Hyperlink.
 
-        Idempotent: wenn extra_text bereits in der Beschreibung steht,
-        wird nichts geaendert (True). Genutzt um nach dem Formular-Eingang
-        den Drive-Link nachzutragen — im neuen Flow wird der Termin VOR
-        dem Formular gebucht, der Drive-Ordner existiert dann noch nicht.
+        Idempotent: ist der Link schon drin, passiert nichts (True).
+        Genutzt um nach dem Formular-Eingang den Drive-Ordner-Link
+        nachzutragen — im neuen Flow wird der Termin VOR dem Formular
+        gebucht, der Ordner existiert dann noch nicht.
 
         Default: No-op (False), damit unbekannte Adapter nicht crashen.
         Google + Microsoft ueberschreiben das.
@@ -265,10 +281,10 @@ class GoogleCalendarAdapter(CalendarAdapter):
             logger.warning(f"Google delete_event({event_id}) failed: {exc}")
             return False
 
-    async def append_to_description(self, event_id, extra_text):
+    async def attach_drive_link(self, event_id, drive_url):
         service = await self._get_service()
-        extra = (extra_text or "").strip()
-        if not extra:
+        url = (drive_url or "").strip()
+        if not url:
             return True
         try:
             ev = service.events().get(
@@ -276,13 +292,14 @@ class GoogleCalendarAdapter(CalendarAdapter):
             ).execute()
         except Exception as exc:  # noqa: BLE001
             logger.warning(
-                f"Google append_to_description get({event_id}) failed: {exc}"
+                f"Google attach_drive_link get({event_id}) failed: {exc}"
             )
             return False
         desc = ev.get("description") or ""
-        if extra in desc:
+        if url in desc:
             return True  # schon dran -> idempotent
-        new_desc = f"{desc}\n{extra}" if desc else extra
+        # Google verlinkt URLs in der Beschreibung automatisch -> Plain-Text.
+        new_desc = _insert_line_before_footer(desc, f"Unterlagen (Drive): {url}")
         try:
             service.events().patch(
                 calendarId=self.calendar_id, eventId=event_id,
@@ -291,7 +308,7 @@ class GoogleCalendarAdapter(CalendarAdapter):
             return True
         except Exception as exc:  # noqa: BLE001
             logger.warning(
-                f"Google append_to_description patch({event_id}) failed: {exc}"
+                f"Google attach_drive_link patch({event_id}) failed: {exc}"
             )
             return False
 
@@ -489,10 +506,10 @@ class MicrosoftCalendarAdapter(CalendarAdapter):
             self.tenant_id, event_id, employee_id=self.employee_id,
         )
 
-    async def append_to_description(self, event_id, extra_text):
-        from core.integrations.microsoft_calendar import append_to_event_body
-        return await append_to_event_body(
-            self.tenant_id, event_id, extra_text,
+    async def attach_drive_link(self, event_id, drive_url):
+        from core.integrations.microsoft_calendar import attach_drive_link_to_event
+        return await attach_drive_link_to_event(
+            self.tenant_id, event_id, drive_url,
             employee_id=self.employee_id,
         )
 

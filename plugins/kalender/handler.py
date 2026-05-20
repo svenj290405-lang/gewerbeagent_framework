@@ -381,9 +381,7 @@ class Plugin(BasePlugin):
                 self.tenant_id, employee_id=employee_id,
                 fallback_calendar_id=self.config["calendar_id"],
             )
-            ok = await adapter.append_to_description(
-                event_id, f"Unterlagen (Drive): {drive_url}",
-            )
+            ok = await adapter.attach_drive_link(event_id, drive_url)
         except Exception as e:  # noqa: BLE001
             logger.warning(f"attach_drive_url fehlgeschlagen: {e}")
             return {"erfolg": False, "nachricht": str(e)}

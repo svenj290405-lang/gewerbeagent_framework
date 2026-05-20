@@ -1,10 +1,13 @@
-"""Tests fuer GoogleCalendarAdapter.append_to_description.
+"""Tests fuer GoogleCalendarAdapter.attach_drive_link.
 
-Deckt den nachtraeglichen Drive-Link-Eintrag ab (neuer Mail-Flow: Termin
-wird VOR dem Formular gebucht, der Drive-Ordner entsteht erst beim
-Formular-Eingang -> Beschreibung wird nachgepatcht). Verifiziert:
-  - Zeile wird angehaengt wenn sie fehlt (bestehende Beschreibung bleibt)
-  - idempotent: schon vorhandene Zeile -> kein zweiter patch
+Deckt den nachtraeglichen Drive-Link-Eintrag ab (neuer Flow: Termin wird
+VOR dem Formular gebucht, der Drive-Ordner entsteht erst beim Formular-
+Eingang -> Beschreibung wird nachgepatcht). Verifiziert:
+  - Link wird VOR dem GA-Footer eingefuegt (bei den Kundendaten, in der
+    Kurzvorschau sichtbar) — nicht ans Ende
+  - bestehende Beschreibung bleibt erhalten
+  - idempotent: schon vorhandener Link -> kein zweiter patch
+  - ohne Footer -> ans Ende angehaengt
 
 Der Google-Service wird durch einen Fake ersetzt (kein OAuth/Netz).
 """
@@ -15,6 +18,9 @@ import uuid
 import pytest
 
 from plugins.kalender.adapters import GoogleCalendarAdapter
+
+FOOTER = "Eingetragen via KI-Agent Q (Gewerbeagent Framework)"
+URL = "https://drive.google.com/drive/folders/abc123"
 
 
 class _FakeExec:
@@ -54,46 +60,51 @@ def _adapter(store):
 
 
 @pytest.mark.asyncio
-async def test_append_to_description_appends_when_missing():
-    store = {"ev1": {"description": "Kunde: Max\nAnliegen: Kueche"}}
+async def test_attach_drive_link_inserts_before_footer():
+    store = {"ev1": {"description": f"Kunde: Max\nTelefon: 0151\n\n{FOOTER}\nGA-Ref: x"}}
     adapter = _adapter(store)
 
-    ok = await adapter.append_to_description(
-        "ev1", "Unterlagen (Drive): https://drive.google.com/x",
-    )
+    ok = await adapter.attach_drive_link("ev1", URL)
 
     assert ok is True
     desc = store["ev1"]["description"]
-    assert desc.startswith("Kunde: Max")  # Bestehendes bleibt erhalten
-    assert "Unterlagen (Drive): https://drive.google.com/x" in desc
+    assert f"Unterlagen (Drive): {URL}" in desc
+    # vor dem Footer (also bei den Kundendaten, vorschau-sichtbar)
+    assert desc.index("Unterlagen (Drive)") < desc.index(FOOTER)
+    # Bestehendes bleibt erhalten
+    assert "Kunde: Max" in desc and "Telefon: 0151" in desc and "GA-Ref: x" in desc
 
 
 @pytest.mark.asyncio
-async def test_append_to_description_is_idempotent():
-    store = {
-        "ev1": {
-            "description": (
-                "Kunde: Max\nUnterlagen (Drive): https://drive.google.com/x"
-            )
-        }
-    }
+async def test_attach_drive_link_is_idempotent():
+    store = {"ev1": {"description": f"Kunde: Max\nUnterlagen (Drive): {URL}\n\n{FOOTER}"}}
     adapter = _adapter(store)
 
-    ok = await adapter.append_to_description(
-        "ev1", "Unterlagen (Drive): https://drive.google.com/x",
-    )
+    ok = await adapter.attach_drive_link("ev1", URL)
 
     assert ok is True
-    # Zeile war schon da -> KEIN patch
-    assert adapter._service.events().patched is None
+    assert adapter._service.events().patched is None  # schon dran -> kein patch
 
 
 @pytest.mark.asyncio
-async def test_append_to_description_empty_extra_is_noop():
+async def test_attach_drive_link_without_footer_appends():
     store = {"ev1": {"description": "Kunde: Max"}}
     adapter = _adapter(store)
 
-    ok = await adapter.append_to_description("ev1", "   ")
+    ok = await adapter.attach_drive_link("ev1", URL)
+
+    assert ok is True
+    desc = store["ev1"]["description"]
+    assert desc.startswith("Kunde: Max")
+    assert f"Unterlagen (Drive): {URL}" in desc
+
+
+@pytest.mark.asyncio
+async def test_attach_drive_link_empty_url_is_noop():
+    store = {"ev1": {"description": "Kunde: Max"}}
+    adapter = _adapter(store)
+
+    ok = await adapter.attach_drive_link("ev1", "   ")
 
     assert ok is True
     assert store["ev1"]["description"] == "Kunde: Max"
