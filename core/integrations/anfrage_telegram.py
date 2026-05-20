@@ -306,6 +306,34 @@ async def _send_dank_mail_and_thread(
         )
         if drive_folder_url:
             await set_conversation_drive_url(conv.id, drive_folder_url)
+            # Wenn fuer die Konversation bereits ein Termin gebucht ist
+            # (neuer Flow: erst Termin, dann Formular), den Drive-Link
+            # nachtraeglich in das Kalender-Event eintragen — beim Buchen
+            # gab es den Ordner noch nicht. Best-effort, blockiert nie.
+            gcal_event_id = getattr(conv, "gcal_event_id", None)
+            if gcal_event_id:
+                try:
+                    from core.plugin_system import get_plugin_for_tenant
+                    kalender = await get_plugin_for_tenant(tenant.slug, "kalender")
+                    if kalender is not None:
+                        res = await kalender.on_webhook("attach_drive_url", {
+                            "event_id": gcal_event_id,
+                            "drive_url": drive_folder_url,
+                            "employee_id": getattr(
+                                conv, "assigned_employee_id", None,
+                            ),
+                        })
+                        logger.info(
+                            f"Drive-Link in Kalender-Event nachgetragen "
+                            f"tenant={tenant.slug} conv_id={conv.id} "
+                            f"event={gcal_event_id} -> {res}"
+                        )
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(
+                        f"Drive-Link in Kalender-Event nachtragen "
+                        f"fehlgeschlagen tenant={tenant.slug} "
+                        f"conv_id={conv.id}: {e}"
+                    )
         logger.info(
             f"Dank-Mail nach Formular gesendet tenant={tenant.slug} "
             f"kunde={kunde_email} conv_id={conv.id} "

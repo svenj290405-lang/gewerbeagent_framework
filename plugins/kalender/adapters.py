@@ -105,6 +105,21 @@ class CalendarAdapter(ABC):
           - match_source: "metadata" | "fulltext"
         """
 
+    async def append_to_description(
+        self, event_id: str, extra_text: str,
+    ) -> bool:
+        """Haengt eine Zeile an die Beschreibung eines bestehenden Events.
+
+        Idempotent: wenn extra_text bereits in der Beschreibung steht,
+        wird nichts geaendert (True). Genutzt um nach dem Formular-Eingang
+        den Drive-Link nachzutragen — im neuen Flow wird der Termin VOR
+        dem Formular gebucht, der Drive-Ordner existiert dann noch nicht.
+
+        Default: No-op (False), damit unbekannte Adapter nicht crashen.
+        Google + Microsoft ueberschreiben das.
+        """
+        return False
+
 
 # =====================================================================
 # GOOGLE Calendar Adapter
@@ -248,6 +263,36 @@ class GoogleCalendarAdapter(CalendarAdapter):
             if "404" in str(exc) or "Not Found" in str(exc):
                 return True
             logger.warning(f"Google delete_event({event_id}) failed: {exc}")
+            return False
+
+    async def append_to_description(self, event_id, extra_text):
+        service = await self._get_service()
+        extra = (extra_text or "").strip()
+        if not extra:
+            return True
+        try:
+            ev = service.events().get(
+                calendarId=self.calendar_id, eventId=event_id,
+            ).execute()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                f"Google append_to_description get({event_id}) failed: {exc}"
+            )
+            return False
+        desc = ev.get("description") or ""
+        if extra in desc:
+            return True  # schon dran -> idempotent
+        new_desc = f"{desc}\n{extra}" if desc else extra
+        try:
+            service.events().patch(
+                calendarId=self.calendar_id, eventId=event_id,
+                body={"description": new_desc},
+            ).execute()
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                f"Google append_to_description patch({event_id}) failed: {exc}"
+            )
             return False
 
     async def find_events(
@@ -442,6 +487,13 @@ class MicrosoftCalendarAdapter(CalendarAdapter):
         from core.integrations.microsoft_calendar import delete_event
         return await delete_event(
             self.tenant_id, event_id, employee_id=self.employee_id,
+        )
+
+    async def append_to_description(self, event_id, extra_text):
+        from core.integrations.microsoft_calendar import append_to_event_body
+        return await append_to_event_body(
+            self.tenant_id, event_id, extra_text,
+            employee_id=self.employee_id,
         )
 
     async def find_events(

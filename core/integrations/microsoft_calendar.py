@@ -325,6 +325,48 @@ async def create_event(
     }
 
 
+async def append_to_event_body(
+    tenant_id: UUID, event_id: str, extra_text: str,
+    *, employee_id: UUID | None = None,
+) -> bool:
+    """Haengt eine Zeile an die (HTML-)Beschreibung eines bestehenden
+    Events. Idempotent: steht extra_text schon drin, passiert nichts.
+
+    Genutzt um nach dem Formular-Eingang den Drive-Link nachzutragen
+    (im neuen Flow wird der Termin VOR dem Formular gebucht).
+    """
+    extra = (extra_text or "").strip()
+    if not event_id or not extra:
+        return not extra  # nichts anzuhaengen = nichts zu tun
+    token = await get_microsoft_token(tenant_id, employee_id=employee_id)
+    headers = {"Authorization": f"Bearer {token}"}
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS) as client:
+        try:
+            gr = await client.get(
+                f"{GRAPH_API_BASE}/me/events/{event_id}",
+                headers=headers, params={"$select": "body"},
+            )
+            gr.raise_for_status()
+            cur = ((gr.json().get("body") or {}).get("content")) or ""
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"append_to_event_body get({event_id}) failed: {exc}")
+            return False
+        if extra in cur:
+            return True  # schon dran -> idempotent
+        new_content = f"{cur}<br>{extra}" if cur else extra
+        try:
+            pr = await client.patch(
+                f"{GRAPH_API_BASE}/me/events/{event_id}",
+                headers=headers,
+                json={"body": {"contentType": "HTML", "content": new_content}},
+            )
+            pr.raise_for_status()
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"append_to_event_body patch({event_id}) failed: {exc}")
+            return False
+
+
 # ---------------------------------------------------------------------
 # EVENT-FIND (kunde_telefon / kunde_email — Storno-Suche)
 # ---------------------------------------------------------------------

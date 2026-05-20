@@ -128,6 +128,8 @@ class Plugin(BasePlugin):
             return await self._cancel_appointment(payload)
         elif endpoint == "find_events":
             return await self._find_events(payload)
+        elif endpoint == "attach_drive_url":
+            return await self._attach_drive_url(payload)
         return {"error": f"Unbekannter Endpunkt: {endpoint}"}
 
     # ---- Endpoints ----
@@ -356,6 +358,36 @@ class Plugin(BasePlugin):
                 "erfolg": False,
                 "nachricht": f"Fehler beim Eintragen: {str(e)}",
             }
+
+    async def _attach_drive_url(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Traegt nachtraeglich den Drive-Link in ein bestehendes Event ein.
+
+        Im neuen Mail-Flow wird der Termin VOR dem Formular gebucht — der
+        Drive-Ordner mit den Formular-Infos (Fotos, Masse, Wuensche) ent-
+        steht erst beim Formular-Eingang. Dieser Endpoint haengt die
+        Drive-Zeile dann an die Event-Beschreibung an (idempotent). Gleiches
+        Format wie _book_appointment, damit kein Doppel-Eintrag entsteht.
+        """
+        event_id = (payload.get("event_id") or "").strip()
+        drive_url = (payload.get("drive_url") or "").strip()
+        if not event_id or not drive_url:
+            return {
+                "erfolg": False,
+                "nachricht": "event_id oder drive_url fehlt",
+            }
+        employee_id = payload.get("employee_id")
+        try:
+            adapter = await get_calendar_adapter(
+                self.tenant_id, employee_id=employee_id,
+                fallback_calendar_id=self.config["calendar_id"],
+            )
+            ok = await adapter.append_to_description(
+                event_id, f"Unterlagen (Drive): {drive_url}",
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"attach_drive_url fehlgeschlagen: {e}")
+            return {"erfolg": False, "nachricht": str(e)}
+        return {"erfolg": bool(ok)}
 
     async def _find_free_slots(self, payload: dict[str, Any]) -> dict[str, Any]:
         """
