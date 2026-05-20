@@ -684,17 +684,17 @@ def _build_storno_html(
         # Sonderfall: wir haben nichts gefunden zum Stornieren.
         # Hoeflich rueckfragen.
         body = (
-            f"<p>danke fuer die Nachricht. Wir koennen aktuell keinen "
+            f"<p>danke für die Nachricht. Wir können aktuell keinen "
             f"bestehenden Termin auf Ihre Adresse finden. Falls Sie einen "
             f"konkreten Termin meinen, antworten Sie bitte kurz mit Datum + "
-            f"Uhrzeit — dann pruefen wir das nochmal manuell.</p>"
+            f"Uhrzeit — dann prüfen wir das nochmal manuell.</p>"
         )
     else:
         plural = "Termin wurde" if cancelled_count == 1 else f"{cancelled_count} Termine wurden"
         body = (
-            f"<p>danke fuer Ihre Nachricht. Ihr {plural} storniert. "
-            f"Sie erhalten dafuer auch keine Rechnung.</p>"
-            f"<p>Falls Sie einen neuen Termin moechten, antworten Sie "
+            f"<p>danke für Ihre Nachricht. Ihr {plural} storniert. "
+            f"Sie erhalten dafür auch keine Rechnung.</p>"
+            f"<p>Falls Sie einen neuen Termin möchten, antworten Sie "
             f"einfach auf diese Mail oder rufen Sie uns an.</p>"
         )
 
@@ -704,7 +704,7 @@ def _build_storno_html(
         f"font-size:14px;color:#222\">"
         f"<p>{anrede}</p>"
         f"{body}"
-        f"<p>Viele Gruesse,<br>{_h(company_name)}</p>"
+        f"<p>Viele Grüße,<br>{_h(company_name)}</p>"
         f"</body></html>"
     )
 
@@ -721,7 +721,7 @@ def _build_verschiebung_html(
 
     if not found_termine:
         body = (
-            f"<p>danke fuer Ihre Nachricht. Wir koennen aktuell keinen "
+            f"<p>danke für Ihre Nachricht. Wir können aktuell keinen "
             f"bestehenden Termin auf Ihre Adresse finden. Bitte antworten "
             f"Sie kurz mit Ihrem aktuellen Termin (Datum + Uhrzeit) und "
             f"Ihrem Wunsch-Ersatztermin, dann setzen wir das um.</p>"
@@ -737,7 +737,7 @@ def _build_verschiebung_html(
             if datum or uhrzeit else "in unserem Kalender"
         )
         body = (
-            f"<p>danke fuer Ihre Nachricht. Wir haben Ihren Termin "
+            f"<p>danke für Ihre Nachricht. Wir haben Ihren Termin "
             f"{termin_label} gefunden.</p>"
             f"<p>Bitte antworten Sie kurz mit Ihrem Wunsch-Ersatztermin "
             f"(z.B. \"Donnerstag 14:00\") oder rufen Sie uns an — dann "
@@ -750,7 +750,7 @@ def _build_verschiebung_html(
         f"font-size:14px;color:#222\">"
         f"<p>{anrede}</p>"
         f"{body}"
-        f"<p>Viele Gruesse,<br>{_h(company_name)}</p>"
+        f"<p>Viele Grüße,<br>{_h(company_name)}</p>"
         f"</body></html>"
     )
 
@@ -861,8 +861,8 @@ async def send_formular_dank_mail(
             "vielen Dank, deine Angaben sind bei mir angekommen. "
             "Wenn du noch Fragen hast, antworte einfach auf diese Mail. "
             "Oder nenn mir direkt deinen Wunschtermin (z.B. \"Donnerstag "
-            "14 Uhr\" oder \"naechste Woche vormittags\") — dann schaue ich "
-            "nach einem passenden Termin fuer dich."
+            "14 Uhr\" oder \"nächste Woche vormittags\") — dann schaue ich "
+            "nach einem passenden Termin für dich."
         )
     body_html = build_kunde_reply_html(
         kunde_anrede_name=kunde_anrede,
@@ -926,18 +926,18 @@ def _build_buche_confirmation_html(
         f'<html><body style="font-family:Arial,Helvetica,sans-serif;'
         f'font-size:14px;color:#222">'
         f"<p>{anrede}</p>"
-        f"<p>vielen Dank fuer Ihren Anruf. Wir haben Ihren Termin "
+        f"<p>vielen Dank für Ihren Anruf. Wir haben Ihren Termin "
         f"eingetragen:</p>"
         f"<p>"
         f"<b>Termin:</b> {_h(datum_label)} um {_h(uhrzeit)} Uhr<br>"
         f"<b>Anliegen:</b> {_h(anliegen)}"
         f"</p>"
         f"{durch_wen}"
-        f"<p>Falls Sie den Termin verschieben oder absagen moechten, "
-        f"antworten Sie einfach auf diese Mail — wir kuemmern uns "
+        f"<p>Falls Sie den Termin verschieben oder absagen möchten, "
+        f"antworten Sie einfach auf diese Mail — wir kümmern uns "
         f"drum.</p>"
         f"{phone_line}"
-        f"<p>Viele Gruesse,<br>{_h(company_name)}</p>"
+        f"<p>Viele Grüße,<br>{_h(company_name)}</p>"
         f"</body></html>"
     )
 
@@ -973,7 +973,7 @@ async def send_buche_confirmation(
         anliegen=anliegen,
         contact_phone=contact_phone,
     )
-    subject = f"Ihre Terminbestaetigung — {datum_label} um {uhrzeit} Uhr"
+    subject = f"Ihre Terminbestätigung — {datum_label} um {uhrzeit} Uhr"
     return await send_tracked_mail(
         tenant_id=tenant_id,
         to_email=to_email,

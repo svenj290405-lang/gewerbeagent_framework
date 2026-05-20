@@ -1044,6 +1044,7 @@ Schreib eine kurze, freundliche, persoenliche Antwort. Beachte:
 5. Unterzeichne mit "{signer}"
 6. KEIN Marketing-Geschwafel, KEINE Floskeln wie "Vielen Dank fuer ihre Anfrage"
 7. Sei direkt und ehrlich
+8. ECHTE UMLAUTE: Schreibe mit echten Umlauten (ä, ö, ü, Ä, Ö, Ü) und ß — NIEMALS Umschreibungen wie ae/oe/ue/ss.
 
 Antworte NUR mit dem Mail-Text (keine Begruessung wie "Hier die Antwort:", kein Markdown)."""
 
@@ -1113,10 +1114,10 @@ async def generate_anfrage_reply(
         # Fallback-Antwort — keine URL im Text, der Button kommt aus dem Template
         return (
             f"Hallo {sender_name or 'zusammen'},\n\n"
-            f"danke fuer deine Nachricht. Damit ich dir gut weiterhelfen kann, "
-            f"fuell bitte kurz unser Anfrage-Formular ueber den Button unten aus. "
+            f"danke für deine Nachricht. Damit ich dir gut weiterhelfen kann, "
+            f"füll bitte kurz unser Anfrage-Formular über den Button unten aus. "
             f"Danach melde ich mich schnell mit einem konkreten Angebot.\n\n"
-            f"Viele Gruesse\n"
+            f"Viele Grüße\n"
             f"{tenant_owner_first_name} (via Q)"
         )
 
@@ -1299,6 +1300,7 @@ ENTSCHEIDUNGS-REIHENFOLGE fuer next_action (PRUEFE IN DIESER REIHENFOLGE und nim
 
 WICHTIGE LEITPLANKEN:
 
+- ECHTE UMLAUTE: Schreibe den reply_text in korrektem Deutsch mit echten Umlauten (ä, ö, ü, Ä, Ö, Ü) und ß — NIEMALS Umschreibungen wie ae/oe/ue/ss. Also "für", "möchte", "Grüße", nicht "fuer", "moechte", "Gruesse".
 - IMMER ZUERST DIE FRAGE BEANTWORTEN: Wenn der Kunde eine inhaltliche Frage stellt (Preise, Material, Ablauf, Lieferzeit, Oeffnungszeiten — alles was in der Wissensbasis steht), beantworte sie im reply_text konkret, BEVOR du auf Termin oder Formular verweist. Die Frage des Kunden darf nie unbeantwortet bleiben.
 - TERMINBUCHUNG OHNE VOLLEN NAMEN + TELEFONNUMMER IST VERBOTEN. Fehlt eines: ASK_MORE und freundlich danach fragen, statt zu buchen.
 - BESTEHT SCHON EIN TERMIN: nie von dir aus einen neuen vorschlagen — auf den bestehenden verweisen.
@@ -1508,8 +1510,8 @@ async def handle_kunde_mail_dialog(
     def _fallback(reason: str) -> dict:
         return {
             "reply_text": (
-                "danke fuer deine Nachricht. Damit wir gut weiterhelfen "
-                "koennen, fuell bitte kurz unser Anfrage-Formular ueber "
+                "danke für deine Nachricht. Damit wir gut weiterhelfen "
+                "können, füll bitte kurz unser Anfrage-Formular über "
                 "den Button unten aus. Wir melden uns danach schnell."
             ),
             "next_action": "SEND_FORMULAR",

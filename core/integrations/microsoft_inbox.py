@@ -1657,7 +1657,7 @@ async def process_relevant_kunde_mail(
         reply_text = (
             "du hast bei uns bereits einen Termin — einen zweiten lege "
             "ich dir nicht parallel an. Wenn du den bestehenden Termin "
-            "verschieben oder absagen moechtest, sag einfach kurz Bescheid."
+            "verschieben oder absagen möchtest, sag einfach kurz Bescheid."
         )
     elif next_action in _termin_actions and not (_has_full_name and _has_telefon):
         fehlend = []
@@ -1673,7 +1673,7 @@ async def process_relevant_kunde_mail(
         next_action = "ASK_MORE"
         result["next_action"] = next_action
         reply_text = (
-            "sehr gerne mache ich einen Termin mit dir aus. Dafuer "
+            "sehr gerne mache ich einen Termin mit dir aus. Dafür "
             "brauche ich nur noch " + " und ".join(fehlend) + " — dann "
             "suche ich dir direkt einen passenden Termin heraus."
         )
@@ -1686,14 +1686,14 @@ async def process_relevant_kunde_mail(
         result["next_action"] = next_action
         if _form_status == "open":
             reply_text = (
-                "danke fuer deine Nachricht. Du hast vorhin schon einen "
+                "danke für deine Nachricht. Du hast vorhin schon einen "
                 "Link zu unserem kurzen Anfrage-Formular bekommen, der ist "
-                "noch offen — fuell den gern kurz aus, dann habe ich alles "
+                "noch offen — füll den gern kurz aus, dann habe ich alles "
                 "was ich brauche."
             )
         else:
             reply_text = (
-                "danke fuer deine Nachricht — deine Angaben aus dem "
+                "danke für deine Nachricht — deine Angaben aus dem "
                 "Formular habe ich bereits. Sag mir gern, wie ich dir "
                 "weiterhelfen kann."
             )
@@ -1798,9 +1798,9 @@ async def process_relevant_kunde_mail(
             next_action = "ASK_MORE"
             result["next_action"] = next_action
             reply_text = (
-                "leider habe ich in den naechsten Tagen keinen freien "
-                "Termin gefunden. Welcher Zeitraum waere fuer dich "
-                "alternativ moeglich?"
+                "leider habe ich in den nächsten Tagen keinen freien "
+                "Termin gefunden. Welcher Zeitraum wäre für dich "
+                "alternativ möglich?"
             )
         else:
             slot_proposals_for_template = normalized
@@ -1846,7 +1846,7 @@ async def process_relevant_kunde_mail(
             next_action = "PROPOSE_SLOTS"
             result["next_action"] = next_action
             reply_text = (
-                "ich konnte deinen gewuenschten Slot nicht eindeutig "
+                "ich konnte deinen gewünschten Slot nicht eindeutig "
                 "zuordnen. Magst du Datum und Uhrzeit nochmal nennen?"
             )
         else:
@@ -1939,7 +1939,7 @@ async def process_relevant_kunde_mail(
                     reply_text = (
                         f"der {slot['datum']} um {slot['uhrzeit']} Uhr "
                         f"ist leider schon belegt. Folgende Termine "
-                        f"haette ich noch frei:"
+                        f"hätte ich noch frei:"
                     )
                 else:
                     # Auch keine Alternativen frei — letzte
@@ -1950,7 +1950,7 @@ async def process_relevant_kunde_mail(
                         f"der {slot['datum']} um {slot['uhrzeit']} Uhr "
                         f"ist leider belegt, und auch drumherum finde "
                         f"ich gerade nichts Freies. Welche Woche oder "
-                        f"welcher Tag waere fuer dich sonst moeglich?"
+                        f"welcher Tag wäre für dich sonst möglich?"
                     )
 
     elif next_action == "CANCEL_TERMIN":
