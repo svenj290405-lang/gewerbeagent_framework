@@ -708,6 +708,8 @@ class Plugin(BasePlugin):
                 )
                 _fid, booked_drive_url = await get_or_create_kunde_folder(
                     tenant.id, name, employee_id=employee_id,
+                    kunde_email=kunde_email or None,
+                    kunde_telefon=telefon or None,
                 )
             except Exception as e:
                 logger.warning(

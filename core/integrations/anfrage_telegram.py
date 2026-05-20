@@ -122,6 +122,8 @@ async def _save_submission_to_drive(
             filename=txt_filename,
             mime_type="text/plain; charset=utf-8",
             employee_id=employee_id,
+            kunde_email=token_obj.kunde_email,
+            kunde_telefon=token_obj.kunde_telefon,
         )
         folder_url = result.get("kunde_folder_url")
         logger.info(
@@ -148,6 +150,8 @@ async def _save_submission_to_drive(
                 filename=f"{prefix}__{f['filename']}"[:200],
                 mime_type=f["content_type"],
                 employee_id=employee_id,
+                kunde_email=token_obj.kunde_email,
+                kunde_telefon=token_obj.kunde_telefon,
             )
         except Exception as e:
             logger.warning(

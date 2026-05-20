@@ -182,7 +182,27 @@ async def get_drive_service(
         )
 
         if not creds.valid and creds.refresh_token and not already_fresh:
-            creds.refresh(GRequest())
+            try:
+                creds.refresh(GRequest())
+            except Exception as exc:
+                # invalid_grant / Refresh-Token revoked? Tenant per Telegram
+                # alarmieren damit er re-authorizen kann. Pipeline wirft
+                # weiterhin den Fehler nach oben — der Push ist nur Sichtbar-
+                # keits-Helfer, nicht Error-Suppression.
+                from core.security.oauth_alert import (
+                    is_oauth_invalid_error, notify_oauth_token_invalid,
+                )
+                if is_oauth_invalid_error(exc):
+                    try:
+                        await notify_oauth_token_invalid(
+                            tenant_id, "google", reason=str(exc)[:200],
+                        )
+                    except Exception as alert_exc:  # noqa: BLE001
+                        logger.warning(
+                            f"oauth-alert (google) failed for tenant={tenant_id}: "
+                            f"{alert_exc}"
+                        )
+                raise
             oauth_token.access_token = creds.token
             if creds.expiry:
                 oauth_token.access_token_expires_at = creds.expiry.replace(
@@ -301,22 +321,58 @@ async def _ensure_root_folder(
     return found_id
 
 
+def _kunde_identity_key(
+    kunde_name: str,
+    kunde_email: str | None = None,
+    kunde_telefon: str | None = None,
+) -> str:
+    """Stabile Kunden-Identitaet fuer den Ordner-Key:
+    E-Mail > Telefon (normalisiert) > Namens-Slug (Fallback).
+
+    So teilen sich zwei gleichnamige Kunden NICHT denselben Ordner, und
+    dieselbe Person (gleiche Mail/Telefon) trifft ihren Ordner auch bei
+    leicht abweichendem Namen wieder.
+    """
+    email = (kunde_email or "").strip().lower()
+    if email:
+        return f"email:{email}"[:120]
+    if kunde_telefon:
+        from core.utils.phone import normalize_phone
+        tel = normalize_phone(kunde_telefon)
+        if tel:
+            return f"tel:{tel}"[:120]
+    return _slugify_kunde(kunde_name)[:120]
+
+
 async def get_or_create_kunde_folder(
     tenant_id: uuid.UUID,
     kunde_name: str,
     employee_id: uuid.UUID | None = None,
+    *,
+    kunde_email: str | None = None,
+    kunde_telefon: str | None = None,
 ) -> tuple[str, str]:
     """Liefert (folder_id, folder_url) fuer den Kunden-Drive-Ordner.
 
-    1. DB-Lookup tenant_kunde_drive
-    2. Wenn vorhanden: returnt cache + Validierung dass Folder noch
-       existiert (Drive-Trash-Recovery)
-    3. Wenn nicht: erstellt Drive-Folder unter Tenant-Root, persistiert.
+    Identitaet ueber E-Mail/Telefon (siehe _kunde_identity_key) statt nur
+    Name — zwei gleichnamige Kunden bekommen getrennte Ordner, dieselbe
+    Person denselben. Ordner-Anzeigename = voller Kundenname.
 
-    Race-Schutz: SELECT FOR UPDATE auf der DB-Zeile damit zwei parallele
-    Uploads nicht zwei Folder erstellen.
+    1. DB-Lookup nach Identitaets-Key
+    2. Adoption: kein Identitaets-Treffer, aber Legacy-Ordner unter dem
+       Namens-Slug -> uebernehmen + auf Identitaets-Key umschluesseln
+    3. Treffer: cache + Validierung (Drive-Trash-Recovery)
+    4. Sonst: Drive-Folder unter Tenant-Root erstellen, persistieren
+
+    Race-Schutz: SELECT FOR UPDATE auf der DB-Zeile.
     """
-    kunde_key = _slugify_kunde(kunde_name)
+    email_norm = (kunde_email or "").strip().lower() or None
+    tel_norm = None
+    if kunde_telefon:
+        from core.utils.phone import normalize_phone
+        tel_norm = normalize_phone(kunde_telefon) or None
+    kunde_key = _kunde_identity_key(kunde_name, email_norm, tel_norm)
+    name_slug = _slugify_kunde(kunde_name)
 
     # Tenant fuer Root-Folder-Name laden
     async with AsyncSessionLocal() as s:
@@ -334,6 +390,29 @@ async def get_or_create_kunde_folder(
             .where(TenantKundeDrive.kunde_key == kunde_key)
             .with_for_update()
         )).scalar_one_or_none()
+
+        # Adoption: Legacy-Ordner (unter Namens-Slug) auf den Identitaets-
+        # Key umschluesseln — einmalige Migration beim ersten Mail/Tel-
+        # Zugriff, damit Bestandsordner nicht verwaisen.
+        if existing is None and kunde_key != name_slug:
+            legacy = (await s.execute(
+                select(TenantKundeDrive)
+                .where(TenantKundeDrive.tenant_id == tenant_id)
+                .where(TenantKundeDrive.kunde_key == name_slug)
+                .with_for_update()
+            )).scalar_one_or_none()
+            if legacy is not None:
+                legacy.kunde_key = kunde_key
+                legacy.kunde_email = email_norm
+                legacy.kunde_telefon = tel_norm
+                if kunde_name:
+                    legacy.kunde_name = kunde_name
+                await s.commit()
+                logger.info(
+                    f"Kundenordner adoptiert: {name_slug!r} -> {kunde_key!r} "
+                    f"(tenant={tenant_id})"
+                )
+                existing = legacy
 
         if existing:
             # Sanity-Check: Folder existiert noch in Drive?
@@ -370,7 +449,7 @@ async def get_or_create_kunde_folder(
     service = await get_drive_service(tenant_id, employee_id)
     root_id = await _ensure_root_folder(service, tenant)
 
-    sub_name = f"{kunde_name} ({kunde_key})"[:200]
+    sub_name = (kunde_name or "Kunde")[:200]  # voller Name als Anzeigename
 
     def _create_subfolder():
         meta = {
@@ -394,6 +473,8 @@ async def get_or_create_kunde_folder(
                 tenant_id=tenant_id,
                 kunde_key=kunde_key,
                 kunde_name=kunde_name,
+                kunde_email=email_norm,
+                kunde_telefon=tel_norm,
                 drive_folder_id=folder_id,
                 drive_folder_url=folder_url,
                 upload_count=0,
@@ -425,6 +506,9 @@ async def upload_file_to_kunde_folder(
     filename: str,
     mime_type: str,
     employee_id: uuid.UUID | None = None,
+    *,
+    kunde_email: str | None = None,
+    kunde_telefon: str | None = None,
 ) -> dict:
     """Uploadet eine Datei in den Kunden-Ordner.
 
@@ -447,6 +531,7 @@ async def upload_file_to_kunde_folder(
     try:
         folder_id, folder_url = await get_or_create_kunde_folder(
             tenant_id, kunde_name, employee_id=employee_id,
+            kunde_email=kunde_email, kunde_telefon=kunde_telefon,
         )
 
         service = await get_drive_service(tenant_id, employee_id)

@@ -5,10 +5,14 @@ Drive des Tenants erstellt. Diese Tabelle persistiert den Folder-Lookup
 damit Folge-Uploads in den gleichen Ordner gehen und /briefing den
 Link kennt ohne Drive-API anzufragen.
 
-Kunden-Identifikation: `kunde_key` = slugify(kunde_name).
-Zwei Kunden mit gleichem normalisierten Namen landen im gleichen
-Ordner — das ist by design (Tenant kann mit Suffix wie '(Trier)'
-disambiguieren).
+Kunden-Identifikation: `kunde_key` = stabile Identitaet —
+  "email:<mail>" > "tel:<normalisierte-nummer>" > slugify(name) (Fallback).
+So teilen sich NICHT mehr zwei Kunden mit gleichem Namen einen Ordner
+(unterschiedliche Mail/Telefon -> unterschiedliche Ordner), und dieselbe
+Person (gleiche Mail/Telefon) landet zuverlaessig im selben Ordner —
+auch wenn der Name minimal abweicht. Der Ordner-ANZEIGENAME ist der
+volle Kundenname. `kunde_email`/`kunde_telefon` werden zur Referenz
+mitgespeichert.
 
 Soft-Delete: nicht noetig. Wenn der Tenant einen Drive-Ordner manuell
 loescht, gibt die naechste Drive-API einen 404 zurueck — der Helper
@@ -45,6 +49,10 @@ class TenantKundeDrive(Base):
     # Identifikation
     kunde_key: Mapped[str] = mapped_column(String(120), nullable=False)
     kunde_name: Mapped[str] = mapped_column(String(200), nullable=False)
+    # Identitaets-Referenz (woraus der kunde_key gebildet wurde) —
+    # zur Nachvollziehbarkeit + um bei Bedarf umzuschluesseln.
+    kunde_email: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    kunde_telefon: Mapped[str | None] = mapped_column(String(40), nullable=True)
 
     # Drive-Folder
     drive_folder_id: Mapped[str] = mapped_column(String(100), nullable=False)

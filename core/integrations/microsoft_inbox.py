@@ -1893,6 +1893,8 @@ async def process_relevant_kunde_mail(
                     _fid, kunde_drive_url = await get_or_create_kunde_folder(
                         tenant_id, kunde_name_for_event,
                         employee_id=employee_id,
+                        kunde_email=sender_email,
+                        kunde_telefon=kunde_telefon_raw,
                     )
                 except Exception as e:
                     logger.warning(
