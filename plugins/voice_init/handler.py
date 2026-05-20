@@ -697,6 +697,37 @@ class Plugin(BasePlugin):
             f"{email_log}"
         )
 
+        # Teil E.0: Kunden-Drive-Ordner anlegen + Link klickbar ins Event
+        # eintragen (failsafe — ohne Drive laeuft die Buchung trotzdem).
+        # Gleicher Mechanismus wie im Mail-Flow.
+        booked_drive_url = None
+        if isinstance(result, dict) and result.get("erfolg"):
+            try:
+                from core.integrations.google_drive import (
+                    get_or_create_kunde_folder,
+                )
+                _fid, booked_drive_url = await get_or_create_kunde_folder(
+                    tenant.id, name, employee_id=employee_id,
+                )
+            except Exception as e:
+                logger.warning(
+                    f"buche_termin: Drive-Kundenordner anlegen "
+                    f"fehlgeschlagen (non-fatal): {e}"
+                )
+                booked_drive_url = None
+            if booked_drive_url and result.get("event_id"):
+                try:
+                    await kalender.on_webhook("attach_drive_url", {
+                        "event_id": result.get("event_id"),
+                        "drive_url": booked_drive_url,
+                        "employee_id": employee_id,
+                    })
+                except Exception as e:
+                    logger.warning(
+                        f"buche_termin: attach_drive_url fehlgeschlagen "
+                        f"(non-fatal): {e}"
+                    )
+
         # Teil E.1: Bestaetigungs-Mail an Kunde (best-effort, blockiert
         # die Buchungs-Response nicht). Nur wenn Buchung erfolgreich
         # UND wir eine Mail-Adresse haben (telefonisch-only-Kunden
@@ -715,6 +746,7 @@ class Plugin(BasePlugin):
                 anliegen=anliegen,
                 employee_id=employee_id,
                 event_id=result.get("event_id"),
+                drive_folder_url=booked_drive_url,
             )
 
         return result
@@ -730,6 +762,7 @@ class Plugin(BasePlugin):
         anliegen: str,
         employee_id: UUID | None,
         event_id: str | None,
+        drive_folder_url: str | None = None,
     ) -> None:
         """Versendet Voice-Buchungs-Bestaetigung + persistiert
         EmailConversation fuer Reply-Threading (E.3).
@@ -792,6 +825,19 @@ class Plugin(BasePlugin):
                 gcal_event_id=event_id, termin_datum=termin_datum,
                 state=STATE_BOOKED,
             )
+            # Kundenordner-URL an der Konv vermerken (Formular-Eingang
+            # findet den Ordner darueber wieder).
+            if drive_folder_url:
+                from core.integrations.mail_pipeline import (
+                    set_conversation_drive_url,
+                )
+                try:
+                    await set_conversation_drive_url(conv.id, drive_folder_url)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(
+                        f"buche-confirmation: set_conversation_drive_url "
+                        f"fehler (non-fatal): {e}"
+                    )
             reply_subject = (
                 f"Ihre Terminbestaetigung — {datum} um {uhrzeit} Uhr"
             )

@@ -1719,6 +1719,7 @@ async def process_relevant_kunde_mail(
     termin_post_state: str | None = None
     booked_event_id: str | None = None
     booked_termin_datum = None
+    booked_drive_url: str | None = None
     # Nach erfolgreicher Buchung schicken wir das Anfrage-Formular gleich
     # mit (neuer Flow: erst Termin, dann Formular). Wird in der Buchungs-
     # Erfolg-Verzweigung gesetzt.
@@ -1875,13 +1876,30 @@ async def process_relevant_kunde_mail(
                     f"{slot['datum']}-{slot['uhrzeit']}"
                 ),
             }
-            # Drive-Ordner-Link (Anfrage-Formular-Daten) in die Event-
-            # Beschreibung — der Handwerker springt so direkt zu Fotos
-            # + Massen + Wuenschen. Kommt aus der Konversation, dort vom
-            # Formular-Eingang gesetzt.
-            _drive_url = getattr(existing_conv, "drive_folder_url", None)
-            if _drive_url:
-                book_payload["drive_url"] = _drive_url
+            # Kunden-Drive-Ordner bestimmen: entweder schon an der Konv
+            # vermerkt (Formular bereits eingegangen) ODER jetzt anlegen
+            # (neuer Flow: Termin VOR dem Formular -> Ordner existiert noch
+            # nicht). Failsafe: ist Drive nicht verbunden, laeuft die
+            # Buchung trotzdem (nur ohne Link). Der Link wird NACH dem
+            # Buchen via attach_drive_url eingetragen (klickbar + vor dem
+            # Footer, auf Google + Outlook einheitlich) — NICHT ins
+            # book_payload, sonst waere er in Outlook nur nackter Text.
+            kunde_drive_url = getattr(existing_conv, "drive_folder_url", None)
+            if not kunde_drive_url:
+                try:
+                    from core.integrations.google_drive import (
+                        get_or_create_kunde_folder,
+                    )
+                    _fid, kunde_drive_url = await get_or_create_kunde_folder(
+                        tenant_id, kunde_name_for_event,
+                        employee_id=employee_id,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"{next_action}: Drive-Kundenordner anlegen "
+                        f"fehlgeschlagen (non-fatal, Buchung laeuft weiter): {e}"
+                    )
+                    kunde_drive_url = None
             # dauer_minuten nur setzen wenn vorhanden — sonst greift im
             # kalender-Plugin der Tenant-Default (`termin_dauer_minuten`).
             # dict.get() liefert None nicht den Default, deshalb explizit.
@@ -1920,6 +1938,22 @@ async def process_relevant_kunde_mail(
                 termin_post_state = STATE_BOOKED
                 # Slot-Vorschlaege loeschen — Buchung ist durch.
                 slots_to_persist = []
+                # Kundenordner-Link klickbar ins Event eintragen (vor dem
+                # Footer). Best-effort. Wird unten auch an der Konv
+                # persistiert, damit Folge-Buchungen/Formular ihn finden.
+                booked_drive_url = kunde_drive_url
+                if kunde_drive_url and booked_event_id:
+                    try:
+                        await kalender.on_webhook("attach_drive_url", {
+                            "event_id": booked_event_id,
+                            "drive_url": kunde_drive_url,
+                            "employee_id": book_payload.get("employee_id"),
+                        })
+                    except Exception as e:
+                        logger.warning(
+                            f"{next_action}: attach_drive_url fehlgeschlagen "
+                            f"(non-fatal): {e}"
+                        )
                 # Neuer Flow: Termin steht -> Anfrage-Formular gleich
                 # mitschicken, damit der Handwerker fuer den Termin alle
                 # Detail-Infos hat. Nur wenn noch keins offen/eingegangen.
@@ -2115,6 +2149,17 @@ async def process_relevant_kunde_mail(
                             if booked_termin_datum:
                                 _c.termin_datum = booked_termin_datum
                             await _s.commit()
+            # Kundenordner-URL an der Konv vermerken (bei der Buchung
+            # gerade angelegt) — Folge-Mails + Formular-Eingang finden den
+            # Ordner darueber wieder.
+            if booked_drive_url:
+                from core.integrations.mail_pipeline import (
+                    set_conversation_drive_url,
+                )
+                try:
+                    await set_conversation_drive_url(conv_id, booked_drive_url)
+                except Exception as e:
+                    logger.warning(f"set_conversation_drive_url fehler: {e}")
             # Slot-Vorschlaege persistieren (None = nicht angefasst,
             # [] = explizit leeren, list = neue Vorschlaege speichern).
             if slots_to_persist is not None:

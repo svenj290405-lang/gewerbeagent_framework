@@ -526,8 +526,9 @@ async def test_book_slot_passes_drive_url_to_calendar(
     pipeline_mocks, dialog_capture,
 ):
     """Wenn die Konversation eine drive_folder_url hat (Formular wurde
-    ausgefuellt + ins Drive archiviert), reicht die Buchung den Link
-    ans kalender-Plugin durch -> landet in der Event-Beschreibung."""
+    ausgefuellt + ins Drive archiviert), traegt die Pipeline den Link
+    NACH der Buchung klickbar ins Event ein (attach_drive_url) — nicht
+    mehr ueber book_payload (sonst in Outlook nur nackter Text)."""
     tenant_id = pipeline_mocks["tenant"].id
     existing = _make_conv(
         tenant_id=tenant_id,
@@ -561,13 +562,21 @@ async def test_book_slot_passes_drive_url_to_calendar(
         existing_conv=existing,
     )
 
+    # Drive-Link wird NACH der Buchung via attach_drive_url eingetragen
+    attach_call = next(
+        c for c in pipeline_mocks["kalender"].calls
+        if c[0] == "attach_drive_url"
+    )
+    assert attach_call[1].get("drive_url") == (
+        "https://drive.google.com/drive/folders/abc123"
+    )
+    assert attach_call[1].get("event_id") == "ev-drive-1"
+    # ... und NICHT mehr ins book_payload gepackt
     book_call = next(
         c for c in pipeline_mocks["kalender"].calls
         if c[0] == "book_appointment"
     )
-    assert book_call[1].get("drive_url") == (
-        "https://drive.google.com/drive/folders/abc123"
-    )
+    assert "drive_url" not in book_call[1]
 
 
 @pytest.mark.asyncio
