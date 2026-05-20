@@ -358,13 +358,17 @@ async def poll_microsoft_inbox(
         # body_preview separat (statt in den Subject-String einzubetten)
         # damit classify_mail_subject das Keyword-Backup fuer Intent
         # darauf anwenden kann.
+        # Reply-Trimming auch hier: zitiertes Original raus, nur der neue
+        # Teil geht in die Klassifikation/Intent-Erkennung.
+        from core.utils.mail_reply import trim_quoted_reply as _trim_quote
+        body_preview_for_ai = _trim_quote(body_preview)
         try:
             cls_result = await classify_mail_subject(
                 subject=subject,
                 sender=sender_email,
                 tenant_company=tenant_company,
                 tenant_branche=tenant_branche,
-                body_preview=body_preview,
+                body_preview=body_preview_for_ai,
             )
             classification = cls_result.get("classification") or "UNSICHER"
             confidence = cls_result.get("confidence") or "low"
@@ -1488,12 +1492,26 @@ async def process_relevant_kunde_mail(
     sender_name = from_obj.get("name", "") or sender_email
     body_obj = full.get("body") or {}
     body_text = body_obj.get("content", "") or full.get("bodyPreview", "") or ""
-    # Wenn HTML, simpel strippen
+    # HTML -> Text: Block-Tags zu Zeilenumbruechen (damit Reply-Trimming
+    # die Quote-Marker zeilenweise findet), Rest strippen, Entities
+    # aufloesen, Spaces (aber NICHT Newlines) kollabieren.
     if body_obj.get("contentType", "").lower() == "html":
+        import html as _htmlmod
         import re as _re
+        body_text = _re.sub(r"(?i)<br\s*/?>", "\n", body_text)
+        body_text = _re.sub(r"(?i)</(p|div|li|tr|h[1-6])>", "\n", body_text)
         body_text = _re.sub(r"<[^>]+>", " ", body_text)
-        body_text = _re.sub(r"\s+", " ", body_text).strip()
+        body_text = _htmlmod.unescape(body_text)
+        body_text = _re.sub(r"[ \t]+", " ", body_text)
+        body_text = "\n".join(ln.strip() for ln in body_text.split("\n"))
+        body_text = _re.sub(r"\n{3,}", "\n\n", body_text).strip()
     internet_message_id = full.get("internetMessageId", "")
+
+    # Reply-Trimming: nur den NEUEN Teil oberhalb des zitierten Originals
+    # an die LLM-Klassifikation/Intent-Erkennung geben. Der volle body_text
+    # bleibt fuer Persistenz (last_user_message) + Threading erhalten.
+    from core.utils.mail_reply import trim_quoted_reply
+    body_text_for_ai = trim_quoted_reply(body_text)
 
     # 2) Tenant + Wissensbasis laden
     async with AsyncSessionLocal() as session:
@@ -1550,7 +1568,8 @@ async def process_relevant_kunde_mail(
         # und um die letzte Frage von Q zu "erinnern".
         if getattr(existing_conv, "last_user_message", None):
             history_turns.append(
-                {"role": "kunde", "text": existing_conv.last_user_message}
+                {"role": "kunde",
+                 "text": trim_quoted_reply(existing_conv.last_user_message)}
             )
         if getattr(existing_conv, "last_q_reply", None):
             history_turns.append(
@@ -1596,7 +1615,7 @@ async def process_relevant_kunde_mail(
             subject=subject,
             sender_name=sender_name,
             sender_email=sender_email,
-            latest_message=body_text,
+            latest_message=body_text_for_ai,
             history_turns=history_turns or None,
             tenant_company=tenant_company,
             tenant_owner_first_name=tenant_owner_first,
