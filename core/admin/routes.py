@@ -748,7 +748,7 @@ async def tenant_detail(
 
 
 # =====================================================================
-# TENANT FEATURES (Paket-Toggle + Per-Feature-Override)
+# TENANT FEATURES (Per-Feature-Toggle)
 # =====================================================================
 
 @router.get(
@@ -761,15 +761,10 @@ async def tenant_features_page(
 ):
     """Feature-Toggle-Seite pro Tenant.
 
-    Zeigt aktuelles Paket + Liste aller Catalog-Features mit Toggle-
-    Buttons. Quick-Switch fuer Basis/Pro/Enterprise an der Spitze.
+    Listet alle Catalog-Features mit Per-Feature-Toggle. Es gibt keine
+    Pakete/Tiers mehr — jedes Feature wird einzeln geschaltet.
     """
-    from core.features import (
-        FEATURES, PACKAGES, ALL_PACKAGES, PACKAGE_CUSTOM,
-        enabled_features_for_tenant, detect_package_from_features,
-    )
-    from core.features.catalog import PACKAGE_LABELS, features_in_package
-    from core.models import ToolConfig
+    from core.features import FEATURES, enabled_features_for_tenant
 
     try:
         tid = uuid.UUID(tenant_id)
@@ -789,60 +784,32 @@ async def tenant_features_page(
         )
 
     enabled = await enabled_features_for_tenant(tid)
-    detected = detect_package_from_features(enabled)
 
-    # Feature-Liste fuers Template — sortiert nach Paket-Tier
-    # (Basis-Features oben, Enterprise-Only unten)
-    basis_keys = PACKAGES["basis"]
-    pro_keys = PACKAGES["pro"] - basis_keys
-    enterprise_keys = PACKAGES["enterprise"] - PACKAGES["pro"]
-
-    def _section(keys, label):
-        rows = []
-        for f in sorted(FEATURES.values(), key=lambda x: x.label):
-            if f.key in keys:
-                rows.append({
-                    "key": f.key,
-                    "label": f.label,
-                    "description": f.description,
-                    "enabled": f.key in enabled,
-                    "always_on": f.always_on,
-                })
-        return {"label": label, "rows": rows}
-
-    sections = [
-        _section(basis_keys, "Basis"),
-        _section(pro_keys, "Pro"),
-        _section(enterprise_keys, "Enterprise"),
-    ]
-
-    # always_on-Features als eigene "immer aktiv" Sektion
-    always_on_rows = [
-        {
+    def _row(f):
+        return {
             "key": f.key,
             "label": f.label,
             "description": f.description,
-            "enabled": True,
-            "always_on": True,
+            "enabled": f.always_on or f.key in enabled,
+            "always_on": f.always_on,
         }
-        for f in sorted(FEATURES.values(), key=lambda x: x.label)
-        if f.always_on
+
+    sorted_features = sorted(FEATURES.values(), key=lambda x: x.label)
+    sections = [
+        {
+            "label": "Immer aktiv",
+            "rows": [_row(f) for f in sorted_features if f.always_on],
+        },
+        {
+            "label": "Features",
+            "rows": [_row(f) for f in sorted_features if not f.always_on],
+        },
     ]
-    sections.insert(0, {"label": "Immer aktiv", "rows": always_on_rows})
 
     return templates.TemplateResponse(request, "tenant_features.html", {
         "request": request, "user": user,
         "tenant": tenant,
         "sections": sections,
-        "current_tier": tenant.package_tier,
-        "detected_tier": detected,
-        "is_drift": (
-            tenant.package_tier != detected and detected != PACKAGE_CUSTOM
-        ),
-        "packages": [
-            (pkg, PACKAGE_LABELS.get(pkg, pkg))
-            for pkg in ALL_PACKAGES
-        ],
         "csrf_token": request.state.admin_csrf,
     })
 
@@ -886,62 +853,6 @@ async def tenant_set_retention(
     )
 
 
-@router.post("/tenants/{tenant_id}/features/package")
-async def tenant_features_apply_package(
-    request: Request,
-    tenant_id: str,
-    package: str = Form(...),
-    csrf_token: str = Form(...),
-    user: AdminUser = Depends(require_admin),
-):
-    """Wendet ein vordefiniertes Paket auf den Tenant an.
-
-    Setzt alle ToolConfig.enabled-Flags entsprechend dem Paket und
-    aktualisiert tenant.package_tier. Idempotent.
-    """
-    require_csrf(request, csrf_token)
-    from core.features import apply_package, ALL_PACKAGES
-
-    if package not in ALL_PACKAGES:
-        raise HTTPException(400, f"Unbekanntes Paket: {package}")
-
-    try:
-        tid = uuid.UUID(tenant_id)
-    except ValueError:
-        raise HTTPException(404, "Tenant nicht gefunden")
-
-    async with get_session() as s:
-        tenant = (await s.execute(
-            select(Tenant).where(Tenant.id == tid)
-        )).scalar_one_or_none()
-        if not tenant:
-            raise HTTPException(404, "Tenant nicht gefunden")
-
-        old_tier = tenant.package_tier
-        # apply_package macht eigene Session — wir comitten danach
-        # die package_tier-Aenderung in dieser Session.
-
-    # Paket anwenden (eigene Session intern)
-    if package != "custom":
-        await apply_package(tid, package)
-
-    async with get_session() as s:
-        tenant = (await s.execute(
-            select(Tenant).where(Tenant.id == tid)
-        )).scalar_one_or_none()
-        tenant.package_tier = package
-        await audit(
-            user_id=user.id, action="tenant.features.package",
-            target=tenant.slug, request=request, session=s,
-            details={"old": old_tier, "new": package},
-        )
-        await s.commit()
-
-    return RedirectResponse(
-        f"/admin/tenants/{tenant_id}/features", status_code=303,
-    )
-
-
 @router.post("/tenants/{tenant_id}/features/{feature_key}/toggle")
 async def tenant_features_toggle(
     request: Request,
@@ -950,17 +861,9 @@ async def tenant_features_toggle(
     csrf_token: str = Form(...),
     user: AdminUser = Depends(require_admin),
 ):
-    """Togglet ein einzelnes Feature fuer den Tenant.
-
-    Bei Abweichung vom vordefinierten Paket wird tenant.package_tier
-    auf 'custom' gesetzt.
-    """
+    """Togglet ein einzelnes Feature fuer den Tenant."""
     require_csrf(request, csrf_token)
-    from core.features import (
-        FEATURES, PACKAGE_CUSTOM,
-        invalidate_feature_cache, detect_package_from_features,
-        enabled_features_for_tenant,
-    )
+    from core.features import FEATURES, invalidate_feature_cache
     from core.models import ToolConfig
 
     if feature_key not in FEATURES:
@@ -1003,25 +906,6 @@ async def tenant_features_toggle(
             tc.enabled = not tc.enabled
 
         new_value = tc.enabled
-        await s.commit()
-
-    invalidate_feature_cache(tid)
-
-    # Nach Toggle: aktuelle Feature-Detection -> ggf. tier auf 'custom'
-    enabled = await enabled_features_for_tenant(tid)
-    detected = detect_package_from_features(enabled)
-
-    async with get_session() as s:
-        tenant = (await s.execute(
-            select(Tenant).where(Tenant.id == tid)
-        )).scalar_one_or_none()
-        if detected == PACKAGE_CUSTOM and tenant.package_tier != PACKAGE_CUSTOM:
-            tenant.package_tier = PACKAGE_CUSTOM
-        elif detected != PACKAGE_CUSTOM and tenant.package_tier != detected:
-            # Falls Sven nach Custom-Toggle wieder genau einem Paket
-            # entspricht (z.B. eine Aenderung rueckgaengig gemacht),
-            # auto-revert zu dem Paket
-            tenant.package_tier = detected
 
         await audit(
             user_id=user.id, action="tenant.features.toggle",
@@ -1029,6 +913,8 @@ async def tenant_features_toggle(
             details={"old": old_value, "new": new_value},
         )
         await s.commit()
+
+    invalidate_feature_cache(tid)
 
     return RedirectResponse(
         f"/admin/tenants/{tenant_id}/features", status_code=303,

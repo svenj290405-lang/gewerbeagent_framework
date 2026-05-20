@@ -6,53 +6,12 @@
 <div class="page-header">
     <div>
         <a href="/admin/tenants/{{ tenant.id }}" style="font-size:13px;color:var(--ink-muted);">&larr; {{ tenant.company_name }}</a>
-        <h1 style="margin-top:8px;">Features &amp; Paket</h1>
+        <h1 style="margin-top:8px;">Features</h1>
         <p>
             {{ tenant.contact_name }} · {{ tenant.contact_email }} ·
             <code>{{ tenant.slug }}</code>
         </p>
     </div>
-</div>
-
-{# ===== Quick-Switch Pakete ===== #}
-<div class="card" style="margin-bottom: 24px;">
-    <h3 style="margin-top:0;">Paket-Tier</h3>
-    <p style="color:var(--ink-muted); font-size: 13px; margin-bottom: 16px;">
-        Aktuelles Paket: <strong>
-            {% if current_tier == 'basis' %}📦 Basis
-            {% elif current_tier == 'pro' %}📦 Pro
-            {% elif current_tier == 'enterprise' %}📦 Enterprise
-            {% else %}🛠 {{ current_tier }}{% endif %}
-        </strong>
-        {% if is_drift %}
-            <br><span style="color:var(--warn);">⚠ Aktuelle Features matchen
-            <strong>{{ detected_tier }}</strong> — willst du den Tier auf
-            {{ detected_tier }} angleichen?</span>
-        {% endif %}
-    </p>
-
-    <form method="post" action="/admin/tenants/{{ tenant.id }}/features/package"
-          style="display: flex; gap: 12px; flex-wrap: wrap;">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-        {% for pkg_key, pkg_label in packages %}
-            <button type="submit" name="package" value="{{ pkg_key }}"
-                    class="btn {% if current_tier == pkg_key %}btn-primary{% else %}btn{% endif %}"
-                    {% if current_tier == pkg_key %}disabled
-                       title="Aktuelles Paket"{% endif %}>
-                {{ pkg_label }}
-            </button>
-        {% endfor %}
-    </form>
-    <p style="color:var(--ink-muted); font-size: 12px; margin-top: 12px;">
-        <strong>Basis:</strong> Telegram, Kalender, Wissensbasis ·
-        <strong>Pro:</strong> + Mail, Anfrage-Form, Lexware, Material, Kalkulation, Werkstatt ·
-        <strong>Enterprise:</strong> + Voice, Drive-Archiv, Visualisierung, Mitarbeiter ·
-        <strong>Custom:</strong> manuell zusammengestellt
-    </p>
-    <p style="color:var(--ink-muted); font-size: 12px;">
-        Paket-Wechsel ueberschreibt alle Toggle-Werte unten und setzt sie auf
-        die Standard-Werte des neuen Pakets.
-    </p>
 </div>
 
 {# ===== Feature-Listen pro Sektion ===== #}
@@ -112,7 +71,7 @@
 
 <p style="color: var(--ink-muted); font-size: 12px;">
     Toggle-Aktionen werden im Audit-Log dokumentiert
-    (<code>tenant.features.toggle</code> + <code>tenant.features.package</code>).
+    (<code>tenant.features.toggle</code>).
 </p>
 
 {% endblock %}

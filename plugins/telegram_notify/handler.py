@@ -736,7 +736,7 @@ def _render_command_blocks(
     werden uebersprungen.
 
     Locked-Blocks zeigen 🔒-Suffix am Header und triggern den Footer-
-    Hinweis "🔒 = nicht in deinem Paket" — Befehle bleiben sichtbar
+    Hinweis "🔒 = nicht freigeschaltet" — Befehle bleiben sichtbar
     damit der User weiss was es gibt.
 
     Wichtig: KEIN <code>-Wrap um den Befehl — Telegram macht
@@ -761,8 +761,8 @@ def _render_command_blocks(
     lines.append("")
     if locked_block_count > 0:
         lines.append(
-            "<i>🔒 = nicht in deinem Paket — Upgrade via "
-            "svenj05@gmx.de. Aktuelle Features: /paket</i>"
+            "<i>🔒 = für dich nicht freigeschaltet — "
+            "Freischaltung via svenj05@gmx.de</i>"
         )
     if footer:
         lines.append(footer)
@@ -1051,10 +1051,8 @@ async def _handle_config_command(chat_id=None):
          "Setup-Tutorial starten oder fortsetzen — Schritt-fuer-Schritt "
          "fragt der Bot alle Stammdaten ab und verbindet Lexware + "
          "Kalender. Mit /hilfe gibts pro Schritt eine Erklaerung."),
-        ("/paket",
-         "Aktuelles Paket + Liste der aktivierten Features."),
         ("/status",
-         "Tenant-Slug und Aktivierungs-Status."),
+         "Tenant-Slug, freigeschaltete Features und Aktivierungs-Status."),
     ], False))
 
     return _render_command_blocks(
@@ -1068,8 +1066,8 @@ async def _handle_config_command(chat_id=None):
 # Feature-Gate fuer Telegram-Befehle
 # =====================================================================
 # Vor jedem Command-Dispatch wird _check_feature_gate aufgerufen.
-# Liefert eine Lock-Message wenn das Feature im Paket nicht enthalten
-# ist; sonst None und der normale Dispatch laeuft.
+# Liefert eine Lock-Message wenn das Feature fuer den Tenant nicht
+# freigeschaltet ist; sonst None und der normale Dispatch laeuft.
 #
 # Always-on-Features (telegram_bot, kunde_lookup) passieren immer.
 # Befehle die in keiner Feature-Definition stehen (z.B. /status, /start
@@ -1113,65 +1111,17 @@ async def _check_feature_gate(text: str, chat_id) -> str | None:
 def _feature_locked_message(feature) -> str:
     """Klartext-Antwort wenn ein gesperrtes Feature angefragt wird."""
     return (
-        f"🔒 <b>{_h_safe(feature.label)}</b> ist nicht in deinem Paket.\n"
-        f"Übersicht: /paket  ·  Upgrade: svenj05@gmx.de"
+        f"🔒 <b>{_h_safe(feature.label)}</b> ist für dich nicht freigeschaltet.\n"
+        f"Freischaltung: svenj05@gmx.de"
     )
 
-
-async def _handle_paket_command(chat_id) -> str:
-    """Zeigt aktuelles Paket + aktive/inaktive Features."""
-    from core.features import enabled_features_for_tenant, FEATURES
-    from core.features.catalog import (
-        PACKAGES, PACKAGE_LABELS, PACKAGE_CUSTOM,
-    )
-
-    tenant = await _get_tenant_by_chat(chat_id)
-    if tenant is None:
-        return (
-            "Dieser Chat ist noch keinem Betrieb zugeordnet. "
-            "Bitte zuerst /start ausfuehren."
-        )
-
-    enabled = await enabled_features_for_tenant(tenant.id)
-    package_label = PACKAGE_LABELS.get(
-        tenant.package_tier, f"📦 {tenant.package_tier}"
-    )
-
-    # Apple-Style: kompakte zweispaltige Liste — ein Symbol + Name pro
-    # Zeile, sortiert nach Label. Aktiv und Inaktiv direkt in einer
-    # Übersicht ohne Block-Header.
-    feature_lines: list[str] = []
-    sorted_features = sorted(
-        (f for f in FEATURES.values() if not f.always_on),
-        key=lambda f: f.label,
-    )
-    for f in sorted_features:
-        icon = "✅" if f.key in enabled else "·"
-        feature_lines.append(f"{icon}  {_h_safe(f.label)}")
-
-    n_on = sum(1 for f in sorted_features if f.key in enabled)
-    n_total = len(sorted_features)
-
-    msg_parts = [
-        f"<b>{package_label}</b>",
-        f"<i>{_h_safe(tenant.company_name)}</i>",
-        f"<i>{n_on} von {n_total} Features aktiv</i>",
-        "",
-        "\n".join(feature_lines),
-        "",
-    ]
-    if tenant.package_tier == PACKAGE_CUSTOM:
-        msg_parts.append("<i>Custom-Paket. Aenderungen via Admin.</i>")
-    else:
-        msg_parts.append("<i>Upgrade: svenj05@gmx.de</i>")
-    return "\n".join(msg_parts)
 
 async def _collect_setup_status(tenant, employee) -> list[tuple[str, str, str | None]]:
     """Pro relevantem Feature: ist die Verbindung konfiguriert?
 
-    Zeigt nur Features die im Paket aktiv sind — sonst wuerde ein
-    Basis-Paket-User ueber fehlendes Drive meckern obwohl er es gar
-    nicht hat. Returns Liste von (icon, label, hint_command_or_None).
+    Zeigt nur freigeschaltete Features — sonst wuerde ein Tenant ohne
+    Drive ueber fehlendes Drive meckern obwohl er es gar nicht hat.
+    Returns Liste von (icon, label, hint_command_or_None).
     """
     from core.features import enabled_features_for_tenant
     from core.security.oauth_token_lookup import find_oauth_token
@@ -1247,10 +1197,8 @@ async def _handle_status_command(chat_id):
 
     Soll auf den ersten Blick zeigen: 'wo stehe ich, wo muss ich noch
     klicken'. Bisher war der Output kryptisch ('demo · onboarding') —
-    jetzt: Identitaet, Paket, Setup-Check, Wizard-Zustand.
+    jetzt: Identitaet, Setup-Check, Wizard-Zustand.
     """
-    from core.features.catalog import PACKAGE_LABELS
-
     res = await _get_current_employee(chat_id)
     if res is None:
         return (
@@ -1259,8 +1207,6 @@ async def _handle_status_command(chat_id):
         )
     tenant, employee = res
 
-    # Paket-Label aus catalog (faellt auf raw-Wert zurueck).
-    package_label = PACKAGE_LABELS.get(tenant.package_tier, tenant.package_tier)
     # Tenant-Status menschen-lesbar.
     status_icon = {
         "active": "✅",
@@ -1274,7 +1220,6 @@ async def _handle_status_command(chat_id):
         f"👤 <b>{_h_safe(employee.name)}</b>  ·  {role_label}",
         f"🏢 <b>{_h_safe(tenant.company_name)}</b>",
         f"Slug: <code>{_h_safe(tenant.slug)}</code>  ·  "
-        f"Paket: <b>{_h_safe(package_label)}</b>  ·  "
         f"Status: {status_icon} {_h_safe(tenant.status)}",
         "",
     ]
@@ -2027,10 +1972,9 @@ async def _dispatch_update(payload):
                 logger.exception("Auto-Reset-Check fehlgeschlagen — ignoriert")
 
     # ----- Feature-Gate -----
-    # Vor dem Befehls-Dispatch pruefen ob das angefragte Feature im
-    # Paket des Tenants ist. Always-on-Befehle (/help, /start, /paket)
-    # passieren unbedrueckt — sonst koennte ein Tenant ohne Paket nie
-    # /paket lesen.
+    # Vor dem Befehls-Dispatch pruefen ob das angefragte Feature fuer
+    # den Tenant freigeschaltet ist. Always-on-Befehle (/help, /start,
+    # /status) passieren unbedrueckt.
     if text.startswith("/"):
         locked_msg = await _check_feature_gate(text, chat_id)
         if locked_msg is not None:
@@ -2059,8 +2003,6 @@ async def _dispatch_update(payload):
         reply = await _handle_help_command(chat_id)
     elif text == "/config":
         reply = await _handle_config_command(chat_id)
-    elif text == "/paket":
-        reply = await _handle_paket_command(chat_id)
     elif text == "/status":
         reply = await _handle_status_command(chat_id)
     elif text == "/wissen":

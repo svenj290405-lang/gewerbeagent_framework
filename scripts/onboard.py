@@ -4,17 +4,16 @@ Onboarding-Script fuer neue Tenants (Kunden).
 Nutzung:
   uv run python -m scripts.onboard --slug dietz --name "Tischlerei Dietz" \
       --email "f.dietz@pura-tischler.de" --contact "Fabian Dietz" \
-      --phone "+49 6502 12345" --tier pro
+      --phone "+49 6502 12345"
 
 Das Script:
 1. Legt Tenant in DB an (Status: ONBOARDING)
-2. Setzt das gewaehlte Paket (basis | pro | enterprise) — aktiviert
-   alle Features im Paket via apply_package()
+2. Aktiviert das Default-Feature-Set (Kalender, Wissensbasis, Mail,
+   Anfrage-Formular, Lexware, Material). Alles Weitere (Voice, Drive,
+   Visualisierung, Mitarbeiter) schaltet Sven per Admin-UI dazu.
 3. Konfiguriert die Kalender-Defaults (arbeitszeiten, etc.)
 4. Generiert Google-OAuth-URL fuer Kalender-Verknuepfung
 5. Gibt eine Checkliste aus mit Rest-Schritten
-
-Wenn --tier nicht angegeben wird, fragt das Skript interaktiv.
 """
 from __future__ import annotations
 
@@ -28,11 +27,7 @@ import httpx
 from sqlalchemy import select
 
 from core.database import AsyncSessionLocal
-from core.features import apply_package
-from core.features.catalog import (
-    PACKAGE_BASIS, PACKAGE_PRO, PACKAGE_ENTERPRISE, ALL_PACKAGES,
-    PACKAGE_LABELS, PACKAGES, FEATURES,
-)
+from core.features.catalog import FEATURES
 from core.models import (
     Tenant, TenantKnowledge, TenantStatus, ToolConfig,
     ALLE_KATEGORIEN,
@@ -138,6 +133,20 @@ async def _ensure_telegram_webhook() -> tuple[bool, str]:
         return False, f"Exception: {e}"
 
 
+# Feature-Set das jeder neue Tenant per Default bekommt. Es gibt keine
+# Pakete/Tiers mehr — alles Weitere (Voice, Drive-Archiv, Visualisierung,
+# Mitarbeiter) wird nach dem Onboarding per Admin-UI einzeln dazugeschaltet.
+# Always-on-Features (telegram_bot, kunde_lookup) sind ohnehin immer aktiv.
+DEFAULT_FEATURES: tuple[str, ...] = (
+    "kalender",
+    "wissensbasis",
+    "mail_intake",
+    "anfrage_formular",
+    "lexware",
+    "material",
+)
+
+
 DEFAULT_KALENDER_CONFIG = {
     "betrieb_name": "",              # wird aus Tenant.company_name uebernommen
     "calendar_id": "primary",
@@ -149,39 +158,11 @@ DEFAULT_KALENDER_CONFIG = {
 }
 
 
-def _prompt_tier() -> str:
-    """Interaktiver Paket-Prompt wenn --tier nicht uebergeben."""
-    print()
-    print("Welches Paket soll der Tenant bekommen?")
-    print()
-    pkg_descriptions = {
-        PACKAGE_BASIS: "Telegram + Kalender + Wissensbasis",
-        PACKAGE_PRO: "+ Mail + Anfrage-Form + Lexware + Material + Kalkulation + Werkstatt",
-        PACKAGE_ENTERPRISE: "+ Voice + Drive-Archiv + Visualisierung + Mitarbeiter",
-    }
-    options = [PACKAGE_BASIS, PACKAGE_PRO, PACKAGE_ENTERPRISE]
-    for i, pkg in enumerate(options, 1):
-        feature_count = len(PACKAGES[pkg])
-        print(f"  [{i}] {PACKAGE_LABELS[pkg]:18} ({feature_count} Features)")
-        print(f"      {pkg_descriptions[pkg]}")
-    print()
-    while True:
-        choice = input("Wahl [1-3, default=2]: ").strip() or "2"
-        try:
-            idx = int(choice) - 1
-            if 0 <= idx < len(options):
-                return options[idx]
-        except ValueError:
-            pass
-        print("Ungueltige Wahl. Bitte 1, 2 oder 3.")
-
-
 async def onboard_tenant(
     slug: str,
     name: str,
     email: str,
     contact: str,
-    tier: str,
     phone: str | None = None,
     notes: str | None = None,
     branche: str | None = None,
@@ -203,18 +184,6 @@ async def onboard_tenant(
         print(f"FEHLER: Slug muss zwischen 2-50 Zeichen lang sein.")
         sys.exit(1)
 
-    # Validierung: tier
-    if tier not in ALL_PACKAGES:
-        print(f"FEHLER: Unbekanntes Paket '{tier}'. Erlaubt: {', '.join(ALL_PACKAGES)}")
-        sys.exit(1)
-    if tier == "custom":
-        print(
-            "FEHLER: Onboarding mit 'custom'-Tier ist nicht sinnvoll — "
-            "starte mit basis/pro/enterprise und togglen einzelne "
-            "Features hinterher via Admin-UI.",
-        )
-        sys.exit(1)
-
     async with AsyncSessionLocal() as session:
         # Pruefen ob Slug schon existiert
         existing = await session.execute(
@@ -234,35 +203,36 @@ async def onboard_tenant(
             contact_phone=phone,
             status=TenantStatus.ONBOARDING,
             notes=notes,
-            package_tier=tier,
             branche=branche,
         )
         session.add(tenant)
         await session.flush()  # damit tenant.id verfuegbar ist
         tenant_id = tenant.id
 
-        # Kalender-Plugin extra konfigurieren (Defaults). apply_package
-        # setzt enabled=True wenn 'kalender' im Paket — wir ergaenzen
-        # nur die config-Daten.
+        # Kalender-Plugin mit Defaults konfigurieren (config-Daten).
         kalender_config = dict(DEFAULT_KALENDER_CONFIG)
         kalender_config["betrieb_name"] = name
 
-        tool_config = ToolConfig(
+        session.add(ToolConfig(
             tenant_id=tenant_id,
             tool_name="kalender",
             enabled=True,
             config=kalender_config,
-        )
-        session.add(tool_config)
+        ))
+
+        # Restliche Default-Features als simple enabled-Flags anlegen.
+        # kalender ist oben schon mit config dabei -> hier ueberspringen.
+        for feat_key in DEFAULT_FEATURES:
+            if feat_key == "kalender":
+                continue
+            session.add(ToolConfig(
+                tenant_id=tenant_id,
+                tool_name=feat_key,
+                enabled=True,
+                config={},
+            ))
 
         await session.commit()
-
-    # Paket anwenden (eigene Session intern in apply_package).
-    # Setzt ToolConfig.enabled fuer alle Catalog-Features entsprechend
-    # dem Paket. Bestehende ToolConfig.config (inkl. der gerade gesetzten
-    # Kalender-Defaults) bleibt erhalten — apply_package aendert nur das
-    # enabled-Flag.
-    await apply_package(tenant_id, tier)
 
     # Phase B10: Branchen-Template laden + als TenantKnowledge schreiben
     knowledge_loaded = 0
@@ -305,11 +275,13 @@ async def onboard_tenant(
     # OAuth-URL generieren (ausserhalb der Session, braucht keinen DB-Zugriff)
     oauth_url = await generate_auth_url(tenant_slug=slug, provider="google")
 
-    # Feature-Liste fuer Output zusammenstellen
-    enabled_in_tier = sorted(PACKAGES[tier])
-    feature_labels = [
-        FEATURES[k].label for k in enabled_in_tier if k in FEATURES
-    ]
+    # Feature-Liste fuer Output: Default-Set + always-on (immer aktiv)
+    activated_keys = set(DEFAULT_FEATURES) | {
+        k for k, f in FEATURES.items() if f.always_on
+    }
+    feature_labels = sorted(
+        FEATURES[k].label for k in activated_keys if k in FEATURES
+    )
 
     # Checkliste ausgeben
     print()
@@ -319,7 +291,7 @@ async def onboard_tenant(
     print(f"  Slug:          {slug}")
     print(f"  ID:            {tenant_id}")
     print(f"  Status:        ONBOARDING")
-    print(f"  Paket:         {PACKAGE_LABELS.get(tier, tier)} ({len(enabled_in_tier)} Features)")
+    print(f"  Features:      Default-Set ({len(feature_labels)} aktiv)")
     print(f"  Kalender:      Mo-Fr 08:00-17:00, 90 Min Standard")
     if branche:
         knowledge_msg = (
@@ -387,11 +359,6 @@ def main() -> None:
     parser.add_argument("--contact", required=True, help="Ansprechpartner-Name")
     parser.add_argument("--phone", default=None, help="Telefon (optional)")
     parser.add_argument("--notes", default=None, help="Interne Notizen (optional)")
-    parser.add_argument(
-        "--tier", default=None,
-        choices=[PACKAGE_BASIS, PACKAGE_PRO, PACKAGE_ENTERPRISE],
-        help="Paket-Tier (basis/pro/enterprise). Wenn nicht gesetzt, wird interaktiv gefragt.",
-    )
     available_branches = _list_available_branches()
     parser.add_argument(
         "--branche", default=None,
@@ -404,10 +371,6 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    tier = args.tier
-    if tier is None:
-        tier = _prompt_tier()
-
     asyncio.run(
         onboard_tenant(
             slug=args.slug,
@@ -416,7 +379,6 @@ def main() -> None:
             contact=args.contact,
             phone=args.phone,
             notes=args.notes,
-            tier=tier,
             branche=args.branche,
         )
     )

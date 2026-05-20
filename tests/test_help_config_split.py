@@ -2,7 +2,7 @@
 
 /help = Daily-Sicht (Aufnahme/Briefing/Angebot/Archiv/...).
 /config = Setup-Sicht (Verbindungen, Status, Werkstatt, Mitarbeiter,
-          Onboarding, Paket).
+          Onboarding).
 """
 from __future__ import annotations
 
@@ -32,7 +32,7 @@ async def test_help_does_not_contain_setup_commands():
                       "/archiv_status", "/kalender_status",
                       "/werkstatt_status", "/werkstatt",
                       "/mitarbeiter", "/team", "/krank", "/urlaub",
-                      "/zurueck", "/onboarding", "/paket"):
+                      "/zurueck", "/onboarding"):
         assert forbidden not in text, (
             f"/help unexpectedly contains {forbidden}"
         )
@@ -81,10 +81,9 @@ async def test_config_contains_mitarbeiter_block():
 
 
 @pytest.mark.asyncio
-async def test_config_contains_onboarding_and_paket():
+async def test_config_contains_onboarding_and_status():
     text = await tn._handle_config_command(chat_id=None)
     assert "/onboarding" in text
-    assert "/paket" in text
     assert "/status" in text
 
 

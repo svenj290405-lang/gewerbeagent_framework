@@ -15,15 +15,7 @@ from sqlalchemy import select
 
 from core.database import AsyncSessionLocal
 from core.models import ToolConfig
-from core.features.catalog import (
-    FEATURES,
-    PACKAGES,
-    PACKAGE_BASIS,
-    PACKAGE_PRO,
-    PACKAGE_ENTERPRISE,
-    PACKAGE_CUSTOM,
-    features_in_package,
-)
+from core.features.catalog import FEATURES
 
 logger = logging.getLogger(__name__)
 
@@ -50,7 +42,7 @@ _cache: dict[uuid.UUID, _CacheEntry] = {}
 
 
 def invalidate_feature_cache(tenant_id: uuid.UUID | None = None) -> None:
-    """Leert den Cache (nach Admin-Toggle oder /paket-Aenderung).
+    """Leert den Cache (nach Feature-Toggle im Admin-UI).
 
     None -> kompletter Cache wird geleert (z.B. bei Boot-Strap).
     """
@@ -65,7 +57,7 @@ def invalidate_feature_cache(tenant_id: uuid.UUID | None = None) -> None:
 # =====================================================================
 
 # Kill-Switch: hier gelistete Features sind fuer ALLE Tenants aus —
-# unabhaengig von ToolConfig/Paket. Code + DB-Felder bleiben dormant
+# unabhaengig von ToolConfig. Code + DB-Felder bleiben dormant
 # (reversibel: einfach aus der Menge entfernen). 'werkstatt' (Smart-
 # Routing ueber Heimat-Adresse) wird momentan nicht benoetigt; die
 # Anschrift wird weiterhin im Onboarding fuers Impressum erfasst.
@@ -123,103 +115,3 @@ async def is_feature_enabled(
         return False
     enabled = await enabled_features_for_tenant(tenant_id)
     return feature_key in enabled
-
-
-async def apply_package(
-    tenant_id: uuid.UUID,
-    package: str,
-) -> None:
-    """Setzt ToolConfig.enabled gemaess Paket-Definition.
-
-    Idempotent. Features im Paket -> enabled=True, Features im Catalog
-    aber NICHT im Paket -> enabled=False. Always-on-Features werden
-    nicht in tool_configs geschrieben (sie sind per Definition aktiv,
-    egal was in der DB steht).
-
-    PACKAGE_CUSTOM ist no-op (Sven setzt Features einzeln).
-
-    Konfigurations-Daten existierender ToolConfig-Eintraege bleiben
-    erhalten — wir aendern nur das `enabled`-Flag.
-    """
-    if package == PACKAGE_CUSTOM:
-        logger.info("apply_package(%s, custom): no-op", tenant_id)
-        return
-
-    target_features = features_in_package(package)
-    if not target_features:
-        raise ValueError(f"Paket '{package}' nicht im Catalog")
-
-    # Always-on-Features ueberspringen — sie haben keinen Toggle in der
-    # ToolConfig-Tabelle (oder wenn doch, lassen wir das enabled-Flag
-    # auf True).
-    target_keys_db = {
-        f.key for f in FEATURES.values()
-        if f.key in target_features and not f.always_on
-    }
-    catalog_keys_db = {
-        f.key for f in FEATURES.values() if not f.always_on
-    }
-
-    async with AsyncSessionLocal() as session:
-        # Bestehende ToolConfig-Zeilen laden
-        rows = (await session.execute(
-            select(ToolConfig)
-            .where(ToolConfig.tenant_id == tenant_id)
-        )).scalars().all()
-        existing_by_name = {tc.tool_name: tc for tc in rows}
-
-        # Fuer jedes Catalog-Feature: setzen oder anlegen
-        for key in catalog_keys_db:
-            should_enable = key in target_keys_db
-            tc = existing_by_name.get(key)
-            if tc is None:
-                # Anlegen mit enabled=should_enable
-                tc = ToolConfig(
-                    tenant_id=tenant_id,
-                    tool_name=key,
-                    enabled=should_enable,
-                    config={},
-                )
-                session.add(tc)
-            else:
-                if tc.enabled != should_enable:
-                    tc.enabled = should_enable
-
-        await session.commit()
-
-    invalidate_feature_cache(tenant_id)
-    logger.info(
-        "apply_package(%s, %s): %d Features aktiviert, %d deaktiviert",
-        tenant_id, package, len(target_keys_db),
-        len(catalog_keys_db) - len(target_keys_db),
-    )
-
-
-def detect_package_from_features(
-    enabled: frozenset[str],
-) -> str:
-    """Versucht aus dem aktiven Feature-Set ein Paket zu erkennen.
-
-    Verwendet fuer Tenant.package_tier-Auto-Setting im Backfill +
-    Admin-UI-Anzeige. Liefert PACKAGE_CUSTOM wenn die Menge mit keinem
-    vordefinierten Paket exakt uebereinstimmt.
-
-    Beim Vergleich:
-    - Always-on-Features werden ignoriert (sind per Definition immer aktiv)
-    - tool_configs.tool_name-Werte die NICHT im Catalog sind werden
-      ignoriert (z.B. legacy 'microsoft_oauth', 'telegram_bot' am
-      _global-Tenant — das sind Infra-Configs, keine Features).
-    """
-    always_on = frozenset(
-        f.key for f in FEATURES.values() if f.always_on
-    )
-    catalog_keys = frozenset(FEATURES.keys())
-    # Nur Catalog-Features minus always_on betrachten — alles andere
-    # ist legacy/infra und stoert das Mapping.
-    relevant = (enabled & catalog_keys) - always_on
-
-    for pkg_name in (PACKAGE_BASIS, PACKAGE_PRO, PACKAGE_ENTERPRISE):
-        pkg_features = PACKAGES[pkg_name]
-        if relevant == pkg_features:
-            return pkg_name
-    return PACKAGE_CUSTOM
