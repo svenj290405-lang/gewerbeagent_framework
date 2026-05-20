@@ -412,9 +412,9 @@ async def test_propose_slots_calls_kalender_and_persists_slots(
     body = pipeline_mocks["captured"]["send_tracked_mail"][0]["body_html"]
     assert "Mögliche Termine" in body
     assert "22.05.2026" in body
-    # Telegram-Push wurde gefeuert (Mitarbeiter sieht den Vorgang)
+    # Push-Politik: Slot-Vorschlaege pingen NICHT mehr (nur Buchung/Storno)
     pushes = pipeline_mocks["captured"]["telegram_pushes"]
-    assert any("Slots vorgeschlagen" in p["label"] for p in pushes)
+    assert not any("Slots vorgeschlagen" in p["label"] for p in pushes)
 
 
 @pytest.mark.asyncio
@@ -515,9 +515,10 @@ async def test_book_slot_uses_previous_proposed_slots(
     body = pipeline_mocks["captured"]["send_tracked_mail"][0]["body_html"]
     assert "Termin bestätigt" in body
     assert "23.05.2026" in body
-    # Telegram-Push "Termin gebucht"
+    # Push-Politik: die Buchung meldet der Kalender-Handler ("Neuer
+    # Termin"), NICHT der Mail-Dialog -> hier kein Intent-Push.
     pushes = pipeline_mocks["captured"]["telegram_pushes"]
-    assert any("Termin gebucht" in p["label"] for p in pushes)
+    assert not any("gebucht" in p["label"] for p in pushes)
 
 
 @pytest.mark.asyncio

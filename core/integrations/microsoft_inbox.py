@@ -557,11 +557,11 @@ async def poll_microsoft_inbox(
                 logger.info(
                     f"poll: Folge-Mail erkannt sender={sender_email} "
                     f"conv_id={existing_conv.id} state={existing_conv.state} "
-                    f"— kein Auto-Reply, Telegram-Push an MA"
+                    f"— kein Auto-Reply (kein Push, Mail steht im Outlook)"
                 )
                 try:
                     from core.integrations.mail_pipeline import (
-                        record_inbound, push_tenant_followup_mail,
+                        record_inbound,
                     )
                     await record_inbound(
                         existing_conv.id,
@@ -571,15 +571,9 @@ async def poll_microsoft_inbox(
                         classification_reason=reason,
                         microsoft_conversation_id=msg.get("conversationId"),
                     )
-                    await push_tenant_followup_mail(
-                        tenant=tenant,
-                        sender_email=sender_email,
-                        sender_name=sender_name,
-                        subject=subject,
-                        body_preview=body_preview,
-                        conv=existing_conv,
-                        employee_id=employee_id,
-                    )
+                    # Push bewusst entfernt: Folge-Mails ohne Auto-Reply
+                    # fluten sonst den Chat (User-Wunsch: nur Buchung +
+                    # Storno pushen). Die Mail liegt im Outlook-Ordner.
                     # Outlook-Kategorie setzen + mark-as-read damit naechster
                     # Poll diese Mail nicht erneut anfasst.
                     try:
@@ -1333,21 +1327,11 @@ async def _handle_verschiebung_intent(
         except Exception as e:
             logger.warning(f"verschiebung-intent: record_outbound: {e}")
 
-    # 6. Tenant-Push
-    detail = (
-        f"{len(found_termine)} Termin(e) gefunden, Rueckfrage raus"
-        if found_termine
-        else "kein Termin gefunden — Rueckfrage-Mail mit Bitte um Details"
-    )
-    try:
-        await push_tenant_intent_event(
-            tenant=tenant, sender_email=sender_email, sender_name=sender_name,
-            subject=subject, body_preview=body_preview,
-            label="Verschiebung erkannt", detail=detail,
-            employee_id=employee_id,
-        )
-    except Exception as e:
-        logger.warning(f"verschiebung-intent: tenant-push: {e}")
+    # 6. Kein Tenant-Push: eine erkannte Verschiebung ist nur ein
+    # Zwischenschritt (Rueckfrage nach dem Wunschtermin), kein fertig
+    # gebuchter Termin und kein Storno. User-Wunsch: nur Buchung +
+    # Storno pushen. Der eigentliche Push folgt erst, wenn der Kunde
+    # den neuen Termin bestaetigt (Buchung) bzw. absagt (Storno).
 
     # 7. Outlook + read
     await _mark_and_categorize_message(
@@ -2159,83 +2143,41 @@ async def process_relevant_kunde_mail(
                 f"conv nicht angelegt/aktualisiert): {e}"
             )
 
-        # Teil F.1: Tenant-Telegram-Push "Neue Kundenanfrage" — der
-        # Mitarbeiter weiss sonst nur ueber den Outlook-Ordner dass eine
-        # neue Anfrage reinkam (Q hat die Mail dorthin verschoben). Push
-        # macht "Kunde gewonnen"-Signal sichtbar + bietet einen direkten
-        # Klick zur Mail im Outlook (webLink).
-        # Phase-1-Dialog: Push NUR wenn das Formular tatsaechlich raus
-        # ist (SEND_FORMULAR). Reine Dialog-Replies sind oft nur Auskunft
-        # — der Mitarbeiter soll erst gepingt werden wenn aus dem
-        # Dialog eine echte Anfrage entstanden ist.
-        if next_action == "SEND_FORMULAR":
-            try:
-                from core.integrations.mail_pipeline import (
-                    push_tenant_new_anfrage_notification,
-                )
-                await push_tenant_new_anfrage_notification(
-                    tenant=tenant,
-                    sender_email=sender_email,
-                    sender_name=sender_name,
-                    subject=subject,
-                    body_preview=(full.get("bodyPreview") or "")[:200],
-                    web_link=full.get("webLink"),
-                    anfrage_url=form_url,
-                    employee_id=employee_id,
-                )
-            except Exception as e:
-                # Push-Fehler darf weder Mail-Versand-Erfolg noch Anhang-
-                # Forward killen.
-                logger.warning(
-                    f"Tenant-Push 'Neue Kundenanfrage' fehlgeschlagen "
-                    f"(non-fatal): {e}"
-                )
-        elif next_action in ("BOOK_SLOT", "CANCEL_TERMIN", "PROPOSE_SLOTS"):
-            # Bei Termin-Aktionen den Mitarbeiter pingen — er soll
-            # sehen, was Q im Mail-Dialog selbststaendig fuer einen
-            # Termin gebucht / storniert / angeboten hat. Push enthaelt
-            # die jeweilige Detail-Zeile damit man's auf einen Blick
-            # einordnet.
+        # Teil F.1: Tenant-Telegram-Push.
+        # Push-Politik (User-Wunsch): NUR Buchung + Storno pingen, nicht
+        # jeder Mail-Verkehr. Konkret heisst das hier:
+        #   - SEND_FORMULAR (Formular raus) -> KEIN Push mehr
+        #   - PROPOSE_SLOTS (Slots vorgeschlagen) -> KEIN Push mehr
+        #   - BOOK_SLOT/BOOK_DIRECT (Buchung) -> KEIN Push HIER; die
+        #     Buchung meldet bereits der Kalender-Handler ("Neuer Termin",
+        #     send_for_employee). So bleibt genau EIN Push pro Buchung.
+        #   - CANCEL_TERMIN (Storno) -> EIN Push (Storno laeuft nicht ueber
+        #     den Kalender-Handler, also hier melden).
+        if next_action == "CANCEL_TERMIN":
             try:
                 from core.integrations.mail_pipeline import (
                     push_tenant_intent_event,
                 )
-                if next_action == "BOOK_SLOT" and booked_termin_for_template:
-                    label = "Termin gebucht (Mail-Dialog)"
-                    detail = (
-                        f"{booked_termin_for_template['datum']} um "
-                        f"{booked_termin_for_template['uhrzeit']} Uhr — "
-                        f"{booked_termin_for_template.get('anliegen','')}"
-                    )
-                elif next_action == "CANCEL_TERMIN":
-                    cnt = (storno_summary_for_template or {}).get(
-                        "cancelled_count", 0
-                    )
-                    label = "Termin storniert (Mail-Dialog)"
-                    detail = (
-                        f"{cnt} Termin(e) geloescht"
-                        if cnt else "kein Termin gefunden"
-                    )
-                else:  # PROPOSE_SLOTS
-                    label = "Termin-Slots vorgeschlagen"
-                    detail = (
-                        f"{len(slot_proposals_for_template or [])} "
-                        f"Vorschlaege an Kunde geschickt"
-                    )
+                cnt = (storno_summary_for_template or {}).get(
+                    "cancelled_count", 0
+                )
+                detail = (
+                    f"{cnt} Termin(e) geloescht" if cnt
+                    else "kein Termin gefunden"
+                )
                 await push_tenant_intent_event(
                     tenant=tenant,
                     sender_email=sender_email,
                     sender_name=sender_name,
                     subject=subject,
                     body_preview=(full.get("bodyPreview") or "")[:200],
-                    label=label,
+                    label="Termin storniert (Mail-Dialog)",
                     detail=detail,
                     employee_id=employee_id,
                 )
             except Exception as e:
                 logger.warning(
-                    f"Tenant-Push (Termin-Aktion {next_action}) "
-                    f"fehlgeschlagen (non-fatal): {e}"
+                    f"Tenant-Push (Storno) fehlgeschlagen (non-fatal): {e}"
                 )
 
     # 6) Original-Mail aufraeumen (nur wenn Send erfolgreich)
