@@ -7,7 +7,9 @@ Nutzung:
       --phone "+49 6502 12345"
 
 Das Script:
-1. Legt Tenant in DB an (Status: ONBOARDING)
+1. Legt Tenant + Default-Employee (Inhaber, slug 'default') in DB an
+   (Status: ONBOARDING). Der Default-Employee ist Pflicht — der
+   /start <slug>-Onboarding-Link bindet den Telegram-Chat an ihn.
 2. Aktiviert das Default-Feature-Set (Kalender, Wissensbasis, Mail,
    Anfrage-Formular, Lexware, Material). Alles Weitere (Voice, Drive,
    Visualisierung, Mitarbeiter) schaltet Sven per Admin-UI dazu.
@@ -32,6 +34,7 @@ from core.models import (
     Tenant, TenantKnowledge, TenantStatus, ToolConfig,
     ALLE_KATEGORIEN,
 )
+from core.models.employee import Employee
 from core.security.oauth_flow import generate_auth_url
 from config.settings import settings
 
@@ -208,6 +211,20 @@ async def onboard_tenant(
         session.add(tenant)
         await session.flush()  # damit tenant.id verfuegbar ist
         tenant_id = tenant.id
+
+        # Default-Employee (Inhaber) — slug 'default', is_default=True.
+        # Pflicht: der /start <slug>-Onboarding-Deep-Link bindet den
+        # Telegram-Chat an genau diesen Employee. Ohne ihn schlaegt
+        # /start mit "Mitarbeiter-Slug 'default' nicht gefunden" fehl.
+        # Heimat-/Telegram-/Kalender-Felder bleiben leer und werden im
+        # Onboarding-Wizard bzw. via /kalender_verbinden gefuellt.
+        session.add(Employee(
+            tenant_id=tenant_id,
+            slug="default",
+            name=contact,
+            contact_email=email,
+            is_default=True,
+        ))
 
         # Kalender-Plugin mit Defaults konfigurieren (config-Daten).
         kalender_config = dict(DEFAULT_KALENDER_CONFIG)
