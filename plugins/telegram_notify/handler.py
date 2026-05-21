@@ -10043,7 +10043,7 @@ ONBOARDING_HELP = {
         "veroeffentlichen willst."
     ),
     "email": (
-        "Deine offizielle E-Mail-Adresse. Wird als Reply-To fuer "
+        "Deine offizielle E-Mail-Adresse. Wird als Antwort-Adresse fuer "
         "Kunden-Mails verwendet — wenn der Kunde auf ein Angebot "
         "antwortet, landet die Antwort hier."
     ),
@@ -10054,9 +10054,10 @@ ONBOARDING_HELP = {
     ),
     "lexware": (
         "Lexware ist der Buchhaltungs-Anbieter, ueber den ich Angebote "
-        "und Rechnungen anlege + dem Kunden schicke. Ohne Lexware geht "
-        "das nicht. Wenn du noch keinen Account hast, kannst du das hier "
-        "ueberspringen und spaeter mit /lexware_setup nachholen."
+        "und Rechnungen anlege + dem Kunden schicke. Fuer diese Funktionen "
+        "ist es Pflicht. Du kannst es hier ueberspringen — aber Angebote "
+        "und Rechnungen gehen erst, sobald du es mit /lexware_setup "
+        "nachgeholt hast."
     ),
     "kalender": (
         "Der Kalender wird fuer /briefing (deine Tagestermine) und fuer "
@@ -10081,9 +10082,29 @@ ONBOARDING_HELP = {
     ),
     "done": (
         "Du bist fertig! Mit /help siehst du alle Befehle. Wenn du etwas "
-        "vergessen hast: /lexware_setup, /kalender_verbinden, /werkstatt "
+        "vergessen hast: /lexware_setup, /kalender_verbinden, /eigenen_bot "
         "etc. funktionieren auch einzeln."
     ),
+}
+
+
+# Lesbare Schritt-Bezeichnungen fuer die /hilfe-Kopfzeile (statt des
+# internen Slugs wie 'inhaber_name'). Deckt sich mit den Titeln der
+# Schritt-Nachrichten (_onboarding_send_*).
+ONBOARDING_STEP_LABELS = {
+    "welcome": "Willkommen",
+    "firmenname": "Firmenname",
+    "inhaber_name": "Dein Name",
+    "strasse": "Strasse",
+    "plz_ort": "PLZ + Ort",
+    "telefon": "Telefon",
+    "email": "E-Mail",
+    "branche": "Branche",
+    "lexware": "Lexware",
+    "kalender": "Kalender",
+    "drive": "Kunden-Archiv",
+    "knowledge": "Wissensbasis",
+    "done": "Fertig",
 }
 
 
@@ -10546,8 +10567,15 @@ async def _handle_onboarding_hilfe(chat_id):
             "Mit /help bekommst du die Befehlsuebersicht."
         )
     text = ONBOARDING_HELP.get(step_key, "Keine Hilfe verfuegbar.")
+    label = ONBOARDING_STEP_LABELS.get(step_key, step_key)
+    # step_idx ist die Nutzer-Schrittnummer (1..11); welcome=0 / done zaehlen
+    # nicht als nummerierter Eingabeschritt.
+    if 1 <= step_idx <= ONBOARDING_TOTAL_USER_STEPS:
+        kopf = f"💡 <b>Hilfe zu Schritt {step_idx} von {ONBOARDING_TOTAL_USER_STEPS} — {label}</b>"
+    else:
+        kopf = f"💡 <b>Hilfe — {label}</b>"
     return (
-        f"💡 <b>Hilfe zu Schritt {step_idx}: {step_key}</b>\n\n"
+        f"{kopf}\n\n"
         f"{text}\n\n"
         "<i>Mit der Antwort auf die obige Frage geht's weiter. "
         "Oder /abbrechen / /skip wenn moeglich.</i>"
