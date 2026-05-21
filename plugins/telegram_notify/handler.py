@@ -1705,10 +1705,33 @@ async def _handle_storno_confirm_input(chat_id, text, state_data):
     await _clear_state(chat_id)
     if not res.get("erfolg"):
         return f"Storno fehlgeschlagen: {res.get('nachricht') or 'unbekannter Fehler'}"
+
+    # Kunde per Mail benachrichtigen (best-effort, ueber die Mail-Pipeline).
+    # Funktioniert nur, wenn zu diesem Termin eine EmailConversation mit
+    # Kunden-Mailadresse existiert (ueber Mail/Voice gebucht). Rein
+    # telefonisch gebuchte Kunden ohne Mail bekommen keine — dann bleibt es
+    # bei der Telegram-Bestaetigung an den Betrieb.
+    from core.integrations.mail_pipeline import send_storno_confirmation_for_event
+    emp_uuid = cancel_payload.get("employee_id")
+    mail_sent = await send_storno_confirmation_for_event(
+        tenant_id=tenant.id,
+        company_name=tenant.company_name or "",
+        event_id=event_id,
+        employee_id=emp_uuid if isinstance(emp_uuid, uuid.UUID) else None,
+        cancelled_count=1,
+    )
+    mail_line = (
+        "\n\n📧 Kunde wurde per Mail benachrichtigt "
+        "(mit Hinweis: fuer neuen Termin einfach antworten)."
+        if mail_sent else
+        "\n\n<i>(Kunde nicht per Mail benachrichtigt — keine Mailadresse "
+        "hinterlegt oder Versand nicht moeglich.)</i>"
+    )
     return (
         f"Termin storniert.\n\n"
         f"<b>{match['wochentag']} {match['datum']} {match['uhrzeit']}</b> "
         f"— {_h_safe(match['summary'])}"
+        f"{mail_line}"
     )
 
 

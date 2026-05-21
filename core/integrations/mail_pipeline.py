@@ -690,10 +690,12 @@ def _build_storno_html(
             f"Uhrzeit — dann prüfen wir das nochmal manuell.</p>"
         )
     else:
-        plural = "Termin wurde" if cancelled_count == 1 else f"{cancelled_count} Termine wurden"
+        storno_satz = (
+            "Ihr Termin wurde storniert." if cancelled_count == 1
+            else f"Ihre {cancelled_count} Termine wurden storniert."
+        )
         body = (
-            f"<p>danke für Ihre Nachricht. Ihr {plural} storniert. "
-            f"Sie erhalten dafür auch keine Rechnung.</p>"
+            f"<p>{storno_satz} Sie erhalten dafür keine Rechnung.</p>"
             f"<p>Falls Sie einen neuen Termin möchten, antworten Sie "
             f"einfach auf diese Mail oder rufen Sie uns an.</p>"
         )
@@ -768,14 +770,14 @@ def _build_storno_text(
             "prüfen wir das nochmal manuell."
         )
     else:
-        plural = (
-            "Termin wurde" if cancelled_count == 1
-            else f"{cancelled_count} Termine wurden"
+        storno_satz = (
+            "Ihr Termin wurde storniert." if cancelled_count == 1
+            else f"Ihre {cancelled_count} Termine wurden storniert."
         )
         body = (
-            f"danke für Ihre Nachricht. Ihr {plural} storniert. Sie erhalten "
-            "dafür auch keine Rechnung.\n\nFalls Sie einen neuen Termin "
-            "möchten, antworten Sie einfach auf diese Mail oder rufen Sie uns an."
+            f"{storno_satz} Sie erhalten dafür keine Rechnung.\n\nFalls Sie "
+            "einen neuen Termin möchten, antworten Sie einfach auf diese Mail "
+            "oder rufen Sie uns an."
         )
     return f"{anrede}\n\n{body}\n\nViele Grüße,\n{company_name}\n"
 
@@ -847,6 +849,85 @@ async def send_storno_confirmation(
         body_text=body_text,
         employee_id=employee_id,
     )
+
+
+async def send_storno_confirmation_for_event(
+    *,
+    tenant_id: uuid.UUID,
+    company_name: str,
+    event_id: str,
+    employee_id: uuid.UUID | None = None,
+    cancelled_count: int = 1,
+) -> bool:
+    """Schickt die Storno-Bestaetigungs-Mail an den Kunden eines stornierten
+    Termins — sofern sich seine Mail-Adresse aufloesen laesst.
+
+    Die Kunden-Mail wird ueber die zur event_id gehoerende EmailConversation
+    aufgeloest (gcal_event_id-Match). Termine, die rein telefonisch ohne
+    Mail-Adresse gebucht wurden, haben keine Konversation -> dann wird KEINE
+    Mail verschickt (Return False).
+
+    Best-effort: faengt alle Fehler ab und loggt nur. Der Storno selbst ist
+    zu diesem Zeitpunkt bereits durchgefuehrt; ein Mail-Fehler darf den
+    Aufrufer nie blockieren. Wiederverwendbar fuer alle Storno-Eintrittspunkte
+    (z.B. /storno-Telegram-Wizard). Returns True, wenn eine Mail rausging.
+    """
+    from core.integrations.mail_template import extract_first_name
+    from core.models import STATE_STORNIERT
+
+    try:
+        conv = await find_conversation_by_event_id(tenant_id, event_id)
+        if conv is None or not conv.kunde_email:
+            logger.info(
+                f"storno-mail: keine EmailConversation mit Mailadresse fuer "
+                f"event={event_id[:20]} — kein Mail-Versand"
+            )
+            return False
+
+        kunde_anrede = extract_first_name(conv.kunde_name or "") or ""
+        original_subject = conv.last_subject or "Ihre Terminbuchung"
+
+        sent_meta = await send_storno_confirmation(
+            tenant_id=tenant_id,
+            to_email=conv.kunde_email,
+            kunde_anrede=kunde_anrede,
+            company_name=company_name or "",
+            original_subject=original_subject,
+            cancelled_count=cancelled_count,
+            employee_id=employee_id,
+        )
+        if not sent_meta.get("success"):
+            logger.warning(
+                f"storno-mail: send fehlgeschlagen tenant={tenant_id} "
+                f"kunde={conv.kunde_email}: {sent_meta.get('error')}"
+            )
+            return False
+
+        reply_subject = (
+            f"Re: {original_subject}"
+            if not original_subject.lower().startswith("re:")
+            else original_subject
+        )
+        await record_outbound_q_reply(
+            conv.id,
+            internet_message_id=sent_meta.get("internet_message_id"),
+            microsoft_conversation_id=sent_meta.get("conversation_id"),
+            q_reply_text=(
+                f"[Storno-Bestaetigung: {cancelled_count} Termin(e) storniert]"
+            ),
+            subject=reply_subject,
+        )
+        await set_conversation_state(conv.id, STATE_STORNIERT)
+        logger.info(
+            f"storno-mail: gesendet tenant={tenant_id} "
+            f"kunde={conv.kunde_email} conv_id={conv.id}"
+        )
+        return True
+    except Exception as e:  # noqa: BLE001
+        logger.exception(
+            f"storno-mail: abgestuerzt (Storno steht trotzdem): {e}"
+        )
+        return False
 
 
 async def send_verschiebung_request(
