@@ -745,11 +745,29 @@ async def _handle_start_command(text, chat_id, from_data):
                 "(/mitarbeiter neu)."
             )
 
-        # Falls schon eine andere Chat-ID hier haengt: warnen + ueberschreiben
-        if emp.telegram_chat_id and emp.telegram_chat_id != chat_id:
+        # SICHERHEIT (H1): bare-slug /start darf eine bereits bestehende
+        # Telegram-Verknuepfung NICHT ueberschreiben. Sonst koennte jeder,
+        # der den (oeffentlich erratbaren) Tenant-Slug kennt, per
+        # /start <slug> die Inhaber-Bindung uebernehmen (Owner-Takeover).
+        # Erlaubt bleiben: Erst-Onboarding (noch keine Bindung) und Re-Scan
+        # durch denselben Chat (idempotent). Auch legacy-desynchronisierte
+        # Tenants (emp.telegram_chat_id NULL, aber tenant.telegram_chat_id
+        # gesetzt) sind geschuetzt, weil beide Quellen geprueft werden.
+        existing_chat = emp.telegram_chat_id or (
+            tenant.telegram_chat_id if emp.is_default else None
+        )
+        if existing_chat and existing_chat != chat_id:
             logger.warning(
-                f"Mitarbeiter {tenant_slug}/{employee_slug}: "
-                f"Chat-ID-Wechsel von {emp.telegram_chat_id} zu {chat_id}"
+                f"H1: Slug-Takeover-Versuch auf {tenant_slug}/{employee_slug} "
+                f"von chat_id={chat_id} abgelehnt "
+                f"(bereits gebunden an {existing_chat})"
+            )
+            return (
+                "Dieser Betrieb ist bereits mit einem Telegram-Konto "
+                "verknuepft.\n\nAus Sicherheitsgruenden laesst sich die "
+                "Verknuepfung nicht per QR-Code uebernehmen. Fuer einen "
+                "Geraetewechsel oder zur Uebertragung bitte beim Support "
+                "einen neuen Aktivierungs-Link anfordern."
             )
         # Bug 2026-05-12: ein Inhaber kann sich mit derselben Telegram-App
         # erst als Default-Employee aktivieren und danach als neu angelegter

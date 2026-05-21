@@ -12,6 +12,9 @@ wheels/
 # Framework-spezifisch
 .env
 .env.local
+.env.bak*
+.env.*.bak
+.env.save
 *.db
 *.sqlite
 logs/

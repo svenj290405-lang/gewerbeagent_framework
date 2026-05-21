@@ -46,6 +46,7 @@ gewerbeagent.de {
         output file /var/log/caddy/access.log {
             roll_size 10mb
             roll_keep 5
+            roll_keep_for 336h
         }
         format console
     }
@@ -63,6 +64,7 @@ www.gewerbeagent.de {
         output file /var/log/caddy/website-access.log {
             roll_size 10mb
             roll_keep 5
+            roll_keep_for 336h
         }
         format console
     }
@@ -96,6 +98,7 @@ quant.gewerbeagent.de {
         output file /var/log/caddy/quantpipeline-access.log {
             roll_size 10mb
             roll_keep 3
+            roll_keep_for 336h
         }
         format console
     }
@@ -134,6 +137,7 @@ status.gewerbeagent.de {
         output file /var/log/caddy/status-access.log {
             roll_size 10mb
             roll_keep 3
+            roll_keep_for 336h
         }
         format console
     }

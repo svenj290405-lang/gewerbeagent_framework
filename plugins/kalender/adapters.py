@@ -557,8 +557,14 @@ async def get_calendar_adapter(
         emp = await get_default_employee(tenant_id)
     else:
         async with AsyncSessionLocal() as s:
+            # tenant_id-Filter ist sicherheitskritisch: ein fremder employee_id
+            # darf nicht den Kalender/Provider eines anderen Tenants liefern.
+            # Bei Mismatch -> emp=None -> Fallback auf Default-Employee dieses Tenants.
             emp = (await s.execute(
-                select(Employee).where(Employee.id == employee_id)
+                select(Employee).where(
+                    Employee.id == employee_id,
+                    Employee.tenant_id == tenant_id,
+                )
             )).scalar_one_or_none()
 
     provider = (emp.calendar_provider if emp else None) or CALENDAR_PROVIDER_GOOGLE
