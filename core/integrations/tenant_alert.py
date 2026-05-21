@@ -114,32 +114,16 @@ async def notify_oauth_revoked(
 ) -> None:
     """OAuth-Token vom User entzogen oder abgelaufen ohne Refresh.
 
-    Tenant muss /kalender_verbinden bzw. /microsoft_setup erneut machen.
+    Wrapper auf core.security.oauth_alert.notify_oauth_token_invalid —
+    konsolidiert auf eine einzige Implementierung mit Re-Auth-Link,
+    Schritt-fuer-Schritt zur Google-Verifizierungs-Warnung und
+    Kontakt-Hinweis. employee_id wird ignoriert (Push geht an Tenant-
+    Default — der Inhaber muss neu autorisieren, nicht Mitarbeiter).
     """
-    alert_kind = f"oauth_revoked.{provider}"
-    if await _was_recently_alerted(tenant_id=tenant_id, alert_kind=alert_kind):
-        logger.info(
-            f"oauth_revoked-Alert fuer tenant={tenant_id} provider={provider} "
-            f"unterdrueckt (cooldown)"
-        )
-        return
+    from core.security.oauth_alert import notify_oauth_token_invalid
 
-    provider_label = {"microsoft": "Microsoft Outlook", "google": "Google Calendar"}.get(
-        provider, provider.title(),
-    )
-    msg = (
-        f"⚠️ <b>{provider_label}-Verbindung getrennt</b>\n\n"
-        f"Der Zugriff wurde entzogen oder ist abgelaufen. Bitte erneut "
-        f"verbinden mit:\n\n"
-        f"<code>/kalender_verbinden</code>\n\n"
-        f"Bis dahin werden Mails / Termine nicht mehr verarbeitet."
-    )
-    sent = await _send_alert(
-        tenant_id=tenant_id, message=msg, employee_id=employee_id,
-    )
-    await _record_alert(
-        tenant_id=tenant_id, alert_kind=alert_kind, success=sent,
-        details={"provider": provider, "employee_id": str(employee_id) if employee_id else None},
+    await notify_oauth_token_invalid(
+        tenant_id, provider, reason="refresh_failed",
     )
 
 

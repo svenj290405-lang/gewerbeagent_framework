@@ -6,8 +6,11 @@ und gibt einen authentifizierten Calendar-Service zurueck.
 """
 from __future__ import annotations
 
+import logging
 import uuid
 from datetime import timezone
+
+logger = logging.getLogger(__name__)
 
 from google.auth.transport.requests import Request as GRequest
 from google.oauth2.credentials import Credentials
@@ -71,7 +74,24 @@ async def get_calendar_service(
 
         # Access-Token abgelaufen? Refreshen und speichern
         if not creds.valid and creds.refresh_token:
-            creds.refresh(GRequest())
+            try:
+                creds.refresh(GRequest())
+            except Exception as exc:
+                # Refresh-Token revoked/expired? -> Tenant alarmieren
+                from core.security.oauth_alert import (
+                    is_oauth_invalid_error, notify_oauth_token_invalid,
+                )
+                if is_oauth_invalid_error(exc):
+                    try:
+                        await notify_oauth_token_invalid(
+                            tenant_id, "google", reason=str(exc)[:200],
+                        )
+                    except Exception as alert_exc:  # noqa: BLE001
+                        logger.warning(
+                            f"oauth-alert (google-calendar) failed for "
+                            f"tenant={tenant_id}: {alert_exc}"
+                        )
+                raise
             oauth_token.access_token = creds.token
             if creds.expiry:
                 oauth_token.access_token_expires_at = creds.expiry.replace(
