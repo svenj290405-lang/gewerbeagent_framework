@@ -35,3 +35,9 @@ dev = [
     "pytest-asyncio>=1.3.0",
     "ruff>=0.15.11",
 ]
+
+[tool.pytest.ini_options]
+markers = [
+    "slow: Test braucht echte externe Services (Gemini, Microsoft Graph). Wird per Default uebersprungen — explizit aktivieren via `pytest -m slow`.",
+]
+addopts = "-m 'not slow'"
