@@ -120,6 +120,15 @@ def _clear_redistribution_state():
     ar._inflight.clear()
 
 
+@pytest.fixture(autouse=True)
+def _disable_smart_routing(monkeypatch):
+    """Diese Tests pruefen die deterministische Stichwort-Logik. Das neue
+    Gemini-Smart-Routing hier abschalten, sonst wuerde choose_employee
+    einen echten Gemini-Call versuchen (Latenz/Flakiness). Der Gemini-Pfad
+    hat eigene Tests in test_employee_router_gemini.py."""
+    monkeypatch.setattr(er.settings, "smart_routing_enabled", False)
+
+
 # =====================================================================
 # extract_skills_from_text (Skill-Erkennung — pure)
 # =====================================================================

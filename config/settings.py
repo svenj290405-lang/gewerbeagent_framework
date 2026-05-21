@@ -41,6 +41,12 @@ class Settings(BaseSettings):
     gemini_model: str = "gemini-2.5-flash"
     gemini_location: str = "europe-west3"
 
+    # Smart-Routing: Gemini waehlt anhand der Mitarbeiter-Skills den
+    # passendsten Mitarbeiter (statt starrem Stichwort-Match). Failsafe:
+    # bei Fehler/Timeout faellt der Router auf die Stichwort-Logik zurueck.
+    # False = nur Stichwort-Logik, kein Gemini im Router.
+    smart_routing_enabled: bool = True
+
     elevenlabs_api_key: str = ""
 
     # Google Maps Platform — Geocoding API + Distance Matrix API. Bevorzugter

@@ -29,6 +29,7 @@ defensiv programmieren.
 """
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import logging
 import uuid
@@ -37,6 +38,7 @@ from typing import Any
 
 from sqlalchemy import select
 
+from config.settings import settings
 from core.database import AsyncSessionLocal
 
 logger = logging.getLogger(__name__)
@@ -234,7 +236,48 @@ async def choose_employee(
             reason="only-active", score=1.0, debug={"candidate_count": 1},
         )
 
-    # 4) Skill-Score
+    # 3a) Smart-Routing: Gemini waehlt anhand der Skills den fachlich
+    #     passendsten Kandidaten. Nur wenn aktiviert, Anliegen-Text da und
+    #     >1 Kandidat (sonst gibt's nichts zu entscheiden). Failsafe:
+    #     bei None/Timeout/Fehler faellt es unten auf die deterministische
+    #     Stichwort-Logik zurueck. Timeout schuetzt den Hot-Path (Mail/
+    #     Voice/Anfrage laufen alle hier durch).
+    if settings.smart_routing_enabled and (anliegen_text or "").strip():
+        picked_slug = None
+        try:
+            from core.ai.gemini import rank_employee_for_request
+            cand = [
+                {
+                    "slug": e.slug, "name": e.name,
+                    "skills": list(e.skills or []),
+                    "job_title": getattr(e, "job_title", None),
+                }
+                for e in emps
+            ]
+            picked_slug = await asyncio.wait_for(
+                rank_employee_for_request(
+                    anliegen_text, cand, tenant_id=str(tenant_id),
+                ),
+                timeout=8.0,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"choose_employee: Gemini-Routing fiel aus: {e}")
+            picked_slug = None
+        if picked_slug:
+            winner = next((e for e in emps if e.slug == picked_slug), None)
+            if winner is not None:
+                logger.info(
+                    f"choose_employee: Gemini -> {winner.slug} "
+                    f"(tenant={tenant_id})"
+                )
+                return RoutingDecision(
+                    employee_id=winner.id, employee_name=winner.name,
+                    employee_slug=winner.slug, reason="gemini-skill-match",
+                    score=1.0, debug={"gemini": True},
+                )
+
+    # 4) Skill-Score (deterministischer Fallback wenn Smart-Routing aus
+    #    ist oder Gemini keinen klaren Treffer/Antwort lieferte)
     needed_skills = _extract_skills_from_text(anliegen_text)
     skill_scores: dict[uuid.UUID, int] = {}
     for e in emps:

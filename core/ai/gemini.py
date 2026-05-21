@@ -1052,6 +1052,96 @@ async def classify_mail_subject(
         }
 
 
+async def rank_employee_for_request(
+    anliegen_text: str,
+    candidates: list[dict],
+    *,
+    tenant_id: str | None = None,
+) -> str | None:
+    """Waehlt per Gemini den fachlich passendsten Mitarbeiter fuer eine
+    Anfrage — anhand der Skills (+ optional Job-Titel) der VERFUEGBAREN
+    Kandidaten.
+
+    candidates: Liste von dicts mit Keys "slug", "name", "skills"
+    (list[str]) und optional "job_title". Es werden nur bereits
+    verfuegbare Kandidaten uebergeben — der Abwesenheits-/Arbeitszeit-
+    Filter laeuft vorher im employee_router.
+
+    Returns: slug des gewaehlten Kandidaten, oder None wenn Gemini keinen
+    klaren fachlichen Treffer sieht, die Antwort unbrauchbar ist oder der
+    Aufruf scheitert. None heisst fuer den Caller: auf die deterministische
+    Stichwort-Logik zurueckfallen — diese Funktion wirft NIE.
+    """
+    import json as _json
+    import re as _re
+
+    if not anliegen_text or not anliegen_text.strip():
+        return None
+    valid_slugs = {c.get("slug") for c in candidates if c.get("slug")}
+    if len(valid_slugs) < 2:
+        return None
+
+    zeilen = []
+    for c in candidates:
+        if not c.get("slug"):
+            continue
+        skills = ", ".join(c.get("skills") or []) or "(keine Skills hinterlegt)"
+        jt = c.get("job_title")
+        jt_part = f", Rolle: {jt}" if jt else ""
+        name = c.get("name") or c.get("slug")
+        zeilen.append(f'- slug "{c["slug"]}" ({name}{jt_part}) — Skills: {skills}')
+    kandidaten_block = "\n".join(zeilen)
+
+    prompt = (
+        "Du ordnest eine eingehende Kunden-Anfrage dem fachlich am besten "
+        "geeigneten Mitarbeiter eines Handwerksbetriebs zu.\n\n"
+        f"ANFRAGE:\n{anliegen_text.strip()[:1500]}\n\n"
+        f"VERFUEGBARE MITARBEITER:\n{kandidaten_block}\n\n"
+        "Waehle GENAU EINEN Mitarbeiter, dessen Skills fachlich am besten "
+        "zum Gewerk/Problem der Anfrage passen. Wenn KEIN Mitarbeiter "
+        "fachlich klar passt, gib slug null zurueck.\n"
+        "Antworte AUSSCHLIESSLICH mit gueltigem JSON (kein Markdown, keine "
+        'Erklaerung), z.B.:\n{"slug": "max", "reason": "Heizung -> heizung-Skill"}'
+    )
+
+    try:
+        text = await call_gemini(
+            prompt=prompt,
+            temperature=0.0,
+            max_output_tokens=512,
+            tenant_id=tenant_id,
+            operation_kind="employee_routing",
+        )
+        text_stripped = text.strip()
+        if text_stripped.startswith("```"):
+            text_stripped = _re.sub(r"^```(?:json)?\s*", "", text_stripped)
+            text_stripped = _re.sub(r"\s*```$", "", text_stripped)
+        try:
+            result = _json.loads(text_stripped)
+        except _json.JSONDecodeError:
+            match = _re.search(r"\{[^{}]*\}", text_stripped, _re.DOTALL)
+            if not match:
+                logger.warning(
+                    f"rank_employee: kein JSON in Antwort: {text[:200]!r}"
+                )
+                return None
+            result = _json.loads(match.group(0))
+        slug = result.get("slug")
+        if not slug or slug not in valid_slugs:
+            logger.info(
+                f"rank_employee: kein gueltiger slug ({slug!r}) -> Fallback"
+            )
+            return None
+        logger.info(
+            "rank_employee: gewaehlt slug=%s reason=%s",
+            slug, (result.get("reason") or "")[:120],
+        )
+        return slug
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"rank_employee_for_request fehler: {e} -> Fallback")
+        return None
+
+
 # =====================================================================
 # Mail-Reply-Generator fuer RELEVANT_KUNDE Mails
 # Generiert persoenliche Antwort auf Kunden-Anfrage mit Wissensbasis-
