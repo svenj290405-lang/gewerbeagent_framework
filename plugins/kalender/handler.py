@@ -690,6 +690,7 @@ class Plugin(BasePlugin):
         Payload:
           - kunde_telefon (str, optional): wird hier normalisiert
           - kunde_email (str, optional)
+          - kunde_name (str, optional): Volltext-Namenssuche
           - time_min (ISO-String, optional, Default: jetzt)
           - time_max (ISO-String, optional, Default: jetzt + 30 Tage)
 
@@ -702,12 +703,16 @@ class Plugin(BasePlugin):
         try:
             telefon_raw = (payload.get("kunde_telefon") or "").strip()
             email_raw = (payload.get("kunde_email") or "").strip()
+            name_raw = (payload.get("kunde_name") or "").strip()
             telefon_norm = normalize_phone(telefon_raw) or None
             email_norm = email_raw.lower() or None
-            if not telefon_norm and not email_norm:
+            name_query = name_raw or None
+            if not telefon_norm and not email_norm and not name_query:
                 return {
                     "erfolg": False,
-                    "nachricht": "kunde_telefon oder kunde_email erforderlich",
+                    "nachricht": (
+                        "kunde_telefon, kunde_email oder kunde_name erforderlich"
+                    ),
                 }
 
             # Zeitraum default: jetzt → +30 Tage
@@ -738,6 +743,7 @@ class Plugin(BasePlugin):
                         time_min=time_min, time_max=time_max,
                         kunde_telefon_normalized=telefon_norm,
                         kunde_email=email_norm,
+                        kunde_name=name_query,
                     )
                 except Exception as exc:  # noqa: BLE001
                     logger.warning(f"find_events: emp={emp.slug} crash: {exc}")
@@ -758,6 +764,7 @@ class Plugin(BasePlugin):
                         "location": ev.get("location", ""),
                         "kunde_telefon_match": ev.get("kunde_telefon_match", False),
                         "kunde_email_match": ev.get("kunde_email_match", False),
+                        "kunde_name_match": ev.get("kunde_name_match", False),
                         "match_source": ev.get("match_source", ""),
                     })
 

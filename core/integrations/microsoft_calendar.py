@@ -400,9 +400,10 @@ async def find_events(
     time_max: dt.datetime,
     kunde_telefon_normalized: str | None = None,
     kunde_email: str | None = None,
+    kunde_name: str | None = None,
     employee_id: UUID | None = None,
 ) -> list[dict[str, Any]]:
-    """Sucht Events nach Telefon ODER Email im Zeitraum.
+    """Sucht Events nach Telefon ODER Email ODER Name im Zeitraum.
 
     Strategie:
     1. Metadaten-Suche: /me/calendarView mit $filter ueber
@@ -417,6 +418,7 @@ async def find_events(
     """
     from plugins.kalender.event_match import (
         verify_fulltext_phone_match, verify_fulltext_email_match,
+        verify_fulltext_name_match,
     )
     token = await get_microsoft_token(tenant_id, employee_id=employee_id)
     start_iso = _iso_no_tz(time_min)
@@ -427,7 +429,7 @@ async def find_events(
     def _parse_dt(s: str) -> dt.datetime:
         return dt.datetime.fromisoformat(s).replace(tzinfo=None)
 
-    def _ingest(items, *, source, phone_match, email_match):
+    def _ingest(items, *, source, phone_match, email_match, name_match=False):
         for ev in items or []:
             eid = ev.get("id") or ""
             if not eid:
@@ -442,6 +444,8 @@ async def find_events(
                     results[eid]["kunde_telefon_match"] = True
                 if email_match:
                     results[eid]["kunde_email_match"] = True
+                if name_match:
+                    results[eid]["kunde_name_match"] = True
                 continue
             results[eid] = {
                 "event_id": eid,
@@ -456,6 +460,7 @@ async def find_events(
                 ).strip(),
                 "kunde_telefon_match": bool(phone_match),
                 "kunde_email_match": bool(email_match),
+                "kunde_name_match": bool(name_match),
                 "match_source": source,
             }
 
@@ -574,6 +579,21 @@ async def find_events(
         _ingest(verified, source="fulltext",
                 phone_match=False, email_match=True)
 
+    async def _query_fulltext_name(query_name: str):
+        # Name nur per Volltext (keine extendedProperty). Verifikation
+        # gegen subject + body, damit nicht jeder Event matcht.
+        events = await _fetch_all_events_in_range()
+        verified = [
+            ev for ev in events
+            if verify_fulltext_name_match(
+                query_name,
+                ev.get("subject") or "",
+                _strip_html((ev.get("body") or {}).get("content") or ""),
+            )
+        ]
+        _ingest(verified, source="fulltext",
+                phone_match=False, email_match=False, name_match=True)
+
     if kunde_telefon_normalized:
         await _query_metadata(
             "kunde_telefon", kunde_telefon_normalized,
@@ -588,6 +608,8 @@ async def find_events(
         await _query_fulltext_phone(kunde_telefon_normalized)
     if kunde_email:
         await _query_fulltext_email(kunde_email)
+    if kunde_name:
+        await _query_fulltext_name(kunde_name)
 
     return list(results.values())
 

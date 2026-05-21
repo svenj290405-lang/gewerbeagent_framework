@@ -1539,8 +1539,10 @@ async def _handle_storno_command(chat_id):
     await _save_state(chat_id, STATE_STORNO_AWAIT_QUERY, {})
     return (
         "<b>Termin stornieren</b>\n\n"
-        "Bitte Telefonnummer ODER E-Mail-Adresse des Kunden eingeben.\n"
+        "Bitte <b>Name</b>, <b>Telefonnummer</b> ODER <b>E-Mail</b> des "
+        "Kunden eingeben.\n"
         "Beispiele:\n"
+        "  <code>Sven Jantos</code>\n"
         "  <code>+49 30 1234567</code>\n"
         "  <code>kunde@example.de</code>\n\n"
         "Oder /abbrechen."
@@ -1553,19 +1555,23 @@ async def _handle_storno_query_input(chat_id, text):
 
     raw = (text or "").strip()
     if not raw:
-        return "Bitte Telefonnummer oder Mail eingeben (oder /abbrechen)."
+        return "Bitte Name, Telefonnummer oder Mail eingeben (oder /abbrechen)."
 
     tenant = await _get_tenant_by_chat(chat_id)
     if not tenant:
         await _clear_state(chat_id)
         return "Dieser Chat ist keinem Betrieb zugeordnet."
 
-    # Heuristik: enthaelt @ -> Mail, sonst Telefon
+    # Heuristik: @ -> Mail; nur Telefon-Zeichen -> Telefon; sonst -> Name.
+    # (Name laeuft serverseitig als Volltext-Suche ueber summary+description.)
     find_payload: dict = {}
+    _phone_chars = set("0123456789 +-/().")
     if "@" in raw:
         find_payload["kunde_email"] = raw
-    else:
+    elif all(c in _phone_chars for c in raw):
         find_payload["kunde_telefon"] = raw
+    else:
+        find_payload["kunde_name"] = raw
 
     kalender = await get_plugin_for_tenant(tenant.slug, "kalender")
     if kalender is None:

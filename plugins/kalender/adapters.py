@@ -102,8 +102,9 @@ class CalendarAdapter(ABC):
         time_max: dt.datetime,
         kunde_telefon_normalized: str | None = None,
         kunde_email: str | None = None,
+        kunde_name: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Sucht Events nach Telefon ODER Email im Zeitraum.
+        """Sucht Events nach Telefon ODER Email ODER Name im Zeitraum.
 
         Strategy beider Provider:
         1. PRIMAERE Metadaten-Suche ueber extendedProperties — exakt,
@@ -117,8 +118,12 @@ class CalendarAdapter(ABC):
         Returns: Liste von dicts mit Keys:
           - event_id, start_dt, end_dt (naive Lokal-Zeit)
           - summary, description, location
-          - kunde_telefon_match (bool), kunde_email_match (bool)
+          - kunde_telefon_match (bool), kunde_email_match (bool),
+            kunde_name_match (bool)
           - match_source: "metadata" | "fulltext"
+
+        Name-Suche ist immer Volltext (der Name liegt nicht als
+        extendedProperty vor, nur in summary/description).
         """
 
     async def attach_drive_link(self, event_id: str, drive_url: str) -> bool:
@@ -314,11 +319,12 @@ class GoogleCalendarAdapter(CalendarAdapter):
 
     async def find_events(
         self, *, time_min, time_max,
-        kunde_telefon_normalized=None, kunde_email=None,
+        kunde_telefon_normalized=None, kunde_email=None, kunde_name=None,
     ):
         from dateutil import parser as _p  # type: ignore
         from plugins.kalender.event_match import (
             verify_fulltext_phone_match, verify_fulltext_email_match,
+            verify_fulltext_name_match,
         )
         service = await self._get_service()
         tz = self._tz_offset()
@@ -327,7 +333,7 @@ class GoogleCalendarAdapter(CalendarAdapter):
 
         results: dict[str, dict[str, Any]] = {}
 
-        def _ingest(items, *, source, phone_match, email_match):
+        def _ingest(items, *, source, phone_match, email_match, name_match=False):
             for ev in items or []:
                 s = ev.get("start", {})
                 e = ev.get("end", {})
@@ -346,6 +352,8 @@ class GoogleCalendarAdapter(CalendarAdapter):
                         results[eid]["kunde_telefon_match"] = True
                     if email_match:
                         results[eid]["kunde_email_match"] = True
+                    if name_match:
+                        results[eid]["kunde_name_match"] = True
                     continue
                 results[eid] = {
                     "event_id": eid,
@@ -356,6 +364,7 @@ class GoogleCalendarAdapter(CalendarAdapter):
                     "location": (ev.get("location") or "").strip(),
                     "kunde_telefon_match": bool(phone_match),
                     "kunde_email_match": bool(email_match),
+                    "kunde_name_match": bool(name_match),
                     "match_source": source,
                 }
 
@@ -428,6 +437,30 @@ class GoogleCalendarAdapter(CalendarAdapter):
                         phone_match=False, email_match=True)
             except Exception as exc:  # noqa: BLE001
                 logger.warning(f"Google find_events email-fulltext failed: {exc}")
+
+        # ----- NAME: nur Volltext (Name liegt nicht als Property vor) -----
+        # Google's q matcht summary/description/location/attendees. Lokale
+        # Verifikation gegen summary+description (alle Namens-Tokens).
+        if kunde_name:
+            try:
+                resp = service.events().list(
+                    calendarId=self.calendar_id,
+                    timeMin=t_min, timeMax=t_max,
+                    singleEvents=True, orderBy="startTime",
+                    q=kunde_name,
+                ).execute()
+                verified = [
+                    ev for ev in resp.get("items", [])
+                    if verify_fulltext_name_match(
+                        kunde_name,
+                        ev.get("summary") or "",
+                        ev.get("description") or "",
+                    )
+                ]
+                _ingest(verified, source="fulltext",
+                        phone_match=False, email_match=False, name_match=True)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"Google find_events name-fulltext failed: {exc}")
 
         return list(results.values())
 
@@ -515,7 +548,7 @@ class MicrosoftCalendarAdapter(CalendarAdapter):
 
     async def find_events(
         self, *, time_min, time_max,
-        kunde_telefon_normalized=None, kunde_email=None,
+        kunde_telefon_normalized=None, kunde_email=None, kunde_name=None,
     ):
         from core.integrations.microsoft_calendar import find_events
         return await find_events(
@@ -523,6 +556,7 @@ class MicrosoftCalendarAdapter(CalendarAdapter):
             time_min=time_min, time_max=time_max,
             kunde_telefon_normalized=kunde_telefon_normalized,
             kunde_email=kunde_email,
+            kunde_name=kunde_name,
             employee_id=self.employee_id,
         )
 

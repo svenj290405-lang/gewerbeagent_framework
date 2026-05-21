@@ -64,3 +64,26 @@ def verify_fulltext_email_match(
     if not needle_email_lower or not description:
         return False
     return needle_email_lower in description.lower()
+
+
+def verify_fulltext_name_match(
+    query_name: str, summary: str, description: str,
+) -> bool:
+    """True wenn ALLE Tokens des Such-Namens in summary ODER description vorkommen.
+
+    Namen sind unscharf, daher tokenweise + case-insensitiv: jedes Wort des
+    Such-Namens (>= 2 Zeichen) muss irgendwo im kombinierten Text auftauchen.
+    So matcht "Sven Jantos" sowohl die summary ("[Betrieb] Reparatur - Sven
+    Jantos") als auch die description ("Kunde: Sven Jantos"), aber nicht jeder
+    beliebige Termin. Einzelwort-Suche ("Jantos") ist erlaubt — der Betrieb
+    waehlt im Wizard ohnehin aus der Trefferliste aus.
+    """
+    if not query_name:
+        return False
+    haystack = f"{summary or ''}\n{description or ''}".lower()
+    if not haystack.strip():
+        return False
+    tokens = [t for t in query_name.lower().split() if len(t) >= 2]
+    if not tokens:
+        return False
+    return all(t in haystack for t in tokens)
