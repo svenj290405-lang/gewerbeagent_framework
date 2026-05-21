@@ -36,6 +36,24 @@ _log_tenant_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
 _log_employee_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "log_employee_id", default=None,
 )
+# Voller (NICHT gekuerzter) Tenant-Slug des aktuellen Webhook-Requests.
+# set_log_tenant kuerzt auf 8 Hex-Zeichen (Recon-Schutz) und taugt daher
+# NICHT zur Tenant-Aufloesung. Diese Var traegt den vollen Slug aus dem
+# Webhook-Pfad — z.B. um den richtigen Telegram-Bot-Token pro Betrieb
+# aufzuloesen (eigener Bot pro Betrieb).
+_webhook_tenant_slug: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "webhook_tenant_slug", default=None,
+)
+
+
+def set_webhook_tenant_slug(slug: str | None) -> None:
+    """Setzt den vollen Tenant-Slug des aktuellen Webhook-Requests."""
+    _webhook_tenant_slug.set(slug or None)
+
+
+def get_webhook_tenant_slug() -> str | None:
+    """Liefert den vollen Tenant-Slug des aktuellen Webhook-Requests."""
+    return _webhook_tenant_slug.get()
 
 
 def set_log_tenant(tenant_id: UUID | str | None) -> None:

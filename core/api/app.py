@@ -214,8 +214,10 @@ async def webhook_dispatch(
     )
 
     # B1: Tenant-Context fuer alle nachfolgenden Logs in diesem Request
-    from core.logging_context import set_log_tenant
+    from core.logging_context import set_log_tenant, set_webhook_tenant_slug
     set_log_tenant(tenant_slug)  # slug ist genauso gut wie UUID hier
+    # Voller Slug (ungekuerzt) fuer Bot-Token-Aufloesung pro Betrieb
+    set_webhook_tenant_slug(tenant_slug)
 
     # Plugin fuer diesen Tenant holen
     plugin = await get_plugin_for_tenant(tenant_slug, plugin_name)
@@ -320,6 +322,16 @@ async def oauth_callback(
     try:
         oauth_token = await handle_callback(code=code, state=state)
         safe_email = _h(oauth_token.account_email or "?")
+        # Onboarding: steht der Tenant gerade beim Kalender-Schritt, das
+        # Tutorial automatisch weiterschalten (Telegram-Push). Failsafe —
+        # ein Telegram-Problem darf den OAuth-Erfolg nie kippen.
+        try:
+            from plugins.telegram_notify.handler import onboarding_advance_after_oauth
+            await onboarding_advance_after_oauth(
+                oauth_token.tenant_id, oauth_token.provider,
+            )
+        except Exception:
+            logger.exception("Onboarding-Auto-Advance nach OAuth fehlgeschlagen")
         return HTMLResponse(
             content=f"""
             <html>

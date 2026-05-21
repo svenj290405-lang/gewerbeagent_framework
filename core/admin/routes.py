@@ -719,6 +719,20 @@ async def tenant_detail(
             .where(FailedMailQueue.status == "dead")
         )).scalar() or 0
 
+        # Eigener Telegram-Bot pro Betrieb: aktueller Token-Status
+        from core.models import ToolConfig
+        tg_tc = (await s.execute(
+            select(ToolConfig).where(
+                ToolConfig.tenant_id == tid,
+                ToolConfig.tool_name == "telegram_notify",
+            )
+        )).scalar_one_or_none()
+        _tg_tok = (tg_tc.config or {}).get("bot_token") if tg_tc else None
+        telegram_bot_set = bool(_tg_tok)
+        telegram_bot_hint = (
+            f"…{_tg_tok[-6:]}" if _tg_tok and len(_tg_tok) > 6 else ""
+        )
+
         await audit(
             user_id=user.id, action="tenant.view",
             target=tenant.slug, request=request, session=s,
@@ -743,6 +757,9 @@ async def tenant_detail(
             "providers": {"labels": prov_labels, "data": prov_data},
         },
         "usage": usage,
+        "telegram_bot_set": telegram_bot_set,
+        "telegram_bot_hint": telegram_bot_hint,
+        "tgbot_msg": request.query_params.get("tgbot"),
         "csrf_token": request.state.admin_csrf,
     })
 
@@ -850,6 +867,97 @@ async def tenant_set_retention(
         await s.commit()
     return RedirectResponse(
         f"/admin/tenants/{tenant_id}", status_code=303,
+    )
+
+
+@router.post("/tenants/{tenant_id}/telegram-bot")
+async def tenant_set_telegram_bot(
+    request: Request,
+    tenant_id: str,
+    bot_token: str = Form(""),
+    csrf_token: str = Form(...),
+    user: AdminUser = Depends(require_admin),
+):
+    """Eigener Telegram-Bot pro Betrieb (Variante A): bot_token setzen oder
+    leeren. Bei gesetztem Token wird ausserdem der Webhook dieses Bots auf
+    den tenant-spezifischen Pfad registriert, damit eingehende Updates dem
+    Betrieb zugeordnet werden und Antworten ueber diesen Bot rausgehen.
+    Leeres Feld = Token entfernen (Betrieb faellt auf den geteilten globalen
+    Bot zurueck)."""
+    require_csrf(request, csrf_token)
+    token = (bot_token or "").strip()
+    try:
+        tid = uuid.UUID(tenant_id)
+    except ValueError:
+        raise HTTPException(404, "Tenant nicht gefunden")
+    from core.models import ToolConfig
+    async with get_session() as s:
+        tenant = (await s.execute(
+            select(Tenant).where(Tenant.id == tid)
+        )).scalar_one_or_none()
+        if not tenant:
+            raise HTTPException(404, "Tenant nicht gefunden")
+        slug = tenant.slug
+        tc = (await s.execute(
+            select(ToolConfig).where(
+                ToolConfig.tenant_id == tid,
+                ToolConfig.tool_name == "telegram_notify",
+            )
+        )).scalar_one_or_none()
+        if tc is None:
+            tc = ToolConfig(
+                tenant_id=tid, tool_name="telegram_notify",
+                enabled=True, config={},
+            )
+            s.add(tc)
+        cfg = dict(tc.config or {})
+        had = bool(cfg.get("bot_token"))
+        if token:
+            cfg["bot_token"] = token
+            tc.enabled = True
+        else:
+            cfg.pop("bot_token", None)
+        tc.config = cfg  # Neuzuweisung triggert JSON-Change-Tracking
+        await audit(
+            user_id=user.id, action="tenant.telegram_bot.update",
+            target=slug, request=request, session=s,
+            details={"had_token": had, "now_set": bool(token)},
+        )
+        await s.commit()
+
+    # Webhook best-effort auf den tenant-spezifischen Pfad setzen
+    note = "Token entfernt — Betrieb nutzt wieder den geteilten Bot."
+    if token:
+        try:
+            from config.settings import settings
+            import httpx
+            public_url = (settings.public_url or "").rstrip("/")
+            webhook_url = f"{public_url}/webhook/{slug}/telegram_notify/incoming"
+            payload = {"url": webhook_url}
+            secret = (settings.telegram_webhook_secret or "").strip()
+            if secret:
+                payload["secret_token"] = secret
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.post(
+                    f"https://api.telegram.org/bot{token}/setWebhook",
+                    json=payload,
+                )
+            data = resp.json() if resp.content else {}
+            if resp.status_code == 200 and data.get("ok"):
+                note = f"Webhook gesetzt: {webhook_url}"
+            else:
+                note = (
+                    f"Token gespeichert, aber setWebhook scheiterte: "
+                    f"HTTP {resp.status_code} {data.get('description', '')}"
+                )
+        except Exception as e:
+            logger.exception("setWebhook fuer Tenant-Bot fehlgeschlagen")
+            note = f"Token gespeichert, setWebhook-Fehler: {e}"
+    logger.info(f"Tenant-Bot-Update {slug}: {note}")
+
+    from urllib.parse import quote
+    return RedirectResponse(
+        f"/admin/tenants/{tenant_id}?tgbot={quote(note)}", status_code=303,
     )
 
 

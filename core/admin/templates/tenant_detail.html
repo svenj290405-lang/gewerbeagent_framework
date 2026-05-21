@@ -40,6 +40,28 @@
     </small>
 </form>
 
+<div class="section-title">Telegram-Bot (eigener Bot pro Betrieb)</div>
+{% if tgbot_msg %}
+<div style="font-size:13px; padding:8px 12px; margin-bottom:10px; border-radius:6px; background:var(--bg-soft,#f4f6fa); color:var(--ink-muted);">
+    {{ tgbot_msg }}
+</div>
+{% endif %}
+<form method="post"
+      action="/admin/tenants/{{ tenant.id }}/telegram-bot"
+      style="display:flex; gap:8px; align-items:center; margin-bottom:6px; flex-wrap:wrap;">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <label style="font-size:13px;color:var(--ink-muted);">BotFather-Token</label>
+    <input type="text" name="bot_token" autocomplete="off"
+           placeholder="{% if telegram_bot_set %}gesetzt ({{ telegram_bot_hint }}) — neuen Token eingeben zum Ersetzen{% else %}123456:ABC-DEF…  (leer = geteilter globaler Bot){% endif %}"
+           style="flex:1; min-width:300px; padding:6px 8px; border:1px solid var(--border); border-radius:6px;">
+    <button type="submit" class="btn">Speichern + Webhook setzen</button>
+</form>
+<small style="display:block; color:var(--ink-muted); margin-bottom:24px;">
+    {% if telegram_bot_set %}Status: <b>eigener Bot aktiv</b> ({{ telegram_bot_hint }}).{% else %}Status: nutzt den <b>geteilten globalen Bot</b>.{% endif %}
+    Feld leer + Speichern entfernt den eigenen Bot. Beim Speichern wird der Webhook automatisch auf
+    <code>/webhook/{{ tenant.slug }}/telegram_notify/incoming</code> gesetzt.
+</small>
+
 <div class="stats-grid">
     <div class="stat-card">
         <div class="stat-label">Kontakt</div>

@@ -3,6 +3,7 @@ Telegram-Plugin: Push-Notifications + Empfang von Telegram-Updates.
 """
 from __future__ import annotations
 
+import contextvars
 import datetime as dt
 import logging
 import uuid
@@ -160,6 +161,46 @@ TELEGRAM_API_BASE = "https://api.telegram.org"
 HTTP_TIMEOUT_SECONDS = 10.0
 GLOBAL_TENANT_SLUG = "_global"
 TELEGRAM_BOT_TOOL_NAME = "telegram_bot"
+
+# Eigener Bot pro Betrieb: Bot-Token, mit dem in DIESEM Update geantwortet
+# wird. Pro Webhook-Request (Async-Task) gesetzt — der Tenant aus dem
+# Webhook-Pfad bestimmt den Bot. Ist kein Tenant-eigener Bot konfiguriert,
+# bleibt es None und alle Sends fallen auf den geteilten globalen Bot
+# zurueck (= bisheriges Verhalten, kein Regression-Risiko).
+_active_bot_token: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "active_bot_token", default=None,
+)
+
+
+async def _resolve_active_bot_token() -> str | None:
+    """Bot-Token fuer das aktuelle Update: Tenant-eigener Bot (aus dem
+    Webhook-Pfad-Slug, `telegram_notify.bot_token`) wenn gesetzt, sonst der
+    geteilte globale Bot. Failsafe — bei jedem Fehler globaler Bot."""
+    try:
+        from core.logging_context import get_webhook_tenant_slug
+        slug = get_webhook_tenant_slug()
+        if slug and slug != GLOBAL_TENANT_SLUG:
+            async with AsyncSessionLocal() as s:
+                tc = (await s.execute(
+                    select(ToolConfig)
+                    .join(Tenant, Tenant.id == ToolConfig.tenant_id)
+                    .where(
+                        Tenant.slug == slug,
+                        ToolConfig.tool_name == "telegram_notify",
+                    )
+                )).scalar_one_or_none()
+            if tc and tc.enabled:
+                tok = (tc.config or {}).get("bot_token")
+                if tok:
+                    return tok
+    except Exception:
+        logger.exception("aktiven Bot-Token aufloesen fehlgeschlagen — global")
+    return await _load_global_bot_token()
+
+
+async def _active_token() -> str | None:
+    """Aktiver Bot-Token fuer dieses Update (ContextVar) oder global."""
+    return _active_bot_token.get() or await _load_global_bot_token()
 STATE_TTL_MINUTES = 30
 WISSEN_MAX_LEN = 2000
 
@@ -497,7 +538,7 @@ async def _send_to_chat(chat_id, text, bot_token=None):
     automatisch in mehrere Messages aufgeteilt — sonst antwortet die
     Bot-API mit HTTP 400 "message is too long"."""
     if bot_token is None:
-        bot_token = await _load_global_bot_token()
+        bot_token = _active_bot_token.get() or await _load_global_bot_token()
         if bot_token is None:
             return False
     text_str = str(text)
@@ -1735,6 +1776,11 @@ async def process_telegram_update(payload):
 
 
 async def _dispatch_update(payload):
+    # Eigener Bot pro Betrieb: Token fuer dieses Update aufloesen (Tenant
+    # aus dem Webhook-Pfad → eigener Bot, sonst geteilter globaler Bot).
+    # Alle Sends/Downloads in diesem Update nutzen diesen Token.
+    _active_bot_token.set(await _resolve_active_bot_token())
+
     # Callback-Query (Button-Klick) hat eigene Top-Level-Struktur
     callback_query = payload.get("callback_query")
     if callback_query:
@@ -1744,7 +1790,7 @@ async def _dispatch_update(payload):
         cq_chat_id = (cq_message.get("chat") or {}).get("id")
         if not cq_chat_id or not cq_data:
             return {"ok": True}
-        bot_token = await _load_global_bot_token()
+        bot_token = _active_bot_token.get() or await _load_global_bot_token()
         logger.info(f"Callback-Query: chat={cq_chat_id} data={cq_data!r}")
         if cq_data.startswith("rg:"):
             await _handle_rechnung_callback(cq_chat_id, cq_data, cq_id, bot_token)
@@ -1807,7 +1853,7 @@ async def _dispatch_update(payload):
             STATE_VIZ_WAITING_PHOTO,
             STATE_BELEG_WAITING_PHOTO,
         ):
-            bot_token = await _load_global_bot_token()
+            bot_token = _active_bot_token.get() or await _load_global_bot_token()
             if not bot_token:
                 await _send_to_chat(
                     chat_id,
@@ -1835,7 +1881,7 @@ async def _dispatch_update(payload):
 
         if state and state.state_key == STATE_ARCHIV_WAITING_FILES:
             if not bot_token:
-                bot_token = await _load_global_bot_token()
+                bot_token = _active_bot_token.get() or await _load_global_bot_token()
                 if not bot_token:
                     await _send_to_chat(
                         chat_id,
@@ -1857,7 +1903,7 @@ async def _dispatch_update(payload):
     if voice and not text:
         state = await _load_state(chat_id)
         if state and state.state_key == STATE_RECHNUNG_WAITING_INPUT:
-            bot_token = await _load_global_bot_token()
+            bot_token = _active_bot_token.get() or await _load_global_bot_token()
             if not bot_token:
                 await _send_to_chat(
                     chat_id,
@@ -1872,7 +1918,7 @@ async def _dispatch_update(payload):
             return {"ok": True}
         # ----- Aufnahme-Wizard: Voice-Note empfangen -----
         if state and state.state_key == STATE_AUFNAHME_WAITING_AUDIO:
-            bot_token = await _load_global_bot_token()
+            bot_token = _active_bot_token.get() or await _load_global_bot_token()
             if not bot_token:
                 await _send_to_chat(
                     chat_id,
@@ -1887,7 +1933,7 @@ async def _dispatch_update(payload):
             return {"ok": True}
         # ----- Angebot-Wizard: Voice-Note empfangen -----
         if state and state.state_key == STATE_ANGEBOT_WAITING_INPUT:
-            bot_token = await _load_global_bot_token()
+            bot_token = _active_bot_token.get() or await _load_global_bot_token()
             if not bot_token:
                 await _send_to_chat(
                     chat_id,
@@ -1903,7 +1949,7 @@ async def _dispatch_update(payload):
             return {"ok": True}
         # ----- Angebot-Wizard: Voice-Anweisungen fuers Anschreiben -----
         if state and state.state_key == STATE_ANGEBOT_AWAITING_INSTRUCTIONS:
-            bot_token = await _load_global_bot_token()
+            bot_token = _active_bot_token.get() or await _load_global_bot_token()
             if not bot_token:
                 await _send_to_chat(
                     chat_id,
@@ -2240,7 +2286,11 @@ async def _dispatch_update(payload):
                 return {"ok": True}
             reply = reply_or_none
         elif state.state_key == STATE_LEXWARE_SETUP_TOKEN:
-            reply = await _handle_lexware_setup_token_input(chat_id, text)
+            reply_or_none = await _handle_lexware_setup_token_input(chat_id, text)
+            if reply_or_none is None:
+                # Onboarding hat schon weitergeschaltet + Folge-Prompt gesendet
+                return {"ok": True}
+            reply = reply_or_none
         elif state.state_key == STATE_BELEG_WAITING_PHOTO:
             reply = "Bitte ein Foto oder PDF des Belegs schicken (kein Text). Oder /abbrechen."
         elif state.state_key == STATE_RECHNUNG_WAITING_INPUT:
@@ -2429,7 +2479,7 @@ async def _telegram_download_file(bot_token, file_path):
 async def _send_photo_to_chat(chat_id, image_bytes, caption=None, bot_token=None):
     """Schickt ein Bild an einen Chat via sendPhoto."""
     if bot_token is None:
-        bot_token = await _load_global_bot_token()
+        bot_token = _active_bot_token.get() or await _load_global_bot_token()
         if bot_token is None:
             return False
     url = f"{TELEGRAM_API_BASE}/bot{bot_token}/sendPhoto"
@@ -3232,6 +3282,23 @@ async def _handle_lexware_setup_token_input(chat_id, text):
     await _save_lexware_config(tenant.id, encrypted, organization_id)
     await _clear_state(chat_id)
 
+    # Kam dieser Setup aus dem Onboarding (Schritt 'lexware')? Dann das
+    # Tutorial automatisch weiterschalten. Sonst bleibt der Nutzer auf
+    # Schritt 8 haengen: der Game-Tutorial-Block laesst nur Lexware-
+    # Befehle zu und /onboarding wiederholt nur denselben Schritt.
+    ob_tenant, _ob_idx, ob_key = await _get_onboarding_state(chat_id)
+    if (
+        ob_tenant is not None
+        and ob_tenant.onboarding_completed_at is None
+        and ob_key == "lexware"
+    ):
+        await _send_to_chat(
+            chat_id,
+            "✅ <b>Lexware ist verbunden!</b> Weiter geht's mit dem Setup…",
+        )
+        await _onboarding_advance(chat_id, ob_tenant)
+        return None
+
     msg = (
         "✅ <b>Lexware ist verbunden!</b>\n\n"
         "Du kannst jetzt:\n"
@@ -3537,7 +3604,7 @@ async def _send_with_inline_buttons(chat_id, text, buttons, bot_token=None):
       [[{"text": "Anlegen", "callback_data": "rechnung:confirm:UUID"}]]
     """
     if bot_token is None:
-        bot_token = await _load_global_bot_token()
+        bot_token = _active_bot_token.get() or await _load_global_bot_token()
         if bot_token is None:
             return False
 
@@ -3575,7 +3642,7 @@ async def _send_with_inline_buttons(chat_id, text, buttons, bot_token=None):
 async def _answer_callback_query(callback_query_id, text=None, bot_token=None):
     """Bestaetigt einen Button-Klick (entfernt das Lade-Symbol in Telegram)."""
     if bot_token is None:
-        bot_token = await _load_global_bot_token()
+        bot_token = _active_bot_token.get() or await _load_global_bot_token()
         if bot_token is None:
             return False
     url = f"{TELEGRAM_API_BASE}/bot{bot_token}/answerCallbackQuery"
@@ -3737,7 +3804,7 @@ async def _handle_rechnung_input_received(
 
     if voice_dict:
         if bot_token is None:
-            bot_token = await _load_global_bot_token()
+            bot_token = _active_bot_token.get() or await _load_global_bot_token()
         audio_bytes, audio_mime = await _telegram_download_voice(bot_token, voice_dict)
         if not audio_bytes:
             await _clear_state(chat_id)
@@ -3858,7 +3925,7 @@ async def _handle_rechnung_input_received(
         ]
 
     if bot_token is None:
-        bot_token = await _load_global_bot_token()
+        bot_token = _active_bot_token.get() or await _load_global_bot_token()
     await _send_with_inline_buttons(chat_id, preview_text, buttons, bot_token=bot_token)
     return None  # Schon mit Buttons gesendet
 
@@ -5033,7 +5100,7 @@ async def _handle_aufnahme_audio_received(chat_id, voice_dict, bot_token=None):
 
     # Audio downloaden
     if bot_token is None:
-        bot_token = await _load_global_bot_token()
+        bot_token = _active_bot_token.get() or await _load_global_bot_token()
     audio_bytes, audio_mime = await _telegram_download_voice(bot_token, voice_dict)
     if not audio_bytes:
         await _clear_state(chat_id)
@@ -5451,7 +5518,7 @@ async def _send_with_keyboard(chat_id, text, keyboard_dict, bot_token=None):
     Keyboard kommt nur ans LETZTE Stueck (sonst wuerde Telegram die
     Buttons in jedem Chunk anzeigen)."""
     if bot_token is None:
-        bot_token = await _load_global_bot_token()
+        bot_token = _active_bot_token.get() or await _load_global_bot_token()
         if bot_token is None:
             return False
     chunks = _split_message_safely(str(text))
@@ -5690,7 +5757,7 @@ async def _handle_angebot_input_received(
     try:
         if voice_dict is not None:
             if not bot_token:
-                bot_token = await _load_global_bot_token()
+                bot_token = _active_bot_token.get() or await _load_global_bot_token()
             file_id = voice_dict.get("file_id")
             file_path = await _telegram_get_file_path(bot_token, file_id)
             audio_bytes = await _telegram_download_file(bot_token, file_path)
@@ -5944,7 +6011,7 @@ async def _handle_angebot_instructions_received(
     try:
         if voice_dict is not None:
             if not bot_token:
-                bot_token = await _load_global_bot_token()
+                bot_token = _active_bot_token.get() or await _load_global_bot_token()
             file_id = voice_dict.get("file_id")
             file_path = await _telegram_get_file_path(bot_token, file_id)
             audio_bytes = await _telegram_download_file(bot_token, file_path)
@@ -7590,7 +7657,7 @@ async def _handle_rechnung_mail_address_input(chat_id, text, state_data):
         },
     )
 
-    bot_token = await _load_global_bot_token()
+    bot_token = _active_bot_token.get() or await _load_global_bot_token()
     msg = f"<b>Senden an</b>\n<code>{text}</code>\n\n"
     msg += "Soll ich die Rechnung jetzt an diese Adresse schicken?\n\n"
     msg += "<i>Du selbst bekommst eine Kopie an deine hinterlegte E-Mail-Adresse.</i>"
@@ -8514,7 +8581,7 @@ def _slugify(name: str) -> str:
 async def _get_bot_username(bot_token: str | None = None) -> str | None:
     """Liefert den @-Username des Bots fuer Deep-Links."""
     if bot_token is None:
-        bot_token = await _load_global_bot_token()
+        bot_token = _active_bot_token.get() or await _load_global_bot_token()
     if not bot_token:
         return None
     url = f"{TELEGRAM_API_BASE}/bot{bot_token}/getMe"
@@ -9758,11 +9825,12 @@ ONBOARDING_STEPS = [
     "branche",         # 7  - Buttons: Tischler/Sanitaer/etc.
     "lexware",         # 8  - Lexware-Setup anbieten
     "kalender",        # 9  - Kalender (Google/Outlook/Spaeter)
-    "knowledge",       # 10 - Erster Wissens-Eintrag (Anfahrt)
-    "done",            # 11 - Fertig + /help
+    "drive",           # 10 - Kunden-Archiv (Google Drive) — auch fuer Outlook-Nutzer
+    "knowledge",       # 11 - Erster Wissens-Eintrag (Anfahrt)
+    "done",            # 12 - Fertig + /help
 ]
 
-ONBOARDING_TOTAL_USER_STEPS = 10  # 1..10 (welcome + done sind keine Eingabe)
+ONBOARDING_TOTAL_USER_STEPS = 11  # 1..11 (welcome + done sind keine Eingabe)
 
 
 def _onboarding_progress(step_idx: int) -> str:
@@ -9776,10 +9844,10 @@ def _onboarding_progress(step_idx: int) -> str:
 # Ausfuehrliche Hilfe-Texte pro Schritt (nur bei /hilfe-Anfrage sichtbar)
 ONBOARDING_HELP = {
     "welcome": (
-        "Du startest gerade das Setup-Tutorial. Wir gehen 10 kurze "
-        "Schritte durch — Firmen-Stammdaten, Lexware-Anbindung, Kalender. "
-        "Dauert ca. 5 Minuten. Du kannst jederzeit /abbrechen und "
-        "spaeter mit /onboarding fortsetzen."
+        "Du startest gerade das Setup-Tutorial. Wir gehen 11 kurze "
+        "Schritte durch — Firmen-Stammdaten, Lexware, Kalender, "
+        "Kunden-Archiv. Dauert ca. 5 Minuten. Du kannst jederzeit "
+        "/abbrechen und spaeter mit /onboarding fortsetzen."
     ),
     "firmenname": (
         "Der Firmenname wird im Impressum deiner E-Mails und in den "
@@ -9827,6 +9895,14 @@ ONBOARDING_HELP = {
         "ODER Outlook waehlen — beide funktionieren gleichwertig. Ohne "
         "Kalender funktioniert der Bot trotzdem, aber ohne Termin-"
         "Intelligenz."
+    ),
+    "drive": (
+        "Das Kunden-Archiv legt pro Kunde einen Google-Drive-Ordner an — "
+        "Fotos, PDFs und Skizzen landen dort automatisch sortiert. Es "
+        "braucht einen Google-Login und funktioniert auch dann, wenn du "
+        "Outlook fuer Mail/Kalender nutzt. Hast du Google-Kalender "
+        "verbunden, ist Drive schon dabei. Spaeter jederzeit mit "
+        "/archiv_verbinden."
     ),
     "knowledge": (
         "Die Wissensbasis fuettert die KI mit Infos die sie sonst nicht "
@@ -9960,11 +10036,12 @@ async def _onboarding_send_welcome(chat_id, tenant):
         "👋 <b>Willkommen beim Gewerbeagent-Bot!</b>\n\n"
         "Ich helfe dir bei Angeboten, Rechnungen, Terminen und Kunden-"
         "Mails — automatisch im Hintergrund. Damit das laeuft, brauche "
-        "ich einmal kurz <b>10 Infos</b>:\n\n"
+        "ich einmal kurz <b>11 Infos</b>:\n\n"
         "  • Stammdaten (Firma, Inhaber, Anschrift) — fuer Impressum + "
         "Lexware\n"
         "  • Lexware-API — fuer Angebote & Rechnungen\n"
-        "  • Kalender (Google oder Outlook) — fuer Termin-Briefings\n\n"
+        "  • Kalender (Google oder Outlook) — fuer Termin-Briefings\n"
+        "  • Kunden-Archiv (Google Drive) — optional, fuer Dokumente\n\n"
         f"Fortschritt: {_onboarding_progress(0)}\n\n"
         "<i>Mit /hilfe bekommst du in jedem Schritt eine "
         "ausfuehrliche Erklaerung. Mit /abbrechen kannst du jederzeit "
@@ -9976,7 +10053,7 @@ async def _onboarding_send_welcome(chat_id, tenant):
 
 async def _onboarding_send_firmenname(chat_id, tenant):
     return (
-        f"📦 <b>Schritt 1 von 10 — Firmenname</b>\n"
+        f"📦 <b>Schritt 1 von 11 — Firmenname</b>\n"
         f"{_onboarding_progress(1)}\n\n"
         "Wie heisst dein Betrieb?\n\n"
         "<i>Beispiele:</i> <i>Schreinerei Mueller GbR</i>, "
@@ -9988,7 +10065,7 @@ async def _onboarding_send_firmenname(chat_id, tenant):
 
 async def _onboarding_send_inhaber_name(chat_id, tenant):
     return (
-        f"👤 <b>Schritt 2 von 10 — Dein Name</b>\n"
+        f"👤 <b>Schritt 2 von 11 — Dein Name</b>\n"
         f"{_onboarding_progress(2)}\n\n"
         "Wie heisst du persoenlich? <b>Vorname + Nachname</b>.\n\n"
         "<i>Beispiel:</i> <i>Anna Mueller</i>\n\n"
@@ -9998,7 +10075,7 @@ async def _onboarding_send_inhaber_name(chat_id, tenant):
 
 async def _onboarding_send_strasse(chat_id, tenant):
     return (
-        f"🏠 <b>Schritt 3 von 10 — Strasse</b>\n"
+        f"🏠 <b>Schritt 3 von 11 — Strasse</b>\n"
         f"{_onboarding_progress(3)}\n\n"
         "Strasse + Hausnummer deiner Werkstatt:\n\n"
         "<i>Beispiel:</i> <i>Hauptstr 5</i>"
@@ -10007,7 +10084,7 @@ async def _onboarding_send_strasse(chat_id, tenant):
 
 async def _onboarding_send_plz_ort(chat_id, tenant):
     return (
-        f"🏘 <b>Schritt 4 von 10 — PLZ + Ort</b>\n"
+        f"🏘 <b>Schritt 4 von 11 — PLZ + Ort</b>\n"
         f"{_onboarding_progress(4)}\n\n"
         "Postleitzahl und Ort, in einer Zeile:\n\n"
         "<i>Beispiel:</i> <i>54290 Trier</i>"
@@ -10016,7 +10093,7 @@ async def _onboarding_send_plz_ort(chat_id, tenant):
 
 async def _onboarding_send_telefon(chat_id, tenant):
     return (
-        f"📞 <b>Schritt 5 von 10 — Telefon</b>\n"
+        f"📞 <b>Schritt 5 von 11 — Telefon</b>\n"
         f"{_onboarding_progress(5)}\n\n"
         "Deine Telefonnummer fuers Impressum:\n\n"
         "<i>Beispiel:</i> <i>0651 12345</i>\n\n"
@@ -10026,7 +10103,7 @@ async def _onboarding_send_telefon(chat_id, tenant):
 
 async def _onboarding_send_email(chat_id, tenant):
     return (
-        f"📧 <b>Schritt 6 von 10 — E-Mail</b>\n"
+        f"📧 <b>Schritt 6 von 11 — E-Mail</b>\n"
         f"{_onboarding_progress(6)}\n\n"
         "Deine offizielle E-Mail fuer Kunden-Antworten:\n\n"
         "<i>Beispiel:</i> <i>info@mein-betrieb.de</i>"
@@ -10056,7 +10133,7 @@ async def _onboarding_send_branche(chat_id, tenant):
         rows.append(cur)
     keyboard = {"inline_keyboard": rows}
     msg = (
-        f"🔧 <b>Schritt 7 von 10 — Branche</b>\n"
+        f"🔧 <b>Schritt 7 von 11 — Branche</b>\n"
         f"{_onboarding_progress(7)}\n\n"
         "Welche Branche passt am besten?\n\n"
         "<i>Hilft mir bei der KI-Klassifikation von Kunden-Mails.</i>"
@@ -10071,7 +10148,7 @@ async def _onboarding_send_lexware(chat_id, tenant):
         [{"text": "⏭ Spaeter (mit /lexware_setup)", "callback_data": "ob:lexware:skip"}],
     ]}
     msg = (
-        f"🧾 <b>Schritt 8 von 10 — Lexware-API</b>\n"
+        f"🧾 <b>Schritt 8 von 11 — Lexware-API</b>\n"
         f"{_onboarding_progress(8)}\n\n"
         "Lexware ist <b>Pflicht</b> fuer Angebote + Rechnungen — ohne "
         "API-Schluessel kann ich dir hier nicht helfen.\n\n"
@@ -10089,7 +10166,7 @@ async def _onboarding_send_kalender(chat_id, tenant):
         [{"text": "⏭ Spaeter (mit /kalender_verbinden)", "callback_data": "ob:kalender:skip"}],
     ]}
     msg = (
-        f"📅 <b>Schritt 9 von 10 — Kalender</b>\n"
+        f"📅 <b>Schritt 9 von 11 — Kalender</b>\n"
         f"{_onboarding_progress(9)}\n\n"
         "Welchen Kalender nutzt du? Damit zeigt /briefing deine "
         "Tagestermine und ich kann Kunden passende Termine vorschlagen."
@@ -10098,10 +10175,56 @@ async def _onboarding_send_kalender(chat_id, tenant):
     return None
 
 
+async def _onboarding_send_drive(chat_id, tenant):
+    # Smart-Skip: wenn ueber den Google-Kalender-Login schon ein Drive-
+    # faehiger Token da ist, diesen Schritt automatisch ueberspringen.
+    emp = None
+    try:
+        res = await _get_current_employee(chat_id)
+        if res is not None:
+            _t, emp = res
+        from core.security.oauth_token_lookup import find_oauth_token
+        from core.integrations.google_drive import is_drive_configured
+        tok = await find_oauth_token(tenant.id, "google", emp.id if emp else None)
+        if tok and is_drive_configured(tok):
+            await _send_to_chat(
+                chat_id,
+                "☁️ <b>Kunden-Archiv ist ueber deinen Google-Login schon "
+                "verbunden</b> — Schritt uebersprungen.",
+            )
+            await _onboarding_advance(chat_id, tenant)
+            return None
+    except Exception:
+        logger.exception("onboarding-drive smart-skip-check fehlgeschlagen")
+
+    from config.settings import settings
+    from urllib.parse import urlencode
+    base = (settings.public_url or "").rstrip("/")
+    params = {"tenant": tenant.slug, "provider": "google"}
+    if emp is not None and getattr(emp, "slug", None):
+        params["employee"] = emp.slug
+    oauth_url = f"{base}/oauth/start?{urlencode(params)}"
+    keyboard = {"inline_keyboard": [
+        [{"text": "☁️ Kunden-Archiv (Google Drive) verbinden", "url": oauth_url}],
+        [{"text": "⏭ Spaeter (mit /archiv_verbinden)", "callback_data": "ob:drive:skip"}],
+    ]}
+    msg = (
+        f"☁️ <b>Schritt 10 von 11 — Kunden-Archiv (Drive)</b>\n"
+        f"{_onboarding_progress(10)}\n\n"
+        "Optional: ein Drive-Archiv, das pro Kunde einen Ordner anlegt "
+        "(Fotos, PDFs, Skizzen). Braucht nur einen Google-Login — "
+        "funktioniert auch, wenn du Outlook nutzt.\n\n"
+        "<i>Q sieht nur Ordner, die er selbst anlegt.</i>\n\n"
+        "Sobald verbunden, geht's automatisch weiter — oder <b>Spaeter</b>."
+    )
+    await _send_with_keyboard(chat_id, msg, keyboard)
+    return None
+
+
 async def _onboarding_send_knowledge(chat_id, tenant):
     return (
-        f"📚 <b>Schritt 10 von 10 — Erster Wissens-Eintrag</b>\n"
-        f"{_onboarding_progress(10)}\n\n"
+        f"📚 <b>Schritt 11 von 11 — Erster Wissens-Eintrag</b>\n"
+        f"{_onboarding_progress(11)}\n\n"
         "Letzte Frage: gib mir <b>einen kurzen Anfahrts-Hinweis</b> oder "
         "irgendwas was die KI ueber dich wissen soll:\n\n"
         "<i>Beispiele:</i>\n"
@@ -10140,6 +10263,7 @@ _ONBOARDING_SENDERS = {
     "branche": _onboarding_send_branche,
     "lexware": _onboarding_send_lexware,
     "kalender": _onboarding_send_kalender,
+    "drive": _onboarding_send_drive,
     "knowledge": _onboarding_send_knowledge,
     "done": _onboarding_send_done,
 }
@@ -10170,6 +10294,44 @@ async def _onboarding_advance(chat_id, tenant):
         prompt = await sender(chat_id, tenant)
         if prompt:
             await _send_to_chat(chat_id, prompt)
+
+
+async def onboarding_advance_after_oauth(tenant_id, provider: str) -> bool:
+    """Wird aus dem OAuth-Web-Callback aufgerufen, sobald ein Kalender
+    (Google/Microsoft) verbunden wurde. Steht der Tenant gerade im
+    Onboarding beim Kalender-Schritt, schalten wir automatisch zum
+    naechsten Schritt weiter und schicken den Folge-Prompt in den
+    Telegram-Chat — der Nutzer muss NICHT /onboarding tippen.
+
+    Failsafe: schluckt eigene Fehler, der OAuth-Callback darf nie wegen
+    eines Telegram-Problems brechen. Returns True wenn weitergeschaltet.
+    """
+    try:
+        if provider not in ("google", "microsoft"):
+            return False
+        async with AsyncSessionLocal() as s:
+            tenant = (await s.execute(
+                select(Tenant).where(Tenant.id == tenant_id)
+            )).scalar_one_or_none()
+        if tenant is None or tenant.onboarding_completed_at is not None:
+            return False
+        step_idx = max(0, min(tenant.onboarding_step or 0, len(ONBOARDING_STEPS) - 1))
+        step_key = ONBOARDING_STEPS[step_idx]
+        if step_key not in ("kalender", "drive"):
+            return False
+        chat_id = tenant.telegram_chat_id
+        if not chat_id:
+            return False
+        label = "Kalender" if step_key == "kalender" else "Kunden-Archiv"
+        await _send_to_chat(
+            chat_id,
+            f"✅ <b>{label} ist verbunden!</b> Weiter geht's mit dem Setup…",
+        )
+        await _onboarding_advance(chat_id, tenant)
+        return True
+    except Exception:
+        logger.exception("onboarding-advance-after-oauth fehlgeschlagen")
+        return False
 
 
 async def _handle_onboarding_command(chat_id):
@@ -10366,9 +10528,8 @@ async def _handle_onboarding_callback(chat_id, callback_data, callback_query_id,
             # kommt User mit /onboarding zurueck (Hinweis im Text).
             await _send_to_chat(
                 chat_id,
-                "🔗 Starte Lexware-Setup… Folge den 3 Schritten — "
-                "nach dem Verbinden kommst du mit /onboarding hier "
-                "zurueck und es geht weiter.",
+                "🔗 Starte Lexware-Setup… Folge den Schritten — sobald der "
+                "Schluessel verbunden ist, geht's hier automatisch weiter.",
             )
             reply = await _handle_lexware_setup_command(chat_id)
             if reply:
@@ -10387,8 +10548,8 @@ async def _handle_onboarding_callback(chat_id, callback_data, callback_query_id,
             # Button schickt — User klickt, OAuth, kommt zurueck.
             await _send_to_chat(
                 chat_id,
-                f"🔗 Starte Kalender-Setup ({choice})… Folge dem Link, "
-                "nach dem Verbinden /onboarding um hier weiterzumachen.",
+                f"🔗 Starte Kalender-Setup ({choice})… Folge dem Link — sobald "
+                "der Kalender verbunden ist, geht's hier automatisch weiter.",
             )
             try:
                 await _handle_kalender_verbinden_command(chat_id)
@@ -10401,6 +10562,12 @@ async def _handle_onboarding_callback(chat_id, callback_data, callback_query_id,
                 )
             return
         # skip — weiter
+        await _onboarding_advance(chat_id, tenant)
+        return
+
+    if action == "drive" and len(parts) >= 3 and step_key == "drive":
+        # 'verbinden' ist ein URL-Button (OAuth-Callback schaltet weiter);
+        # hier kommt nur das skip an.
         await _onboarding_advance(chat_id, tenant)
         return
 
@@ -10839,7 +11006,7 @@ async def _ausloesen_bestellung(chat_id, material, menge: int) -> str:
         text_msg += f"Lieferant: {_h_safe(material.lieferant_name)}\n"
     text_msg += "\nKlick den Button zum Bestellen:"
 
-    bot_token = await _load_global_bot_token()
+    bot_token = _active_bot_token.get() or await _load_global_bot_token()
     if bot_token is None:
         # Fallback: Link als Text
         return text_msg + f"\n\n{material.bestell_link}"
