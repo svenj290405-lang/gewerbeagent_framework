@@ -4810,7 +4810,7 @@ async def _handle_kunde_command(chat_id, args):
                 if a.kunde_name and a.kunde_name not in drive_candidates:
                     drive_candidates.append(a.kunde_name)
             for c in lexware_hits:
-                lex_name = (c or {}).get("name") or ""
+                lex_name = getattr(c, "name", None) or ""
                 if lex_name and lex_name not in drive_candidates:
                     drive_candidates.append(lex_name)
             # Fallback: der Roh-Suchbegriff selbst (kein Email!)
