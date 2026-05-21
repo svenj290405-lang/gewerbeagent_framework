@@ -9902,6 +9902,45 @@ async def _handle_kalender_status_command(chat_id) -> str:
     return msg
 
 
+async def _start_kalender_oauth(chat_id, tenant, emp, provider: str, *, bot_token=None) -> None:
+    """Setzt den Kalender-Provider des Mitarbeiters und schickt den OAuth-
+    Login-Link. Gemeinsame Logik fuer /kalender_verbinden (kal:-Callback)
+    UND den Onboarding-Kalender-Schritt — so muss der Provider nur EINMAL
+    gewaehlt werden (vorher fragte das Onboarding und der verbinden-Flow je
+    einmal)."""
+    from core.models.employee import Employee
+    async with AsyncSessionLocal() as s:
+        emp_db = (await s.execute(
+            select(Employee).where(Employee.id == emp.id)
+        )).scalar_one_or_none()
+        if emp_db is not None:
+            emp_db.calendar_provider = provider
+            emp_db.calendar_id = None  # Default ('primary' bzw. /me/events)
+            await s.commit()
+
+    # OAuth-Deeplink — public_url + /oauth/start; employee-Slug mitgeben,
+    # damit das Token am Mitarbeiter-Datensatz landet (nicht nur tenant-weit).
+    from config.settings import settings
+    from urllib.parse import urlencode
+    base = (settings.public_url or "").rstrip("/")
+    qs = urlencode({"tenant": tenant.slug, "provider": provider, "employee": emp.slug})
+    oauth_url = f"{base}/oauth/start?{qs}"
+
+    label = _kalender_label(provider)
+    msg = (
+        f"✅ <b>{label}</b> als Provider gespeichert.\n\n"
+        f"<b>Jetzt einloggen:</b>\n"
+        f"<a href=\"{oauth_url}\">{oauth_url}</a>\n\n"
+        "Klick den Link, melde dich mit deinem "
+        f"{'Google' if provider == 'google' else 'Microsoft'}-Account an, "
+        "und erlaube Zugriff auf den Kalender. Danach landet das Token im "
+        "System und du kriegst Termine direkt in deinen Kalender.\n\n"
+        "<i>Tipp:</i> mit /kalender_status kannst du jederzeit pruefen "
+        "welcher Provider aktiv ist."
+    )
+    await _send_to_chat(chat_id, msg, bot_token=bot_token)
+
+
 async def _handle_kalender_callback(chat_id, cq_data, cq_id, bot_token) -> None:
     """Verarbeitet Klick auf Inline-Buttons aus /kalender_verbinden.
 
@@ -9930,49 +9969,9 @@ async def _handle_kalender_callback(chat_id, cq_data, cq_id, bot_token) -> None:
         )
         return
 
-    # Provider in DB speichern
-    from core.models.employee import Employee
-    async with AsyncSessionLocal() as s:
-        emp_db = (await s.execute(
-            select(Employee).where(Employee.id == emp.id)
-        )).scalar_one_or_none()
-        if emp_db is None:
-            await _answer_callback_query(cq_id, "Mitarbeiter weg", bot_token)
-            return
-        emp_db.calendar_provider = provider
-        # calendar_id zuruecksetzen → Default ('primary' bzw. /me/events)
-        emp_db.calendar_id = None
-        await s.commit()
-
     await _clear_state(chat_id)
     await _answer_callback_query(cq_id, f"{provider.capitalize()} gewaehlt", bot_token)
-
-    # OAuth-Deeplink generieren — public_url + /oauth/start
-    # Phase 1 Multi-OAuth: employee-Slug mitgeben damit Token am
-    # Mitarbeiter-Datensatz landet (nicht nur tenant-weit).
-    from config.settings import settings
-    from urllib.parse import urlencode
-    base = (settings.public_url or "").rstrip("/")
-    qs = urlencode({
-        "tenant": tenant.slug,
-        "provider": provider,
-        "employee": emp.slug,
-    })
-    oauth_url = f"{base}/oauth/start?{qs}"
-
-    label = _kalender_label(provider)
-    msg = (
-        f"✅ <b>{label}</b> als Provider gespeichert.\n\n"
-        f"<b>Jetzt einloggen:</b>\n"
-        f"<a href=\"{oauth_url}\">{oauth_url}</a>\n\n"
-        "Klick den Link, melde dich mit deinem "
-        f"{'Google' if provider == 'google' else 'Microsoft'}-Account an, "
-        "und erlaube Zugriff auf den Kalender. Danach landet das Token im "
-        "System und du kriegst Termine direkt in deinen Kalender.\n\n"
-        "<i>Tipp:</i> mit /kalender_status kannst du jederzeit pruefen "
-        "welcher Provider aktiv ist."
-    )
-    await _send_to_chat(chat_id, msg, bot_token=bot_token)
+    await _start_kalender_oauth(chat_id, tenant, emp, provider, bot_token=bot_token)
 
 
 # =====================================================================
@@ -10712,17 +10711,25 @@ async def _handle_onboarding_callback(chat_id, callback_data, callback_query_id,
     if action == "kalender" and len(parts) >= 3 and step_key == "kalender":
         choice = parts[2]
         if choice in ("google", "microsoft"):
-            # Wir reusen den bestehenden kalender_callback-Flow indirekt:
-            # _get_current_employee + OAuth-URL-Generation. Vereinfacht:
-            # bot ruft _handle_kalender_verbinden_command, das einen
-            # Button schickt — User klickt, OAuth, kommt zurueck.
-            await _send_to_chat(
-                chat_id,
-                f"🔗 Starte Kalender-Setup ({choice})… Folge dem Link — sobald "
-                "der Kalender verbunden ist, geht's hier automatisch weiter.",
-            )
+            # Provider ist hier schon gewaehlt (ob:kalender:<provider>) —
+            # direkt den OAuth-Link schicken, NICHT nochmal nach dem
+            # Provider fragen (sonst muesste man Outlook/Google doppelt
+            # waehlen).
             try:
-                await _handle_kalender_verbinden_command(chat_id)
+                res = await _get_current_employee(chat_id)
+                if res is None:
+                    await _send_to_chat(
+                        chat_id,
+                        "Chat ist keinem Betrieb zugeordnet — erst /start.",
+                    )
+                    return
+                ob_tenant, emp = res
+                await _start_kalender_oauth(chat_id, ob_tenant, emp, choice)
+                await _send_to_chat(
+                    chat_id,
+                    "▶️ Sobald der Kalender verbunden ist, geht's hier "
+                    "automatisch weiter — oder /skip zum Ueberspringen.",
+                )
             except Exception:
                 logger.exception("Kalender-Setup im Onboarding fehlgeschlagen")
                 await _send_to_chat(
