@@ -727,7 +727,8 @@ async def tenant_detail(
                 ToolConfig.tool_name == "telegram_notify",
             )
         )).scalar_one_or_none()
-        _tg_tok = (tg_tc.config or {}).get("bot_token") if tg_tc else None
+        from core.security.encryption import try_decrypt
+        _tg_tok = try_decrypt((tg_tc.config or {}).get("bot_token")) if tg_tc else None
         telegram_bot_set = bool(_tg_tok)
         telegram_bot_hint = (
             f"…{_tg_tok[-6:]}" if _tg_tok and len(_tg_tok) > 6 else ""
@@ -904,55 +905,20 @@ async def tenant_set_telegram_bot(
                 ToolConfig.tool_name == "telegram_notify",
             )
         )).scalar_one_or_none()
-        if tc is None:
-            tc = ToolConfig(
-                tenant_id=tid, tool_name="telegram_notify",
-                enabled=True, config={},
-            )
-            s.add(tc)
-        cfg = dict(tc.config or {})
-        had = bool(cfg.get("bot_token"))
-        if token:
-            cfg["bot_token"] = token
-            tc.enabled = True
-        else:
-            cfg.pop("bot_token", None)
-        tc.config = cfg  # Neuzuweisung triggert JSON-Change-Tracking
+        had = bool((tc.config or {}).get("bot_token")) if tc else False
+
+    # Speichern (verschluesselt) + Webhook setzen — gemeinsame Logik mit
+    # dem Self-Service-Chat-Flow (/eigenen_bot).
+    from plugins.telegram_notify.handler import provision_tenant_bot
+    note = await provision_tenant_bot(tid, slug, token)
+
+    async with get_session() as s:
         await audit(
             user_id=user.id, action="tenant.telegram_bot.update",
             target=slug, request=request, session=s,
             details={"had_token": had, "now_set": bool(token)},
         )
         await s.commit()
-
-    # Webhook best-effort auf den tenant-spezifischen Pfad setzen
-    note = "Token entfernt — Betrieb nutzt wieder den geteilten Bot."
-    if token:
-        try:
-            from config.settings import settings
-            import httpx
-            public_url = (settings.public_url or "").rstrip("/")
-            webhook_url = f"{public_url}/webhook/{slug}/telegram_notify/incoming"
-            payload = {"url": webhook_url}
-            secret = (settings.telegram_webhook_secret or "").strip()
-            if secret:
-                payload["secret_token"] = secret
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                resp = await client.post(
-                    f"https://api.telegram.org/bot{token}/setWebhook",
-                    json=payload,
-                )
-            data = resp.json() if resp.content else {}
-            if resp.status_code == 200 and data.get("ok"):
-                note = f"Webhook gesetzt: {webhook_url}"
-            else:
-                note = (
-                    f"Token gespeichert, aber setWebhook scheiterte: "
-                    f"HTTP {resp.status_code} {data.get('description', '')}"
-                )
-        except Exception as e:
-            logger.exception("setWebhook fuer Tenant-Bot fehlgeschlagen")
-            note = f"Token gespeichert, setWebhook-Fehler: {e}"
     logger.info(f"Tenant-Bot-Update {slug}: {note}")
 
     from urllib.parse import quote

@@ -20,6 +20,7 @@ from core.models import (
     STATE_BELEG_CONFIRMING,
     STATE_BELEG_WAITING_PHOTO,
     STATE_LEXWARE_SETUP_TOKEN,
+    STATE_EIGENER_BOT_TOKEN,
     STATE_VIZ_WAITING_DESCRIPTION,
     STATE_VIZ_WAITING_KUNDE,
     STATE_VIZ_WAITING_PHOTO,
@@ -124,6 +125,7 @@ from core.models.angebot import (
 )
 from core.models.angebot_position import AngebotPosition
 from core.security import decrypt, encrypt
+from core.security.encryption import try_decrypt
 from core.ai import (
     extract_rechnung_from_audio,
     extract_rechnung_from_text,
@@ -190,7 +192,7 @@ async def _resolve_active_bot_token() -> str | None:
                     )
                 )).scalar_one_or_none()
             if tc and tc.enabled:
-                tok = (tc.config or {}).get("bot_token")
+                tok = try_decrypt((tc.config or {}).get("bot_token"))
                 if tok:
                     return tok
     except Exception:
@@ -501,7 +503,70 @@ async def _load_global_bot_token():
         )).scalar_one_or_none()
         if not tc or not tc.enabled:
             return None
-        return (tc.config or {}).get("bot_token") or None
+        return try_decrypt((tc.config or {}).get("bot_token"))
+
+
+async def provision_tenant_bot(tenant_id, slug: str, token: str) -> str:
+    """Hinterlegt den eigenen Bot eines Betriebs: speichert den Token
+    VERSCHLUESSELT in der `telegram_notify`-ToolConfig und registriert den
+    Webhook auf `/webhook/<slug>/telegram_notify/incoming`. Leerer Token
+    entfernt den Bot (Betrieb faellt auf den geteilten globalen Bot
+    zurueck).
+
+    EINE Implementierung fuer beide Wege: das Admin-Feld und den
+    Self-Service-Chat-Flow (/eigenen_bot). Returnt eine menschenlesbare
+    Status-Notiz (beginnt mit "Webhook gesetzt" bei Erfolg)."""
+    token = (token or "").strip()
+    async with AsyncSessionLocal() as s:
+        tc = (await s.execute(
+            select(ToolConfig).where(
+                ToolConfig.tenant_id == tenant_id,
+                ToolConfig.tool_name == "telegram_notify",
+            )
+        )).scalar_one_or_none()
+        if tc is None:
+            tc = ToolConfig(
+                tenant_id=tenant_id, tool_name="telegram_notify",
+                enabled=True, config={},
+            )
+            s.add(tc)
+        cfg = dict(tc.config or {})
+        if token:
+            cfg["bot_token"] = encrypt(token)  # at-rest verschluesselt
+            tc.enabled = True
+        else:
+            cfg.pop("bot_token", None)
+        tc.config = cfg  # Neuzuweisung triggert JSON-Change-Tracking
+        await s.commit()
+
+    if not token:
+        return "Token entfernt — Betrieb nutzt wieder den geteilten Bot."
+
+    # Webhook best-effort auf den tenant-spezifischen Pfad setzen.
+    try:
+        from config.settings import settings
+        import httpx
+        public_url = (settings.public_url or "").rstrip("/")
+        webhook_url = f"{public_url}/webhook/{slug}/telegram_notify/incoming"
+        payload = {"url": webhook_url}
+        secret = (settings.telegram_webhook_secret or "").strip()
+        if secret:
+            payload["secret_token"] = secret
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(
+                f"https://api.telegram.org/bot{token}/setWebhook", json=payload,
+            )
+        data = resp.json() if resp.content else {}
+        if resp.status_code == 200 and data.get("ok"):
+            return f"Webhook gesetzt: {webhook_url}"
+        return (
+            f"Token gespeichert, aber setWebhook scheiterte: "
+            f"HTTP {resp.status_code} {data.get('description', '')}"
+        )
+    except Exception as e:
+        logger.exception("setWebhook fuer Tenant-Bot fehlgeschlagen")
+        return f"Token gespeichert, setWebhook-Fehler: {e}"
+
 
 # Telegram limitiert eine Bot-Message auf 4096 Zeichen. Wir nehmen 3900
 # als sichere Schwelle (Reserve fuer Markup-Overhead).
@@ -2064,6 +2129,8 @@ async def _dispatch_update(payload):
         reply = await _handle_visualisierung_command(chat_id)
     elif text == "/lexware_setup":
         reply = await _handle_lexware_setup_command(chat_id)
+    elif text == "/eigenen_bot":
+        reply = await _handle_eigenen_bot_command(chat_id)
     elif text == "/lexware_status":
         reply = await _handle_lexware_status_command(chat_id)
     elif text == "/beleg":
@@ -2291,6 +2358,8 @@ async def _dispatch_update(payload):
                 # Onboarding hat schon weitergeschaltet + Folge-Prompt gesendet
                 return {"ok": True}
             reply = reply_or_none
+        elif state.state_key == STATE_EIGENER_BOT_TOKEN:
+            reply = await _handle_eigenen_bot_token_input(chat_id, text)
         elif state.state_key == STATE_BELEG_WAITING_PHOTO:
             reply = "Bitte ein Foto oder PDF des Belegs schicken (kein Text). Oder /abbrechen."
         elif state.state_key == STATE_RECHNUNG_WAITING_INPUT:
@@ -3313,6 +3382,107 @@ async def _handle_lexware_setup_token_input(chat_id, text):
         "Status spaeter pruefen mit <b>/lexware_status</b>."
     )
     return msg
+
+
+async def _handle_eigenen_bot_command(chat_id):
+    """/eigenen_bot — Self-Service: der Betrieb hinterlegt seinen eigenen
+    BotFather-Token, damit Nachrichten ueber einen eigenen Bot (eigener
+    @name, eigenes Rate-Limit, eigene Ausfall-Isolation) laufen statt ueber
+    den geteilten globalen Bot. Schritt-fuer-Schritt-Anleitung + wartet
+    dann auf den Token (STATE_EIGENER_BOT_TOKEN)."""
+    tenant = await _get_tenant_by_chat(chat_id)
+    if not tenant:
+        return (
+            "Dieser Chat ist noch keinem Betrieb zugeordnet.\n"
+            "Bitte zuerst /start ausfuehren."
+        )
+    await _save_state(chat_id, STATE_EIGENER_BOT_TOKEN, {})
+    return (
+        "🤖 <b>Eigenen Telegram-Bot einrichten</b>\n\n"
+        "Optional: ein eigener Bot mit deinem Namen (z.B. "
+        "<code>@MeinBetriebBot</code>) statt des gemeinsamen Bots. "
+        "Vorteil: eigenes Branding und eigene Reserven bei vielen "
+        "Nachrichten.\n\n"
+        "━━━━━━━━━━━━━━━━━━━\n"
+        "<b>Schritt-fuer-Schritt:</b>\n\n"
+        "<b>1️⃣ BotFather oeffnen</b>\n"
+        "👉 <a href=\"https://t.me/BotFather\">t.me/BotFather</a> (in "
+        "Telegram) und auf <b>Start</b> tippen.\n\n"
+        "<b>2️⃣ Neuen Bot anlegen</b>\n"
+        "Schick <code>/newbot</code> an BotFather.\n"
+        "  • <b>Name:</b> wie dein Betrieb heisst (frei waehlbar)\n"
+        "  • <b>Username:</b> muss auf <code>bot</code> enden, z.B. "
+        "<code>schreinerei_mueller_bot</code>\n\n"
+        "<b>3️⃣ Token kopieren</b>\n"
+        "BotFather schickt dir eine Zeile wie:\n"
+        "<code>123456789:AAExampleToken_xxxxxxxxxxxxxxxxxxx</code>\n"
+        "Lange darauf tippen → <b>Kopieren</b>.\n\n"
+        "<b>4️⃣ Token hier einfuegen</b> ✏️\n"
+        "Fuege den Token jetzt in den Chat ein und sende ihn. Ich pruefe "
+        "ihn, richte alles ein und sage dir, wie dein Bot heisst.\n\n"
+        "━━━━━━━━━━━━━━━━━━━\n"
+        "<i>🔒 Der Token wird verschluesselt gespeichert. Du kannst ihn "
+        "jederzeit in BotFather mit <code>/token</code> neu erzeugen.</i>\n\n"
+        "Mit /abbrechen brichst du ab — dann bleibt alles beim "
+        "gemeinsamen Bot."
+    )
+
+
+async def _handle_eigenen_bot_token_input(chat_id, text):
+    """Der Betrieb schickt seinen BotFather-Token. Wir validieren ihn live
+    (getMe), speichern verschluesselt und registrieren den Webhook."""
+    import re
+    token = (text or "").strip()
+    # BotFather-Token: <ziffern>:<langer Buchstaben-Zahlen-Mix>
+    if not re.fullmatch(r"\d{6,}:[A-Za-z0-9_-]{30,}", token):
+        return (
+            "🤔 Das sieht nicht nach einem BotFather-Token aus.\n\n"
+            "Er hat die Form <code>123456789:AA…</code> — Zahlen, dann ein "
+            "Doppelpunkt, dann ein langer Buchstaben-Zahlen-Mix. Bitte den "
+            "Token <b>am Stueck</b> aus BotFather kopieren.\n\n"
+            "Nochmal probieren oder /abbrechen."
+        )
+
+    tenant = await _get_tenant_by_chat(chat_id)
+    if not tenant:
+        await _clear_state(chat_id)
+        return "Chat ist keinem Betrieb zugeordnet — erst /start ausfuehren."
+
+    # Live-Validierung: getMe beweist, dass der Token echt ist, und liefert
+    # den @username fuer den Umstieg-Link.
+    bot_username = await _get_bot_username(token)
+    if not bot_username:
+        await _clear_state(chat_id)
+        return (
+            "🔒 <b>Telegram lehnt diesen Token ab.</b>\n\n"
+            "Moegliche Gruende: beim Kopieren ist etwas verlorengegangen, "
+            "oder der Token wurde in BotFather schon zurueckgezogen.\n\n"
+            "Erzeug in BotFather mit <code>/token</code> einen neuen und "
+            "probier nochmal /eigenen_bot."
+        )
+
+    note = await provision_tenant_bot(tenant.id, tenant.slug, token)
+    await _clear_state(chat_id)
+    logger.info(f"Self-Service-Bot {tenant.slug}: {note}")
+
+    if note.startswith("Webhook gesetzt"):
+        return (
+            "✅ <b>Dein eigener Bot ist eingerichtet!</b>\n\n"
+            f"Er heisst <b>@{bot_username}</b>.\n\n"
+            "👉 Oeffne ab jetzt deinen eigenen Bot:\n"
+            f"<a href=\"https://t.me/{bot_username}\">t.me/{bot_username}</a>\n\n"
+            "Dort laufen kuenftig alle Nachrichten. Schreib ihm einmal "
+            "<code>/start</code> — dann bist du verbunden."
+        )
+    # Token gespeichert, aber Webhook-Problem — ehrlich melden, Fallback
+    # ist weiterhin der gemeinsame Bot.
+    return (
+        f"⚠️ Token gespeichert (Bot <b>@{bot_username}</b>), aber das "
+        "automatische Einrichten des Empfangs hat nicht geklappt:\n\n"
+        f"<code>{_h_safe(note)}</code>\n\n"
+        "Bitte bei svenj05@gmx.de melden — bis dahin laeuft weiter der "
+        "gemeinsame Bot."
+    )
 
 
 async def _handle_lexware_status_command(chat_id):

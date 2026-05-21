@@ -27,3 +27,21 @@ def decrypt(ciphertext: str) -> str:
         return ""
     f = _get_fernet()
     return f.decrypt(ciphertext.encode()).decode()
+
+
+def try_decrypt(value: str | None) -> str | None:
+    """Entschluesselt einen Wert; gibt ihn UNVERAENDERT zurueck, wenn er
+    nicht verschluesselt ist.
+
+    Brueckt den Alt-Bestand ab: Werte, die vor der Umstellung auf
+    Verschluesselung-at-rest im Klartext gespeichert wurden (z.B. der
+    globale Bot-Token). So kann ein Lesepfad sofort auf verschluesselte
+    Speicherung umgestellt werden, ohne dass eine Daten-Migration noetig
+    ist. Ein echter Klartext-Wert ist kein gueltiges Fernet-Token (kein
+    passender HMAC unter unserem Key) -> decrypt() wirft -> Fallback."""
+    if not value:
+        return None
+    try:
+        return decrypt(value) or None
+    except Exception:
+        return value

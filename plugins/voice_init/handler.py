@@ -1724,7 +1724,8 @@ class Plugin(BasePlugin):
             )).scalar_one_or_none()
             if not tc:
                 return False
-            bot_token = (tc.config or {}).get("bot_token")
+            from core.security.encryption import try_decrypt
+            bot_token = try_decrypt((tc.config or {}).get("bot_token"))
             if not bot_token:
                 return False
 

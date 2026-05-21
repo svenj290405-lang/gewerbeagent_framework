@@ -38,6 +38,10 @@ STATE_BELEG_CONFIRMING = "beleg_confirming"
 
 # Lexware-Setup-Wizard
 STATE_LEXWARE_SETUP_TOKEN = "lexware_setup_token"
+# Eigener-Bot-Setup-Wizard (Self-Service: Betrieb schickt seinen
+# BotFather-Token an den globalen Bot, wir speichern verschluesselt +
+# registrieren den Webhook auf seinen eigenen Bot).
+STATE_EIGENER_BOT_TOKEN = "eigener_bot_token"
 # Rechnung-Wizard
 STATE_RECHNUNG_WAITING_INPUT = "rechnung_waiting_input"
 STATE_RECHNUNG_CONFIRMING = "rechnung_confirming"
