@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<title>Eigenen Telegram-Bot einrichten</title>
+<style>
+  @page { size: A4; margin: 18mm 16mm; }
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    color: #1c2530; line-height: 1.5; max-width: 720px; margin: 0 auto;
+    padding: 24px; font-size: 15px;
+  }
+  h1 { font-size: 26px; margin: 0 0 4px; color: #0f1b2d; }
+  .sub { color: #5b6675; font-size: 15px; margin: 0 0 20px; }
+  h2 {
+    font-size: 18px; margin: 26px 0 8px; padding-top: 14px;
+    border-top: 1px solid #e6eaef; color: #0f1b2d;
+  }
+  ul { margin: 8px 0; padding-left: 20px; }
+  li { margin: 4px 0; }
+  code {
+    background: #f1f4f8; border: 1px solid #e0e6ee; border-radius: 4px;
+    padding: 1px 5px; font-family: "SF Mono", Consolas, monospace; font-size: 13px;
+  }
+  pre {
+    background: #0f1b2d; color: #e8eef6; padding: 10px 14px; border-radius: 6px;
+    font-family: "SF Mono", Consolas, monospace; font-size: 13px; overflow-x: auto;
+  }
+  .note {
+    background: #fff8e6; border: 1px solid #f0dca0; border-radius: 6px;
+    padding: 10px 14px; margin: 12px 0; font-size: 14px;
+  }
+  .tip { color: #2563a8; font-weight: 600; }
+  .faq-q { font-weight: 600; margin-top: 12px; }
+  footer { margin-top: 28px; color: #5b6675; font-size: 13px; border-top: 1px solid #e6eaef; padding-top: 10px; }
+  h2 { page-break-after: avoid; }
+  pre, .note { page-break-inside: avoid; }
+</style>
+</head>
+<body>
+
+<h1>Eigenen Telegram-Bot einrichten</h1>
+<p class="sub"><strong>In 5 Minuten zu deinem eigenen Assistenten-Bot — mit deinem Namen.</strong></p>
+
+<p>Standardmäßig läuft alles über unseren gemeinsamen Bot. Das funktioniert
+einwandfrei. Wenn du möchtest, kannst du stattdessen einen <strong>eigenen
+Bot</strong> mit <strong>deinem eigenen Namen</strong> verwenden (z.B.
+<code>@MeinBetrieb_Bot</code>). Vorteile:</p>
+<ul>
+  <li><strong>Dein Branding</strong> — der Bot trägt deinen Firmennamen.</li>
+  <li><strong>Eigene Reserven</strong> — du teilst dir das Tempo-Limit mit niemandem.</li>
+  <li><strong>Unabhängig</strong> — eine Störung bei anderen Betrieben betrifft dich nicht.</li>
+</ul>
+<p>Das Ganze ist <strong>optional</strong>. Wenn du nichts machst, bleibt alles beim gemeinsamen Bot.</p>
+
+<h2>Was du brauchst</h2>
+<ul>
+  <li>Dein Handy mit <strong>Telegram</strong> (das hast du ja schon 🙂).</li>
+  <li>5 Minuten Zeit.</li>
+</ul>
+
+<h2>Schritt 1 — BotFather öffnen</h2>
+<p>BotFather ist der offizielle Telegram-Dienst, mit dem man Bots anlegt.</p>
+<ul>
+  <li>Öffne in Telegram die Suche (Lupe oben) und tippe <strong>BotFather</strong> ein.</li>
+  <li>Wähle den Treffer mit dem <strong>blauen Haken ✓</strong> (<code>@BotFather</code>).</li>
+  <li>Tippe unten auf <strong>Start</strong>.</li>
+</ul>
+<p><span class="tip">👉 Direktlink: t.me/BotFather</span></p>
+
+<h2>Schritt 2 — Neuen Bot anlegen</h2>
+<ul>
+  <li>Schick BotFather die Nachricht: <pre>/newbot</pre></li>
+  <li><strong>Name des Bots:</strong> Nimm deinen Firmennamen, z.B.
+      <code>Schreinerei Müller</code>. (Frei wählbar, darf Leerzeichen enthalten.)</li>
+  <li><strong>Username:</strong> Muss auf <code>bot</code> enden und ist einmalig, z.B.
+      <code>schreinerei_mueller_bot</code>. Ist er vergeben, häng eine Zahl an
+      (<code>schreinerei_mueller_2_bot</code>).</li>
+</ul>
+
+<h2>Schritt 3 — Token kopieren</h2>
+<p>BotFather schickt dir eine Erfolgsmeldung mit einer <strong>langen Zeile</strong> —
+das ist dein <strong>Token</strong>. Sie sieht ungefähr so aus:</p>
+<pre>123456789:AAE3xampleToken_abcdefghijklmnopqrstuv</pre>
+<ul>
+  <li><strong>Tippe lange</strong> auf diese Zeile → <strong>Kopieren</strong>.</li>
+</ul>
+<div class="note">⚠️ Behandle den Token wie ein <strong>Passwort</strong>: nicht
+weitergeben, nicht öffentlich posten.</div>
+
+<h2>Schritt 4 — Token bei uns einfügen</h2>
+<ul>
+  <li>Geh zurück in den Chat mit dem <strong>Gewerbeagent-Bot</strong> (der, über den dein Onboarding lief).</li>
+  <li>Schick den Befehl: <pre>/eigenen_bot</pre></li>
+  <li>Der Bot zeigt dir nochmal kurz die Schritte und wartet auf deinen Token.</li>
+  <li><strong>Füge den kopierten Token ein</strong> (langes Tippen ins Eingabefeld → <em>Einfügen</em>) und sende ihn.</li>
+</ul>
+<p>Wir prüfen den Token sofort, richten alles ein und sagen dir, wie dein Bot heißt.</p>
+
+<h2>Schritt 5 — Auf deinen Bot umsteigen</h2>
+<p>Hat alles geklappt, bekommst du eine Bestätigung mit dem Namen deines Bots
+und einem Link, z.B. <code>t.me/schreinerei_mueller_bot</code>.</p>
+<ul>
+  <li><strong>Öffne deinen eigenen Bot</strong> über den Link.</li>
+  <li>Schick ihm einmal: <pre>/start</pre></li>
+</ul>
+<p>Ab jetzt laufen <strong>alle</strong> Nachrichten über deinen eigenen Bot. Fertig! 🎉</p>
+
+<h2>Häufige Fragen</h2>
+<p class="faq-q">Muss ich das machen?</p>
+<p>Nein. Ohne eigenen Bot läuft alles über den gemeinsamen Bot — völlig in Ordnung.</p>
+<p class="faq-q">„Telegram lehnt diesen Token ab."</p>
+<p>Beim Kopieren ist vermutlich etwas verlorengegangen. Erzeuge in BotFather mit
+<code>/token</code> einen neuen Token und probier <code>/eigenen_bot</code> nochmal.</p>
+<p class="faq-q">Ich möchte zurück zum gemeinsamen Bot.</p>
+<p>Kein Problem — melde dich kurz bei uns, wir stellen das zurück.</p>
+<p class="faq-q">Mein Bot soll ein Profilbild / eine Beschreibung haben.</p>
+<p>Das kannst du jederzeit selbst in BotFather setzen (<code>/setuserpic</code>,
+<code>/setdescription</code>) — rein kosmetisch, nicht nötig für die Funktion.</p>
+
+<footer>Fragen? Schreib uns: svenj05@gmx.de</footer>
+
+</body>
+</html>
