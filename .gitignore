@@ -54,3 +54,7 @@ docker-compose.freeswitch.yml
 # Backup-Dateien (Edit-History, lokal)
 *.bak
 *.before_*.bak
+
+# Claude Code (lokale Agent-Einstellungen + Runtime, nicht teilen)
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
