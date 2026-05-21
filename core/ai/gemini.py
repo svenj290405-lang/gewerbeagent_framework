@@ -589,6 +589,50 @@ async def extract_rechnung_from_audio(
     )
 
 
+async def transcribe_audio(audio_bytes: bytes, mime_type: str = "audio/ogg") -> str:
+    """Transkribiert eine Sprachnachricht WORTGETREU zu reinem Text (kein
+    Schema, kein Task). Fuer Archiv-Sprachnotizen. Verarbeitung in
+    europe-west3 (Frankfurt). Leerer String bei leerem Audio/Fehler.
+
+    mime_type: audio/ogg fuer Telegram-Voice-Notes (Opus codec)."""
+    if not audio_bytes:
+        return ""
+    from google.genai.types import GenerateContentConfig, Part
+
+    client = _get_genai_client(location=GENAI_TEXT_LOCATION)
+    model = "gemini-2.5-flash"
+    audio_part = Part.from_bytes(data=audio_bytes, mime_type=mime_type)
+    prompt = (
+        "Transkribiere die folgende Sprachnachricht wortgetreu. Gib NUR den "
+        "reinen Transkript-Text in der gesprochenen Sprache zurueck — ohne "
+        "Einleitung, ohne Anfuehrungszeichen, ohne Zeitstempel, ohne "
+        "Kommentar."
+    )
+    config = GenerateContentConfig(temperature=0.0, max_output_tokens=2048)
+
+    def _sync_call():
+        return client.models.generate_content(
+            model=model, contents=[audio_part, prompt], config=config,
+        )
+
+    try:
+        loop = asyncio.get_event_loop()
+        response = await loop.run_in_executor(None, _sync_call)
+    except Exception:
+        logger.exception("transcribe_audio: Gemini-Call fehlgeschlagen")
+        return ""
+    if not response.candidates:
+        return ""
+    candidate = response.candidates[0]
+    if not candidate.content or not candidate.content.parts:
+        return ""
+    out = ""
+    for p in candidate.content.parts:
+        if getattr(p, "text", None):
+            out += p.text
+    return out.strip()
+
+
 
 def _normalize_gespraech_extraction(data: dict) -> dict:
     """Normalisiert das Gemini-Output fuer Kundengespraeche.

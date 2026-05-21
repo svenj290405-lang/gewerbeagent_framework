@@ -1967,6 +1967,15 @@ async def _dispatch_update(payload):
     # ----- Voice-Pfad: nur wenn State darauf wartet -----
     if voice and not text:
         state = await _load_state(chat_id)
+        # ----- /archiv: Sprachnotiz -> transkribieren -> .txt in Drive -----
+        if state and state.state_key == STATE_ARCHIV_WAITING_FILES:
+            bot_token = _active_bot_token.get() or await _load_global_bot_token()
+            reply = await _handle_archiv_voice_received(
+                chat_id, voice, bot_token, state.state_data,
+            )
+            if reply:
+                await _send_to_chat(chat_id, reply)
+            return {"ok": True}
         if state and state.state_key == STATE_RECHNUNG_WAITING_INPUT:
             bot_token = _active_bot_token.get() or await _load_global_bot_token()
             if not bot_token:
@@ -2455,11 +2464,9 @@ async def _dispatch_update(payload):
         elif state.state_key == STATE_MATERIAL_NEU_PREVIEWING:
             reply = "Bitte einen der Buttons oben antippen oder /abbrechen schicken."
         elif state.state_key == STATE_ARCHIV_WAITING_FILES:
-            kunde = (state.state_data or {}).get("kunde_name") or "diesen Kunden"
-            reply = (
-                f"Schick mir Bilder, PDFs oder andere Dokumente fuer "
-                f"<b>{_h_safe(kunde)}</b>. Mit <b>/fertig</b> abschliessen "
-                f"oder /abbrechen."
+            # Text waehrend /archiv -> als Notiz-.txt im Kunden-Ordner
+            reply = await _handle_archiv_text_received(
+                chat_id, text, state.state_data,
             )
         elif state.state_key == STATE_ARCHIV_AWAIT_CHOICE:
             reply = await _handle_archiv_choice_input(
@@ -10075,10 +10082,13 @@ ONBOARDING_HELP = {
         "/archiv_verbinden."
     ),
     "knowledge": (
-        "Die Wissensbasis fuettert die KI mit Infos die sie sonst nicht "
-        "hat — z.B. 'wir kommen Mo-Fr 8-17 nicht in die Innenstadt' oder "
-        "'unser Stundensatz ist 75 EUR netto'. Du kannst spaeter mit "
-        "/wissen mehr eintragen. Hier nur ein erster Test-Eintrag."
+        "Die Wissensbasis fuettert <b>Q</b> mit Infos, die er sonst nicht "
+        "hat — Q nutzt sie <b>im Kundengespraech</b> (am Telefon und beim "
+        "Beantworten von Mails), z.B. 'wir kommen Mo-Fr 8-17 nicht in die "
+        "Innenstadt' oder 'unser Stundensatz ist 75 EUR netto'. Du waehlst "
+        "eine Kategorie und schreibst den Inhalt. Mit /wissen kannst du "
+        "spaeter mehr eintragen; mit 0 ('Spaeter beenden') schliesst du das "
+        "Setup ab."
     ),
     "done": (
         "Du bist fertig! Mit /help siehst du alle Befehle. Wenn du etwas "
@@ -10412,18 +10422,22 @@ async def _onboarding_send_drive(chat_id, tenant):
 
 
 async def _onboarding_send_knowledge(chat_id, tenant):
-    return (
-        f"📚 <b>Schritt 11 von 11 — Erster Wissens-Eintrag</b>\n"
+    msg = (
+        f"📚 <b>Schritt 11 von 11 — Wissensbasis</b>\n"
         f"{_onboarding_progress(11)}\n\n"
-        "Letzte Frage: gib mir <b>einen kurzen Anfahrts-Hinweis</b> oder "
-        "irgendwas was die KI ueber dich wissen soll:\n\n"
-        "<i>Beispiele:</i>\n"
-        "  • <i>Mo-Fr 7-9 Uhr keine Termine in der Innenstadt (Stau)</i>\n"
-        "  • <i>Unser Stundensatz ist 75 EUR netto</i>\n"
-        "  • <i>Wir arbeiten nur im Umkreis von 30 km</i>\n\n"
-        "Mit /skip ueberspringen — kannst du auch spaeter mit /wissen "
-        "nachholen."
+        "Zum Schluss: gib Q etwas Wissen ueber deinen Betrieb mit — das "
+        "nutzt <b>Q im Kundengespraech</b> (am Telefon und in Mails), z.B. "
+        "Anfahrt, Preise oder was ihr (nicht) macht.\n\n"
+        "<b>Wozu gehoert dein erster Eintrag?</b>\n"
     )
+    for i, key in enumerate(ALLE_KATEGORIEN, start=1):
+        label = KATEGORIE_LABELS.get(key, key)
+        msg += f"{i}) {label}\n"
+    msg += (
+        "\n<b>0)</b> ⏭ Spaeter beenden (jederzeit mit /wissen nachtragen)\n\n"
+        f"Antworte mit einer Nummer (1-{len(ALLE_KATEGORIEN)}) oder 0."
+    )
+    return msg
 
 
 async def _onboarding_send_done(chat_id, tenant):
@@ -10652,19 +10666,44 @@ async def _handle_onboarding_text_input(chat_id, text: str):
             )
         await _onboarding_save_field(tenant.id, "contact_email", text)
     elif step_key == "knowledge":
-        if len(text) < 10 or len(text) > 1000:
-            return (
-                "🤔 Zwischen 10 und 1000 Zeichen. Oder /skip wenn du "
-                "noch nichts ergaenzen willst."
-            )
-        from core.models.tenant_knowledge import KATEGORIE_ANFAHRT
-        async with AsyncSessionLocal() as s:
-            s.add(TenantKnowledge(
-                tenant_id=tenant.id,
-                kategorie=KATEGORIE_ANFAHRT,
-                text=text,
-            ))
-            await s.commit()
+        # Zweiphasig wie /wissen: erst Kategorie (Nummer), dann Inhalt. Die
+        # gewaehlte Kategorie haelt der Onboarding-State zwischen den beiden
+        # Nachrichten. '0' = Spaeter beenden (Setup ohne Eintrag abschliessen).
+        st = await _load_state(chat_id)
+        chosen = ((st.state_data if st else None) or {}).get("wissens_kategorie")
+        n = len(ALLE_KATEGORIEN)
+        if not chosen:
+            t = text.strip()
+            if t == "0":
+                pass  # Spaeter beenden -> faellt unten in _onboarding_advance
+            elif t.isdigit() and 1 <= int(t) <= n:
+                kategorie = ALLE_KATEGORIEN[int(t) - 1]
+                label = KATEGORIE_LABELS.get(kategorie, kategorie)
+                await _save_state(
+                    chat_id, STATE_ONBOARDING_ACTIVE,
+                    {"step_key": "knowledge", "wissens_kategorie": kategorie},
+                )
+                return (
+                    f"Kategorie: <b>{label}</b>\n\n"
+                    "Was soll Q sich dazu merken? Schreib den Inhalt in einer "
+                    "Nachricht.\n\n<i>Beispiel: Wir kommen Mo-Fr 7-9 Uhr nicht "
+                    "in die Innenstadt (Stau).</i>\n\n"
+                    "Oder /skip zum spaeteren Nachtragen."
+                )
+            else:
+                return (
+                    f"🤔 Bitte eine Nummer von 1 bis {n} waehlen — oder "
+                    "<b>0</b> fuer „Spaeter beenden\"."
+                )
+        else:
+            inhalt = text.strip()
+            if len(inhalt) < 5 or len(inhalt) > WISSEN_MAX_LEN:
+                return f"🤔 Zwischen 5 und {WISSEN_MAX_LEN} Zeichen. Oder /skip."
+            async with AsyncSessionLocal() as s:
+                s.add(TenantKnowledge(
+                    tenant_id=tenant.id, kategorie=chosen, text=inhalt,
+                ))
+                await s.commit()
     else:
         # Steps mit Button-Eingabe akzeptieren keinen Text
         return (
@@ -11493,7 +11532,8 @@ async def _start_archiv_upload_wizard(
     )
     return (
         f"<b>📁 {_h_safe(kunde_name)}</b>\n"
-        "Schick Bilder/PDFs. Mehrere OK.\n"
+        "Schick Fotos, PDFs, Text oder eine Sprachnachricht — alles landet "
+        "im Kunden-Ordner (Text/Sprache als Notiz-Datei). Mehrere OK.\n"
         "<b>/fertig</b> zum Abschliessen."
     )
 
@@ -11698,6 +11738,112 @@ async def _handle_deprecated_drive_command(old_command: str, args: str = "") -> 
     return hint
 
 
+async def _archiv_store_blob(chat_id, state_data, file_bytes, filename, mime_type) -> str:
+    """Laedt einen Byte-Blob in den Kunden-Drive-Ordner — gemeinsam fuer
+    Foto/Dokument, Text-Notiz und transkribierte Sprachnotiz. Zaehlt den
+    Wizard-Counter hoch und liefert die Bestaetigung. Failsafe bei
+    Drive-Fehlern (Klartext statt Stacktrace)."""
+    from core.integrations.google_drive import upload_file_to_kunde_folder
+    data = state_data or {}
+    kunde_name = data.get("kunde_name") or "Unbekannt"
+    tenant_id_str = data.get("tenant_id")
+    employee_id_str = data.get("employee_id")
+    if not tenant_id_str:
+        await _clear_state(chat_id)
+        return "Wizard-State korrupt. Bitte /archiv erneut starten."
+    try:
+        tenant_id = uuid.UUID(tenant_id_str)
+        employee_id = uuid.UUID(employee_id_str) if employee_id_str else None
+    except (ValueError, TypeError):
+        await _clear_state(chat_id)
+        return "Wizard-State korrupt. Bitte /archiv erneut starten."
+
+    try:
+        result = await upload_file_to_kunde_folder(
+            tenant_id=tenant_id, kunde_name=kunde_name, file_bytes=file_bytes,
+            filename=filename, mime_type=mime_type, employee_id=employee_id,
+        )
+    except ValueError as e:
+        msg = str(e)
+        logger.warning(f"Drive-Upload ValueError: {msg}")
+        return (
+            f"⚠️ <b>Drive-Upload fehlgeschlagen</b>\n\n{_h_safe(msg)}\n\n"
+            "Bitte einmal /archiv_verbinden — danach /archiv erneut."
+        )
+    except Exception as e:
+        err = str(e)
+        logger.exception(f"Drive-Upload-Fehler: {err[:200]}")
+        if "quotaExceeded" in err or "storageQuotaExceeded" in err:
+            hint = (
+                "Drive-Speicher voll. In Drive aufraeumen oder Workspace-"
+                "Plan upgraden, dann erneut versuchen."
+            )
+        elif "403" in err and "rateLimitExceeded" in err:
+            hint = "Drive-API-Rate-Limit. In ein paar Sekunden erneut versuchen."
+        else:
+            hint = (
+                "Unerwarteter Drive-Fehler. Bitte erneut versuchen oder "
+                "/archiv_status pruefen."
+            )
+        return f"⚠️ <b>Upload fehlgeschlagen</b>\n\n{hint}"
+
+    new_data = dict(data)
+    new_data["uploaded"] = int(data.get("uploaded") or 0) + 1
+    new_data["folder_url"] = result.get("kunde_folder_url") or ""
+    new_data["folder_id"] = result.get("kunde_folder_id") or ""
+    await _save_state(chat_id, STATE_ARCHIV_WAITING_FILES, new_data)
+    return (
+        f"✅ <b>{_h_safe(filename)}</b> abgelegt "
+        f"({new_data['uploaded']} fuer {_h_safe(kunde_name)})\n\n"
+        "Naechste Datei/Notiz schicken oder mit <b>/fertig</b> abschliessen."
+    )
+
+
+def _archiv_note_header(kunde_name: str, art: str) -> str:
+    """Kleiner Kopf fuer Text-/Sprachnotizen in der .txt."""
+    jetzt = dt.datetime.now(dt.timezone.utc).strftime("%d.%m.%Y %H:%M")
+    return f"{art} fuer {kunde_name}\nErfasst: {jetzt} UTC\n{'-' * 40}\n\n"
+
+
+async def _handle_archiv_text_received(chat_id, text, state_data) -> str:
+    """Text-Notiz waehrend /archiv -> als .txt im Kunden-Ordner ablegen."""
+    note = (text or "").strip()
+    if len(note) < 2:
+        return "Bitte etwas mehr Text — oder ein Foto/PDF, oder /fertig."
+    kunde_name = (state_data or {}).get("kunde_name") or "Unbekannt"
+    ts = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d_%H%M%S")
+    blob = (_archiv_note_header(kunde_name, "Notiz") + note).encode("utf-8")
+    return await _archiv_store_blob(
+        chat_id, state_data, blob, f"notiz_{ts}.txt", "text/plain",
+    )
+
+
+async def _handle_archiv_voice_received(chat_id, voice_dict, bot_token, state_data) -> str:
+    """Sprachnachricht waehrend /archiv -> transkribieren -> .txt ablegen."""
+    from core.ai.gemini import transcribe_audio
+    if bot_token is None:
+        bot_token = _active_bot_token.get() or await _load_global_bot_token()
+    audio_bytes, audio_mime = await _telegram_download_voice(bot_token, voice_dict)
+    if not audio_bytes:
+        return "Sprachnachricht konnte nicht geladen werden — nochmal versuchen."
+    try:
+        transcript = await transcribe_audio(audio_bytes, audio_mime or "audio/ogg")
+    except Exception:
+        logger.exception("Archiv-Voice-Transkription fehlgeschlagen")
+        transcript = ""
+    if not transcript:
+        return (
+            "🤔 Konnte die Sprachnachricht nicht verstehen. Nochmal "
+            "einsprechen oder als Text schicken."
+        )
+    kunde_name = (state_data or {}).get("kunde_name") or "Unbekannt"
+    ts = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d_%H%M%S")
+    blob = (_archiv_note_header(kunde_name, "Sprachnotiz") + transcript).encode("utf-8")
+    return await _archiv_store_blob(
+        chat_id, state_data, blob, f"sprachnotiz_{ts}.txt", "text/plain",
+    )
+
+
 async def _handle_archiv_file_received(
     chat_id, photo_array, document, bot_token, state_data,
 ) -> str:
@@ -11769,55 +11915,9 @@ async def _handle_archiv_file_received(
     if not file_bytes:
         return "Telegram-Download fehlgeschlagen — bitte erneut schicken."
 
-    # Drive-Upload
-    try:
-        result = await upload_file_to_kunde_folder(
-            tenant_id=tenant_id,
-            kunde_name=kunde_name,
-            file_bytes=file_bytes,
-            filename=filename,
-            mime_type=mime_type,
-            employee_id=employee_id,
-        )
-    except ValueError as e:
-        # Token-/Scope-Fehler — sauberer Reset, User soll re-authen
-        msg = str(e)
-        logger.warning(f"Drive-Upload ValueError: {msg}")
-        return (
-            f"⚠️ <b>Drive-Upload fehlgeschlagen</b>\n\n"
-            f"{_h_safe(msg)}\n\n"
-            "Bitte einmal /archiv_verbinden — danach /archiv erneut."
-        )
-    except Exception as e:
-        # Quota / Network / API-Error — Wizard NICHT abbrechen
-        # damit User naechste Datei probieren kann.
-        err = str(e)
-        logger.exception(f"Drive-Upload-Fehler: {err[:200]}")
-        if "quotaExceeded" in err or "storageQuotaExceeded" in err:
-            hint = (
-                "Drive-Speicher voll. In Drive aufraumen oder Workspace-"
-                "Plan upgraden, dann erneut versuchen."
-            )
-        elif "403" in err and "rateLimitExceeded" in err:
-            hint = "Drive-API-Rate-Limit. In ein paar Sekunden erneut versuchen."
-        else:
-            hint = (
-                "Unerwarteter Drive-Fehler. Bitte erneut versuchen oder "
-                "/archiv_status pruefen."
-            )
-        return f"⚠️ <b>Upload fehlgeschlagen</b>\n\n{hint}"
-
-    # Counter im State hochzaehlen
-    new_data = dict(data)
-    new_data["uploaded"] = int(data.get("uploaded") or 0) + 1
-    new_data["folder_url"] = result.get("kunde_folder_url") or ""
-    new_data["folder_id"] = result.get("kunde_folder_id") or ""
-    await _save_state(chat_id, STATE_ARCHIV_WAITING_FILES, new_data)
-
-    return (
-        f"✅ <b>{_h_safe(filename)}</b> abgelegt "
-        f"({new_data['uploaded']} fuer {_h_safe(kunde_name)})\n\n"
-        "Naechste Datei schicken oder mit <b>/fertig</b> abschliessen."
+    # Drive-Upload (gemeinsame Logik fuer Datei/Text/Voice)
+    return await _archiv_store_blob(
+        chat_id, state_data, file_bytes, filename, mime_type,
     )
 
 
