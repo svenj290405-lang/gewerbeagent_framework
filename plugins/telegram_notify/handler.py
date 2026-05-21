@@ -6783,7 +6783,6 @@ async def _run_rechnung_versand_pipeline(angebot_id) -> str:
         kunde_strasse = ang.kunde_strasse
         kunde_plz = ang.kunde_plz
         kunde_ort = ang.kunde_ort
-        custom_intro = ang.introduction_text
 
     provider = await _get_lexware_provider_for_tenant(tenant)
     if provider is None:
@@ -6810,16 +6809,16 @@ async def _run_rechnung_versand_pipeline(angebot_id) -> str:
 
     report = [f"🧾 <b>Rechnung: {_h_safe(kunde_name)}</b>", ""]
 
-    # Stufe 1: Finalisierte Rechnung in Lexware anlegen
+    # Stufe 1: Finalisierte Rechnung in Lexware anlegen.
+    # WICHTIG: Hier bewusst NICHT das personalisierte Angebots-Anschreiben
+    # (ang.introduction_text) uebernehmen. Das ist auf die Anfrage/das Angebot
+    # gemuenzt ("danke fuer Ihre Anfrage, anbei unser Angebot") und passt nicht
+    # auf eine Rechnung. Stattdessen ein eigener, neutraler Rechnungstext.
     intro_text = (
-        f"Sehr geehrte Damen und Herren,\n\nvielen Dank fuer den "
-        f"Auftrag. Nachstehend unsere Rechnung."
+        "Sehr geehrte Damen und Herren,\n\nvielen Dank fuer Ihren Auftrag "
+        "und das entgegengebrachte Vertrauen. Wie vereinbart stellen wir "
+        "Ihnen die erbrachten Leistungen nachstehend in Rechnung."
     )
-    if custom_intro:
-        # Wir nutzen das gleiche personalisierte Anschreiben wie im
-        # Angebot — passt meist auch zur Rechnung ("danke fuer den
-        # Auftrag, hier die Abrechnung").
-        intro_text = custom_intro
     try:
         invoice = await provider.create_invoice_draft(
             line_items=line_items,
