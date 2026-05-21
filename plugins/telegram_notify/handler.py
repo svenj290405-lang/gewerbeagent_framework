@@ -205,31 +205,19 @@ async def _active_token() -> str | None:
     return _active_bot_token.get() or await _load_global_bot_token()
 
 
-async def _resolve_push_bot_token(tenant_id) -> str | None:
-    """Bot-Token fuer PROAKTIVE Pushes an einen Tenant: tenant-eigener
-    Bot (`telegram_notify.bot_token`, entschluesselt) wenn gesetzt, sonst
-    der geteilte globale Bot.
+async def _push_bot_token(own_token: str | None) -> str | None:
+    """Bot-Token fuer PROAKTIVE Pushes: der (entschluesselte) tenant-eigene
+    Token wenn gesetzt, sonst der geteilte globale Bot.
 
-    Spiegelt den Webhook-Reply-Pfad (`_resolve_active_bot_token`/
-    `_active_token`), der diesen globalen Fallback schon hatte. Ohne ihn
-    bekamen Tenants am geteilten Bot (= Default-Fall) NIE einen Push ueber
-    send_for_tenant/resolve_employee_push_target. Failsafe: bei jedem
-    Fehler globaler Bot."""
-    try:
-        async with AsyncSessionLocal() as s:
-            tc = (await s.execute(
-                select(ToolConfig).where(
-                    ToolConfig.tenant_id == tenant_id,
-                    ToolConfig.tool_name == "telegram_notify",
-                )
-            )).scalar_one_or_none()
-        if tc and tc.enabled:
-            tok = try_decrypt((tc.config or {}).get("bot_token"))
-            if tok:
-                return tok
-    except Exception:
-        logger.exception("Push-Bot-Token aufloesen fehlgeschlagen — global")
-    return await _load_global_bot_token()
+    Spiegelt den Reply-Pfad (`_active_token`), der den globalen Fallback
+    schon hatte — ohne ihn bekamen Tenants am geteilten Bot (Default-Fall)
+    NIE einen Push ueber send_for_tenant/resolve_employee_push_target.
+
+    own_token: der rohe `telegram_notify.bot_token`-Wert des Tenants
+    (ggf. Fernet-verschluesselt) oder None/leer. Bewusst KEIN eigener
+    DB-Zugriff — der Caller hat die Config schon geladen."""
+    tok = try_decrypt(own_token) if own_token else None
+    return tok or await _load_global_bot_token()
 STATE_TTL_MINUTES = 30
 WISSEN_MAX_LEN = 2000
 
@@ -264,7 +252,8 @@ class TelegramNotifier:
                 chat_id = await _resolve_chat_id_for_push(
                     session, tenant_id, employee_id, fallback=cfg.get("chat_id", ""),
                 )
-            bot_token = await _resolve_push_bot_token(tenant_id)
+                # Token: tenant-eigener Bot oder globaler Fallback.
+                bot_token = await _push_bot_token(cfg.get("bot_token"))
             if not bot_token or not chat_id:
                 return False
             return await TelegramNotifier._send_raw(bot_token, chat_id, text)
@@ -359,11 +348,6 @@ class TelegramNotifier:
         kein Legacy-chat_id).
         """
         from core.models.employee import Employee
-        # Token zuerst (eigener Bot oder globaler Fallback) — sonst bekamen
-        # Tenants am geteilten globalen Bot NIE einen Employee-Push.
-        bot_token = await _resolve_push_bot_token(tenant_id)
-        if not bot_token:
-            return None, None, ""
         async with AsyncSessionLocal() as s:
             tc = (await s.execute(
                 select(ToolConfig).where(
@@ -375,6 +359,11 @@ class TelegramNotifier:
             if tc is not None and not tc.enabled:
                 return None, None, ""
             cfg = {**MANIFEST.default_config, **(tc.config or {})} if tc else {}
+            # Token: tenant-eigener Bot oder globaler Fallback — sonst
+            # bekamen Tenants am geteilten globalen Bot NIE einen Push.
+            bot_token = await _push_bot_token(cfg.get("bot_token"))
+            if not bot_token:
+                return None, None, ""
 
             prefix = ""
             if employee_id is not None:
