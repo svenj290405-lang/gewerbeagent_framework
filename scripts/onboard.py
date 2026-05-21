@@ -30,6 +30,7 @@ from sqlalchemy import select
 
 from core.database import AsyncSessionLocal
 from core.features.catalog import FEATURES
+from core.features.check import GLOBALLY_DISABLED_FEATURES
 from core.models import (
     Tenant, TenantKnowledge, TenantStatus, ToolConfig,
     ALLE_KATEGORIEN,
@@ -140,13 +141,14 @@ async def _ensure_telegram_webhook() -> tuple[bool, str]:
 # Pakete/Tiers mehr — alles Weitere (Voice, Drive-Archiv, Visualisierung,
 # Mitarbeiter) wird nach dem Onboarding per Admin-UI einzeln dazugeschaltet.
 # Always-on-Features (telegram_bot, kunde_lookup) sind ohnehin immer aktiv.
-DEFAULT_FEATURES: tuple[str, ...] = (
-    "kalender",
-    "wissensbasis",
-    "mail_intake",
-    "anfrage_formular",
-    "lexware",
-    "material",
+# Standardmaessig werden ALLE umschaltbaren Tools aktiviert. Ausgenommen:
+# - always-on-Features (telegram_bot, kunde_lookup) — brauchen keinen Toggle
+# - global per Kill-Switch deaktivierte (z.B. werkstatt)
+# Dynamisch aus dem Katalog, damit kuenftige Features automatisch dabei sind.
+DEFAULT_FEATURES: tuple[str, ...] = tuple(
+    key for key, feat in FEATURES.items()
+    if not getattr(feat, "always_on", False)
+    and key not in GLOBALLY_DISABLED_FEATURES
 )
 
 
