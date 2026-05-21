@@ -203,6 +203,33 @@ async def _resolve_active_bot_token() -> str | None:
 async def _active_token() -> str | None:
     """Aktiver Bot-Token fuer dieses Update (ContextVar) oder global."""
     return _active_bot_token.get() or await _load_global_bot_token()
+
+
+async def _resolve_push_bot_token(tenant_id) -> str | None:
+    """Bot-Token fuer PROAKTIVE Pushes an einen Tenant: tenant-eigener
+    Bot (`telegram_notify.bot_token`, entschluesselt) wenn gesetzt, sonst
+    der geteilte globale Bot.
+
+    Spiegelt den Webhook-Reply-Pfad (`_resolve_active_bot_token`/
+    `_active_token`), der diesen globalen Fallback schon hatte. Ohne ihn
+    bekamen Tenants am geteilten Bot (= Default-Fall) NIE einen Push ueber
+    send_for_tenant/resolve_employee_push_target. Failsafe: bei jedem
+    Fehler globaler Bot."""
+    try:
+        async with AsyncSessionLocal() as s:
+            tc = (await s.execute(
+                select(ToolConfig).where(
+                    ToolConfig.tenant_id == tenant_id,
+                    ToolConfig.tool_name == "telegram_notify",
+                )
+            )).scalar_one_or_none()
+        if tc and tc.enabled:
+            tok = try_decrypt((tc.config or {}).get("bot_token"))
+            if tok:
+                return tok
+    except Exception:
+        logger.exception("Push-Bot-Token aufloesen fehlgeschlagen — global")
+    return await _load_global_bot_token()
 STATE_TTL_MINUTES = 30
 WISSEN_MAX_LEN = 2000
 
@@ -225,17 +252,21 @@ class TelegramNotifier:
                     )
                 )
                 tc = result.scalar_one_or_none()
-                if tc is None or not tc.enabled:
+                # Explizit deaktiviert -> kein Push. FEHLENDE Config ist
+                # KEIN Abbruch: Tenants am geteilten globalen Bot haben
+                # oft gar keine telegram_notify-Config — Token kommt dann
+                # ueber den globalen Fallback (_resolve_push_bot_token).
+                if tc is not None and not tc.enabled:
                     return False
-                cfg = {**MANIFEST.default_config, **(tc.config or {})}
-                bot_token = cfg.get("bot_token", "")
+                cfg = {**MANIFEST.default_config, **(tc.config or {})} if tc else {}
 
                 # Chat-ID-Aufloesung: Employee > Default-Employee > Legacy-Config
                 chat_id = await _resolve_chat_id_for_push(
                     session, tenant_id, employee_id, fallback=cfg.get("chat_id", ""),
                 )
-                if not bot_token or not chat_id:
-                    return False
+            bot_token = await _resolve_push_bot_token(tenant_id)
+            if not bot_token or not chat_id:
+                return False
             return await TelegramNotifier._send_raw(bot_token, chat_id, text)
         except Exception as e:
             logger.exception(f"Telegram-Versand fehlgeschlagen: {e}")
@@ -328,6 +359,11 @@ class TelegramNotifier:
         kein Legacy-chat_id).
         """
         from core.models.employee import Employee
+        # Token zuerst (eigener Bot oder globaler Fallback) — sonst bekamen
+        # Tenants am geteilten globalen Bot NIE einen Employee-Push.
+        bot_token = await _resolve_push_bot_token(tenant_id)
+        if not bot_token:
+            return None, None, ""
         async with AsyncSessionLocal() as s:
             tc = (await s.execute(
                 select(ToolConfig).where(
@@ -335,12 +371,10 @@ class TelegramNotifier:
                     ToolConfig.tool_name == "telegram_notify",
                 )
             )).scalar_one_or_none()
-            if tc is None or not tc.enabled:
+            # Explizit deaktiviert -> kein Push. Fehlende Config ist ok.
+            if tc is not None and not tc.enabled:
                 return None, None, ""
-            cfg = {**MANIFEST.default_config, **(tc.config or {})}
-            bot_token = cfg.get("bot_token", "")
-            if not bot_token:
-                return None, None, ""
+            cfg = {**MANIFEST.default_config, **(tc.config or {})} if tc else {}
 
             prefix = ""
             if employee_id is not None:
