@@ -31,7 +31,8 @@ from core.models.employee_absence import (
     EmployeeAbsence,
 )
 from core.integrations import absence_redistribution as ar
-from core.routing.employee_router import extract_skills_from_text
+from core.routing import employee_router as er
+from core.routing.employee_router import choose_employee, extract_skills_from_text
 
 
 # =====================================================================
@@ -100,9 +101,23 @@ def _emp(**kw):
         is_default=False,
         arbeitstage=None,
         arbeitszeiten=None,
+        skills=None,
+        calendar_provider=None,
+        calendar_id=None,
     )
     base.update(kw)
     return SimpleNamespace(**base)
+
+
+@pytest.fixture(autouse=True)
+def _clear_redistribution_state():
+    """Die In-Memory-Anti-Doppellauf-Sets sind Modul-global — vor jedem
+    Test leeren, damit Tests sich nicht gegenseitig beeinflussen."""
+    ar._processed_events.clear()
+    ar._inflight.clear()
+    yield
+    ar._processed_events.clear()
+    ar._inflight.clear()
 
 
 # =====================================================================
@@ -331,3 +346,208 @@ async def test_cron_redistributes_krank_not_urlaub(monkeypatch):
 
     # Nur der Kranke wurde umverteilt — der Urlauber nicht.
     assert calls == [emp_krank.id]
+
+
+# =====================================================================
+# Termin-Verschiebung: Event wird im Ersatz-Kalender angelegt und beim
+# Kranken geloescht
+# =====================================================================
+
+
+def _event(event_id="e1", subject="Heizung Kunde"):
+    return {
+        "event_id": event_id,
+        "subject": subject,
+        "body_preview": "Kessel tropft",
+        "location": "Hauptstr 5",
+        "start_dt": dt.datetime(2026, 5, 20, 9, 0),
+        "end_dt": dt.datetime(2026, 5, 20, 10, 0),
+    }
+
+
+@pytest.mark.asyncio
+async def test_move_event_creates_in_substitute_then_deletes_from_sick(monkeypatch):
+    """_move_event: ERST im neuen Kalender anlegen, DANN beim Kranken
+    loeschen — kein Event-Verlust."""
+    tenant = SimpleNamespace(id=uuid.uuid4(), slug="demo")
+    sick = _emp(slug="max", name="Max", calendar_provider="google", calendar_id="primary")
+    new = _emp(slug="anna", name="Anna", calendar_provider="google", calendar_id="primary")
+    event = _event()
+
+    create_mock = AsyncMock(return_value={"new_event_id": "n1", "html_link": "x"})
+    delete_mock = AsyncMock(return_value=True)
+    monkeypatch.setattr(ar, "_create_event_for_employee", create_mock)
+    monkeypatch.setattr(ar, "_delete_event_from_employee", delete_mock)
+
+    res = await ar._move_event(tenant, sick, new, event)
+
+    assert res["new_event_id"] == "n1"
+    create_mock.assert_awaited_once()
+    assert create_mock.await_args.args[0] is new      # angelegt beim Ersatz
+    delete_mock.assert_awaited_once()
+    assert delete_mock.await_args.args[0] is sick      # geloescht beim Kranken
+    assert delete_mock.await_args.args[1] == "e1"
+
+
+@pytest.mark.asyncio
+async def test_handle_one_event_moves_to_substitute(monkeypatch):
+    """_handle_one_event: Skill-Router liefert Ersatz -> Event verschoben,
+    reason='moved'."""
+    tenant = SimpleNamespace(id=uuid.uuid4(), slug="demo")
+    sick = _emp(slug="max", name="Max", calendar_provider="google")
+    new = _emp(slug="anna", name="Anna", calendar_provider="google")
+    event = _event()
+
+    decision = SimpleNamespace(
+        employee_id=new.id, employee_slug="anna", reason="skill-match",
+    )
+    monkeypatch.setattr(ar, "choose_employee", AsyncMock(return_value=decision))
+    monkeypatch.setattr(ar, "AsyncSessionLocal", _session_factory([new]))  # lädt new_emp
+    monkeypatch.setattr(ar, "_create_event_for_employee",
+                        AsyncMock(return_value={"new_event_id": "n1"}))
+    monkeypatch.setattr(ar, "_delete_event_from_employee", AsyncMock(return_value=True))
+    monkeypatch.setattr(ar, "_notify_move", AsyncMock())
+
+    res = await ar._handle_one_event(tenant, sick, event, dt.date(2026, 5, 20))
+
+    assert res.reason == "moved"
+    assert res.new_emp_slug == "anna"
+
+
+@pytest.mark.asyncio
+async def test_handle_one_event_no_coverage_does_not_move(monkeypatch):
+    """Kein Kollege verfuegbar -> reason='no-coverage', KEIN Kalender-Move."""
+    tenant = SimpleNamespace(id=uuid.uuid4(), slug="demo")
+    sick = _emp(slug="max", calendar_provider="google")
+    event = _event(event_id="e2")
+
+    monkeypatch.setattr(
+        ar, "choose_employee",
+        AsyncMock(return_value=SimpleNamespace(
+            employee_id=uuid.uuid4(), employee_slug="x", reason="no-coverage",
+        )),
+    )
+    create_mock = AsyncMock()
+    monkeypatch.setattr(ar, "_create_event_for_employee", create_mock)
+
+    res = await ar._handle_one_event(tenant, sick, event, dt.date(2026, 5, 20))
+
+    assert res.reason == "no-coverage"
+    create_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_redistribute_for_employee_collects_moved(monkeypatch):
+    """redistribute_for_employee: Tagesschleife sammelt die verschobenen
+    Events in report.reassigned."""
+    tenant = SimpleNamespace(id=uuid.uuid4(), slug="demo")
+    sick = _emp(slug="max", name="Max", calendar_provider="google")
+    # Lädt nacheinander tenant + sick (scalar_one_or_none x2)
+    monkeypatch.setattr(ar, "AsyncSessionLocal", _session_factory([tenant, sick]))
+    monkeypatch.setattr(
+        ar, "_list_events_for_employee_day", AsyncMock(return_value=[_event()]),
+    )
+    moved = ar.EventRedistributionResult(
+        event_id="e1", event_subject="Heizung Kunde",
+        event_start=dt.datetime(2026, 5, 20, 9, 0),
+        sick_emp_slug="max", new_emp_slug="anna", reason="moved",
+    )
+    monkeypatch.setattr(ar, "_handle_one_event", AsyncMock(return_value=moved))
+
+    report = await ar.redistribute_for_employee(
+        tenant.id, sick.id, (dt.date(2026, 5, 20), dt.date(2026, 5, 20)),
+    )
+
+    assert len(report.reassigned) == 1
+    assert report.reassigned[0].new_emp_slug == "anna"
+    assert not report.no_coverage and not report.errors
+
+
+# =====================================================================
+# Buchung: bei Krankheit wird KEIN Termin beim Abwesenden gebucht
+# (choose_employee mit target_datetime filtert Abwesende raus)
+# =====================================================================
+
+
+@pytest.mark.asyncio
+async def test_choose_employee_skips_absent_books_available(monkeypatch):
+    """Anfrage mit Termin-Zeitpunkt: der Abwesende faellt raus, der
+    Verfuegbare wird gewaehlt."""
+    tenant_id = uuid.uuid4()
+    absent = _emp(slug="max", name="Max", skills=["heizung"])
+    available = _emp(slug="anna", name="Anna", skills=["heizung"])
+    monkeypatch.setattr(er, "AsyncSessionLocal", _session_factory([[absent, available]]))
+
+    async def _working(emp_id, target):
+        return emp_id == available.id  # nur Anna arbeitet
+
+    monkeypatch.setattr(
+        "core.models.employee_absence.is_employee_working_at",
+        AsyncMock(side_effect=_working),
+    )
+    decision = await choose_employee(
+        tenant_id, anliegen_text="Heizung kaputt",
+        target_datetime=dt.datetime(2026, 5, 20, 9, 0),
+    )
+    assert decision.employee_slug == "anna"  # der Kranke wird nicht gebucht
+
+
+@pytest.mark.asyncio
+async def test_choose_employee_all_absent_returns_no_coverage(monkeypatch):
+    """Ist der einzige passende Mitarbeiter krank -> no-coverage (kein
+    Termin gebucht, Eskalation an den Inhaber)."""
+    tenant_id = uuid.uuid4()
+    absent = _emp(slug="max", name="Max", skills=["heizung"], is_default=True)
+    monkeypatch.setattr(er, "AsyncSessionLocal", _session_factory([[absent]]))
+    monkeypatch.setattr(
+        "core.models.employee_absence.is_employee_working_at",
+        AsyncMock(return_value=False),
+    )
+    monkeypatch.setattr(
+        "core.models.employee.get_default_employee",
+        AsyncMock(return_value=absent),
+    )
+    decision = await choose_employee(
+        tenant_id, anliegen_text="Heizung kaputt",
+        target_datetime=dt.datetime(2026, 5, 20, 9, 0),
+    )
+    assert decision.reason == "no-coverage"
+
+
+# =====================================================================
+# Skill-Routing: passender Mitarbeiter wird per Skill gewaehlt
+# =====================================================================
+
+
+@pytest.mark.asyncio
+async def test_choose_employee_picks_matching_skill(monkeypatch):
+    """'Heizung'-Anfrage -> der Mitarbeiter mit Skill 'heizung' gewinnt."""
+    tenant_id = uuid.uuid4()
+    hans = _emp(slug="hans", name="Hans", skills=["heizung"])
+    maler = _emp(slug="maler", name="Maler", skills=["maler"])
+    monkeypatch.setattr(er, "AsyncSessionLocal", _session_factory([[hans, maler]]))
+
+    decision = await choose_employee(tenant_id, anliegen_text="Die Heizung ist kaputt")
+
+    assert decision.reason == "skill-match"
+    assert decision.employee_slug == "hans"
+    assert decision.score == 1.0
+
+
+@pytest.mark.asyncio
+async def test_choose_employee_no_skill_falls_back_to_default(monkeypatch):
+    """Kein Skill-Treffer im Text -> Default-Employee (fallback-default)."""
+    tenant_id = uuid.uuid4()
+    a = _emp(slug="a", skills=[])
+    b = _emp(slug="b", skills=[])
+    default = _emp(slug="inhaber", name="Inhaber", is_default=True, skills=[])
+    monkeypatch.setattr(er, "AsyncSessionLocal", _session_factory([[a, b]]))
+    monkeypatch.setattr(
+        "core.models.employee.get_default_employee",
+        AsyncMock(return_value=default),
+    )
+    decision = await choose_employee(
+        tenant_id, anliegen_text="Eine ganz allgemeine Frage ohne Gewerk",
+    )
+    assert decision.reason == "fallback-default"
+    assert decision.employee_slug == "inhaber"
