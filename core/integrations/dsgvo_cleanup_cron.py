@@ -1,8 +1,16 @@
 """DSGVO-Cleanup-Cron — laeuft 1x taeglich um 03:00 Europe/Berlin.
 
-Loescht Mail-Konversationen deren Termin laenger als 14 Tage zurueck-
-liegt (Datenminimierung). Nutzt die bestehende cleanup()-Funktion aus
-scripts/cleanup_email_conversations.py — keine Code-Duplikation.
+Loescht personenbezogene Daten nach Ablauf der Aufbewahrungsfrist des
+jeweiligen Tenants (data_retention_days, Default 90 Tage) —
+Datenminimierung / Speicherbegrenzung (Art. 5 Abs. 1 lit. e DSGVO):
+- Mail-Konversationen via cleanup() aus
+  scripts/cleanup_email_conversations.py
+- Gespraechs-/Anruf-Transkripte + Web-Formular-Anfragen via
+  scripts/cleanup_pii.py (cleanup_kundengespraeche / cleanup_anfragen)
+- Geocode-Cache (Kundenadressen) global via cleanup_geocode_cache
+
+Keine Code-Duplikation — die eigentliche Loesch-Logik liegt in den
+scripts-Modulen, dieser Cron orchestriert nur pro Tenant.
 
 Patterns analog zu rechnung_paid_summary_cron:
 - Tickt jede Minute, prueft ob die taegliche 03:00-Marke schon
@@ -58,6 +66,11 @@ async def _maybe_run_cleanup() -> None:
         from core.database import AsyncSessionLocal
         from core.models import Tenant
         from scripts.cleanup_email_conversations import cleanup
+        from scripts.cleanup_pii import (
+            cleanup_anfragen,
+            cleanup_geocode_cache,
+            cleanup_kundengespraeche,
+        )
 
         async with AsyncSessionLocal() as s:
             tenants = (await s.execute(
@@ -66,25 +79,53 @@ async def _maybe_run_cleanup() -> None:
                 )
             )).all()
 
-        total_deleted = 0
+        total_mails = 0
+        total_gespraeche = 0
+        total_anfragen = 0
+        # Laengste Retention bestimmt, wie lange der globale Geocode-Cache
+        # gehalten wird (kein Eintrag soll geloescht werden, solange noch
+        # irgendein Tenant ihn innerhalb seiner Frist nutzen darf).
+        max_retention = DEFAULT_RETENTION_DAYS
         for t_id, slug, retention in tenants:
             r_days = retention or DEFAULT_RETENTION_DAYS
+            max_retention = max(max_retention, r_days)
             try:
-                deleted = await cleanup(r_days, execute=True, tenant_id=t_id)
-                if deleted:
+                mails = await cleanup(r_days, execute=True, tenant_id=t_id)
+                gespraeche = await cleanup_kundengespraeche(
+                    r_days, execute=True, tenant_id=t_id
+                )
+                anfragen = await cleanup_anfragen(
+                    r_days, execute=True, tenant_id=t_id
+                )
+                if mails or gespraeche or anfragen:
                     logger.info(
                         f"  tenant={slug} retention={r_days}d: "
-                        f"{deleted} Konversationen geloescht"
+                        f"{mails} Konversationen, {gespraeche} Gespraeche, "
+                        f"{anfragen} Anfragen geloescht"
                     )
-                total_deleted += deleted
+                total_mails += mails
+                total_gespraeche += gespraeche
+                total_anfragen += anfragen
             except Exception as t_exc:  # noqa: BLE001
                 logger.exception(
                     f"DSGVO-Cleanup Tenant {slug} fehlgeschlagen: {t_exc}"
                 )
 
+        # Geocode-Cache ist tenant-uebergreifend → einmal global mit der
+        # laengsten Tenant-Retention.
+        geocode_deleted = 0
+        try:
+            geocode_deleted = await cleanup_geocode_cache(
+                max_retention, execute=True
+            )
+        except Exception as g_exc:  # noqa: BLE001
+            logger.exception(f"Geocode-Cache-Cleanup fehlgeschlagen: {g_exc}")
+
         logger.info(
-            f"DSGVO-Cleanup fertig: {total_deleted} Konversationen geloescht "
-            f"ueber {len(tenants)} Tenants"
+            f"DSGVO-Cleanup fertig ueber {len(tenants)} Tenants: "
+            f"{total_mails} Konversationen, {total_gespraeche} Gespraeche, "
+            f"{total_anfragen} Anfragen, {geocode_deleted} Geocode-Eintraege "
+            f"geloescht"
         )
         # Nur bei Erfolg merken — bei Fehler retried der naechste Tick
         _last_run_date = today
