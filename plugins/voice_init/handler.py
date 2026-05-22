@@ -305,6 +305,24 @@ def _routing_to_response(routing):
     }
 
 
+# DSGVO-Pflicht-Ansage (Art. 13 DSGVO; § 201 StGB bei Aufzeichnung). Wird
+# als dynamic_variable `datenschutz_hinweis` an ElevenLabs gegeben. Der
+# Agent MUSS sie in seiner first_message zu Beginn vorlesen — die Variable
+# allein wirkt nicht, das first_message-Template im ElevenLabs-Dashboard
+# muss `{{datenschutz_hinweis}}` einbinden.
+#
+# WICHTIG: Falls ElevenLabs Audio/Transkripte speichert, ist dieser Text
+# zu erweitern ("Das Gespraech wird aufgezeichnet") und es ist i.d.R. eine
+# Einwilligung noetig — Aufnahme ohne Hinweis ist nach § 201 StGB strafbar.
+# Die Retention-Einstellung im ElevenLabs-Dashboard pruefen.
+DATENSCHUTZ_HINWEIS = (
+    "Kurzer Hinweis vorab: Sie sprechen mit einem digitalen KI-Assistenten. "
+    "Ihre Angaben werden zur Bearbeitung Ihres Anliegens verarbeitet. "
+    "Informationen zum Datenschutz und zu Ihren Rechten erhalten Sie "
+    "jederzeit auf Nachfrage oder auf der Webseite des Betriebs."
+)
+
+
 class Plugin(BasePlugin):
     """voice_init Plugin: liefert Init-Daten fuer ElevenLabs-Conversations."""
 
@@ -417,6 +435,7 @@ class Plugin(BasePlugin):
                     "tenant_company_name": "diesem Handwerksbetrieb",
                     "tenant_branche": "Handwerk",
                     "tenant_knowledge_block": "Es liegen aktuell keine spezifischen Informationen ueber den Betrieb vor.",
+                    "datenschutz_hinweis": DATENSCHUTZ_HINWEIS,
                 },
             }
 
@@ -435,6 +454,7 @@ class Plugin(BasePlugin):
                 "tenant_company_name": tenant.company_name or "",
                 "tenant_branche": tenant.branche or "Handwerk",
                 "tenant_knowledge_block": knowledge_block,
+                "datenschutz_hinweis": DATENSCHUTZ_HINWEIS,
             },
         }
 
