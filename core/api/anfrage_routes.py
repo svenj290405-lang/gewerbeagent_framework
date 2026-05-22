@@ -258,6 +258,18 @@ async def submit_anfrage_form(token: str, request: Request):
             else:
                 antworten[key] = value
 
+    # DSGVO: Einwilligung ist Pflicht (Art. 6/7). Der Browser sendet
+    # `_consent` nur, wenn die Checkbox angehakt ist — fehlt sie, brechen
+    # wir serverseitig ab (clientseitige Pruefung allein ist umgehbar).
+    if not antworten.get("_consent"):
+        return HTMLResponse(
+            content=render_submit_error_page(
+                "Bitte bestätige die Datenschutz-Einwilligung, um die "
+                "Anfrage abzusenden."
+            ),
+            status_code=400,
+        )
+
     submitted_ip = request.client.host if request.client else None
 
     success, message = await submit_anfrage(

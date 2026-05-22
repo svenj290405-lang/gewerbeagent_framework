@@ -749,6 +749,14 @@ JS = """
                     grp[0].closest('.card-grid')?.scrollIntoView({ behavior: 'smooth', block: 'center' });
                     return false;
                 }
+            } else if (inp.type === 'checkbox') {
+                // Pflicht-Checkbox (z.B. DSGVO-Einwilligung): value ist immer
+                // "on", daher muss explizit auf .checked geprueft werden.
+                if (!inp.checked) {
+                    inp.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                    flashInvalid(inp);
+                    return false;
+                }
             } else if (!inp.value.trim()) {
                 inp.focus({ preventScroll: true });
                 inp.scrollIntoView({ behavior: 'smooth', block: 'center' });
@@ -850,12 +858,36 @@ def render_anfrage_form_html(
         # 01 / 03 Stil
         step_label = f"{i+1:02d} &mdash; {total:02d}"
 
+        # DSGVO: Pflicht-Einwilligung im letzten Schritt (Art. 6/7/13).
+        # Die Checkbox wird client- UND serverseitig erzwungen; `_consent`
+        # landet in den Antworten und dient als Einwilligungs-Nachweis
+        # (Art. 7 Abs. 1, mit submitted_at als Zeitstempel).
+        consent_html = ""
+        if is_last:
+            consent_html = (
+                '<label class="consent" style="display:flex;gap:10px;'
+                'align-items:flex-start;margin:18px 0 4px;font-size:13px;'
+                'line-height:1.5;color:#6e6e73;text-align:left;cursor:pointer;">'
+                '<input type="checkbox" name="_consent" required '
+                'style="margin-top:3px;flex:0 0 auto;width:18px;height:18px;">'
+                f'<span>Ich willige ein, dass {company} die von mir '
+                'angegebenen Daten zur Bearbeitung meiner Anfrage verarbeitet. '
+                'Zur Missbrauchsvermeidung wird meine IP-Adresse gespeichert. '
+                'Meine Rechte (Auskunft, Berichtigung, Löschung) und weitere '
+                'Hinweise stehen in der '
+                '<a href="https://www.gewerbeagent.de/datenschutz/" '
+                'target="_blank" rel="noopener">Datenschutzerklärung</a>. '
+                'Die Einwilligung kann ich jederzeit mit Wirkung für die '
+                'Zukunft widerrufen.</span></label>'
+            )
+
         steps_html.append(f'''
         <div class="step{' active' if i == 0 else ''}" data-step="{i}">
             <div class="step-counter">{step_label}</div>
             <h1>{_html.escape(step["title"])}</h1>
             <p class="subtitle">{_html.escape(step["subtitle"])}</p>
             {fields_html}
+            {consent_html}
             <div class="actions">
                 {prev_btn}
                 {next_btn}
