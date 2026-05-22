@@ -13,6 +13,9 @@ Was verschluesselt ist:
   - oauth_tokens._access_token_encrypted
   - tool_configs.config['encrypted_api_key']  (Lexware-Keys)
   - tool_configs.config['encrypted_*']        (defensiv: jede 'encrypted_*'-Key)
+  - tool_configs.config['bot_token']          (Telegram-Bot pro Betrieb —
+    verschluesselt gespeichert, folgt aber NICHT dem 'encrypted_'-Schema;
+    muss explizit mit-rotiert werden, sonst Daten-Verlust)
 
 Dry-Run zuerst (Default), dann mit --execute fuer den echten Rotation.
 
@@ -118,6 +121,13 @@ async def _rotate_oauth_tokens(
     return stats
 
 
+# Felder, die verschluesselt gespeichert werden, aber NICHT dem
+# 'encrypted_'-Namensschema folgen (historisch gewachsen). Diese muessen
+# bei der Rotation mit-recrypted werden, sonst sind sie nach dem
+# Key-Wechsel dauerhaft unentschluesselbar (Daten-Verlust).
+_PLAINTEXT_NAMED_ENCRYPTED_KEYS = {"bot_token"}
+
+
 async def _rotate_tool_configs(
     old: Fernet, new: Fernet, *, execute: bool,
 ) -> dict:
@@ -126,6 +136,10 @@ async def _rotate_tool_configs(
     Conventions:
       - cfg['encrypted_api_key']  (Lexware)
       - andere encrypted_*-Felder werden defensiv mitgenommen
+      - cfg['bot_token'] (Telegram-Bot pro Betrieb) wird explizit
+        mitgenommen, obwohl es nicht dem 'encrypted_'-Schema folgt.
+        Es kann historisch im Klartext vorliegen (try_decrypt-Fallback);
+        in dem Fall bleibt es unveraendert (kein harter Fehler).
     """
     stats = {"total": 0, "configs_touched": 0, "fields_recrypted": 0, "errors": 0}
     async with AsyncSessionLocal() as s:
@@ -136,7 +150,8 @@ async def _rotate_tool_configs(
             cfg = dict(row.config or {})
             touched = False
             for key, val in list(cfg.items()):
-                if not key.startswith("encrypted_"):
+                is_named_encrypted = key in _PLAINTEXT_NAMED_ENCRYPTED_KEYS
+                if not key.startswith("encrypted_") and not is_named_encrypted:
                     continue
                 if not isinstance(val, str) or not val:
                     continue
@@ -145,10 +160,21 @@ async def _rotate_tool_configs(
                     stats["fields_recrypted"] += 1
                     touched = True
                 except InvalidToken:
-                    logger.error(
-                        f"tool_config {row.id} field={key} InvalidToken — Skip."
-                    )
-                    stats["errors"] += 1
+                    if is_named_encrypted:
+                        # bot_token kann Klartext-Altbestand sein (vor der
+                        # Verschluesselung-at-rest gespeichert). Klartext
+                        # bleibt via try_decrypt lesbar → unveraendert
+                        # lassen, kein harter Fehler.
+                        logger.warning(
+                            f"tool_config {row.id} field={key}: kein gueltiges "
+                            f"Ciphertext (vermutlich Klartext-Altbestand) — "
+                            f"unveraendert gelassen."
+                        )
+                    else:
+                        logger.error(
+                            f"tool_config {row.id} field={key} InvalidToken — Skip."
+                        )
+                        stats["errors"] += 1
             if touched:
                 stats["configs_touched"] += 1
                 if execute:
