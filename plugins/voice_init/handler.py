@@ -322,7 +322,26 @@ class Plugin(BasePlugin):
         # als statischer Header-Vergleich gegen 'X-Webhook-Secret'.
         from config.settings import settings
         expected = (settings.elevenlabs_webhook_secret or "").strip()
-        if expected:
+        # Production-Hard-Veto: ohne gesetztes Secret ist der Webhook offen
+        # — jeder koennte gefakete Anrufe einschmuggeln (Termine buchen/
+        # stornieren, Lexware-Kontakte anlegen, Telegram-Pushes faken) und
+        # via Payload-`tenant_slug` sogar fuer fremde Betriebe. Lieber
+        # fail-closed (Voice abgelehnt) als offen. In Dev bleibt es offen
+        # fuer lokales Testen.
+        if not expected:
+            if settings.is_production:
+                logger.error(
+                    "voice_init: ELEVENLABS_WEBHOOK_SECRET ist in Production "
+                    "nicht gesetzt — Webhook wird abgelehnt (fail-closed). "
+                    "Secret in .env UND als Custom-Header 'X-Webhook-Secret' "
+                    "im ElevenLabs-Tool setzen."
+                )
+                raise PermissionError("elevenlabs-secret-not-configured")
+            logger.warning(
+                "voice_init: kein ELEVENLABS_WEBHOOK_SECRET gesetzt — "
+                "Signatur-Pruefung uebersprungen (nur Dev erlaubt)."
+            )
+        else:
             got = (headers or {}).get("x-webhook-secret", "") or (
                 headers or {}
             ).get("elevenlabs-signature", "")
