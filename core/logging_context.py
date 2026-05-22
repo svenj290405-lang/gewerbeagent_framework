@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import contextvars
 import logging
+import re
 from typing import Any
 from uuid import UUID
 
@@ -98,6 +99,39 @@ class TenantContextFilter(logging.Filter):
         return True
 
 
+# =====================================================================
+# SECRET-REDACTION
+# =====================================================================
+#
+# Verhindert, dass Geheimnisse im Klartext in den Logs landen. Der
+# httpx-Logger schreibt z.B. jede Anfrage-URL — inklusive
+# `api.telegram.org/bot<TOKEN>/sendMessage`, womit der Bot-Token offen
+# in den App-Logs (und damit 14 Tage in den Caddy-Logs) liegt. Wir
+# daempfen httpx zwar auf WARNING (siehe configure_structured_logging),
+# aber ein zusaetzlicher Redaction-Filter am Formatter faengt auch
+# Token ab, die App-Code versehentlich selbst loggt.
+_REDACTION_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    # Telegram-Bot-Token: <bot-id>:<35-Zeichen-Secret>, oft als
+    # "bot12345:AA..."-Pfadsegment in der API-URL.
+    (re.compile(r"bot\d{6,}:[A-Za-z0-9_-]{20,}"), "bot<redacted>"),
+    (re.compile(r"\b\d{6,}:[A-Za-z0-9_-]{30,}\b"), "<redacted-token>"),
+)
+
+
+def _redact_secrets(text: str) -> str:
+    for pattern, replacement in _REDACTION_PATTERNS:
+        text = pattern.sub(replacement, text)
+    return text
+
+
+class RedactingFormatter(logging.Formatter):
+    """Formatter, der nach der ueblichen Formatierung bekannte Secrets
+    aus der fertigen Logzeile maskiert (Telegram-Bot-Token etc.)."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        return _redact_secrets(super().format(record))
+
+
 def configure_structured_logging(*, level: str = "INFO") -> None:
     """Richtet das Root-Logger-Format mit Tenant-Context ein.
 
@@ -115,10 +149,17 @@ def configure_structured_logging(*, level: str = "INFO") -> None:
         root.removeHandler(h)
 
     handler = logging.StreamHandler()
-    handler.setFormatter(logging.Formatter(fmt))
+    handler.setFormatter(RedactingFormatter(fmt))
     handler.addFilter(TenantContextFilter())
     root.addHandler(handler)
     root.setLevel(level)
+
+    # httpx/httpcore loggen jede Request-URL auf INFO — inklusive des
+    # Telegram-Bot-Tokens im Pfad (api.telegram.org/bot<TOKEN>/...).
+    # Auf WARNING heben, damit diese URLs gar nicht erst entstehen.
+    # (Der RedactingFormatter ist die zweite Verteidigungslinie.)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 # Convenience: kurzer Helper fuer Cron-Loops, die pro Tenant iterieren.
