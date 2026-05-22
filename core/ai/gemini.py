@@ -1107,8 +1107,14 @@ async def rank_employee_for_request(
     try:
         text = await call_gemini(
             prompt=prompt,
+            # 2048 statt 512: Gemini 2.5 Flash verbraucht Tokens fuers
+            # interne "Thinking" VOR dem Output (siehe call_gemini-Doc).
+            # Bei 512 brach die Antwort gelegentlich nach dem Markdown-
+            # Fence ab ('```json' ohne JSON) -> stiller Stichwort-Fallback.
+            # 2048 wie classify_mail_subject/transcribe_audio. Cap, kein
+            # Zwang -> keine Latenz-Erhoehung, nur Truncation weg.
             temperature=0.0,
-            max_output_tokens=512,
+            max_output_tokens=2048,
             tenant_id=tenant_id,
             operation_kind="employee_routing",
         )
