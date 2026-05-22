@@ -454,3 +454,141 @@ async def test_buche_termin_invalid_slot_id():
     })
     assert result["erfolg"] is False
     assert "Slot" in result["nachricht"]
+
+
+# =====================================================================
+# Async-Terminsuche — starte_terminsuche + hole_terminvorschlaege
+# =====================================================================
+
+
+@pytest.mark.asyncio
+async def test_starte_terminsuche_returns_jobid_immediately_and_hole_delivers(
+    monkeypatch,
+):
+    """starte_terminsuche gibt sofort job_id+laeuft zurueck; nach Abschluss
+    des Hintergrund-Tasks liefert hole_terminvorschlaege die Slots+Routing."""
+    voice_handler._TERMINSUCHE_JOBS.clear()
+    tenant = _make_tenant("demo")
+    routed_emp = _make_employee(
+        slug="daniel", name="Daniel Mueller", calendar_provider="microsoft",
+        tenant_id=tenant.id, skills=["tischler"],
+    )
+    routing = RoutingDecision(
+        employee_id=routed_emp.id, employee_name="Daniel Mueller",
+        employee_slug="daniel", reason="skill-match", score=1.0,
+        debug={"needed_skills": ["tischler"]},
+    )
+    kalender = _FakeKalender(find_slots_result={
+        "erfolg": True,
+        "slots": [{"datum": "20.05.2026", "uhrzeit": "14:00"}],
+        "smart_routing": None,
+    })
+    # Session-Queue: 1) Tenant (starte), 2) emp (ensure_calendar im Worker)
+    monkeypatch.setattr(
+        voice_handler, "AsyncSessionLocal",
+        _make_session_factory([tenant, routed_emp]),
+    )
+    monkeypatch.setattr(voice_handler, "choose_employee", AsyncMock(return_value=routing))
+    import core.plugin_system as ps
+    monkeypatch.setattr(ps, "get_plugin_for_tenant", AsyncMock(return_value=kalender))
+
+    plugin = _make_plugin()
+    start = await plugin._handle_starte_terminsuche({
+        "tenant_slug": "demo",
+        "wunschzeit": "2026-05-20T14:00",
+        "anliegen": "Kuechenmontage Tischler",
+    })
+    assert start["erfolg"] is True
+    assert start["status"] == "laeuft"
+    job_id = start["job_id"]
+    assert job_id
+
+    # Hintergrund-Task zu Ende laufen lassen (im echten Betrieb laeuft er
+    # weiter waehrend der Agent redet).
+    await voice_handler._TERMINSUCHE_JOBS[job_id]["task"]
+
+    done = await plugin._handle_hole_terminvorschlaege({"job_id": job_id})
+    assert done["erfolg"] is True
+    assert done["status"] == "fertig"
+    assert len(done["slots"]) == 1
+    assert "slot_id" in done["slots"][0]
+    assert done["routing"]["employee_slug"] == "daniel"
+    # employee_id wurde im Worker ans kalender-Plugin durchgereicht
+    _, k_payload = kalender.received_payloads[0]
+    assert k_payload["employee_id"] == routed_emp.id
+
+
+@pytest.mark.asyncio
+async def test_starte_terminsuche_tenant_not_found(monkeypatch):
+    """Unbekannter Tenant → erfolg=False, kein Job, kein choose_employee."""
+    voice_handler._TERMINSUCHE_JOBS.clear()
+    monkeypatch.setattr(
+        voice_handler, "AsyncSessionLocal", _make_session_factory([None]),
+    )
+    choose_mock = AsyncMock()
+    monkeypatch.setattr(voice_handler, "choose_employee", choose_mock)
+
+    plugin = _make_plugin()
+    result = await plugin._handle_starte_terminsuche({
+        "tenant_slug": "ghost", "wunschzeit": "2026-05-20T14:00",
+    })
+    assert result["erfolg"] is False
+    assert "ghost" in result["nachricht"]
+    choose_mock.assert_not_called()
+    assert len(voice_handler._TERMINSUCHE_JOBS) == 0
+
+
+@pytest.mark.asyncio
+async def test_hole_terminvorschlaege_unknown_job():
+    """Unbekannte/abgelaufene job_id → erfolg=False, status=unbekannt."""
+    voice_handler._TERMINSUCHE_JOBS.clear()
+    plugin = _make_plugin()
+    result = await plugin._handle_hole_terminvorschlaege({"job_id": "gibtsnicht"})
+    assert result["erfolg"] is False
+    assert result["status"] == "unbekannt"
+
+
+@pytest.mark.asyncio
+async def test_hole_terminvorschlaege_still_running():
+    """Job existiert, aber noch nicht fertig → status=laeuft (Agent wartet)."""
+    voice_handler._TERMINSUCHE_JOBS.clear()
+    voice_handler._TERMINSUCHE_JOBS["job-x"] = {
+        "created_at": dt.datetime.now(dt.timezone.utc),
+        "status": "laeuft",
+        "result": None,
+    }
+    plugin = _make_plugin()
+    result = await plugin._handle_hole_terminvorschlaege({"job_id": "job-x"})
+    assert result["erfolg"] is True
+    assert result["status"] == "laeuft"
+    assert "slots" not in result
+
+
+@pytest.mark.asyncio
+async def test_starte_terminsuche_worker_failure_is_reported(monkeypatch):
+    """Crasht die Suche im Hintergrund, meldet hole_terminvorschlaege das
+    sauber (erfolg=False) statt den Job ewig auf 'laeuft' zu lassen."""
+    voice_handler._TERMINSUCHE_JOBS.clear()
+    tenant = _make_tenant("demo")
+    kalender = _FakeKalender(find_slots_result=None)
+    monkeypatch.setattr(
+        voice_handler, "AsyncSessionLocal", _make_session_factory([tenant]),
+    )
+    monkeypatch.setattr(
+        voice_handler, "choose_employee",
+        AsyncMock(side_effect=RuntimeError("Gemini down")),
+    )
+    import core.plugin_system as ps
+    monkeypatch.setattr(ps, "get_plugin_for_tenant", AsyncMock(return_value=kalender))
+
+    plugin = _make_plugin()
+    start = await plugin._handle_starte_terminsuche({
+        "tenant_slug": "demo", "wunschzeit": "2026-05-20T14:00",
+    })
+    job_id = start["job_id"]
+    await voice_handler._TERMINSUCHE_JOBS[job_id]["task"]
+
+    done = await plugin._handle_hole_terminvorschlaege({"job_id": job_id})
+    assert done["status"] == "fertig"
+    assert done["erfolg"] is False
+    assert "fehlgeschlagen" in done["nachricht"]

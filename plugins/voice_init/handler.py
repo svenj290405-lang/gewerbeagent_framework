@@ -3,6 +3,7 @@ voice_init Plugin: Conversation-Initiation-Webhook fuer ElevenLabs.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import secrets
 from datetime import datetime, timedelta, timezone
@@ -107,6 +108,42 @@ def _consume_stornier_token(
     # Atomar einlosen: erst markieren, dann zurueckgeben
     entry["used"] = True
     return entry
+
+
+# ----------------------------------------------------------------------
+# Terminsuche-Job-Store (asynchrone Voice-Pipeline)
+# ----------------------------------------------------------------------
+# checke_kalender (Gemini-Skill-Routing + Kalender-API) dauert bis ~9s.
+# Damit der Voice-Agent nicht so lange stumm blockiert, laeuft die Suche
+# als Hintergrund-Task: der Agent startet sie via `starte_terminsuche`
+# (sofortige job_id-Antwort, dann redet er weiter — Webformular-Hinweis
+# etc.) und holt das Ergebnis via `hole_terminvorschlaege` ab.
+#
+# Gleiche single-worker-Begruendung wie beim Stornier-Token-Cache oben:
+# in-process dict reicht, weil das Framework single-worker laeuft (uvicorn
+# ohne --workers). Bei Multi-Worker waeren Jobs an einen Worker gebunden
+# -> dann auf Redis/DB umstellen.
+TERMINSUCHE_JOB_TTL_SECONDS = 5 * 60   # nach 5 min raeumen wir auf
+TERMINSUCHE_JOB_MAX_ENTRIES = 500      # safety cap
+
+_TERMINSUCHE_JOBS: dict[str, dict[str, Any]] = {}
+
+
+def _gc_terminsuche_jobs() -> None:
+    """GC abgelaufener Terminsuche-Jobs (vor jedem Insert/Lookup)."""
+    now = datetime.now(timezone.utc)
+    stale = [
+        jid for jid, e in _TERMINSUCHE_JOBS.items()
+        if (now - e["created_at"]).total_seconds() > TERMINSUCHE_JOB_TTL_SECONDS
+    ]
+    for jid in stale:
+        _TERMINSUCHE_JOBS.pop(jid, None)
+    if len(_TERMINSUCHE_JOBS) > TERMINSUCHE_JOB_MAX_ENTRIES:
+        sorted_items = sorted(
+            _TERMINSUCHE_JOBS.items(), key=lambda kv: kv[1]["created_at"],
+        )
+        for jid, _ in sorted_items[: len(_TERMINSUCHE_JOBS) - TERMINSUCHE_JOB_MAX_ENTRIES]:
+            _TERMINSUCHE_JOBS.pop(jid, None)
 
 
 def _normalize_phone(num):
@@ -373,6 +410,10 @@ class Plugin(BasePlugin):
             return await self._handle_save_contact(payload)
         if endpoint == "checke_kalender":
             return await self._handle_checke_kalender(payload)
+        if endpoint == "starte_terminsuche":
+            return await self._handle_starte_terminsuche(payload)
+        if endpoint == "hole_terminvorschlaege":
+            return await self._handle_hole_terminvorschlaege(payload)
         if endpoint == "buche_termin":
             return await self._handle_buche_termin(payload)
         if endpoint == "finde_termine":
@@ -505,6 +546,19 @@ class Plugin(BasePlugin):
                 "nachricht": "Der Kalender ist fuer diesen Betrieb nicht eingerichtet.",
             }
 
+        # Slot-Suche + Skill-Routing — gemeinsame Logik mit der async-Variante
+        # (starte_terminsuche). checke_kalender bleibt der synchrone Pfad
+        # (Rueckwaerts-Kompatibilitaet / Fallback).
+        return await self._run_terminsuche(tenant, kalender, payload)
+
+    async def _run_terminsuche(self, tenant, kalender, payload):
+        """Die eigentliche Termin-Slot-Suche: Skill-Routing + Kalender.
+
+        Geteilt von `checke_kalender` (synchron) und `starte_terminsuche`
+        (Hintergrund-Task). Erwartet bereits aufgeloeste `tenant` (ORM,
+        Spalten geladen) + `kalender` (Plugin-Instanz). Liefert dieselbe
+        Response-Struktur wie checke_kalender frueher.
+        """
         datum, uhrzeit = _split_wunschzeit(payload.get("wunschzeit", ""))
         dauer_min = payload.get("dauer_min")
         kunde_adresse = (payload.get("kunde_adresse") or "").strip()
@@ -549,7 +603,7 @@ class Plugin(BasePlugin):
 
         routing_response = _routing_to_response(routing)
         logger.info(
-            f"checke_kalender: tenant={tenant_slug} wunsch={datum} {uhrzeit} "
+            f"terminsuche: tenant={tenant.slug} wunsch={datum} {uhrzeit} "
             f"emp={routing.employee_slug if routing else '?'} "
             f"reason={routing.reason if routing else '-'} -> {len(slots)} Slots"
         )
@@ -560,6 +614,123 @@ class Plugin(BasePlugin):
             "smart_routing": result.get("smart_routing"),
             "routing": routing_response,
         }
+
+    async def _handle_starte_terminsuche(self, payload):
+        """Startet die Termin-Slot-Suche als Hintergrund-Task und gibt
+        SOFORT eine job_id zurueck — damit der Voice-Agent weiterreden kann
+        (Webformular-Hinweis, 'ich schaue beim passenden Ansprechpartner'),
+        statt ~9s stumm zu blockieren. Ergebnis spaeter via
+        hole_terminvorschlaege abholen.
+
+        Payload identisch zu checke_kalender (wunschzeit, dauer_min,
+        kunde_adresse, anliegen, tenant_slug). Die schnelle Validierung
+        (Tenant + Kalender vorhanden) laeuft synchron, damit Setup-Fehler
+        sofort gemeldet werden; nur die langsame Suche (Gemini-Routing +
+        Kalender-API) wandert in den Hintergrund.
+        """
+        from core.plugin_system import get_plugin_for_tenant
+
+        tenant_slug = (payload.get("tenant_slug") or "").strip()
+        if not tenant_slug:
+            return {"erfolg": False, "nachricht": "tenant_slug fehlt"}
+
+        async with AsyncSessionLocal() as s:
+            tenant = (await s.execute(
+                select(Tenant).where(Tenant.slug == tenant_slug)
+            )).scalar_one_or_none()
+        if tenant is None:
+            return {
+                "erfolg": False,
+                "nachricht": f"Tenant '{tenant_slug}' nicht gefunden",
+            }
+
+        kalender = await get_plugin_for_tenant(tenant_slug, "kalender")
+        if kalender is None:
+            logger.warning(
+                f"starte_terminsuche: kalender-Plugin fuer Tenant "
+                f"{tenant_slug!r} nicht verfuegbar/aktiviert"
+            )
+            return {
+                "erfolg": False,
+                "nachricht": "Der Kalender ist fuer diesen Betrieb nicht eingerichtet.",
+            }
+
+        _gc_terminsuche_jobs()
+        job_id = secrets.token_urlsafe(12)
+        _TERMINSUCHE_JOBS[job_id] = {
+            "created_at": datetime.now(timezone.utc),
+            "status": "laeuft",
+            "result": None,
+        }
+
+        async def _worker():
+            try:
+                res = await self._run_terminsuche(tenant, kalender, payload)
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    f"starte_terminsuche: Suche fehlgeschlagen job={job_id}"
+                )
+                res = {
+                    "erfolg": False,
+                    "nachricht": "Die Terminsuche ist fehlgeschlagen.",
+                }
+            entry = _TERMINSUCHE_JOBS.get(job_id)
+            if entry is not None:  # koennte per TTL-GC weg sein
+                entry["result"] = res
+                entry["status"] = "fertig"
+
+        # Task-Referenz im Job halten, sonst kann der GC den Task einsammeln
+        # bevor er fertig ist (asyncio haelt nur schwache Referenzen).
+        _TERMINSUCHE_JOBS[job_id]["task"] = asyncio.create_task(_worker())
+
+        logger.info(
+            f"starte_terminsuche: job={job_id} tenant={tenant_slug} gestartet"
+        )
+        return {
+            "erfolg": True,
+            "job_id": job_id,
+            "status": "laeuft",
+            "nachricht": (
+                "Ich suche im Hintergrund einen Termin beim passenden "
+                "Ansprechpartner."
+            ),
+        }
+
+    async def _handle_hole_terminvorschlaege(self, payload):
+        """Holt das Ergebnis einer via starte_terminsuche gestarteten Suche.
+
+        Payload: {"job_id": "...", "tenant_slug": "..."}
+
+        - Suche laeuft noch -> {"erfolg": True, "status": "laeuft"}
+          (der Agent ueberbrueckt dann weiter und fragt gleich nochmal).
+        - Fertig -> Slots + Routing (gleiche Struktur wie checke_kalender),
+          plus "status": "fertig".
+        - Unbekannt/abgelaufen -> {"erfolg": False, "status": "unbekannt"}.
+        """
+        job_id = (payload.get("job_id") or "").strip()
+        if not job_id:
+            return {"erfolg": False, "nachricht": "job_id fehlt"}
+
+        _gc_terminsuche_jobs()
+        entry = _TERMINSUCHE_JOBS.get(job_id)
+        if entry is None:
+            return {
+                "erfolg": False,
+                "status": "unbekannt",
+                "nachricht": (
+                    "Die Terminsuche ist abgelaufen oder unbekannt. "
+                    "Bitte die Suche neu starten."
+                ),
+            }
+        if entry["status"] != "fertig":
+            return {"erfolg": True, "status": "laeuft"}
+
+        # Fertig: Ergebnis zurueckgeben (bleibt bis TTL im Cache, damit ein
+        # erneutes Nachfragen dasselbe liefert). Task-Objekt nie mit-
+        # serialisieren.
+        result = dict(entry.get("result") or {})
+        result["status"] = "fertig"
+        return result
 
 
     async def _handle_buche_termin(self, payload):
