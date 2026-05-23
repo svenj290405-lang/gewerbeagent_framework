@@ -219,6 +219,22 @@ async def webhook_dispatch(
     # Voller Slug (ungekuerzt) fuer Bot-Token-Aufloesung pro Betrieb
     set_webhook_tenant_slug(tenant_slug)
 
+    # SICHERHEITS-GATE (default-closed): Nur Plugins, die sich im Manifest
+    # explizit als external_webhook=True deklarieren, duerfen ueber HTTP
+    # erreicht werden. Interne Plugins (z.B. 'kalender') werden ausschliess-
+    # lich in-process aufgerufen — ein externer POST darf sie nie erreichen,
+    # sonst koennte jeder ungeauthentifiziert Termine buchen/stornieren oder
+    # via find_events Kunden-PII abgreifen. 404 (nicht 403/401), um die
+    # Existenz interner Plugins nicht zu verraten. Pruefung VOR Tenant-/
+    # Plugin-Aufloesung, damit blockierte Requests keine DB-Last erzeugen.
+    manifest = PLUGIN_MANIFESTS.get(plugin_name)
+    if manifest is None or not manifest.external_webhook:
+        logger.warning(
+            f"Webhook abgelehnt (nicht extern erreichbar): tenant={tenant_slug} "
+            f"plugin={plugin_name} endpoint={endpoint}"
+        )
+        raise HTTPException(status_code=404, detail="Not Found")
+
     # Plugin fuer diesen Tenant holen
     plugin = await get_plugin_for_tenant(tenant_slug, plugin_name)
 

@@ -16,6 +16,9 @@ MANIFEST = PluginManifest(
         "betrieb_name": "",     # fuer schoene Nachricht
         "enabled": True,        # Plugin-weit aus/an
     },
+    # Empfaengt echte externe Webhooks von Telegram (POST .../incoming) —
+    # Auth per X-Telegram-Bot-Api-Secret-Token-Vergleich in on_webhook.
+    external_webhook=True,
     webhook_endpoints=[
         # Reserviert fuer zukuenftige Befehl-Empfangs-Logik:
         # {"path": "/update", "method": "POST"},

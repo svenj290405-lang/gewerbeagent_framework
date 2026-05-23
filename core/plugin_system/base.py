@@ -33,7 +33,20 @@ class PluginManifest(BaseModel):
 
     # Welche Webhook-Endpunkte das Plugin registriert
     # Format: [{"path": "/check_availability", "method": "POST"}, ...]
+    # Hinweis: rein dokumentarisch — der Dispatcher reicht JEDEN
+    # {plugin}/{endpoint} an on_webhook durch, prueft die Liste nicht.
     webhook_endpoints: list[dict] = []
+
+    # SICHERHEIT (default-closed): Ist dieses Plugin ueber den oeffentlichen
+    # HTTP-Dispatcher (POST /webhook/<tenant>/<plugin>/<endpoint>) erreichbar?
+    # False = NUR in-process aufrufbar (z.B. voice_init -> kalender). Der
+    # zentrale Dispatcher (core/api/app.py) lehnt externe Aufrufe an solche
+    # Plugins mit 404 ab, BEVOR on_webhook laeuft. Plugins, die echte externe
+    # Webhooks empfangen (ElevenLabs, Telegram), setzen das auf True UND sind
+    # selbst fuer ihre Signatur-/Secret-Pruefung in on_webhook verantwortlich.
+    # Default False, damit ein neues Plugin keinen Endpunkt aus Versehen
+    # offen ins Netz haengt (z.B. eine Buchungs-/Loesch-Route).
+    external_webhook: bool = False
 
 
 class PluginContext(BaseModel):

@@ -113,11 +113,17 @@ class Plugin(BasePlugin):
         self, endpoint: str, payload: dict[str, Any],
         headers: dict[str, str] | None = None,
     ) -> dict[str, Any]:
-        # Kalender wird nur intern aufgerufen (voice_init-Handler +
-        # microsoft_inbox via mail_pipeline.cancel_kunde_termine), nicht
-        # von externen Webhooks.
-        # Header-Verifikation entfaellt; Param fuer BasePlugin-Konformitaet.
-        _ = headers  # noqa: F841
+        # kalender ist ein INTERNAL-ONLY Plugin (Manifest external_webhook=
+        # False): es wird ausschliesslich in-process aufgerufen (voice_init,
+        # mail_pipeline.cancel_kunde_termine, anfrage_telegram) — diese Caller
+        # rufen on_webhook OHNE `headers` auf (headers=None). Externe
+        # HTTP-Aufrufe blockt bereits der zentrale Dispatcher (core/api/app.py)
+        # mit 404. Defense-in-depth: sollte uns DOCH je ein HTTP-dispatchter
+        # Aufruf erreichen (headers gesetzt), ist das ein Routing-/Konfig-
+        # Fehler — fail-closed, niemals ausfuehren (sonst koennte jemand
+        # Termine buchen/stornieren oder via find_events Kunden-PII abgreifen).
+        if headers is not None:
+            raise PermissionError("kalender-internal-only")
         if endpoint == "check_availability":
             return await self._check_availability(payload)
         elif endpoint == "book_appointment":

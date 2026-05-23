@@ -16,6 +16,9 @@ MANIFEST = PluginManifest(
         "Prompts. Liefert Wissensbasis, Firmenname und Branche dynamisch."
     ),
     default_config={},
+    # Empfaengt echte externe Webhooks von ElevenLabs — Auth per
+    # X-Webhook-Secret-Vergleich in on_webhook (fail-closed in Production).
+    external_webhook=True,
     webhook_endpoints=[
         {"path": "/initiation", "method": "POST"},
         {"path": "/save_contact", "method": "POST"},
