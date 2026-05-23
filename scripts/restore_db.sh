@@ -12,8 +12,10 @@
 #   3. Verifikation, dann manuell die Daten extrahieren oder DBs swappen
 #
 # Verwendung:
-#   ./scripts/restore_db.sh --file=/var/backups/.../dump-XYZ.sql.gz \
+#   ./scripts/restore_db.sh --file=/var/backups/.../dump-XYZ.sql.gz.gpg \
 #       --db=gewerbeagent_restore
+# Bei .gpg-Dumps vorher den privaten Backup-Schluessel importieren:
+#   gpg --import gewerbeagent-backup-private.asc
 #
 # Exit-Codes:
 #   0  Restore erfolgreich
@@ -73,10 +75,18 @@ if ! docker exec "$POSTGRES_CONTAINER" \
     exit 1
 fi
 
-# Restore: zcat → psql im Container
-if ! zcat "$FILE" | docker exec -i "$POSTGRES_CONTAINER" \
+# Restore: (entschluesseln falls .gpg) → gunzip → psql im Container.
+# .sql.gz.gpg braucht den PRIVATEN Backup-Schluessel im gpg-Keyring dieses
+# Hosts (einmalig importieren: gpg --import gewerbeagent-backup-private.asc).
+# Alte unverschluesselte .sql.gz werden weiter unterstuetzt.
+if [[ "$FILE" == *.gpg ]]; then
+    src_cmd=(gpg --batch --quiet --decrypt "$FILE")
+else
+    src_cmd=(cat "$FILE")
+fi
+if ! "${src_cmd[@]}" | zcat | docker exec -i "$POSTGRES_CONTAINER" \
         psql -U "$POSTGRES_USER" -d "$DB" --quiet --set ON_ERROR_STOP=on; then
-    echo "[$(date -u +%FT%TZ)] FEHLER: Restore fehlgeschlagen" >&2
+    echo "[$(date -u +%FT%TZ)] FEHLER: Restore fehlgeschlagen (privaten GPG-Key importiert?)" >&2
     exit 2
 fi
 
