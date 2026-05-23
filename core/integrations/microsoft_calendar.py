@@ -467,6 +467,13 @@ async def find_events(
     async def _query_metadata(prop_name: str, prop_value: str,
                               phone_match: bool, email_match: bool):
         prop_id = ga_prop_id(prop_name)
+        # OData-String-Literale escapen: ein einfaches Anfuehrungszeichen im
+        # Wert (z.B. Mailadresse wie o'brien@x.de) wuerde sonst den $filter
+        # zerbrechen -> Graph 400 -> Termin wird nicht gefunden (stiller
+        # Storno-/Verschiebe-Ausfall). Verdoppeln ('->'') ist die OData-
+        # Escape-Regel fuer das Hochkomma.
+        prop_id_odata = str(prop_id).replace("'", "''")
+        prop_value_odata = str(prop_value).replace("'", "''")
         # $filter erfordert ConsistencyLevel: eventual fuer extended
         # property queries (Graph "advanced query parameters").
         params = {
@@ -474,10 +481,10 @@ async def find_events(
             "endDateTime": end_iso,
             "$filter": (
                 f"singleValueExtendedProperties/any("
-                f"ep:ep/id eq '{prop_id}' and ep/value eq '{prop_value}')"
+                f"ep:ep/id eq '{prop_id_odata}' and ep/value eq '{prop_value_odata}')"
             ),
             "$expand": (
-                f"singleValueExtendedProperties($filter=id eq '{prop_id}')"
+                f"singleValueExtendedProperties($filter=id eq '{prop_id_odata}')"
             ),
             "$top": 100,
         }

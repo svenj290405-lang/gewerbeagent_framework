@@ -115,6 +115,15 @@ _REDACTION_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     # "bot12345:AA..."-Pfadsegment in der API-URL.
     (re.compile(r"bot\d{6,}:[A-Za-z0-9_-]{20,}"), "bot<redacted>"),
     (re.compile(r"\b\d{6,}:[A-Za-z0-9_-]{30,}\b"), "<redacted-token>"),
+    # DSGVO: Endkunden-PII darf nicht im Klartext in den Prod-Logs liegen
+    # (StreamHandler -> Container-/Caddy-Logs, 14 Tage). Diverse INFO-Logs
+    # interpolieren Kunden-Mail/-Telefon. Wir maskieren beides am Formatter
+    # zentral. E-Mail: erstes Zeichen + Domain bleiben fuer Debugging
+    # (a***@domain.de). Telefon: kontiguierte +49-/0049-/0…-Nummern.
+    (re.compile(r"(?i)\b([a-z0-9._%+-])[a-z0-9._%+-]*@([a-z0-9.-]+\.[a-z]{2,})\b"),
+     r"\1***@\2"),
+    (re.compile(r"(?<!\d)(?:\+|00)\d{9,14}(?!\d)"), "<tel-redacted>"),
+    (re.compile(r"(?<!\d)0\d{9,13}(?!\d)"), "<tel-redacted>"),
 )
 
 

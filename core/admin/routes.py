@@ -845,7 +845,7 @@ async def tenant_set_retention(
     Range 7-365. dsgvo_cleanup_cron nimmt den Wert beim naechsten 03:00-
     Tick auf — kein Restart noetig.
     """
-    require_csrf(request, csrf_token)
+    await require_csrf(request)
     if data_retention_days < 7 or data_retention_days > 365:
         raise HTTPException(400, "Retention muss zwischen 7 und 365 Tagen liegen")
     try:
@@ -885,7 +885,7 @@ async def tenant_set_telegram_bot(
     Betrieb zugeordnet werden und Antworten ueber diesen Bot rausgehen.
     Leeres Feld = Token entfernen (Betrieb faellt auf den geteilten globalen
     Bot zurueck)."""
-    require_csrf(request, csrf_token)
+    await require_csrf(request)
     token = (bot_token or "").strip()
     try:
         tid = uuid.UUID(tenant_id)
@@ -936,7 +936,7 @@ async def tenant_features_toggle(
     user: AdminUser = Depends(require_admin),
 ):
     """Togglet ein einzelnes Feature fuer den Tenant."""
-    require_csrf(request, csrf_token)
+    await require_csrf(request)
     from core.features import FEATURES, invalidate_feature_cache
     from core.models import ToolConfig
 
