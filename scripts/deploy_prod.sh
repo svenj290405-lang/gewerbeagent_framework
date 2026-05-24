@@ -73,22 +73,22 @@ fi
 echo "==> Sentry release tag: $commit_sha"
 
 echo "==> Migrations ausfuehren..."
-docker compose -p prod -f docker-compose.prod.yml exec -T framework \
-    uv run alembic upgrade head
+docker exec gewerbeagent_framework bash -c \
+    "cd /app && /app/.venv/bin/alembic upgrade head"
 
 echo "==> Container restart (Code-Reload)..."
-docker compose -p prod -f docker-compose.prod.yml restart framework
+docker restart gewerbeagent_framework
 
 echo "==> Warte 10s auf Service-Start..."
 sleep 10
 
 echo "==> Health-Check..."
-if docker compose -p prod -f docker-compose.prod.yml exec -T framework \
-        curl -sf http://localhost:8001/ > /dev/null; then
+if docker exec gewerbeagent_framework \
+        curl -sf http://localhost:8001/health > /dev/null; then
     echo "==> ✅ Prod deployed: $(git rev-parse --short HEAD) [$tag]"
 else
     echo "==> ⚠️  Health-Check fehlgeschlagen — Logs pruefen:"
     echo "    docker logs gewerbeagent_framework --tail 50"
-    echo "==> Rollback: git reset --hard $tag^ && docker compose -p prod restart framework"
+    echo "==> Rollback: git reset --hard $tag^ && docker restart gewerbeagent_framework"
     exit 1
 fi

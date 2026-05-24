@@ -9265,42 +9265,48 @@ async def _handle_mitarbeiter_neu_skills_input(chat_id, text, state_data):
         await s.refresh(emp)
         emp_id = emp.id
 
-    # One-Time-Use Aktivierungs-Token erzeugen + Deeplink bauen.
-    # Faellt der Token-Insert aus irgendeinem Grund aus, faellt das
-    # Wizard-Ergebnis auf den Legacy-Pfad (?start=tenant__slug) zurueck,
-    # damit der Inhaber den Mitarbeiter zumindest weiter onboarden kann.
+    # One-Time-Use Aktivierungs-Token erzeugen. Der Mitarbeiter onboardet
+    # bevorzugt ueber den kurzen Code (Bot suchen -> START -> Code eingeben);
+    # der Deep-Link ist nur die Alternative (in Telegram Web unzuverlaessig).
     activation_token = None
+    activation_code = None
     try:
         token_obj = await create_activation_token(tenant.id, emp_id)
         activation_token = token_obj.token
+        activation_code = token_obj.short_code
     except Exception as e:  # noqa: BLE001
         logger.exception(f"Aktivierungs-Token-Insert fehlgeschlagen: {e}")
 
     await _clear_state(chat_id)
 
+    from core.models import format_short_code
     bot_username = await _get_bot_username()
-    if not bot_username:
-        deeplink = "(Bot-Username unbekannt — pruefe Bot-Konfig)"
-        gueltig_hinweis = ""
-    elif activation_token:
-        deeplink = f"https://t.me/{bot_username}?start=activate_{activation_token}"
-        gueltig_hinweis = "\n<i>(Gueltig 7 Tage, einmalig einloesbar.)</i>"
-    else:
-        # S13: KEIN Slug-Fallback mehr — der waere ein toter Link, seit nur
-        # noch `activate_<token>` bindet. Inhaber soll es erneut versuchen.
-        deeplink = (
-            "(Aktivierungs-Link konnte nicht erzeugt werden — "
-            "bitte erneut /mitarbeiter neu)"
+    if not activation_code:
+        return (
+            f"✅ Mitarbeiter <b>{name}</b> angelegt (Slug <code>{slug}</code>).\n\n"
+            "⚠️ Aktivierungs-Code konnte nicht erzeugt werden — bitte erneut "
+            "<b>/mitarbeiter neu</b>."
         )
-        gueltig_hinweis = ""
+    code_disp = format_short_code(activation_code)
+    bot_disp = f"@{bot_username}" if bot_username else "den Bot"
+    link_line = ""
+    if bot_username and activation_token:
+        link_line = (
+            "\nAlternativ als Link: "
+            f"<code>https://t.me/{bot_username}?start=activate_{activation_token}</code>"
+        )
     return (
         f"✅ Mitarbeiter <b>{name}</b> angelegt (Slug <code>{slug}</code>).\n\n"
-        f"<b>Telegram-Onboarding-Link</b> an den Mitarbeiter weiterleiten:\n"
-        f"<code>{deeplink}</code>{gueltig_hinweis}\n\n"
-        "Sobald er den Link oeffnet + /start drueckt, wird er als "
-        f"<b>{name}</b> mit dem Bot verbunden.\n\n"
-        "Spaeter kann er optional <i>/werkstatt</i> ausfuehren um seine "
-        "eigene Heimat-Adresse zu setzen (fuer Smart-Termin-Routing)."
+        f"<b>So verbindet sich {name}:</b>\n"
+        f"1. In Telegram <b>{bot_disp}</b> suchen + oeffnen\n"
+        "2. <b>START</b> druecken\n"
+        "3. diesen Code eingeben:\n"
+        f"<b>{code_disp}</b>\n"
+        "<i>(persoenlich, einmalig, 7 Tage gueltig)</i>"
+        f"{link_line}\n\n"
+        f"Danach ist {name} als eigener Mitarbeiter verbunden (eigener "
+        "Kalender, Skill-Routing). Spaeter optional <i>/werkstatt</i> fuer "
+        "die Heimat-Adresse."
     )
 
 
