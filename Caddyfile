@@ -57,6 +57,14 @@ www.gewerbeagent.de {
 
     import security_headers
 
+    # Geschlossene Demo-Phase: Website nur fuer 1-2 eingeladene Leute.
+    # Basic-Auth haelt die Seite "nicht oeffentlich" → Impressumspflicht
+    # greift in dieser Phase nicht. Vor oeffentlichem Launch entfernen
+    # (dann Impressum/Datenschutz ausfuellen).
+    basic_auth {
+        "svenj05@gmx.de" $2a$14$DE654iml3iLSHil8zdu6OexJwdmiuJA8fm93a5lq7PHHdcR9MWJ2C
+    }
+
     root * /srv/website
     file_server
 
