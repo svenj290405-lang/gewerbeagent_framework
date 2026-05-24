@@ -1,0 +1,103 @@
+{% extends "_base.html" %}
+{% set active = 'metrics' %}
+{% block title %}Metriken — Gewerbeagent Admin{% endblock %}
+
+{% macro cell(val, fmt) -%}
+{%- if fmt == 'eur' -%}{{ "%.2f €"|format(val) }}
+{%- elif fmt == 'cost' -%}{{ "%.4f €"|format(val) }}
+{%- elif fmt == 'h' -%}{{ val }} h
+{%- else -%}{{ val }}
+{%- endif -%}
+{%- endmacro %}
+
+{% block content %}
+<div class="page-header">
+    <div>
+        <h1>Metriken</h1>
+        <p>Was das System leistet — Grundlage für Preisgespräche. {{ rows|length }} Betriebe.</p>
+    </div>
+    <div>
+        <a href="/admin/metrics/export.csv?days={{ days }}" class="btn btn-sm">CSV export</a>
+    </div>
+</div>
+
+<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:18px;">
+    {% for d, label in periods %}
+    <a href="/admin/metrics?days={{ d }}"
+       class="btn btn-sm {% if d == days %}btn-primary{% endif %}">{{ label }}</a>
+    {% endfor %}
+</div>
+
+<div class="section-title">
+    Verkaufsargumente
+    <small>Plattform-Summe im gewählten Zeitraum</small>
+</div>
+<div class="stats-grid">
+    {% for tile in tiles %}
+    <div class="stat-card">
+        <div class="stat-label">{{ tile.label }}</div>
+        <div class="stat-value">{{ tile.value }}</div>
+        <div class="stat-sub">{{ tile.sub }}</div>
+    </div>
+    {% endfor %}
+</div>
+
+<div class="section-title">
+    Detail pro Betrieb
+    <small>alle erfassten Metriken · horizontal scrollbar</small>
+</div>
+<div class="card" style="overflow-x:auto;">
+<table class="data-table">
+    <thead>
+        <tr>
+            <th>Betrieb</th>
+            {% for key, header, fmt in columns %}
+            <th class="num">{{ header }}</th>
+            {% endfor %}
+        </tr>
+    </thead>
+    <tbody>
+    {% for r in rows %}
+        <tr>
+            <td>
+                <a href="/admin/tenants/{{ r.id }}">{{ r.company_name }}</a>
+                <div class="muted" style="font-size:12px;">{{ r.slug }}</div>
+            </td>
+            {% for key, header, fmt in columns %}
+            <td class="num">{{ cell(r[key], fmt) }}</td>
+            {% endfor %}
+        </tr>
+    {% else %}
+        <tr>
+            <td colspan="{{ columns|length + 1 }}" class="muted">
+                Noch keine Betriebe / keine Daten im Zeitraum.
+            </td>
+        </tr>
+    {% endfor %}
+    </tbody>
+    {% if rows %}
+    <tfoot>
+        <tr style="font-weight:600;">
+            <td>Summe ({{ rows|length }})</td>
+            {% for key, header, fmt in columns %}
+            <td class="num">{{ cell(totals[key], fmt) }}</td>
+            {% endfor %}
+        </tr>
+    </tfoot>
+    {% endif %}
+</table>
+</div>
+
+<p class="muted" style="margin-top:14px;font-size:13px;line-height:1.6;">
+    <strong>Lesehilfe:</strong>
+    <em>Tel.-Min.</em> = Summe aufgezeichneter Gesprächsminuten ·
+    <em>Mails bearb.</em> = automatisch zu Buchung/Abschluss geführt ·
+    <em>Außerh. GZ</em> = Anrufe/Mails/Anfragen außerhalb Mo–Fr 8–18 Uhr (24/7) ·
+    <em>Umsatz / Angebotsvol.</em> = Brutto-Beträge der über das System erstellten
+    Rechnungen bzw. Angebote (= Lexware-Aktivität; rohe API-Klicks werden nicht geloggt).
+    <br>
+    <strong>Zeit gespart</strong> ist eine konservative Schätzung: Telefonzeit 1:1 plus
+    je Vorgang 5 Min (Mail/Anfrage), 3 Min (Buchung/Beleg), 10 Min (Rechnung),
+    15 Min (Angebot).
+</p>
+{% endblock %}

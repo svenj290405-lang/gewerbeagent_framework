@@ -63,6 +63,20 @@ from core.models.admin import (
 )
 from core.models.anfrage import AnfrageToken, AnfrageResponse
 from core.models.tenant import Tenant, TenantStatus
+from core.models import Angebot, Beleg, EmailConversation, Kundengespraech, Rechnung
+from core.models.email_conversation import (
+    STATE_BOOKED,
+    STATE_CLOSED,
+    STATE_STORNIERT,
+)
+from core.models.rechnung import RECHNUNG_STATUS_BEZAHLT
+from core.models.angebot import (
+    ANGEBOT_STATUS_ACCEPTED,
+    ANGEBOT_STATUS_RECHNUNG_ERSTELLT,
+    ANGEBOT_STATUS_WORK_IN_PROGRESS,
+    ANGEBOT_STATUS_WORK_DONE,
+    ANGEBOT_STATUS_RECHNUNG_GESENDET,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1266,3 +1280,325 @@ async def audit_view(
         "csrf_token": request.state.admin_csrf,
         "events": events,
     })
+
+
+# =====================================================================
+# METRIKEN — Business-Nutzung pro Betrieb (Grundlage Preisverhandlung)
+# =====================================================================
+
+# (key, Spaltenkopf, fmt) — fmt: int | eur | cost | h. Reihenfolge =
+# Spaltenreihenfolge in Tabelle + CSV.
+_METRIC_COLUMNS = [
+    ("anrufe", "Anrufe", "int"),
+    ("anruf_min", "Tel.-Min.", "int"),
+    ("mails_empf", "Mails empf.", "int"),
+    ("mails_bearb", "Mails bearb.", "int"),
+    ("mails_send", "Mails vers.", "int"),
+    ("anfragen", "Anfragen", "int"),
+    ("anfragen_beantw", "Anfr. beantw.", "int"),
+    ("buchungen", "Buchungen", "int"),
+    ("stornos", "Stornos", "int"),
+    ("ausserhalb_gz", "Außerh. GZ", "int"),
+    ("angebote", "Angebote", "int"),
+    ("angebote_angen", "Angeb. angen.", "int"),
+    ("angebot_volumen_eur", "Angebotsvol.", "eur"),
+    ("rechnungen", "Rechnungen", "int"),
+    ("rechnungen_bezahlt", "Rechn. bez.", "int"),
+    ("umsatz_eur", "Umsatz ges.", "eur"),
+    ("umsatz_bezahlt_eur", "Umsatz bez.", "eur"),
+    ("belege", "Belege", "int"),
+    ("zeitersparnis_h", "Zeit gespart", "h"),
+    ("kosten", "API-Kosten", "cost"),
+]
+
+_PERIODS = [(30, "30 Tage"), (90, "90 Tage"), (365, "12 Monate"), (0, "Gesamt")]
+
+# Angebot-Status, die als "angenommen" zaehlen (accepted + Folgezustaende).
+_ANGEBOT_ANGENOMMEN = [
+    ANGEBOT_STATUS_ACCEPTED,
+    ANGEBOT_STATUS_RECHNUNG_ERSTELLT,
+    ANGEBOT_STATUS_WORK_IN_PROGRESS,
+    ANGEBOT_STATUS_WORK_DONE,
+    ANGEBOT_STATUS_RECHNUNG_GESENDET,
+]
+
+# Geschaetzte manuelle Minuten je Vorgang (konservativ) fuer die
+# Zeitersparnis-Hochrechnung. Telefonzeit zaehlt zusaetzlich 1:1.
+_SAVE_MIN = {
+    "mails_bearb": 5,
+    "anfragen": 5,
+    "buchungen": 3,
+    "angebote": 15,
+    "rechnungen": 10,
+    "belege": 3,
+}
+
+
+def _metrics_days(request: Request) -> int:
+    try:
+        days = int(request.query_params.get("days", "30"))
+    except (TypeError, ValueError):
+        days = 30
+    return days if days in (30, 90, 365, 0) else 30
+
+
+def _after_hours(ts):
+    """Bedingung: Zeitstempel liegt ausserhalb Mo-Fr 8-18 Uhr
+    (Europe/Berlin) — Abende, Naechte, Wochenenden. ts ist timestamptz."""
+    local = func.timezone("Europe/Berlin", ts)
+    return or_(
+        func.date_part("isodow", local) > 5,   # Samstag (6) / Sonntag (7)
+        func.date_part("hour", local) < 8,
+        func.date_part("hour", local) >= 18,
+    )
+
+
+async def _collect_metrics(s, start: dt.datetime | None) -> tuple[list[dict], dict]:
+    """Business-Metriken pro Tenant. Eine gruppierte Aggregat-Query je
+    Metrik (statt N-pro-Tenant). start=None => Gesamt-Zeitraum (kein
+    created-Filter). Liefert (rows, totals)."""
+
+    async def grouped(value_expr, tenant_col, created_col, *wheres) -> dict:
+        q = select(tenant_col, value_expr).group_by(tenant_col)
+        if start is not None and created_col is not None:
+            q = q.where(created_col >= start)
+        for w in wheres:
+            q = q.where(w)
+        return {row[0]: row[1] for row in (await s.execute(q))}
+
+    # --- Kommunikation ---
+    anrufe = await grouped(
+        func.count(Kundengespraech.id), Kundengespraech.tenant_id,
+        Kundengespraech.gespraech_datum)
+    sekunden = await grouped(
+        func.coalesce(func.sum(Kundengespraech.audio_dauer_sekunden), 0),
+        Kundengespraech.tenant_id, Kundengespraech.gespraech_datum)
+    mails_empf = await grouped(
+        func.count(EmailConversation.id), EmailConversation.tenant_id,
+        EmailConversation.created_at)
+    mails_bearb = await grouped(
+        func.count(EmailConversation.id), EmailConversation.tenant_id,
+        EmailConversation.created_at,
+        EmailConversation.state.in_([STATE_BOOKED, STATE_CLOSED]))
+    mails_send = await grouped(
+        func.coalesce(func.sum(ApiUsageLog.units_consumed), 0),
+        ApiUsageLog.tenant_id, ApiUsageLog.created_at,
+        ApiUsageLog.unit == "mail_send")
+
+    # --- Anfragen / Termine ---
+    anfragen = await grouped(
+        func.count(AnfrageToken.id), AnfrageToken.tenant_id,
+        AnfrageToken.created_at)
+    anfragen_beantw = await grouped(
+        func.count(AnfrageToken.id), AnfrageToken.tenant_id,
+        AnfrageToken.submitted_at, AnfrageToken.submitted_at.isnot(None))
+    buchungen = await grouped(
+        func.count(EmailConversation.id), EmailConversation.tenant_id,
+        EmailConversation.created_at,
+        EmailConversation.gcal_event_id.isnot(None))
+    stornos = await grouped(
+        func.count(EmailConversation.id), EmailConversation.tenant_id,
+        EmailConversation.created_at,
+        EmailConversation.state == STATE_STORNIERT)
+
+    # --- Lexware / Umsatz ---
+    angebote = await grouped(
+        func.count(Angebot.id), Angebot.tenant_id, Angebot.created_at)
+    angebote_angen = await grouped(
+        func.count(Angebot.id), Angebot.tenant_id, Angebot.created_at,
+        Angebot.status.in_(_ANGEBOT_ANGENOMMEN))
+    angebot_volumen = await grouped(
+        func.coalesce(func.sum(Angebot.gesamtbetrag_brutto_eur), 0),
+        Angebot.tenant_id, Angebot.created_at)
+    rechnungen = await grouped(
+        func.count(Rechnung.id), Rechnung.tenant_id, Rechnung.created_at)
+    rechnungen_bezahlt = await grouped(
+        func.count(Rechnung.id), Rechnung.tenant_id, Rechnung.created_at,
+        Rechnung.status == RECHNUNG_STATUS_BEZAHLT)
+    umsatz = await grouped(
+        func.coalesce(func.sum(Rechnung.betrag_brutto_eur), 0),
+        Rechnung.tenant_id, Rechnung.created_at)
+    umsatz_bezahlt = await grouped(
+        func.coalesce(func.sum(Rechnung.betrag_brutto_eur), 0),
+        Rechnung.tenant_id, Rechnung.created_at,
+        Rechnung.status == RECHNUNG_STATUS_BEZAHLT)
+    belege = await grouped(
+        func.count(Beleg.id), Beleg.tenant_id, Beleg.created_at)
+    kosten = await grouped(
+        func.coalesce(func.sum(ApiUsageLog.cost_eur), 0),
+        ApiUsageLog.tenant_id, ApiUsageLog.created_at)
+
+    # --- 24/7: Vorgaenge ausserhalb der Geschaeftszeiten ---
+    ah_calls = await grouped(
+        func.count(Kundengespraech.id), Kundengespraech.tenant_id,
+        Kundengespraech.gespraech_datum,
+        _after_hours(Kundengespraech.gespraech_datum))
+    ah_mails = await grouped(
+        func.count(EmailConversation.id), EmailConversation.tenant_id,
+        EmailConversation.created_at,
+        _after_hours(EmailConversation.created_at))
+    ah_anfr = await grouped(
+        func.count(AnfrageToken.id), AnfrageToken.tenant_id,
+        AnfrageToken.created_at, _after_hours(AnfrageToken.created_at))
+
+    tenants = (await s.execute(
+        select(Tenant).order_by(Tenant.company_name)
+    )).scalars().all()
+
+    def geti(d: dict, tid) -> int:
+        return int(d.get(tid, 0) or 0)
+
+    def getf(d: dict, tid) -> float:
+        return float(d.get(tid, 0) or 0)
+
+    rows: list[dict] = []
+    totals = {k: 0 for k, _h, _fmt in _METRIC_COLUMNS}
+    for t in tenants:
+        tid = t.id
+        anruf_min = round(geti(sekunden, tid) / 60)
+        m_bearb = geti(mails_bearb, tid)
+        anfr = geti(anfragen, tid)
+        buch = geti(buchungen, tid)
+        ang = geti(angebote, tid)
+        rech = geti(rechnungen, tid)
+        bel = geti(belege, tid)
+        # Geschaetzte Zeitersparnis: Telefonzeit 1:1 + Pauschalen je Vorgang
+        save_min = (
+            anruf_min
+            + m_bearb * _SAVE_MIN["mails_bearb"]
+            + anfr * _SAVE_MIN["anfragen"]
+            + buch * _SAVE_MIN["buchungen"]
+            + ang * _SAVE_MIN["angebote"]
+            + rech * _SAVE_MIN["rechnungen"]
+            + bel * _SAVE_MIN["belege"]
+        )
+        row = {
+            "id": str(tid),
+            "company_name": t.company_name,
+            "slug": t.slug,
+            "anrufe": geti(anrufe, tid),
+            "anruf_min": anruf_min,
+            "mails_empf": geti(mails_empf, tid),
+            "mails_bearb": m_bearb,
+            "mails_send": geti(mails_send, tid),
+            "anfragen": anfr,
+            "anfragen_beantw": geti(anfragen_beantw, tid),
+            "buchungen": buch,
+            "stornos": geti(stornos, tid),
+            "ausserhalb_gz": (
+                geti(ah_calls, tid) + geti(ah_mails, tid) + geti(ah_anfr, tid)
+            ),
+            "angebote": ang,
+            "angebote_angen": geti(angebote_angen, tid),
+            "angebot_volumen_eur": getf(angebot_volumen, tid),
+            "rechnungen": rech,
+            "rechnungen_bezahlt": geti(rechnungen_bezahlt, tid),
+            "umsatz_eur": getf(umsatz, tid),
+            "umsatz_bezahlt_eur": getf(umsatz_bezahlt, tid),
+            "belege": bel,
+            "zeitersparnis_h": round(save_min / 60),
+            "kosten": getf(kosten, tid),
+        }
+        for k, _h, _fmt in _METRIC_COLUMNS:
+            totals[k] += row[k]
+        rows.append(row)
+    return rows, totals
+
+
+def _eur0(x) -> str:
+    """Ganze Euro mit Tausenderpunkt: 12345.6 -> '12.346 €'."""
+    return f"{round(x):,}".replace(",", ".") + " €"
+
+
+def _build_tiles(totals: dict) -> list[dict]:
+    """Headline-Wert-Kacheln (Plattform-Summe im Zeitraum) als
+    Verkaufsargumente."""
+    tel_std = round(totals["anruf_min"] / 60)
+    arbeitstage = round(totals["zeitersparnis_h"] / 8)
+    return [
+        {"label": "Umsatz über System (brutto)",
+         "value": _eur0(totals["umsatz_eur"]),
+         "sub": f'davon {_eur0(totals["umsatz_bezahlt_eur"])} bezahlt'},
+        {"label": "Angebotsvolumen erstellt",
+         "value": _eur0(totals["angebot_volumen_eur"]),
+         "sub": f'{totals["angebote"]} Angebote · {totals["angebote_angen"]} angenommen'},
+        {"label": "Anrufe entgegengenommen",
+         "value": str(totals["anrufe"]),
+         "sub": f"{tel_std} Std. am Telefon abgenommen"},
+        {"label": "Mails automatisch bearbeitet",
+         "value": str(totals["mails_bearb"]),
+         "sub": f'von {totals["mails_empf"]} eingegangen'},
+        {"label": "Termine gebucht",
+         "value": str(totals["buchungen"]),
+         "sub": f'{totals["stornos"]} storniert'},
+        {"label": "Außerhalb der Geschäftszeiten",
+         "value": str(totals["ausserhalb_gz"]),
+         "sub": "Abende & Wochenenden erledigt — 24/7"},
+        {"label": "Anfragen erfasst",
+         "value": str(totals["anfragen"]),
+         "sub": f'{totals["anfragen_beantw"]} vollständig beantwortet'},
+        {"label": "Geschätzte Zeitersparnis",
+         "value": f'{totals["zeitersparnis_h"]} h',
+         "sub": f"≈ {arbeitstage} Arbeitstage (à 8 h)"},
+    ]
+
+
+def _csv_val(v, fmt: str):
+    """Rohwert fuers CSV (Zahlen statt formatierter Strings -> Excel-tauglich)."""
+    if fmt == "eur":
+        return f"{v:.2f}"
+    if fmt == "cost":
+        return f"{v:.4f}"
+    return v
+
+
+@router.get("/metrics", response_class=HTMLResponse)
+async def metrics_view(
+    request: Request,
+    user: AdminUser = Depends(require_admin),
+):
+    days = _metrics_days(request)
+    start = None if days == 0 else _today_utc_start() - dt.timedelta(days=days)
+
+    async with get_session() as s:
+        rows, totals = await _collect_metrics(s, start)
+        await audit(user_id=user.id, action="metrics.view",
+                    request=request, session=s)
+
+    return templates.TemplateResponse(request, "metrics.html", {
+        "request": request, "user": user,
+        "rows": rows, "totals": totals, "tiles": _build_tiles(totals),
+        "columns": _METRIC_COLUMNS, "days": days, "periods": _PERIODS,
+        "csrf_token": request.state.admin_csrf,
+    })
+
+
+@router.get("/metrics/export.csv")
+async def metrics_export_csv(
+    request: Request,
+    user: AdminUser = Depends(require_admin),
+):
+    days = _metrics_days(request)
+    start = None if days == 0 else _today_utc_start() - dt.timedelta(days=days)
+
+    async with get_session() as s:
+        rows, totals = await _collect_metrics(s, start)
+        await audit(user_id=user.id, action="metrics.export",
+                    request=request, session=s)
+
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["Betrieb", "Slug"] + [h for _k, h, _f in _METRIC_COLUMNS])
+    for r in rows:
+        w.writerow([r["company_name"], r["slug"]]
+                   + [_csv_val(r[k], fmt) for k, _h, fmt in _METRIC_COLUMNS])
+    w.writerow(["SUMME", ""]
+               + [_csv_val(totals[k], fmt) for k, _h, fmt in _METRIC_COLUMNS])
+
+    label = "gesamt" if days == 0 else f"{days}d"
+    fname = f"metriken_{label}_{_today_utc_start().strftime('%Y%m%d')}.csv"
+    return Response(
+        content=buf.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+    )
