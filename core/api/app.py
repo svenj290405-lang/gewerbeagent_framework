@@ -24,6 +24,7 @@ from core.plugin_system import (
 )
 from core.api.anfrage_routes import router as anfrage_router
 from core.admin.routes import router as admin_router, mount_static as mount_admin_static
+from core.admin.onboarding_routes import router as admin_onboarding_router
 from core.integrations.microsoft_cron import cron_loop as microsoft_cron_loop
 from core.integrations.rechnung_payment_monitor import (
     cron_loop as rechnung_payment_cron_loop,
@@ -148,6 +149,7 @@ app = FastAPI(
 
 app.include_router(anfrage_router)
 app.include_router(admin_router)
+app.include_router(admin_onboarding_router)
 mount_admin_static(app)
 
 # Phase B6: Status-Page Routes (/status + /api/status). Oeffentlich

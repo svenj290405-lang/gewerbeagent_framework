@@ -1,0 +1,97 @@
+{% extends "_base.html" %}
+{% set active = 'tenants' %}
+{% block title %}Neuer Betrieb — Gewerbeagent Admin{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <div>
+        <h1>Neuer Betrieb</h1>
+        <p>Legt einen Kunden an und verschickt automatisch den persoenlichen,
+           einmaligen Onboarding-Link per Mail.</p>
+    </div>
+</div>
+
+{% if msg %}
+<div class="card" style="border-left:4px solid #16a34a; max-width:760px; margin-bottom:24px;">
+    <strong>Erledigt.</strong>
+    <p style="margin:8px 0 0; word-break:break-all;">{{ msg }}</p>
+</div>
+{% endif %}
+{% if err %}
+<div class="card" style="border-left:4px solid #dc2626; max-width:760px; margin-bottom:24px;">
+    <strong>Fehler:</strong> {{ err }}
+</div>
+{% endif %}
+
+<div class="card" style="max-width:760px;">
+    <form method="post" action="/admin/tenants/new">
+        <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+
+        <div class="form-row">
+            <div class="form-group">
+                <label>Firmenname *</label>
+                <input type="text" name="company_name" class="form-control" required
+                       placeholder="z.B. Schreinerei Mueller GmbH">
+            </div>
+            <div class="form-group">
+                <label>Slug (Kurz-ID) *</label>
+                <input type="text" name="slug" class="form-control" required
+                       pattern="[A-Za-z0-9_-]{2,50}"
+                       placeholder="z.B. mueller">
+                <div class="hint">Nur Buchstaben/Zahlen/-/_. Intern, nicht oeffentlich.</div>
+            </div>
+        </div>
+
+        <div class="form-row">
+            <div class="form-group">
+                <label>Ansprechpartner *</label>
+                <input type="text" name="contact_name" class="form-control" required
+                       placeholder="Vor- und Nachname">
+            </div>
+            <div class="form-group">
+                <label>Kontakt-E-Mail *</label>
+                <input type="email" name="contact_email" class="form-control" required
+                       placeholder="inhaber@betrieb.de">
+                <div class="hint">An diese Adresse geht der Onboarding-Link.</div>
+            </div>
+        </div>
+
+        <div class="form-row">
+            <div class="form-group">
+                <label>Telefon (optional)</label>
+                <input type="text" name="contact_phone" class="form-control"
+                       placeholder="+49 ...">
+            </div>
+            <div class="form-group">
+                <label>Branche (optional)</label>
+                <select name="branche" class="form-control">
+                    <option value="">— keine / leere Wissensbasis —</option>
+                    {% for b in branches %}
+                    <option value="{{ b }}">{{ b }}</option>
+                    {% endfor %}
+                </select>
+                <div class="hint">Seedet die Wissensbasis mit Branchen-Vorlagen.</div>
+            </div>
+        </div>
+
+        <div class="form-group">
+            <label style="display:flex; align-items:center; gap:8px;">
+                <input type="checkbox" name="send_mail" value="on" checked style="width:auto;">
+                Onboarding-Link sofort per Mail an den Kunden schicken
+            </label>
+            <div class="hint">Ohne Haken wird der Betrieb angelegt und der Link nur hier angezeigt.</div>
+        </div>
+
+        <div style="display:flex; gap:8px; margin-top:8px;">
+            <button type="submit" class="btn btn-primary">Betrieb anlegen &amp; Link verschicken</button>
+            <a href="/admin/tenants" class="btn">Abbrechen</a>
+        </div>
+    </form>
+</div>
+
+<p class="muted" style="max-width:760px; margin-top:16px; font-size:13px;">
+    Hinweis: sipgate-Nummer, ElevenLabs-Agent und Kalender-Verknuepfung bleiben
+    separate Schritte. Dieses Formular legt den Betrieb an und sichert den
+    Telegram-Zugang per einmaligem Token-Link ab.
+</p>
+{% endblock %}

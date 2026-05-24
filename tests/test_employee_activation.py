@@ -272,7 +272,7 @@ async def test_handle_activate_happy_path(monkeypatch):
     )
     tenant = SimpleNamespace(
         id=tenant_id, slug="demo", company_name="Demo Handwerk GmbH",
-        telegram_chat_id=None,
+        telegram_chat_id=None, onboarding_completed_at=None,
     )
     token_row = SimpleNamespace(
         employee_id=emp.id, tenant_id=tenant_id,

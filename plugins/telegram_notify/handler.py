@@ -704,9 +704,22 @@ async def _handle_activate_token_start(token_str, chat_id, from_data):
             tenant.telegram_chat_id = chat_id
         emp_name = emp.name
         company = tenant.company_name
+        is_default = emp.is_default
+        onboarding_done = tenant.onboarding_completed_at is not None
         await s.commit()
 
     first_name = (from_data.get("first_name") or "").strip() or "dort"
+    # Inhaber-Erst-Onboarding (Default-Employee, Tutorial noch nicht durch):
+    # ins Setup-Tutorial leiten — gleiche Begruessung wie frueher der slug-
+    # basierte Pfad, jetzt aber sicher per Token erreicht (S13).
+    if is_default and not onboarding_done:
+        return (
+            f"Willkommen, {first_name}!\n\n"
+            f"Ihr Telegram ist jetzt mit <b>{company}</b> verbunden.\n\n"
+            "<i>Ich nehme dich jetzt einmal kurz an die Hand und richte dein "
+            "Setup ein — dauert ca. 5 Minuten.</i>\n\n"
+            "Tippe <b>/onboarding</b> um zu starten."
+        )
     return (
         f"Willkommen, {first_name}!\n\n"
         f"Du bist jetzt als <b>{emp_name}</b> mit "
@@ -731,125 +744,28 @@ async def _handle_start_command(text, chat_id, from_data):
         return await _handle_activate_token_start(
             raw_payload[len("activate_"):], chat_id, from_data,
         )
-    raw = raw_payload.lower()
-    # Format: "<tenant_slug>" (Owner-Onboarding, Default-Employee)
-    # oder:   "<tenant_slug>__<employee_slug>" (Mitarbeiter-Onboarding,
-    # Legacy-Pfad ohne Token — bleibt aus Rueckwaertskompatibilitaet).
-    if "__" in raw:
-        tenant_slug, _, employee_slug = raw.partition("__")
-    else:
-        tenant_slug, employee_slug = raw, "default"
-    for token in (tenant_slug, employee_slug):
-        if not token or not token.replace("-", "").replace("_", "").isalnum():
-            return "Aktivierungs-Link ungueltig. Bitte verwenden Sie den QR-Code."
-
-    from core.models.employee import Employee
-    async with AsyncSessionLocal() as s:
-        tenant = (await s.execute(
-            select(Tenant).where(Tenant.slug == tenant_slug)
-        )).scalar_one_or_none()
-        if tenant is None:
-            return f"Aktivierungs-Link ungueltig (Tenant {tenant_slug} nicht gefunden)."
-        if tenant_slug == GLOBAL_TENANT_SLUG:
-            return "Dieser Aktivierungs-Link ist nicht fuer Endkunden bestimmt."
-
-        # Employee finden (oder beim Default-Slug 'default' garantiert
-        # da dank Phase-0-Backfill)
-        emp = (await s.execute(
-            select(Employee).where(
-                Employee.tenant_id == tenant.id,
-                Employee.slug == employee_slug,
-            )
-        )).scalar_one_or_none()
-        if emp is None:
-            return (
-                f"Mitarbeiter-Slug '{employee_slug}' nicht gefunden. "
-                "Der Inhaber muss diesen Mitarbeiter erst anlegen "
-                "(/mitarbeiter neu)."
-            )
-
-        # SICHERHEIT (H1): bare-slug /start darf eine bereits bestehende
-        # Telegram-Verknuepfung NICHT ueberschreiben. Sonst koennte jeder,
-        # der den (oeffentlich erratbaren) Tenant-Slug kennt, per
-        # /start <slug> die Inhaber-Bindung uebernehmen (Owner-Takeover).
-        # Erlaubt bleiben: Erst-Onboarding (noch keine Bindung) und Re-Scan
-        # durch denselben Chat (idempotent). Auch legacy-desynchronisierte
-        # Tenants (emp.telegram_chat_id NULL, aber tenant.telegram_chat_id
-        # gesetzt) sind geschuetzt, weil beide Quellen geprueft werden.
-        existing_chat = emp.telegram_chat_id or (
-            tenant.telegram_chat_id if emp.is_default else None
+    # SICHERHEIT (S13): Die frueher hier moegliche Bindung ueber einen
+    # ratbaren `/start <slug>` (bzw. `<slug>__<employee>`) ist abgeschaltet.
+    # Wer den oeffentlich erratbaren Slug kennt, koennte sich sonst auf einen
+    # noch nicht verbundenen Betrieb draufbinden und dessen Pushes (Kunden-
+    # PII) empfangen. Gebunden wird ausschliesslich ueber den einmaligen,
+    # zufaelligen `activate_<token>`-Link (oben behandelt), den Inhaber bzw.
+    # Mitarbeiter per Mail/QR vom Betreiber erhalten.
+    existing = await _get_tenant_by_chat(chat_id)
+    if existing is not None:
+        # Bereits verbundener Chat tippt einen alten Slug-Link erneut an —
+        # freundlich bestaetigen statt verwirren.
+        return (
+            f"Sie sind bereits mit <b>{existing.company_name}</b> verbunden.\n\n"
+            "Mit /help sehen Sie alle verfuegbaren Befehle."
         )
-        if existing_chat and existing_chat != chat_id:
-            logger.warning(
-                f"H1: Slug-Takeover-Versuch auf {tenant_slug}/{employee_slug} "
-                f"von chat_id={chat_id} abgelehnt "
-                f"(bereits gebunden an {existing_chat})"
-            )
-            return (
-                "Dieser Betrieb ist bereits mit einem Telegram-Konto "
-                "verknuepft.\n\nAus Sicherheitsgruenden laesst sich die "
-                "Verknuepfung nicht per QR-Code uebernehmen. Fuer einen "
-                "Geraetewechsel oder zur Uebertragung bitte beim Support "
-                "einen neuen Aktivierungs-Link anfordern."
-            )
-        # Bug 2026-05-12: ein Inhaber kann sich mit derselben Telegram-App
-        # erst als Default-Employee aktivieren und danach als neu angelegter
-        # Mitarbeiter — `uq_emp_telegram_chat_id` knallt sonst beim Commit.
-        # Loesung: alle FREMDEN Employees mit dieser chat_id (im selben oder
-        # einem anderen Tenant) entkoppeln, bevor wir uns selbst zuweisen.
-        if emp.telegram_chat_id != chat_id:
-            stale = (await s.execute(
-                select(Employee).where(
-                    Employee.telegram_chat_id == chat_id,
-                    Employee.id != emp.id,
-                )
-            )).scalars().all()
-            for old in stale:
-                logger.info(
-                    f"Loese alte chat_id-Bindung an Employee {old.id} "
-                    f"(slug={old.slug}, tenant={old.tenant_id}) bevor "
-                    f"sie an {emp.slug} uebergeht"
-                )
-                old.telegram_chat_id = None
-            if stale:
-                # Vor dem Reassign muss die NULL-Zuweisung in der DB
-                # ankommen, sonst greift uq_emp_telegram_chat_id immer noch.
-                await s.flush()
-        # Chat-ID auf Mitarbeiter setzen
-        emp.telegram_chat_id = chat_id
-        # Fuer Default-Employee zusaetzlich tenant.telegram_chat_id mitspiegeln
-        # (Backward-Compat fuer Code-Pfade die noch nicht employee-aware sind)
-        if emp.is_default:
-            tenant.telegram_chat_id = chat_id
-        await s.commit()
-
-        first_name = (from_data.get("first_name") or "").strip() or "dort"
-        reply = f"Willkommen, {first_name}!\n\n"
-        if emp.is_default:
-            reply += f"Ihr Telegram ist jetzt mit <b>{tenant.company_name}</b> verbunden.\n\n"
-        else:
-            reply += (
-                f"Sie sind als Mitarbeiter <b>{emp.name}</b> "
-                f"bei <b>{tenant.company_name}</b> angemeldet.\n\n"
-            )
-
-        # Wenn der Tenant noch nicht durchs Onboarding ist: das Tutorial
-        # starten — Default-Employee, sonst regulaere Begruessung weil
-        # Mitarbeiter keinen Tenant einrichten muss.
-        if emp.is_default and tenant.onboarding_completed_at is None:
-            reply += (
-                "<i>Ich nehme dich jetzt einmal kurz an die Hand und "
-                "richte dein Setup ein — dauert ca. 5 Minuten.</i>\n\n"
-                "Tippe <b>/onboarding</b> um zu starten."
-            )
-            return reply
-
-        reply += "Ab jetzt erhalten Sie hier:\n"
-        reply += "- Push-Nachrichten zu Ihren Anrufen und Mails\n"
-        reply += "- Bestaetigungen ueber gebuchte Termine\n"
-        reply += "- Hinweise wenn Q nicht weiterkommt\n\n"
-        reply += "Mit /help sehen Sie alle verfuegbaren Befehle."
-        return reply
+    return (
+        "Dieser Aktivierungs-Link wird aus Sicherheitsgruenden nicht mehr "
+        "unterstuetzt.\n\nBitte nutzen Sie den <b>persoenlichen Link</b> aus "
+        "Ihrer Begruessungs-Mail (er beginnt mit "
+        "<code>?start=activate_</code>). Ohne Link fordern Sie beim Support "
+        "einen neuen an."
+    )
 
 async def _resolve_enabled_features(chat_id):
     """Holt das Set aktiver Features fuer den Tenant des Chats.
@@ -8963,15 +8879,19 @@ async def _format_mitarbeiter_detail(tenant_id, slug) -> str:
     # Telegram-Deeplink: Inhaber bekommt einfachen tenant-Slug,
     # weitere Mitarbeiter brauchen das __<emp_slug>-Suffix damit der
     # Bot beim ersten /start die richtige Person zuordnet.
-    if bot_username:
-        if emp.is_default:
-            tg_deeplink = f"https://t.me/{bot_username}?start={tenant.slug}"
-        else:
-            tg_deeplink = (
-                f"https://t.me/{bot_username}?start={tenant.slug}__{emp.slug}"
-            )
-    else:
+    # Sicherer Token-Link (S13): kein ratbarer Slug-Link mehr. Bereits
+    # verbundene Mitarbeiter brauchen keinen Link.
+    if emp.telegram_chat_id:
+        tg_deeplink = "✅ bereits mit Telegram verbunden"
+    elif not bot_username:
         tg_deeplink = "(Bot-Username unbekannt)"
+    else:
+        try:
+            from core.onboarding import build_owner_activation_link
+            tg_deeplink = await build_owner_activation_link(tenant_id, emp.id)
+        except Exception:
+            logger.exception("Aktivierungs-Link (Mitarbeiter-Detail) fehlgeschlagen")
+            tg_deeplink = "(Link konnte nicht erzeugt werden)"
 
     # OAuth-Deeplink — funktioniert sobald Provider gewaehlt ist
     base = (_settings.public_url or "").rstrip("/")
@@ -9311,8 +9231,12 @@ async def _handle_mitarbeiter_neu_skills_input(chat_id, text, state_data):
         deeplink = f"https://t.me/{bot_username}?start=activate_{activation_token}"
         gueltig_hinweis = "\n<i>(Gueltig 7 Tage, einmalig einloesbar.)</i>"
     else:
-        # Fallback: Legacy-Slug-Pfad, ohne Token (Audit-loses Onboarding).
-        deeplink = f"https://t.me/{bot_username}?start={tenant.slug}__{slug}"
+        # S13: KEIN Slug-Fallback mehr — der waere ein toter Link, seit nur
+        # noch `activate_<token>` bindet. Inhaber soll es erneut versuchen.
+        deeplink = (
+            "(Aktivierungs-Link konnte nicht erzeugt werden — "
+            "bitte erneut /mitarbeiter neu)"
+        )
         gueltig_hinweis = ""
     return (
         f"✅ Mitarbeiter <b>{name}</b> angelegt (Slug <code>{slug}</code>).\n\n"

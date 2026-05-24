@@ -22,7 +22,7 @@ from sqlalchemy import select
 
 sys.path.insert(0, "/app")
 from core.database import AsyncSessionLocal
-from core.models import Tenant, ToolConfig
+from core.models import Tenant, ToolConfig, Employee, create_activation_token
 
 
 @dataclass
@@ -72,6 +72,21 @@ async def generate_for_slug(slug: str) -> QRResult:
         if not tenant:
             raise ValueError(f"Tenant '{tenant_slug}' nicht gefunden")
 
+        # S13: Default-Employee (Inhaber) fuer den Token-Link bestimmen.
+        default_emp = (await s.execute(
+            select(Employee).where(
+                Employee.tenant_id == tenant.id,
+                Employee.is_default == True,  # noqa: E712
+            )
+        )).scalar_one_or_none()
+        if default_emp is None:
+            raise ValueError(
+                f"Tenant '{tenant_slug}' hat keinen Default-Employee — "
+                "Onboarding-Link nicht erzeugbar."
+            )
+        tenant_id_for_token = tenant.id
+        default_emp_id = default_emp.id
+
         global_tenant = (await s.execute(
             select(Tenant).where(Tenant.slug == "_global")
         )).scalar_one_or_none()
@@ -100,7 +115,11 @@ async def generate_for_slug(slug: str) -> QRResult:
             "Bot-Username konnte nicht via Telegram-API geholt werden"
         )
 
-    deep_link = f"https://t.me/{bot_username}?start={tenant_slug}"
+    # S13: sicherer Einmal-Token-Link statt ratbarem ?start=<slug>.
+    token_obj = await create_activation_token(
+        tenant_id_for_token, default_emp_id, ttl_days=14,
+    )
+    deep_link = f"https://t.me/{bot_username}?start=activate_{token_obj.token}"
 
     qr = qrcode.QRCode(
         version=None,
