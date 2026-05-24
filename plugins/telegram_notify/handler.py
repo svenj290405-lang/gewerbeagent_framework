@@ -2611,15 +2611,51 @@ async def _telegram_get_file_path(bot_token, file_id):
         return data["result"].get("file_path")
 
 
-async def _telegram_download_file(bot_token, file_path):
-    """Laedt eine Datei von Telegram-Servern als Bytes."""
+# Hard-Backstop gegen OOM: Telegram getFile ist serverseitig ~20 MB
+# gedeckelt, aber darauf verlassen wir uns NICHT. Der Body wird gestreamt
+# und abgebrochen, sobald die Groesse das Limit reisst — kein unbegrenztes
+# resp.content mehr. 50 MB = groesster legitimer Fall (Voice-Aufnahme).
+TELEGRAM_DOWNLOAD_MAX_BYTES = 50 * 1024 * 1024
+
+
+async def _telegram_download_file(
+    bot_token, file_path, *, max_bytes=TELEGRAM_DOWNLOAD_MAX_BYTES
+):
+    """Laedt eine Datei von Telegram-Servern als Bytes.
+
+    Bricht ab, sobald die Datei `max_bytes` ueberschreitet (Content-Length
+    vorab + inkrementell beim Streamen), damit ein grosser Upload den Prozess
+    nicht per OOM killt. Gibt None zurueck bei Fehler ODER Limit-Ueberschreitung
+    — alle Aufrufer behandeln None bereits als "Download fehlgeschlagen".
+    """
     url = f"{TELEGRAM_API_BASE}/file/bot{bot_token}/{file_path}"
     async with httpx.AsyncClient(timeout=30.0) as client:
-        resp = await client.get(url)
-        if resp.status_code != 200:
-            logger.warning(f"file download fehlgeschlagen: {resp.status_code}")
-            return None
-        return resp.content
+        async with client.stream("GET", url) as resp:
+            if resp.status_code != 200:
+                logger.warning(f"file download fehlgeschlagen: {resp.status_code}")
+                return None
+            declared = resp.headers.get("content-length")
+            if declared is not None:
+                try:
+                    if int(declared) > max_bytes:
+                        logger.warning(
+                            f"file download abgelehnt: content-length {declared} "
+                            f"> limit {max_bytes} bytes"
+                        )
+                        return None
+                except ValueError:
+                    pass
+            chunks = []
+            total = 0
+            async for chunk in resp.aiter_bytes():
+                total += len(chunk)
+                if total > max_bytes:
+                    logger.warning(
+                        f"file download abgebrochen: > limit {max_bytes} bytes"
+                    )
+                    return None
+                chunks.append(chunk)
+            return b"".join(chunks)
 
 
 async def _send_photo_to_chat(chat_id, image_bytes, caption=None, bot_token=None):
