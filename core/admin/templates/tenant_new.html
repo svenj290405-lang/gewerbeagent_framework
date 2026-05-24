@@ -7,7 +7,8 @@
     <div>
         <h1>Neuer Betrieb</h1>
         <p>Legt einen Kunden an und verschickt automatisch den persoenlichen,
-           einmaligen Onboarding-Link per Mail.</p>
+           einmaligen Aktivierungs-Code per Mail (Kunde sucht den Bot →
+           START → Code eingeben).</p>
     </div>
 </div>
 
@@ -77,9 +78,9 @@
         <div class="form-group">
             <label style="display:flex; align-items:center; gap:8px;">
                 <input type="checkbox" name="send_mail" value="on" checked style="width:auto;">
-                Onboarding-Link sofort per Mail an den Kunden schicken
+                Aktivierungs-Code sofort per Mail an den Kunden schicken
             </label>
-            <div class="hint">Ohne Haken wird der Betrieb angelegt und der Link nur hier angezeigt.</div>
+            <div class="hint">Ohne Haken wird der Betrieb angelegt und der Code nur hier angezeigt.</div>
         </div>
 
         <div style="display:flex; gap:8px; margin-top:8px;">
@@ -92,6 +93,6 @@
 <p class="muted" style="max-width:760px; margin-top:16px; font-size:13px;">
     Hinweis: sipgate-Nummer, ElevenLabs-Agent und Kalender-Verknuepfung bleiben
     separate Schritte. Dieses Formular legt den Betrieb an und sichert den
-    Telegram-Zugang per einmaligem Token-Link ab.
+    Telegram-Zugang per einmaligem Aktivierungs-Code ab.
 </p>
 {% endblock %}

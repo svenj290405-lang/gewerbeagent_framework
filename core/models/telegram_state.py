@@ -42,6 +42,10 @@ STATE_LEXWARE_SETUP_TOKEN = "lexware_setup_token"
 # BotFather-Token an den globalen Bot, wir speichern verschluesselt +
 # registrieren den Webhook auf seinen eigenen Bot).
 STATE_EIGENER_BOT_TOKEN = "eigener_bot_token"
+# Onboarding per Suche: unverbundener Chat hat /start gedrueckt und soll
+# jetzt seinen kurzen Aktivierungs-Code aus der Mail eingeben. state_data
+# haelt {"attempts": <int>} fuer das Rate-Limit.
+STATE_AWAIT_ACTIVATION_CODE = "await_activation_code"
 # Rechnung-Wizard
 STATE_RECHNUNG_WAITING_INPUT = "rechnung_waiting_input"
 STATE_RECHNUNG_CONFIRMING = "rechnung_confirming"

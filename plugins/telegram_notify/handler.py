@@ -21,6 +21,7 @@ from core.models import (
     STATE_BELEG_WAITING_PHOTO,
     STATE_LEXWARE_SETUP_TOKEN,
     STATE_EIGENER_BOT_TOKEN,
+    STATE_AWAIT_ACTIVATION_CODE,
     STATE_VIZ_WAITING_DESCRIPTION,
     STATE_VIZ_WAITING_KUNDE,
     STATE_VIZ_WAITING_PHOTO,
@@ -651,7 +652,6 @@ async def _handle_activate_token_start(token_str, chat_id, from_data):
        ueberschreiben).
     """
     from core.models import consume_activation_token
-    from core.models.employee import Employee
 
     token_row = await consume_activation_token(token_str)
     if token_row is None:
@@ -659,10 +659,24 @@ async def _handle_activate_token_start(token_str, chat_id, from_data):
             "Aktivierungs-Link ungueltig, abgelaufen oder bereits "
             "eingeloest. Bitte beim Inhaber einen neuen anfordern."
         )
+    return await _bind_employee_to_chat(token_row.employee_id, chat_id, from_data)
+
+
+async def _bind_employee_to_chat(employee_id, chat_id, from_data):
+    """Bindet einen Employee an eine Telegram-chat_id und liefert die
+    Begruessung. Gemeinsamer Kern fuer den `activate_<token>`-Deep-Link
+    UND den kurzen Aktivierungs-Code (Suche-Onboarding).
+
+    Konfliktaufloesung wie der Legacy-Pfad: fremde Bindungen derselben
+    chat_id loesen, alte chat_id desselben Employees ueberschreiben. Fuer
+    den Default-Employee (Inhaber) mit noch offenem Onboarding wird ins
+    /onboarding-Tutorial geleitet, sonst die Mitarbeiter-Begruessung.
+    """
+    from core.models.employee import Employee
 
     async with AsyncSessionLocal() as s:
         emp = (await s.execute(
-            select(Employee).where(Employee.id == token_row.employee_id)
+            select(Employee).where(Employee.id == employee_id)
         )).scalar_one_or_none()
         if emp is None:
             return "Der zugehoerige Mitarbeiter existiert nicht mehr."
@@ -672,16 +686,9 @@ async def _handle_activate_token_start(token_str, chat_id, from_data):
         if tenant is None:
             return "Tenant nicht gefunden."
 
-        # Konfliktaufloesung (selbe Logik wie der Legacy-/start-Pfad):
-        # - Wenn der gleiche chat_id schon an einen fremden Employee
-        #   gebunden ist (z.B. Inhaber-Account, der jetzt zusaetzlich
-        #   Mitarbeiter sein moechte): alte Bindung loesen.
-        # - Wenn dieser Employee bereits eine ANDERE chat_id hatte:
-        #   warnen + ueberschreiben.
         if emp.telegram_chat_id and emp.telegram_chat_id != chat_id:
             logger.warning(
-                f"activate-token: Chat-ID-Wechsel fuer Mitarbeiter "
-                f"{tenant.slug}/{emp.slug}: "
+                f"bind: Chat-ID-Wechsel fuer {tenant.slug}/{emp.slug}: "
                 f"{emp.telegram_chat_id} -> {chat_id}"
             )
         if emp.telegram_chat_id != chat_id:
@@ -693,8 +700,8 @@ async def _handle_activate_token_start(token_str, chat_id, from_data):
             )).scalars().all()
             for old in stale:
                 logger.info(
-                    f"activate-token: loese alte chat_id-Bindung "
-                    f"Employee {old.id} bevor sie an {emp.slug} uebergeht"
+                    f"bind: loese alte chat_id-Bindung Employee {old.id} "
+                    f"bevor sie an {emp.slug} uebergeht"
                 )
                 old.telegram_chat_id = None
             if stale:
@@ -708,20 +715,20 @@ async def _handle_activate_token_start(token_str, chat_id, from_data):
         onboarding_done = tenant.onboarding_completed_at is not None
         await s.commit()
 
-    first_name = (from_data.get("first_name") or "").strip() or "dort"
+    first_name = (from_data.get("first_name") or "").strip()
+    greeting = f"Willkommen, {first_name}!" if first_name else "Willkommen!"
     # Inhaber-Erst-Onboarding (Default-Employee, Tutorial noch nicht durch):
-    # ins Setup-Tutorial leiten — gleiche Begruessung wie frueher der slug-
-    # basierte Pfad, jetzt aber sicher per Token erreicht (S13).
+    # ins Setup-Tutorial leiten — sicher per Token/Code erreicht (S13).
     if is_default and not onboarding_done:
         return (
-            f"Willkommen, {first_name}!\n\n"
+            f"{greeting}\n\n"
             f"Ihr Telegram ist jetzt mit <b>{company}</b> verbunden.\n\n"
             "<i>Ich nehme dich jetzt einmal kurz an die Hand und richte dein "
             "Setup ein — dauert ca. 5 Minuten.</i>\n\n"
             "Tippe <b>/onboarding</b> um zu starten."
         )
     return (
-        f"Willkommen, {first_name}!\n\n"
+        f"{greeting}\n\n"
         f"Du bist jetzt als <b>{emp_name}</b> mit "
         f"<b>{company}</b> verknuepft.\n\n"
         "Tippe <b>/kalender_verbinden</b> um deinen Kalender hinzuzufuegen — "
@@ -732,10 +739,21 @@ async def _handle_activate_token_start(token_str, chat_id, from_data):
 async def _handle_start_command(text, chat_id, from_data):
     parts = text.split(maxsplit=1)
     if len(parts) < 2 or not parts[1].strip():
-        msg = "Hallo! Dies ist der <b>Gewerbeagent-Bot</b>.\n\n"
-        msg += "Falls Sie sich gerade einrichten, scannen Sie bitte den QR-Code, "
-        msg += "den Sie von uns erhalten haben."
-        return msg
+        # Onboarding per Suche: kein Payload (Kunde hat den Bot gesucht +
+        # START gedrueckt). Bereits verbunden -> Hinweis; sonst nach dem
+        # kurzen Aktivierungs-Code aus der Mail fragen (S13).
+        existing = await _get_tenant_by_chat(chat_id)
+        if existing is not None:
+            return (
+                f"Sie sind bereits mit <b>{existing.company_name}</b> "
+                "verbunden.\n\nMit /help sehen Sie alle verfuegbaren Befehle."
+            )
+        await _save_state(chat_id, STATE_AWAIT_ACTIVATION_CODE, {"attempts": 0})
+        return (
+            "Willkommen beim <b>Gewerbeagent-Bot</b>! 👋\n\n"
+            "Bitte gib jetzt deinen <b>Aktivierungs-Code</b> ein, den du per "
+            "E-Mail bekommen hast (8 Zeichen, z.B. <code>K7P4-9X2M</code>)."
+        )
     raw_payload = parts[1].strip()
     # Neuer Pfad: token-basiertes Mitarbeiter-Onboarding ueber
     # `activate_<token>`. Token ist URL-safe base64 (case-sensitiv!),
@@ -766,6 +784,41 @@ async def _handle_start_command(text, chat_id, from_data):
         "<code>?start=activate_</code>). Ohne Link fordern Sie beim Support "
         "einen neuen an."
     )
+
+
+async def _handle_activation_code_input(chat_id, text):
+    """Verarbeitet den eingetippten kurzen Aktivierungs-Code (Onboarding
+    per Telegram-Suche). Bei Erfolg wird der Chat an den Employee gebunden.
+
+    Rate-Limit: nach MAX_CODE_ATTEMPTS Fehlversuchen wird der State
+    geloescht (der Kunde muss /start erneut druecken). So bleibt der
+    8-Zeichen-Code trotz Tippbarkeit brute-force-sicher.
+    """
+    from core.models import consume_activation_code
+    MAX_CODE_ATTEMPTS = 5
+
+    row = await consume_activation_code(text or "")
+    if row is not None:
+        await _clear_state(chat_id)
+        return await _bind_employee_to_chat(row.employee_id, chat_id, {})
+
+    st = await _load_state(chat_id)
+    attempts = (int((st.state_data or {}).get("attempts", 0)) + 1) if st else 1
+    if attempts >= MAX_CODE_ATTEMPTS:
+        await _clear_state(chat_id)
+        return (
+            "Zu viele Fehlversuche. 🚫\n\nBitte fordere einen neuen "
+            "Aktivierungs-Code an und druecke danach erneut /start."
+        )
+    await _save_state(
+        chat_id, STATE_AWAIT_ACTIVATION_CODE, {"attempts": attempts},
+    )
+    return (
+        "Dieser Code stimmt nicht (oder ist abgelaufen / schon benutzt). "
+        f"Bitte nochmal eingeben — noch {MAX_CODE_ATTEMPTS - attempts} "
+        "Versuch(e).\n\nMit /abbrechen kannst du abbrechen."
+    )
+
 
 async def _resolve_enabled_features(chat_id):
     """Holt das Set aktiver Features fuer den Tenant des Chats.
@@ -2355,6 +2408,8 @@ async def _dispatch_update(payload):
             reply = reply_or_none
         elif state.state_key == STATE_EIGENER_BOT_TOKEN:
             reply = await _handle_eigenen_bot_token_input(chat_id, text)
+        elif state.state_key == STATE_AWAIT_ACTIVATION_CODE:
+            reply = await _handle_activation_code_input(chat_id, text)
         elif state.state_key == STATE_BELEG_WAITING_PHOTO:
             reply = "Bitte ein Foto oder PDF des Belegs schicken (kein Text). Oder /abbrechen."
         elif state.state_key == STATE_RECHNUNG_WAITING_INPUT:

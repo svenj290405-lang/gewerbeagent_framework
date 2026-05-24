@@ -305,29 +305,46 @@ async def _get_bot_username(bot_token: str) -> str | None:
         return None
 
 
+async def create_owner_activation(
+    tenant_id: uuid.UUID,
+    employee_id: uuid.UUID,
+    *,
+    ttl_days: int = OWNER_TOKEN_TTL_DAYS,
+):
+    """Erzeugt einen einmaligen Aktivierungs-Token (inkl. kurzem
+    short_code) fuer das Onboarding. Gibt die Token-Zeile zurueck —
+    `.token` fuer den Deep-Link, `.short_code` fuer die Code-Eingabe per
+    Telegram-Suche."""
+    return await create_activation_token(
+        tenant_id, employee_id, ttl_days=ttl_days,
+    )
+
+
+async def global_bot_username() -> str | None:
+    """@username des geteilten Bots (fuer die Such-Anleitung in der Mail).
+    Best-effort — None wenn Bot/Telegram nicht erreichbar."""
+    bot_token = await _load_global_bot_token()
+    if not bot_token:
+        return None
+    return await _get_bot_username(bot_token)
+
+
 async def build_owner_activation_link(
     tenant_id: uuid.UUID,
     default_employee_id: uuid.UUID,
     *,
     ttl_days: int = OWNER_TOKEN_TTL_DAYS,
 ) -> str:
-    """Erzeugt einen einmaligen Aktivierungs-Token fuer den Inhaber und
-    baut den Telegram-Deep-Link `?start=activate_<token>`.
+    """Erzeugt einen Aktivierungs-Token und baut den Telegram-Deep-Link
+    `?start=activate_<token>` (fuer Kontexte, die einen Ein-Klick-Link
+    wollen, z.B. Mitarbeiter-Detail im Bot).
 
-    Wirft OnboardingError, wenn der geteilte Bot nicht erreichbar ist
-    (kein Token / Telegram-API antwortet nicht) — dann gibt es keinen
-    sinnvollen Link, und der Aufrufer muss den Fehler melden.
+    Wirft OnboardingError, wenn der geteilte Bot nicht erreichbar ist.
     """
-    token_obj = await create_activation_token(
+    token_obj = await create_owner_activation(
         tenant_id, default_employee_id, ttl_days=ttl_days,
     )
-    bot_token = await _load_global_bot_token()
-    if not bot_token:
-        raise OnboardingError(
-            "Globaler Telegram-Bot-Token fehlt — Aktivierungs-Link kann "
-            "nicht erzeugt werden (_global telegram_bot ToolConfig pruefen)."
-        )
-    bot_username = await _get_bot_username(bot_token)
+    bot_username = await global_bot_username()
     if not bot_username:
         raise OnboardingError(
             "Bot-Username konnte nicht via Telegram-API geholt werden."

@@ -129,6 +129,94 @@ async def test_activate_payload_routes_to_token_handler(monkeypatch):
     assert called["token"] == "abc123"
 
 
+# =====================================================================
+# Kurzer Aktivierungs-Code (Onboarding per Suche)
+# =====================================================================
+
+def test_short_code_helpers():
+    from core.models.employee_activation_token import (
+        _generate_short_code, _SHORT_CODE_ALPHABET, _SHORT_CODE_LEN,
+        normalize_short_code, format_short_code,
+    )
+    code = _generate_short_code()
+    assert len(code) == _SHORT_CODE_LEN
+    assert all(c in _SHORT_CODE_ALPHABET for c in code)
+    # normalize: Grossschrift, Bindestrich/Leerzeichen weg
+    assert normalize_short_code(" k7p4-9x2m ") == "K7P49X2M"
+    # format: XXXX-XXXX
+    assert format_short_code("K7P49X2M") == "K7P4-9X2M"
+
+
+@pytest.mark.asyncio
+async def test_consume_activation_code_bad_format_returns_none():
+    """Falsche Laenge -> None, ohne DB-Zugriff (Vor-Validierung)."""
+    from core.models import consume_activation_code
+    assert await consume_activation_code("abc") is None
+    assert await consume_activation_code("") is None
+
+
+@pytest.mark.asyncio
+async def test_bare_start_unbound_prompts_for_code(monkeypatch):
+    """/start ohne Payload + unverbundener Chat -> nach Code fragen + State."""
+    monkeypatch.setattr(
+        tn_handler, "_get_tenant_by_chat", AsyncMock(return_value=None),
+    )
+    saved = {}
+
+    async def fake_save(chat_id, key, data=None):
+        saved["key"] = key
+        saved["data"] = data
+
+    monkeypatch.setattr(tn_handler, "_save_state", fake_save)
+    reply = await tn_handler._handle_start_command("/start", 4242, {})
+    assert "Aktivierungs-Code" in reply
+    assert saved["key"] == tn_handler.STATE_AWAIT_ACTIVATION_CODE
+
+
+@pytest.mark.asyncio
+async def test_activation_code_input_valid_binds(monkeypatch):
+    """Gueltiger Code -> State weg + Bindung ueber _bind_employee_to_chat."""
+    emp_id = uuid.uuid4()
+    monkeypatch.setattr(
+        "core.models.consume_activation_code",
+        AsyncMock(return_value=SimpleNamespace(employee_id=emp_id)),
+        raising=False,
+    )
+    monkeypatch.setattr(tn_handler, "_clear_state", AsyncMock())
+    bind = AsyncMock(return_value="BOUND-OK")
+    monkeypatch.setattr(tn_handler, "_bind_employee_to_chat", bind)
+    reply = await tn_handler._handle_activation_code_input(4242, "K7P4-9X2M")
+    assert reply == "BOUND-OK"
+    assert bind.await_args.args[0] == emp_id
+
+
+@pytest.mark.asyncio
+async def test_activation_code_input_invalid_counts_and_locks(monkeypatch):
+    """Falscher Code -> Fehlversuch hochzaehlen; nach 5 -> Sperre."""
+    monkeypatch.setattr(
+        "core.models.consume_activation_code",
+        AsyncMock(return_value=None), raising=False,
+    )
+    monkeypatch.setattr(tn_handler, "_save_state", AsyncMock())
+    monkeypatch.setattr(tn_handler, "_clear_state", AsyncMock())
+
+    # 1. Fehlversuch (attempts war 0)
+    monkeypatch.setattr(
+        tn_handler, "_load_state",
+        AsyncMock(return_value=SimpleNamespace(state_data={"attempts": 0})),
+    )
+    reply = await tn_handler._handle_activation_code_input(4242, "WRONGXXX")
+    assert "stimmt nicht" in reply.lower()
+
+    # 5. Fehlversuch (attempts war 4 -> 5 == MAX) -> Sperre
+    monkeypatch.setattr(
+        tn_handler, "_load_state",
+        AsyncMock(return_value=SimpleNamespace(state_data={"attempts": 4})),
+    )
+    reply = await tn_handler._handle_activation_code_input(4242, "WRONGXXX")
+    assert "Zu viele" in reply
+
+
 @pytest.mark.asyncio
 async def test_create_tenant_record_rejects_bad_slug():
     """Slug-Validierung greift VOR jedem DB-Zugriff."""

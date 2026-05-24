@@ -25,6 +25,7 @@ from core.models.telegram_state import (
     STATE_BELEG_CONFIRMING,
     STATE_LEXWARE_SETUP_TOKEN,
     STATE_EIGENER_BOT_TOKEN,
+    STATE_AWAIT_ACTIVATION_CODE,
     STATE_RECHNUNG_WAITING_INPUT,
     STATE_RECHNUNG_CONFIRMING,
     STATE_RECHNUNG_AWAITING_MAIL,
@@ -132,6 +133,8 @@ from core.models.employee_activation_token import (
     EmployeeActivationToken,
     create_activation_token,
     consume_activation_token,
+    consume_activation_code,
+    format_short_code,
 )
 from core.models.tenant_knowledge import (
     TenantKnowledge,
@@ -197,6 +200,8 @@ __all__ = [
     "EmployeeActivationToken",
     "create_activation_token",
     "consume_activation_token",
+    "consume_activation_code",
+    "format_short_code",
     "TenantKnowledge",
     "KATEGORIE_LEISTUNGEN",
     "KATEGORIE_MATERIALIEN",
@@ -237,6 +242,7 @@ __all__ = [
     "STATE_BELEG_CONFIRMING",
     "STATE_LEXWARE_SETUP_TOKEN",
     "STATE_EIGENER_BOT_TOKEN",
+    "STATE_AWAIT_ACTIVATION_CODE",
     "STATE_RECHNUNG_WAITING_INPUT",
     "STATE_RECHNUNG_CONFIRMING",
     "STATE_RECHNUNG_AWAITING_MAIL",
