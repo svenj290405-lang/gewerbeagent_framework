@@ -5,9 +5,12 @@ name: Deploy Dev
 # separaten manuellen Workflow (deploy-prod.yml).
 
 on:
-  push:
-    branches: [develop]
-  workflow_dispatch:    # zusaetzlich: manueller Trigger fuer Force-Deploy
+  # Auto-Deploy bei develop-Push DEAKTIVIERT: auf dem Host gibt es (noch)
+  # kein Dev-Environment (/opt/gewerbeagent/framework-dev fehlt), der Run
+  # schlug daher bei jedem Push fehl. Nur noch manueller Trigger.
+  # push:
+  #   branches: [develop]
+  workflow_dispatch:    # manueller Trigger fuer Force-Deploy
 
 concurrency:
   group: deploy-dev
