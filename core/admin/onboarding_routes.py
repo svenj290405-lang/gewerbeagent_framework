@@ -103,28 +103,44 @@ async def _send_onboarding_mail(*, to_email: str, to_name: str,
     wird im Admin-Ergebnis trotzdem angezeigt und kann manuell geschickt
     werden).
     """
-    from core.integrations.brevo import BrevoMailer, MailRecipient
-    cfg = await _load_central_brevo_config()
-    api_key = (cfg or {}).get("brevo_api_key", "")
-    sender_email = (cfg or {}).get("sender_email", "")
-    sender_name = (cfg or {}).get("sender_name", "Gewerbeagent")
-    if not api_key or not sender_email:
-        raise RuntimeError(
-            "Brevo-Config (_global/mail_intake) unvollstaendig — "
-            "kein api_key/sender_email."
-        )
-    html, text = _onboarding_mail_bodies(
-        company, to_name, code, bot_username, sender_name,
+    from sqlalchemy import select
+    from core.models import Tenant, OAuthToken
+    from core.integrations.microsoft import send_tracked_mail
+
+    # Versand ueber das _global-Outlook-Plattformpostfach (Microsoft Graph) —
+    # Brevo lieferte nicht zuverlaessig, Outlook ist erprobt. Das _global-
+    # Postfach wird vom Inbox-Poller ausgenommen (Send-only).
+    async with AsyncSessionLocal() as s:
+        gt = (await s.execute(
+            select(Tenant).where(Tenant.slug == GLOBAL_TENANT_SLUG)
+        )).scalar_one_or_none()
+        tok = None
+        if gt is not None:
+            tok = (await s.execute(
+                select(OAuthToken).where(
+                    OAuthToken.tenant_id == gt.id,
+                    OAuthToken.provider == "microsoft",
+                )
+            )).scalar_one_or_none()
+        if gt is None or tok is None:
+            raise RuntimeError(
+                "Kein _global-Outlook-Postfach verbunden — Microsoft-OAuth "
+                "fuer _global fehlt (Plattform-Mailversand nicht konfiguriert)."
+            )
+        gid, eid = gt.id, tok.employee_id
+
+    html, _text = _onboarding_mail_bodies(
+        company, to_name, code, bot_username, "Gewerbeagent",
     )
-    mailer = BrevoMailer(api_key=api_key)
-    await mailer.send(
-        sender_email=sender_email,
-        sender_name=sender_name,
-        to=MailRecipient(email=to_email, name=to_name or to_email),
-        subject=f"Ihr Zugang zu {sender_name} — Einrichtung in 5 Minuten",
-        html_body=html,
-        text_body=text,
+    res = await send_tracked_mail(
+        tenant_id=gid,
+        to_email=to_email,
+        subject="Ihr Zugang zu Gewerbeagent — Einrichtung in 5 Minuten",
+        body_html=html,
+        employee_id=eid,
     )
+    if not res.get("success"):
+        raise RuntimeError(f"Outlook-Versand fehlgeschlagen: {res.get('error')}")
 
 
 @router.get("/tenants/new", response_class=HTMLResponse)

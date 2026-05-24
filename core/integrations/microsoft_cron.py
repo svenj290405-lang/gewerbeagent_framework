@@ -38,6 +38,11 @@ async def get_microsoft_mailboxes() -> list[tuple[Tenant, OAuthToken]]:
             select(Tenant, OAuthToken)
             .join(OAuthToken, OAuthToken.tenant_id == Tenant.id)
             .where(OAuthToken.provider == "microsoft")
+            # _global ist der Plattform-Tenant (Onboarding-Mailversand) —
+            # sein Postfach wird NUR zum Senden genutzt, nie als Kunden-
+            # Inbox gepollt. Sonst wuerde ein Postfach, das gleichzeitig
+            # einem echten Tenant gehoert, doppelt verarbeitet.
+            .where(Tenant.slug != "_global")
         )
         return [(t, ot) for t, ot in result.all()]
 
