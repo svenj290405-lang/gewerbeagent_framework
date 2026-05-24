@@ -7162,6 +7162,17 @@ async def _create_rechnung_in_lexware(chat_id, rechnung_id, bot_token):
             )
             contact_id = new_contact.contact_id
             logger.info(f"Lexware-Kontakt angelegt: {new_contact.name} -> {contact_id}")
+            # Metrik: Neuanlage zaehlen (failsafe, darf Rechnung nie stoppen)
+            try:
+                from core.billing.usage import track_api_usage
+                from core.models.admin import UNIT_KUNDE_NEU
+                if tenant:
+                    await track_api_usage(
+                        tenant_id=tenant.id, provider="lexware",
+                        operation="contact-create", units=1, unit=UNIT_KUNDE_NEU,
+                    )
+            except Exception:
+                logger.debug("kunde_neu-Tracking uebersprungen", exc_info=True)
     except Exception as e:
         logger.warning(f"Contact-Handling fehlgeschlagen, fallback auf one-time-address: {e}")
         contact_id = None

@@ -43,6 +43,25 @@
 </div>
 
 <div class="section-title">
+    Visualisierung
+    <small>Plattform-Leistung &amp; Aktivität je Betrieb im gewählten Zeitraum</small>
+</div>
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:18px;">
+    <div class="card">
+        <h3 style="margin:0 0 10px;font-size:14px;">Was das System erledigt hat</h3>
+        <div class="chart-wrap" style="position:relative;height:300px;">
+            <canvas id="plattformChart"></canvas>
+        </div>
+    </div>
+    <div class="card">
+        <h3 style="margin:0 0 10px;font-size:14px;">Aktivität je Betrieb (Top 12)</h3>
+        <div class="chart-wrap" style="position:relative;height:300px;">
+            <canvas id="betriebeChart"></canvas>
+        </div>
+    </div>
+</div>
+
+<div class="section-title">
     Detail pro Betrieb
     <small>alle erfassten Metriken · horizontal scrollbar</small>
 </div>
@@ -92,12 +111,57 @@
     <strong>Lesehilfe:</strong>
     <em>Tel.-Min.</em> = Summe aufgezeichneter Gesprächsminuten ·
     <em>Mails bearb.</em> = automatisch zu Buchung/Abschluss geführt ·
+    <em>Kunden angel.</em> = neu in Lexware angelegte Kontakte (zählt ab Einbau dieser Metrik) ·
+    <em>Webform. verarb.</em> = ausgefüllte Anfrage-Formulare, die das System eingelesen hat ·
     <em>Außerh. GZ</em> = Anrufe/Mails/Anfragen außerhalb Mo–Fr 8–18 Uhr (24/7) ·
     <em>Umsatz / Angebotsvol.</em> = Brutto-Beträge der über das System erstellten
     Rechnungen bzw. Angebote (= Lexware-Aktivität; rohe API-Klicks werden nicht geloggt).
-    <br>
-    <strong>Zeit gespart</strong> ist eine konservative Schätzung: Telefonzeit 1:1 plus
-    je Vorgang 5 Min (Mail/Anfrage), 3 Min (Buchung/Beleg), 10 Min (Rechnung),
-    15 Min (Angebot).
 </p>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<script>
+const PALETTE = ['#3b82f6','#8b5cf6','#10b981','#f59e0b','#ef4444','#06b6d4','#ec4899','#6366f1','#14b8a6','#84cc16','#f97316','#a855f7'];
+const PLATTFORM = {{ charts.plattform | tojson }};
+const BETRIEBE = {{ charts.betriebe | tojson }};
+
+function vBar(id, labels, data) {
+    const el = document.getElementById(id);
+    if (!el) return;
+    new Chart(el, {
+        type: 'bar',
+        data: { labels, datasets: [{
+            data, backgroundColor: labels.map((_, i) => PALETTE[i % PALETTE.length]),
+            borderRadius: 6,
+        }] },
+        options: {
+            responsive: true, maintainAspectRatio: false,
+            plugins: { legend: { display: false } },
+            scales: {
+                x: { grid: { display: false }, ticks: { font: { size: 10 } } },
+                y: { beginAtZero: true, ticks: { font: { size: 10 }, precision: 0 } },
+            },
+        },
+    });
+}
+
+function hBar(id, labels, data) {
+    const el = document.getElementById(id);
+    if (!el) return;
+    new Chart(el, {
+        type: 'bar',
+        data: { labels, datasets: [{ data, backgroundColor: '#3b82f6', borderRadius: 6 }] },
+        options: {
+            responsive: true, maintainAspectRatio: false, indexAxis: 'y',
+            plugins: { legend: { display: false } },
+            scales: {
+                x: { beginAtZero: true, ticks: { font: { size: 10 }, precision: 0 } },
+                y: { ticks: { font: { size: 10 } } },
+            },
+        },
+    });
+}
+
+vBar('plattformChart', PLATTFORM.labels, PLATTFORM.data);
+hBar('betriebeChart', BETRIEBE.labels, BETRIEBE.data);
+</script>
 {% endblock %}

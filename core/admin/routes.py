@@ -1294,8 +1294,10 @@ _METRIC_COLUMNS = [
     ("mails_empf", "Mails empf.", "int"),
     ("mails_bearb", "Mails bearb.", "int"),
     ("mails_send", "Mails vers.", "int"),
+    ("kunden_neu", "Kunden angel.", "int"),
     ("anfragen", "Anfragen", "int"),
     ("anfragen_beantw", "Anfr. beantw.", "int"),
+    ("webformulare", "Webform. verarb.", "int"),
     ("buchungen", "Buchungen", "int"),
     ("stornos", "Stornos", "int"),
     ("ausserhalb_gz", "Außerh. GZ", "int"),
@@ -1307,7 +1309,6 @@ _METRIC_COLUMNS = [
     ("umsatz_eur", "Umsatz ges.", "eur"),
     ("umsatz_bezahlt_eur", "Umsatz bez.", "eur"),
     ("belege", "Belege", "int"),
-    ("zeitersparnis_h", "Zeit gespart", "h"),
     ("kosten", "API-Kosten", "cost"),
 ]
 
@@ -1322,16 +1323,6 @@ _ANGEBOT_ANGENOMMEN = [
     ANGEBOT_STATUS_RECHNUNG_GESENDET,
 ]
 
-# Geschaetzte manuelle Minuten je Vorgang (konservativ) fuer die
-# Zeitersparnis-Hochrechnung. Telefonzeit zaehlt zusaetzlich 1:1.
-_SAVE_MIN = {
-    "mails_bearb": 5,
-    "anfragen": 5,
-    "buchungen": 3,
-    "angebote": 15,
-    "rechnungen": 10,
-    "belege": 3,
-}
 
 
 def _metrics_days(request: Request) -> int:
@@ -1384,6 +1375,10 @@ async def _collect_metrics(s, start: dt.datetime | None) -> tuple[list[dict], di
         func.coalesce(func.sum(ApiUsageLog.units_consumed), 0),
         ApiUsageLog.tenant_id, ApiUsageLog.created_at,
         ApiUsageLog.unit == "mail_send")
+    kunden_neu = await grouped(
+        func.coalesce(func.sum(ApiUsageLog.units_consumed), 0),
+        ApiUsageLog.tenant_id, ApiUsageLog.created_at,
+        ApiUsageLog.unit == "kunde_neu")
 
     # --- Anfragen / Termine ---
     anfragen = await grouped(
@@ -1392,6 +1387,17 @@ async def _collect_metrics(s, start: dt.datetime | None) -> tuple[list[dict], di
     anfragen_beantw = await grouped(
         func.count(AnfrageToken.id), AnfrageToken.tenant_id,
         AnfrageToken.submitted_at, AnfrageToken.submitted_at.isnot(None))
+    # Verarbeitete Webformulare = tatsaechlich eingegangene Formular-
+    # Antworten. AnfrageResponse hat keine tenant_id -> Join ueber Token.
+    wf_q = (
+        select(AnfrageToken.tenant_id, func.count(AnfrageResponse.id))
+        .select_from(AnfrageResponse)
+        .join(AnfrageToken, AnfrageResponse.token_id == AnfrageToken.id)
+        .group_by(AnfrageToken.tenant_id)
+    )
+    if start is not None:
+        wf_q = wf_q.where(AnfrageResponse.submitted_at >= start)
+    webformulare = {row[0]: row[1] for row in (await s.execute(wf_q))}
     buchungen = await grouped(
         func.count(EmailConversation.id), EmailConversation.tenant_id,
         EmailConversation.created_at,
@@ -1462,16 +1468,6 @@ async def _collect_metrics(s, start: dt.datetime | None) -> tuple[list[dict], di
         ang = geti(angebote, tid)
         rech = geti(rechnungen, tid)
         bel = geti(belege, tid)
-        # Geschaetzte Zeitersparnis: Telefonzeit 1:1 + Pauschalen je Vorgang
-        save_min = (
-            anruf_min
-            + m_bearb * _SAVE_MIN["mails_bearb"]
-            + anfr * _SAVE_MIN["anfragen"]
-            + buch * _SAVE_MIN["buchungen"]
-            + ang * _SAVE_MIN["angebote"]
-            + rech * _SAVE_MIN["rechnungen"]
-            + bel * _SAVE_MIN["belege"]
-        )
         row = {
             "id": str(tid),
             "company_name": t.company_name,
@@ -1481,8 +1477,10 @@ async def _collect_metrics(s, start: dt.datetime | None) -> tuple[list[dict], di
             "mails_empf": geti(mails_empf, tid),
             "mails_bearb": m_bearb,
             "mails_send": geti(mails_send, tid),
+            "kunden_neu": geti(kunden_neu, tid),
             "anfragen": anfr,
             "anfragen_beantw": geti(anfragen_beantw, tid),
+            "webformulare": geti(webformulare, tid),
             "buchungen": buch,
             "stornos": geti(stornos, tid),
             "ausserhalb_gz": (
@@ -1496,7 +1494,6 @@ async def _collect_metrics(s, start: dt.datetime | None) -> tuple[list[dict], di
             "umsatz_eur": getf(umsatz, tid),
             "umsatz_bezahlt_eur": getf(umsatz_bezahlt, tid),
             "belege": bel,
-            "zeitersparnis_h": round(save_min / 60),
             "kosten": getf(kosten, tid),
         }
         for k, _h, _fmt in _METRIC_COLUMNS:
@@ -1510,37 +1507,76 @@ def _eur0(x) -> str:
     return f"{round(x):,}".replace(",", ".") + " €"
 
 
+def _n0(x) -> str:
+    """Ganze Zahl mit Tausenderpunkt: 12345 -> '12.345'."""
+    return f"{int(round(x)):,}".replace(",", ".")
+
+
 def _build_tiles(totals: dict) -> list[dict]:
-    """Headline-Wert-Kacheln (Plattform-Summe im Zeitraum) als
-    Verkaufsargumente."""
+    """Headline-Wert-Kacheln (Plattform-Summe im Zeitraum). Reine Zahlen,
+    im Verkaufsgespraech zeigbar — operative Zaehler zuerst, dann Umsatz."""
     tel_std = round(totals["anruf_min"] / 60)
-    arbeitstage = round(totals["zeitersparnis_h"] / 8)
     return [
-        {"label": "Umsatz über System (brutto)",
-         "value": _eur0(totals["umsatz_eur"]),
-         "sub": f'davon {_eur0(totals["umsatz_bezahlt_eur"])} bezahlt'},
-        {"label": "Angebotsvolumen erstellt",
-         "value": _eur0(totals["angebot_volumen_eur"]),
-         "sub": f'{totals["angebote"]} Angebote · {totals["angebote_angen"]} angenommen'},
-        {"label": "Anrufe entgegengenommen",
-         "value": str(totals["anrufe"]),
-         "sub": f"{tel_std} Std. am Telefon abgenommen"},
-        {"label": "Mails automatisch bearbeitet",
-         "value": str(totals["mails_bearb"]),
-         "sub": f'von {totals["mails_empf"]} eingegangen'},
+        {"label": "Minuten am Telefon",
+         "value": _n0(totals["anruf_min"]),
+         "sub": f'{_n0(totals["anrufe"])} Anrufe entgegengenommen (≈ {tel_std} Std.)'},
+        {"label": "Mails eingegangen",
+         "value": _n0(totals["mails_empf"]),
+         "sub": "automatisch gelesen & einsortiert"},
+        {"label": "Mails bearbeitet",
+         "value": _n0(totals["mails_bearb"]),
+         "sub": "bis zu Buchung / Abschluss geführt"},
+        {"label": "Mails versendet",
+         "value": _n0(totals["mails_send"]),
+         "sub": "automatisch beantwortet"},
+        {"label": "Webformulare verarbeitet",
+         "value": _n0(totals["webformulare"]),
+         "sub": "ausgefüllte Anfrage-Formulare eingelesen"},
+        {"label": "Kunden angelegt",
+         "value": _n0(totals["kunden_neu"]),
+         "sub": "neue Kontakte in Lexware"},
+        {"label": "Rechnungen erstellt",
+         "value": _n0(totals["rechnungen"]),
+         "sub": f'{_n0(totals["rechnungen_bezahlt"])} bereits bezahlt'},
         {"label": "Termine gebucht",
-         "value": str(totals["buchungen"]),
-         "sub": f'{totals["stornos"]} storniert'},
-        {"label": "Außerhalb der Geschäftszeiten",
-         "value": str(totals["ausserhalb_gz"]),
-         "sub": "Abende & Wochenenden erledigt — 24/7"},
+         "value": _n0(totals["buchungen"]),
+         "sub": f'{_n0(totals["stornos"])} storniert'},
+        {"label": "Angebote erstellt",
+         "value": _n0(totals["angebote"]),
+         "sub": f'{_n0(totals["angebote_angen"])} angenommen'},
         {"label": "Anfragen erfasst",
-         "value": str(totals["anfragen"]),
-         "sub": f'{totals["anfragen_beantw"]} vollständig beantwortet'},
-        {"label": "Geschätzte Zeitersparnis",
-         "value": f'{totals["zeitersparnis_h"]} h',
-         "sub": f"≈ {arbeitstage} Arbeitstage (à 8 h)"},
+         "value": _n0(totals["anfragen"]),
+         "sub": f'{_n0(totals["anfragen_beantw"])} vollständig beantwortet'},
+        {"label": "Außerhalb der Geschäftszeiten",
+         "value": _n0(totals["ausserhalb_gz"]),
+         "sub": "Abende & Wochenenden erledigt — 24/7"},
     ]
+
+
+def _build_charts(rows: list[dict], totals: dict) -> dict:
+    """Daten fuer die Chart.js-Visualisierungen: Plattform-Leistung als
+    Balken + Aktivitaet je Betrieb (Top 12 nach Gesamt-Vorgaengen)."""
+    plattform = {
+        "labels": ["Anrufe", "Mails eing.", "Mails bearb.", "Mails vers.",
+                   "Webform.", "Kunden", "Rechn.", "Termine", "Angebote",
+                   "Anfragen"],
+        "data": [totals["anrufe"], totals["mails_empf"], totals["mails_bearb"],
+                 totals["mails_send"], totals["webformulare"],
+                 totals["kunden_neu"], totals["rechnungen"],
+                 totals["buchungen"], totals["angebote"], totals["anfragen"]],
+    }
+
+    def aktivitaet(r: dict) -> int:
+        return (r["anrufe"] + r["mails_bearb"] + r["mails_send"]
+                + r["webformulare"] + r["buchungen"] + r["rechnungen"]
+                + r["kunden_neu"])
+
+    top = sorted(rows, key=aktivitaet, reverse=True)[:12]
+    betriebe = {
+        "labels": [r["company_name"] for r in top],
+        "data": [aktivitaet(r) for r in top],
+    }
+    return {"plattform": plattform, "betriebe": betriebe}
 
 
 def _csv_val(v, fmt: str):
@@ -1568,6 +1604,7 @@ async def metrics_view(
     return templates.TemplateResponse(request, "metrics.html", {
         "request": request, "user": user,
         "rows": rows, "totals": totals, "tiles": _build_tiles(totals),
+        "charts": _build_charts(rows, totals),
         "columns": _METRIC_COLUMNS, "days": days, "periods": _PERIODS,
         "csrf_token": request.state.admin_csrf,
     })

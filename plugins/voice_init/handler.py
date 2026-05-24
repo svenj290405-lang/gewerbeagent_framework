@@ -1473,6 +1473,18 @@ class Plugin(BasePlugin):
             f"name={name!r} action={action}"
         )
 
+        # Metrik: nur echte Neuanlagen zaehlen (failsafe)
+        if created:
+            try:
+                from core.billing.usage import track_api_usage
+                from core.models.admin import UNIT_KUNDE_NEU
+                await track_api_usage(
+                    tenant_id=tenant_id, provider="lexware",
+                    operation="contact-create", units=1, unit=UNIT_KUNDE_NEU,
+                )
+            except Exception:
+                logger.debug("kunde_neu-Tracking uebersprungen", exc_info=True)
+
         # Anfrage-Formular-Mail an den Kunden (nur wenn eine E-Mail vorliegt).
         # Der Kontakt ist an dieser Stelle bereits in Lexware gespeichert —
         # ein Mail-Fehler darf das nicht ruecksetzen, er loest nur eine

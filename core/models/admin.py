@@ -132,6 +132,9 @@ UNIT_CHARACTER = "character"
 UNIT_SECOND = "second"
 UNIT_REQUEST = "request"
 UNIT_MAIL_SEND = "mail_send"
+# Zaehl-Unit fuer neu in Lexware angelegte Kunden-Kontakte (Metrik, nicht
+# abgerechnet — Preis 0). Eine Zeile units_consumed=1 je Neuanlage.
+UNIT_KUNDE_NEU = "kunde_neu"
 
 # Bekannte Provider
 PROVIDER_GEMINI = "gemini"
