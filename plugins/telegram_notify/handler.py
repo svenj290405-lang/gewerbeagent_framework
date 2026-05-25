@@ -9090,7 +9090,7 @@ async def _handle_mitarbeiter_command(chat_id, text):
         return err
 
     from core.database import AsyncSessionLocal
-    from core.models import Employee, ALLE_SKILLS
+    from core.models import Employee
     async with AsyncSessionLocal() as s:
         emp = (await s.execute(
             select(Employee).where(
@@ -9112,15 +9112,11 @@ async def _handle_mitarbeiter_command(chat_id, text):
             return f"✅ Mitarbeiter <b>{emp.name}</b> aktiviert."
         if sub_args.startswith("skills "):
             raw = sub_args[len("skills "):].strip()
+            # Frei eingebbar — keine Whitelist. Smart-Routing (Gemini)
+            # bewertet beliebige Faehigkeits-Strings.
             new_skills = [
                 t.strip().lower() for t in raw.split(",") if t.strip()
             ]
-            unbekannt = [sk for sk in new_skills if sk not in ALLE_SKILLS]
-            if unbekannt:
-                return (
-                    f"Unbekannte Skills: {', '.join(unbekannt)}.\n"
-                    f"Erlaubt: {', '.join(ALLE_SKILLS)}."
-                )
             emp.skills = new_skills or None
             await s.commit()
             return (
@@ -9204,13 +9200,14 @@ async def _handle_mitarbeiter_neu_name_input(chat_id, text):
         chat_id, STATE_MITARBEITER_NEU_SKILLS,
         {"name": name, "slug": final_slug},
     )
-    from core.models import ALLE_SKILLS
     return (
         f"Slug wird <code>{final_slug}</code>.\n\n"
-        "<b>Welche Skills hat der Mitarbeiter?</b>\n"
-        f"Erlaubt: {', '.join(ALLE_SKILLS)}\n\n"
-        "Mehrere mit Komma trennen (z.B. <code>heizung, sanitaer</code>),\n"
-        "oder <b>keine</b> tippen wenn keine Spezialisierung."
+        "<b>Welche Faehigkeiten/Skills hat der Mitarbeiter?</b>\n"
+        "Frei eingebbar — schreib einfach, was er/sie kann "
+        "(kommagetrennt), z.B. <code>heizung, sanitaer, fenster, "
+        "parkett</code>. Das Smart-Routing bewertet die Faehigkeiten "
+        "automatisch.\n\n"
+        "Oder <b>keine</b> tippen wenn keine Spezialisierung."
     )
 
 
@@ -9226,15 +9223,9 @@ async def _handle_mitarbeiter_neu_skills_input(chat_id, text, state_data):
     if raw in ("keine", "none", "-"):
         new_skills = None
     else:
-        new_skills = [t.strip() for t in raw.split(",") if t.strip()]
-        from core.models import ALLE_SKILLS
-        unbekannt = [sk for sk in new_skills if sk not in ALLE_SKILLS]
-        if unbekannt:
-            return (
-                f"Unbekannte Skills: {', '.join(unbekannt)}.\n"
-                f"Erlaubt: {', '.join(ALLE_SKILLS)}.\n\n"
-                "Bitte korrigieren oder <b>keine</b> tippen."
-            )
+        # Skills sind frei eingebbar — keine feste Whitelist mehr. Das
+        # Smart-Routing (Gemini) bewertet beliebige Faehigkeits-Strings.
+        new_skills = [t.strip() for t in raw.split(",") if t.strip()] or None
 
     name = state_data.get("name", "")
     slug = state_data.get("slug", "")
@@ -9268,11 +9259,9 @@ async def _handle_mitarbeiter_neu_skills_input(chat_id, text, state_data):
     # One-Time-Use Aktivierungs-Token erzeugen. Der Mitarbeiter onboardet
     # bevorzugt ueber den kurzen Code (Bot suchen -> START -> Code eingeben);
     # der Deep-Link ist nur die Alternative (in Telegram Web unzuverlaessig).
-    activation_token = None
     activation_code = None
     try:
         token_obj = await create_activation_token(tenant.id, emp_id)
-        activation_token = token_obj.token
         activation_code = token_obj.short_code
     except Exception as e:  # noqa: BLE001
         logger.exception(f"Aktivierungs-Token-Insert fehlgeschlagen: {e}")
@@ -9289,21 +9278,15 @@ async def _handle_mitarbeiter_neu_skills_input(chat_id, text, state_data):
         )
     code_disp = format_short_code(activation_code)
     bot_disp = f"@{bot_username}" if bot_username else "den Bot"
-    link_line = ""
-    if bot_username and activation_token:
-        link_line = (
-            "\nAlternativ als Link: "
-            f"<code>https://t.me/{bot_username}?start=activate_{activation_token}</code>"
-        )
     return (
         f"✅ Mitarbeiter <b>{name}</b> angelegt (Slug <code>{slug}</code>).\n\n"
-        f"<b>So verbindet sich {name}:</b>\n"
+        f"<b>So verbindet sich {name} — auf dem eigenen Handy/Telegram "
+        f"des Mitarbeiters (nicht auf deinem!):</b>\n"
         f"1. In Telegram <b>{bot_disp}</b> suchen + oeffnen\n"
         "2. <b>START</b> druecken\n"
         "3. diesen Code eingeben:\n"
         f"<b>{code_disp}</b>\n"
-        "<i>(persoenlich, einmalig, 7 Tage gueltig)</i>"
-        f"{link_line}\n\n"
+        "<i>(persoenlich, einmalig, 7 Tage gueltig)</i>\n\n"
         f"Danach ist {name} als eigener Mitarbeiter verbunden (eigener "
         "Kalender, Skill-Routing). Spaeter optional <i>/werkstatt</i> fuer "
         "die Heimat-Adresse."
