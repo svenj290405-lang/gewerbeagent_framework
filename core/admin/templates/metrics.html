@@ -37,9 +37,31 @@
     {% endfor %}
 </div>
 
+{% if selected_tenant %}
+{% set r = rows[0] if rows else None %}
 <div class="section-title">
-    {% if selected_tenant %}Kennzahlen{% else %}Verkaufsargumente{% endif %}
-    <small>{% if selected_tenant %}nur {{ selected_tenant.company_name }}{% else %}Plattform-Summe{% endif %} im gewählten Zeitraum</small>
+    Alle Kennzahlen
+    <small>vollständige Übersicht für {{ selected_tenant.company_name }} im gewählten Zeitraum</small>
+</div>
+{% if r %}
+{% for title, items in metric_groups %}
+<div style="margin:16px 0 8px;font-weight:600;font-size:12px;color:#64748b;text-transform:uppercase;letter-spacing:.04em;">{{ title }}</div>
+<div class="stats-grid">
+    {% for key, header, fmt in items %}
+    <div class="stat-card">
+        <div class="stat-label">{{ header }}</div>
+        <div class="stat-value">{{ cell(r[key], fmt) }}</div>
+    </div>
+    {% endfor %}
+</div>
+{% endfor %}
+{% else %}
+<p class="muted">Noch keine Daten im gewählten Zeitraum.</p>
+{% endif %}
+{% else %}
+<div class="section-title">
+    Verkaufsargumente
+    <small>Plattform-Summe im gewählten Zeitraum</small>
 </div>
 <div class="stats-grid">
     {% for tile in tiles %}
@@ -50,6 +72,7 @@
     </div>
     {% endfor %}
 </div>
+{% endif %}
 
 <div class="section-title">
     Visualisierung
@@ -72,9 +95,10 @@
     {% endif %}
 </div>
 
+{% if not selected_tenant %}
 <div class="section-title">
-    {% if selected_tenant %}Alle Kennzahlen{% else %}Detail pro Betrieb{% endif %}
-    <small>{% if not selected_tenant %}Klick auf einen Betrieb → nur dessen Metriken · {% endif %}alle erfassten Metriken · horizontal scrollbar</small>
+    Detail pro Betrieb
+    <small>Klick auf einen Betrieb → nur dessen Metriken · alle erfassten Metriken · horizontal scrollbar</small>
 </div>
 <div class="card" style="overflow-x:auto;">
 <table class="data-table">
@@ -121,6 +145,7 @@
     {% endif %}
 </table>
 </div>
+{% endif %}
 
 <p class="muted" style="margin-top:14px;font-size:13px;line-height:1.6;">
     <strong>Lesehilfe:</strong>

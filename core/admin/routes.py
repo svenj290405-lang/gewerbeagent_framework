@@ -1312,6 +1312,34 @@ _METRIC_COLUMNS = [
     ("kosten", "API-Kosten", "cost"),
 ]
 
+# Key -> (Header, fmt) fuer schnelle Lookups (z.B. gruppierte Detailansicht).
+_METRIC_META = {k: (h, f) for k, h, f in _METRIC_COLUMNS}
+
+# Thematische Gruppierung fuer die Einzel-Betrieb-Detailansicht: ALLE
+# Kennzahlen als Karten-Raster auf einer Seite (statt scrollbarer Tabelle).
+_METRIC_GROUPS = [
+    ("Kommunikation",
+     ["anrufe", "anruf_min", "mails_empf", "mails_bearb", "mails_send"]),
+    ("Anfragen & Termine",
+     ["anfragen", "anfragen_beantw", "webformulare", "buchungen",
+      "stornos", "ausserhalb_gz"]),
+    ("Kunden & Angebote",
+     ["kunden_neu", "angebote", "angebote_angen", "angebot_volumen_eur"]),
+    ("Umsatz & Belege",
+     ["rechnungen", "rechnungen_bezahlt", "umsatz_eur",
+      "umsatz_bezahlt_eur", "belege"]),
+    ("System", ["kosten"]),
+]
+
+
+def _build_metric_groups() -> list[tuple]:
+    """Gruppen mit aufgeloesten (key, header, fmt)-Tripeln fuers Template."""
+    return [
+        (title, [(k, _METRIC_META[k][0], _METRIC_META[k][1]) for k in keys])
+        for title, keys in _METRIC_GROUPS
+    ]
+
+
 _PERIODS = [(30, "30 Tage"), (90, "90 Tage"), (365, "12 Monate"), (0, "Gesamt")]
 
 # Angebot-Status, die als "angenommen" zaehlen (accepted + Folgezustaende).
@@ -1633,6 +1661,7 @@ async def metrics_view(
         "rows": rows, "totals": totals, "tiles": _build_tiles(totals),
         "charts": _build_charts(rows, totals),
         "columns": _METRIC_COLUMNS, "days": days, "periods": _PERIODS,
+        "metric_groups": _build_metric_groups(),
         "selected_tenant": selected_tenant, "tenant_q": tenant_q,
         "csrf_token": request.state.admin_csrf,
     })
