@@ -169,13 +169,25 @@ class GoogleCalendarAdapter(CalendarAdapter):
         # TODO: aus tenant-Config; pragmatisch jetzt "+02:00" wie bisher
         return "+02:00"
 
+    def _rfc3339(self, value: dt.datetime) -> str:
+        """Google verlangt einen RFC3339-Zeitstempel mit GENAU EINEM
+        Offset. Ist ``value`` bereits tz-aware, traegt ``.isoformat()``
+        den Offset schon selbst — dann darf ``_tz_offset()`` NICHT
+        zusaetzlich angeklebt werden, sonst entsteht ein doppelter
+        Offset (z.B. ``...+00:00+02:00``) und Google antwortet mit
+        HTTP 400 ``Bad Request``. Naive Werte interpretieren wir als
+        lokale Zeit und haengen den konfigurierten Offset an (bisheriges
+        Verhalten)."""
+        if value.tzinfo is not None:
+            return value.isoformat()
+        return value.isoformat() + self._tz_offset()
+
     async def is_slot_busy(self, start, end) -> bool:
         service = await self._get_service()
-        tz = self._tz_offset()
         result = service.events().list(
             calendarId=self.calendar_id,
-            timeMin=start.isoformat() + tz,
-            timeMax=end.isoformat() + tz,
+            timeMin=self._rfc3339(start),
+            timeMax=self._rfc3339(end),
             singleEvents=True,
             orderBy="startTime",
         ).execute()
@@ -183,10 +195,9 @@ class GoogleCalendarAdapter(CalendarAdapter):
 
     async def get_busy_periods(self, time_min, time_max):
         service = await self._get_service()
-        tz = self._tz_offset()
         body = {
-            "timeMin": time_min.isoformat() + tz,
-            "timeMax": time_max.isoformat() + tz,
+            "timeMin": self._rfc3339(time_min),
+            "timeMax": self._rfc3339(time_max),
             "items": [{"id": self.calendar_id}],
         }
         result = service.freebusy().query(body=body).execute()
@@ -195,8 +206,8 @@ class GoogleCalendarAdapter(CalendarAdapter):
     async def list_events_for_day(self, target_date):
         from dateutil import parser as _p  # type: ignore
         service = await self._get_service()
-        day_start = dt.datetime.combine(target_date, dt.time(0, 0)).isoformat() + self._tz_offset()
-        day_end = dt.datetime.combine(target_date, dt.time(23, 59)).isoformat() + self._tz_offset()
+        day_start = self._rfc3339(dt.datetime.combine(target_date, dt.time(0, 0)))
+        day_end = self._rfc3339(dt.datetime.combine(target_date, dt.time(23, 59)))
         try:
             resp = service.events().list(
                 calendarId=self.calendar_id,
@@ -327,9 +338,8 @@ class GoogleCalendarAdapter(CalendarAdapter):
             verify_fulltext_name_match,
         )
         service = await self._get_service()
-        tz = self._tz_offset()
-        t_min = time_min.isoformat() + tz
-        t_max = time_max.isoformat() + tz
+        t_min = self._rfc3339(time_min)
+        t_max = self._rfc3339(time_max)
 
         results: dict[str, dict[str, Any]] = {}
 
