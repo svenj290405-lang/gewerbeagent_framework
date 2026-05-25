@@ -41,6 +41,9 @@ from core.integrations.absence_redistribution import (
 from core.integrations.anfrage_reminder_cron import (
     cron_loop as anfrage_reminder_cron_loop,
 )
+from core.integrations.daily_health_check import (
+    cron_loop as daily_health_check_cron_loop,
+)
 
 logger = logging.getLogger(__name__)
 # Phase B1: strukturiertes Logging mit Tenant-/Employee-Context.
@@ -90,11 +93,20 @@ async def lifespan(app: FastAPI):
         anfrage_reminder_task = asyncio.create_task(anfrage_reminder_cron_loop())
         logger.info("Anfrage-Reminder-Cron (stuendlich, 24h vor Termin) gestartet")
 
+        health_tasks = ()
+        if settings.health_check_enabled:
+            health_check_task = asyncio.create_task(daily_health_check_cron_loop())
+            logger.info(
+                "Daily-Health-Check-Cron (taegl. %02d:00) gestartet",
+                settings.health_check_hour,
+            )
+            health_tasks = (health_check_task,)
+
         cron_tasks = (
             cron_task, payment_task, summary_task, dsgvo_task,
             mail_retry_task, db_maintenance_task, absence_task,
             anfrage_reminder_task,
-        )
+        ) + health_tasks
     else:
         logger.warning(
             "Cron-Loops deaktiviert (environment=%s, dev_cron_disabled=%s)",

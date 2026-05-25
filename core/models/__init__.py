@@ -115,6 +115,12 @@ from core.models.employee import (
     get_employees_for_tenant,
     get_employee_by_telegram_chat,
 )
+from core.models.health_check import (
+    HealthCheckResult,
+    HEALTH_STATUS_OK,
+    HEALTH_STATUS_DEGRADED,
+    HEALTH_STATUS_ERROR,
+)
 from core.models.employee_absence import (
     EmployeeAbsence,
     ABSENCE_KRANK,
@@ -185,6 +191,10 @@ __all__ = [
     "get_default_employee",
     "get_employees_for_tenant",
     "get_employee_by_telegram_chat",
+    "HealthCheckResult",
+    "HEALTH_STATUS_OK",
+    "HEALTH_STATUS_DEGRADED",
+    "HEALTH_STATUS_ERROR",
     "EmployeeAbsence",
     "ABSENCE_KRANK",
     "ABSENCE_URLAUB",

@@ -89,6 +89,13 @@ class Settings(BaseSettings):
     # in .env.dev kann man auch im Dev explizit alle Crons abschalten.
     dev_cron_disabled: bool = False
 
+    # Taeglicher System-Health-Check (core/integrations/daily_health_check.py).
+    # Prueft morgens, ob DB/Telegram-Bot/Crons laufen, schreibt das Ergebnis
+    # ins Admin-Tool (/admin/health) und schickt bei einem Problem eine Mail.
+    health_check_enabled: bool = True
+    health_check_hour: int = 7          # Stunde (Europe/Berlin), morgens
+    health_alert_email: str = "svenj05@gmx.de"
+
     @property
     def is_production(self) -> bool:
         return self.environment == "production"

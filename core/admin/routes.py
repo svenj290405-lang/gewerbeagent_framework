@@ -36,6 +36,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import and_, desc, func, or_, select, text, update
 
+from config.settings import settings
 from core.admin.auth import (
     SESSION_COOKIE_NAME,
     admin_users_exist,
@@ -536,6 +537,77 @@ async def api_health(
         }
     except Exception as e:
         return {"status": "ok", "db": "ok", "cron_check_error": str(e)[:80]}
+
+
+@router.get("/health", response_class=HTMLResponse)
+async def health_view(
+    request: Request,
+    user: AdminUser = Depends(require_admin),
+):
+    """System-Health-Seite: Ergebnisse des taeglichen Health-Checks +
+    aktueller Live-Cron-Status."""
+    from core.models import HealthCheckResult
+    async with get_session() as s:
+        results = (await s.execute(
+            select(HealthCheckResult)
+            .order_by(HealthCheckResult.checked_at.desc())
+            .limit(20)
+        )).scalars().all()
+        await audit(user_id=user.id, action="health.view",
+                    request=request, session=s)
+
+    try:
+        from core.integrations.cron_health import get_health_report
+        live = get_health_report()
+    except Exception:  # noqa: BLE001
+        live = None
+
+    return templates.TemplateResponse(request, "health.html", {
+        "request": request, "user": user, "active": "health",
+        "results": results, "latest": results[0] if results else None,
+        "live": live,
+        "alert_email": settings.health_alert_email,
+        "check_hour": settings.health_check_hour,
+        "csrf_token": request.state.admin_csrf,
+    })
+
+
+@router.post("/health/run")
+async def health_run_now(
+    request: Request,
+    user: AdminUser = Depends(require_admin),
+    _: None = Depends(require_csrf),
+):
+    """Manuell einen Health-Check ausloesen (statt auf den Morgen zu warten)."""
+    from core.integrations.daily_health_check import run_health_check
+    await run_health_check(send_alert=True)
+    async with get_session() as s:
+        await audit(user_id=user.id, action="health.run_manual",
+                    request=request, session=s)
+    return RedirectResponse("/admin/health", status_code=303)
+
+
+@router.post("/health/test-alert")
+async def health_test_alert(
+    request: Request,
+    user: AdminUser = Depends(require_admin),
+    _: None = Depends(require_csrf),
+):
+    """Test-Alarm-Mail an die Alert-Adresse schicken (prueft den Mail-Pfad)."""
+    from core.integrations.daily_health_check import _send_alert_email
+    detail = {
+        "db": {"ok": True, "error": None},
+        "telegram": {"ok": True, "info": "Test"},
+        "crons": {"status": "ok", "crons": {}},
+    }
+    try:
+        await _send_alert_email("test", detail)
+    except Exception:  # noqa: BLE001
+        logger.exception("Test-Alarm-Mail fehlgeschlagen")
+    async with get_session() as s:
+        await audit(user_id=user.id, action="health.test_alert",
+                    request=request, session=s)
+    return RedirectResponse("/admin/health", status_code=303)
 
 
 # =====================================================================
