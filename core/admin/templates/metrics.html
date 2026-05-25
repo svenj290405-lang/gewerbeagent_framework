@@ -13,24 +13,33 @@
 {% block content %}
 <div class="page-header">
     <div>
+        {% if selected_tenant %}
+        <h1>Metriken — {{ selected_tenant.company_name }}</h1>
+        <p>
+            <a href="/admin/metrics">← Alle Betriebe</a> ·
+            <a href="/admin/tenants/{{ selected_tenant.id }}">Betrieb verwalten →</a>
+            · <span class="muted">{{ selected_tenant.slug }}</span>
+        </p>
+        {% else %}
         <h1>Metriken</h1>
         <p>Was das System leistet — Grundlage für Preisgespräche. {{ rows|length }} Betriebe.</p>
+        {% endif %}
     </div>
     <div>
-        <a href="/admin/metrics/export.csv?days={{ days }}" class="btn btn-sm">CSV export</a>
+        <a href="/admin/metrics/export.csv?days={{ days }}{{ tenant_q }}" class="btn btn-sm">CSV export</a>
     </div>
 </div>
 
 <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:18px;">
     {% for d, label in periods %}
-    <a href="/admin/metrics?days={{ d }}"
+    <a href="/admin/metrics?days={{ d }}{{ tenant_q }}"
        class="btn btn-sm {% if d == days %}btn-primary{% endif %}">{{ label }}</a>
     {% endfor %}
 </div>
 
 <div class="section-title">
-    Verkaufsargumente
-    <small>Plattform-Summe im gewählten Zeitraum</small>
+    {% if selected_tenant %}Kennzahlen{% else %}Verkaufsargumente{% endif %}
+    <small>{% if selected_tenant %}nur {{ selected_tenant.company_name }}{% else %}Plattform-Summe{% endif %} im gewählten Zeitraum</small>
 </div>
 <div class="stats-grid">
     {% for tile in tiles %}
@@ -44,26 +53,28 @@
 
 <div class="section-title">
     Visualisierung
-    <small>Plattform-Leistung &amp; Aktivität je Betrieb im gewählten Zeitraum</small>
+    <small>{% if selected_tenant %}Leistung dieses Betriebs{% else %}Plattform-Leistung &amp; Aktivität je Betrieb{% endif %} im gewählten Zeitraum</small>
 </div>
-<div style="display:grid;grid-template-columns:1fr 1fr;gap:18px;">
+<div style="display:grid;grid-template-columns:{% if selected_tenant %}1fr{% else %}1fr 1fr{% endif %};gap:18px;">
     <div class="card">
-        <h3 style="margin:0 0 10px;font-size:14px;">Was das System erledigt hat</h3>
+        <h3 style="margin:0 0 10px;font-size:14px;">Was {% if selected_tenant %}dieser Betrieb{% else %}das System{% endif %} erledigt hat</h3>
         <div class="chart-wrap" style="position:relative;height:300px;">
             <canvas id="plattformChart"></canvas>
         </div>
     </div>
+    {% if not selected_tenant %}
     <div class="card">
         <h3 style="margin:0 0 10px;font-size:14px;">Aktivität je Betrieb (Top 12)</h3>
         <div class="chart-wrap" style="position:relative;height:300px;">
             <canvas id="betriebeChart"></canvas>
         </div>
     </div>
+    {% endif %}
 </div>
 
 <div class="section-title">
-    Detail pro Betrieb
-    <small>alle erfassten Metriken · horizontal scrollbar</small>
+    {% if selected_tenant %}Alle Kennzahlen{% else %}Detail pro Betrieb{% endif %}
+    <small>{% if not selected_tenant %}Klick auf einen Betrieb → nur dessen Metriken · {% endif %}alle erfassten Metriken · horizontal scrollbar</small>
 </div>
 <div class="card" style="overflow-x:auto;">
 <table class="data-table">
@@ -79,7 +90,11 @@
     {% for r in rows %}
         <tr>
             <td>
+                {% if selected_tenant %}
                 <a href="/admin/tenants/{{ r.id }}">{{ r.company_name }}</a>
+                {% else %}
+                <a href="/admin/metrics?tenant={{ r.id }}">{{ r.company_name }}</a>
+                {% endif %}
                 <div class="muted" style="font-size:12px;">{{ r.slug }}</div>
             </td>
             {% for key, header, fmt in columns %}

@@ -40,17 +40,23 @@
 
 <div class="chart-wrap">
     <h3>Mails &amp; Anfragen pro Tag</h3>
-    <canvas id="trafficChart" height="80"></canvas>
+    <div style="position:relative;height:220px;">
+        <canvas id="trafficChart"></canvas>
+    </div>
 </div>
 
 <div style="display:grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 24px;">
     <div class="chart-wrap">
         <h3>API-Kosten nach Provider (30 Tage)</h3>
-        <canvas id="costsByProvider" height="220"></canvas>
+        <div style="position:relative;height:240px;">
+            <canvas id="costsByProvider"></canvas>
+        </div>
     </div>
     <div class="chart-wrap">
         <h3>Top Tenants nach Kosten (30 Tage)</h3>
-        <canvas id="costsByTenant" height="220"></canvas>
+        <div style="position:relative;height:240px;">
+            <canvas id="costsByTenant"></canvas>
+        </div>
     </div>
 </div>
 

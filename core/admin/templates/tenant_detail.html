@@ -12,7 +12,12 @@
             · status <span class="pill pill-{{ 'green' if tenant.status == 'active' else 'yellow' }}">{{ tenant.status }}</span>
         </p>
     </div>
-    <div>
+    <div style="display:flex;gap:8px;">
+        <a href="/admin/metrics?tenant={{ tenant.id }}"
+           class="btn"
+           style="text-decoration:none;">
+           📊 Metriken
+        </a>
         <a href="/admin/tenants/{{ tenant.id }}/features"
            class="btn btn-primary"
            style="text-decoration:none;">
@@ -99,11 +104,15 @@
 <div style="display:grid; grid-template-columns: 2fr 1fr; gap: 16px; margin-bottom: 24px;">
     <div class="chart-wrap">
         <h3>API-Kosten letzte 30 Tage</h3>
-        <canvas id="costTimeline" height="200"></canvas>
+        <div style="position:relative;height:240px;">
+            <canvas id="costTimeline"></canvas>
+        </div>
     </div>
     <div class="chart-wrap">
         <h3>Provider-Verteilung</h3>
-        <canvas id="providerPie" height="200"></canvas>
+        <div style="position:relative;height:240px;">
+            <canvas id="providerPie"></canvas>
+        </div>
     </div>
 </div>
 

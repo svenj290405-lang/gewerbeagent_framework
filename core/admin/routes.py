@@ -1333,6 +1333,17 @@ def _metrics_days(request: Request) -> int:
     return days if days in (30, 90, 365, 0) else 30
 
 
+def _metrics_tenant_id(request: Request) -> uuid.UUID | None:
+    """Optionaler ?tenant=<uuid>-Filter fuer den Drill-down auf einen Betrieb."""
+    raw = request.query_params.get("tenant")
+    if not raw:
+        return None
+    try:
+        return uuid.UUID(raw)
+    except (ValueError, TypeError):
+        return None
+
+
 def _after_hours(ts):
     """Bedingung: Zeitstempel liegt ausserhalb Mo-Fr 8-18 Uhr
     (Europe/Berlin) — Abende, Naechte, Wochenenden. ts ist timestamptz."""
@@ -1344,15 +1355,20 @@ def _after_hours(ts):
     )
 
 
-async def _collect_metrics(s, start: dt.datetime | None) -> tuple[list[dict], dict]:
+async def _collect_metrics(
+    s, start: dt.datetime | None, tenant_id: uuid.UUID | None = None,
+) -> tuple[list[dict], dict]:
     """Business-Metriken pro Tenant. Eine gruppierte Aggregat-Query je
     Metrik (statt N-pro-Tenant). start=None => Gesamt-Zeitraum (kein
-    created-Filter). Liefert (rows, totals)."""
+    created-Filter). tenant_id gesetzt => nur dieser eine Betrieb
+    (Drill-down). Liefert (rows, totals)."""
 
     async def grouped(value_expr, tenant_col, created_col, *wheres) -> dict:
         q = select(tenant_col, value_expr).group_by(tenant_col)
         if start is not None and created_col is not None:
             q = q.where(created_col >= start)
+        if tenant_id is not None:
+            q = q.where(tenant_col == tenant_id)
         for w in wheres:
             q = q.where(w)
         return {row[0]: row[1] for row in (await s.execute(q))}
@@ -1397,6 +1413,8 @@ async def _collect_metrics(s, start: dt.datetime | None) -> tuple[list[dict], di
     )
     if start is not None:
         wf_q = wf_q.where(AnfrageResponse.submitted_at >= start)
+    if tenant_id is not None:
+        wf_q = wf_q.where(AnfrageToken.tenant_id == tenant_id)
     webformulare = {row[0]: row[1] for row in (await s.execute(wf_q))}
     buchungen = await grouped(
         func.count(EmailConversation.id), EmailConversation.tenant_id,
@@ -1447,9 +1465,10 @@ async def _collect_metrics(s, start: dt.datetime | None) -> tuple[list[dict], di
         func.count(AnfrageToken.id), AnfrageToken.tenant_id,
         AnfrageToken.created_at, _after_hours(AnfrageToken.created_at))
 
-    tenants = (await s.execute(
-        select(Tenant).order_by(Tenant.company_name)
-    )).scalars().all()
+    tq = select(Tenant).order_by(Tenant.company_name)
+    if tenant_id is not None:
+        tq = tq.where(Tenant.id == tenant_id)
+    tenants = (await s.execute(tq)).scalars().all()
 
     def geti(d: dict, tid) -> int:
         return int(d.get(tid, 0) or 0)
@@ -1595,17 +1614,26 @@ async def metrics_view(
 ):
     days = _metrics_days(request)
     start = None if days == 0 else _today_utc_start() - dt.timedelta(days=days)
+    tid = _metrics_tenant_id(request)
 
     async with get_session() as s:
-        rows, totals = await _collect_metrics(s, start)
+        selected_tenant = None
+        if tid is not None:
+            selected_tenant = (await s.execute(
+                select(Tenant).where(Tenant.id == tid)
+            )).scalar_one_or_none()
+        scope = tid if selected_tenant else None
+        rows, totals = await _collect_metrics(s, start, tenant_id=scope)
         await audit(user_id=user.id, action="metrics.view",
                     request=request, session=s)
 
+    tenant_q = f"&tenant={tid}" if selected_tenant else ""
     return templates.TemplateResponse(request, "metrics.html", {
         "request": request, "user": user,
         "rows": rows, "totals": totals, "tiles": _build_tiles(totals),
         "charts": _build_charts(rows, totals),
         "columns": _METRIC_COLUMNS, "days": days, "periods": _PERIODS,
+        "selected_tenant": selected_tenant, "tenant_q": tenant_q,
         "csrf_token": request.state.admin_csrf,
     })
 
@@ -1617,9 +1645,16 @@ async def metrics_export_csv(
 ):
     days = _metrics_days(request)
     start = None if days == 0 else _today_utc_start() - dt.timedelta(days=days)
+    tid = _metrics_tenant_id(request)
 
     async with get_session() as s:
-        rows, totals = await _collect_metrics(s, start)
+        selected_tenant = None
+        if tid is not None:
+            selected_tenant = (await s.execute(
+                select(Tenant).where(Tenant.id == tid)
+            )).scalar_one_or_none()
+        scope = tid if selected_tenant else None
+        rows, totals = await _collect_metrics(s, start, tenant_id=scope)
         await audit(user_id=user.id, action="metrics.export",
                     request=request, session=s)
 
@@ -1633,7 +1668,8 @@ async def metrics_export_csv(
                + [_csv_val(totals[k], fmt) for k, _h, fmt in _METRIC_COLUMNS])
 
     label = "gesamt" if days == 0 else f"{days}d"
-    fname = f"metriken_{label}_{_today_utc_start().strftime('%Y%m%d')}.csv"
+    slug_part = f"_{selected_tenant.slug}" if selected_tenant else ""
+    fname = f"metriken{slug_part}_{label}_{_today_utc_start().strftime('%Y%m%d')}.csv"
     return Response(
         content=buf.getvalue(),
         media_type="text/csv",
