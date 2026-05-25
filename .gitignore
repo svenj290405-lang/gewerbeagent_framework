@@ -13,6 +13,7 @@ wheels/
 .env
 .env.local
 .env.bak*
+.env.backup*
 .env.*.bak
 .env.save
 *.db
