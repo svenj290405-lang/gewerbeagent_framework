@@ -238,10 +238,23 @@ async def _maybe_run() -> None:
 
 async def cron_loop() -> None:
     """Backgroundtask: tick alle 60s, fuehre Health-Check 1x morgens aus."""
+    global _last_run_date
     logger.info(
         "Daily-Health-Check-Cron gestartet (taegl. %02d:00 Europe/Berlin)",
         settings.health_check_hour,
     )
+    # Beim Start NICHT sofort nachfeuern, wenn die Check-Stunde heute schon
+    # vorbei ist — sonst loest jeder Restart (z.B. ein Deploy am Nachmittag)
+    # einen Lauf aus, der wegen noch kalter Cron-Heartbeats faelschlich
+    # "degraded" meldet und eine Fehlalarm-Mail schickt. Erst morgen.
+    now_local = dt.datetime.now(zoneinfo.ZoneInfo("Europe/Berlin"))
+    if now_local.hour >= settings.health_check_hour:
+        _last_run_date = now_local.date()
+        logger.info(
+            "Daily-Health-Check: heutiger Lauf uebersprungen (Start nach "
+            "%02d:00) — naechster Lauf morgen frueh.",
+            settings.health_check_hour,
+        )
     from core.integrations.cron_health import record_heartbeat
     try:
         while True:
