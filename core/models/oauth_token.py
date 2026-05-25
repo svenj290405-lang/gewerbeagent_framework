@@ -10,14 +10,15 @@ und werden ueber die zwei partial-unique-Indizes
 uq_oauth_employee_provider) eindeutig gehalten — siehe Migration
 q3l7h2j5g9k4.
 
-Der alte Constraint uq_tenant_provider bleibt waehrend der
-Uebergangsphase als Sicherheitsnetz, wird aber in Migration M2
-gedroppt sobald der Code stabil employee_id-aware schreibt.
+Der alte Constraint uq_tenant_provider (tenant_id, provider) wurde in
+Migration s5n9j4l7q3r8 (M2) gedroppt, nachdem der Code stabil
+employee_id-aware schreibt — sonst koennte ein zweiter Mitarbeiter
+keinen eigenen Provider-Token verbinden.
 """
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, String, UniqueConstraint
+from sqlalchemy import DateTime, ForeignKey, String
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -28,11 +29,13 @@ from core.security.encryption import decrypt, encrypt
 class OAuthToken(Base):
     __tablename__ = "oauth_tokens"
 
-    __table_args__ = (
-        # Legacy-Constraint — bleibt als Sicherheitsnetz fuer M1.
-        # Wird in M2 (separate Migration) gedroppt.
-        UniqueConstraint("tenant_id", "provider", name="uq_tenant_provider"),
-    )
+    # Eindeutigkeit wird durch zwei partial-unique-Indizes erzwungen
+    # (Migration q3l7h2j5g9k4): uq_oauth_employee_provider (employee_id,
+    # provider) und uq_oauth_tenant_provider_when_no_employee
+    # (tenant_id, provider WHERE employee_id IS NULL). Der alte
+    # uq_tenant_provider wurde in Migration s5n9j4l7q3r8 (M2) gedroppt,
+    # damit mehrere Mitarbeiter pro Tenant je einen eigenen Provider-
+    # Token (eigener Kalender) verbinden koennen.
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
