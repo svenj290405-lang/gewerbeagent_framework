@@ -1303,11 +1303,8 @@ _METRIC_COLUMNS = [
     ("ausserhalb_gz", "Außerh. GZ", "int"),
     ("angebote", "Angebote", "int"),
     ("angebote_angen", "Angeb. angen.", "int"),
-    ("angebot_volumen_eur", "Angebotsvol.", "eur"),
     ("rechnungen", "Rechnungen", "int"),
     ("rechnungen_bezahlt", "Rechn. bez.", "int"),
-    ("umsatz_eur", "Umsatz ges.", "eur"),
-    ("umsatz_bezahlt_eur", "Umsatz bez.", "eur"),
     ("belege", "Belege", "int"),
     ("kosten", "API-Kosten", "cost"),
 ]
@@ -1324,10 +1321,9 @@ _METRIC_GROUPS = [
      ["anfragen", "anfragen_beantw", "webformulare", "buchungen",
       "stornos", "ausserhalb_gz"]),
     ("Kunden & Angebote",
-     ["kunden_neu", "angebote", "angebote_angen", "angebot_volumen_eur"]),
-    ("Umsatz & Belege",
-     ["rechnungen", "rechnungen_bezahlt", "umsatz_eur",
-      "umsatz_bezahlt_eur", "belege"]),
+     ["kunden_neu", "angebote", "angebote_angen"]),
+    ("Rechnungen & Belege",
+     ["rechnungen", "rechnungen_bezahlt", "belege"]),
     ("System", ["kosten"]),
 ]
 
@@ -1459,20 +1455,10 @@ async def _collect_metrics(
     angebote_angen = await grouped(
         func.count(Angebot.id), Angebot.tenant_id, Angebot.created_at,
         Angebot.status.in_(_ANGEBOT_ANGENOMMEN))
-    angebot_volumen = await grouped(
-        func.coalesce(func.sum(Angebot.gesamtbetrag_brutto_eur), 0),
-        Angebot.tenant_id, Angebot.created_at)
     rechnungen = await grouped(
         func.count(Rechnung.id), Rechnung.tenant_id, Rechnung.created_at)
     rechnungen_bezahlt = await grouped(
         func.count(Rechnung.id), Rechnung.tenant_id, Rechnung.created_at,
-        Rechnung.status == RECHNUNG_STATUS_BEZAHLT)
-    umsatz = await grouped(
-        func.coalesce(func.sum(Rechnung.betrag_brutto_eur), 0),
-        Rechnung.tenant_id, Rechnung.created_at)
-    umsatz_bezahlt = await grouped(
-        func.coalesce(func.sum(Rechnung.betrag_brutto_eur), 0),
-        Rechnung.tenant_id, Rechnung.created_at,
         Rechnung.status == RECHNUNG_STATUS_BEZAHLT)
     belege = await grouped(
         func.count(Beleg.id), Beleg.tenant_id, Beleg.created_at)
@@ -1535,11 +1521,8 @@ async def _collect_metrics(
             ),
             "angebote": ang,
             "angebote_angen": geti(angebote_angen, tid),
-            "angebot_volumen_eur": getf(angebot_volumen, tid),
             "rechnungen": rech,
             "rechnungen_bezahlt": geti(rechnungen_bezahlt, tid),
-            "umsatz_eur": getf(umsatz, tid),
-            "umsatz_bezahlt_eur": getf(umsatz_bezahlt, tid),
             "belege": bel,
             "kosten": getf(kosten, tid),
         }
