@@ -122,6 +122,13 @@ _REDACTION_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     # (a***@domain.de). Telefon: kontiguierte +49-/0049-/0…-Nummern.
     (re.compile(r"(?i)\b([a-z0-9._%+-])[a-z0-9._%+-]*@([a-z0-9.-]+\.[a-z]{2,})\b"),
      r"\1***@\2"),
+    # S14: dieselbe Adresse in URL-kodierter Form (das "@" steht als
+    # "%40"). Tritt in geloggten Google-API-Fehler-URLs auf, z.B.
+    # "...kunde_email%3Dsvenj05%40gmx.de&q=svenj05%40gmx.de" — dort
+    # greift der @-Pattern oben nicht. (Local-Part-Klasse ohne "%",
+    # damit der Greedy-Match das "%40" nicht selbst verschluckt.)
+    (re.compile(r"(?i)([a-z0-9._+-])[a-z0-9._+-]*%40([a-z0-9.-]+\.[a-z]{2,})"),
+     r"\1***%40\2"),
     (re.compile(r"(?<!\d)(?:\+|00)\d{9,14}(?!\d)"), "<tel-redacted>"),
     (re.compile(r"(?<!\d)0\d{9,13}(?!\d)"), "<tel-redacted>"),
 )
