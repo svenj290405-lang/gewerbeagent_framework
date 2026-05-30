@@ -444,6 +444,48 @@ async def test_buche_termin_invalid_employee_id_falls_back_to_rerouting(monkeypa
 
 
 @pytest.mark.asyncio
+async def test_buche_termin_no_coverage_does_not_book(monkeypatch):
+    """reason='no-coverage' (kein Mitarbeiter zur Zeit verfuegbar) → NICHT
+    blind den Default-Employee buchen, sondern erfolg=False zurueckgeben."""
+    tenant = _make_tenant("demo")
+    fallback_emp = _make_employee(
+        slug="inhaber", is_default=True, calendar_provider="google",
+        tenant_id=tenant.id,
+    )
+    # choose_employee liefert bei no-coverage zwar den Default-Employee als
+    # Signal-Traeger, aber eine Buchung waere auf einen abwesenden Mitarbeiter.
+    routing = RoutingDecision(
+        employee_id=fallback_emp.id, employee_name="Inhaber",
+        employee_slug="inhaber", reason="no-coverage", score=0.0, debug={},
+    )
+    kalender = _FakeKalender(find_slots_result=None)
+
+    monkeypatch.setattr(
+        voice_handler, "AsyncSessionLocal",
+        _make_session_factory([tenant, fallback_emp]),
+    )
+    monkeypatch.setattr(
+        voice_handler, "choose_employee", AsyncMock(return_value=routing),
+    )
+    import core.plugin_system as ps
+    monkeypatch.setattr(ps, "get_plugin_for_tenant", AsyncMock(return_value=kalender))
+
+    plugin = _make_plugin()
+    result = await plugin._handle_buche_termin({
+        "tenant_slug": "demo",
+        "slot_id": "20.05.2026|14:00|90",
+        # employee_id fehlt → reroute → no-coverage
+        "kunde_name": "Frau Mueller",
+        "anliegen": "Notfall",
+    })
+
+    assert result["erfolg"] is False
+    assert "kein mitarbeiter" in result["nachricht"].lower()
+    # KEINE Buchung an den Kalender weitergereicht.
+    assert kalender.received_payloads == []
+
+
+@pytest.mark.asyncio
 async def test_buche_termin_invalid_slot_id():
     """Kaputte slot_id → frueher Fail mit aussagekraeftiger Nachricht."""
     plugin = _make_plugin()

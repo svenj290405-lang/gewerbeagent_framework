@@ -870,6 +870,25 @@ class Plugin(BasePlugin):
             )
             employee_id = routing.employee_id if routing else None
 
+            # no-coverage: der Verfuegbarkeits-Filter hat ALLE Mitarbeiter
+            # ausgeschlossen (keiner arbeitet zu dieser Zeit). choose_employee
+            # liefert dann nur den Default-Employee als Signal-Traeger — eine
+            # Buchung waere auf einen abwesenden Mitarbeiter. Daher NICHT blind
+            # buchen, sondern dem Voice-Agenten zurueckmelden, damit er eine
+            # andere Zeit anbietet.
+            if routing is not None and routing.reason == "no-coverage":
+                logger.info(
+                    f"buche_termin: no-coverage fuer {datum} {uhrzeit} "
+                    f"(tenant={tenant_slug}) — keine Buchung, andere Zeit anbieten"
+                )
+                return {
+                    "erfolg": False,
+                    "nachricht": (
+                        "Zu diesem Zeitpunkt ist leider kein Mitarbeiter "
+                        "verfuegbar. Bitte einen anderen Termin anbieten."
+                    ),
+                }
+
         book_payload = {
             "name": name,
             "anliegen": anliegen,
