@@ -2245,9 +2245,7 @@ async def _dispatch_update(payload):
     elif text == "/neue_termine":
         await _clear_state(chat_id)
         reply = await _handle_neue_termine_command(chat_id)
-    elif text in ("/aufnahmen", "/anrufe"):
-        # /anrufe = alter Name, als stiller Alias erhalten (Muscle-Memory),
-        # nicht mehr in der Befehlsliste beworben.
+    elif text == "/aufnahmen":
         await _clear_state(chat_id)
         reply = await _handle_aufnahmen_command(chat_id)
     elif text.startswith("/kunde"):
