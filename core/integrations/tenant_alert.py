@@ -80,15 +80,21 @@ async def _send_alert(
 ) -> bool:
     """Schickt Push an passenden Telegram-Chat. Failsafe."""
     try:
-        # Lazy-Import damit keine Plugin-Loading-Zirkel
-        from plugins.telegram_notify.handler import _resolve_chat_id_for_push  # type: ignore
-        from core.database.connection import get_session as _gs
-        from core.models.admin import AdminAuditLog as _A  # noqa
-        chat_id, bot_token = await _resolve_chat_id_for_push(
-            tenant_id=tenant_id, employee_id=employee_id,
+        # Lazy-Import damit keine Plugin-Loading-Zirkel.
+        # resolve_employee_push_target liefert (bot_token, chat_id, prefix);
+        # das frueher hier genutzte _resolve_chat_id_for_push hatte eine
+        # andere Signatur (session/fallback) + Rueckgabe (nur chat_id) und
+        # warf bei diesem Aufruf still einen TypeError -> Push fiel lautlos aus.
+        from plugins.telegram_notify.handler import TelegramNotifier  # type: ignore
+        bot_token, chat_id, prefix = (
+            await TelegramNotifier.resolve_employee_push_target(
+                tenant_id, employee_id,
+            )
         )
         if not chat_id or not bot_token:
             return False
+        if prefix:
+            message = f"{prefix}{message}"
         # Direkter Telegram-API-Call (httpx) um nicht den Plugin-State
         # zu pollutieren.
         import httpx

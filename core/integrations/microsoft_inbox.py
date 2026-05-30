@@ -792,13 +792,19 @@ async def _forward_attachments_to_telegram(
     if not attachments:
         return 0
 
-    # Telegram-Chat finden via _resolve_chat_id_for_push
+    # Telegram-Chat + Bot-Token aufloesen. resolve_employee_push_target
+    # liefert (bot_token, chat_id, prefix); das frueher hier genutzte
+    # _resolve_chat_id_for_push hatte eine andere Signatur (session/fallback)
+    # + Rueckgabe (nur chat_id) und warf bei diesem Aufruf still einen
+    # TypeError -> die Anhang-Weiterleitung fiel lautlos komplett aus.
     try:
         from plugins.telegram_notify.handler import (
-            _resolve_chat_id_for_push,  # type: ignore
+            TelegramNotifier,  # type: ignore
         )
-        chat_id, bot_token = await _resolve_chat_id_for_push(
-            tenant_id=tenant_id, employee_id=employee_id,
+        bot_token, chat_id, _prefix = (
+            await TelegramNotifier.resolve_employee_push_target(
+                tenant_id, employee_id,
+            )
         )
     except Exception as e:
         logger.debug(f"Anhang-Forward: chat_id-Lookup failed: {e}")
@@ -807,7 +813,10 @@ async def _forward_attachments_to_telegram(
     if not chat_id or not bot_token:
         return 0
 
-    # Pre-Header: was kommt
+    # Pre-Header: was kommt. Absender/Betreff stammen aus einer eingehenden
+    # (angreiferkontrollierten) Mail -> HTML-escapen, damit kein Markup in
+    # die Inhaber-Chat-Nachricht injiziert werden kann (parse_mode=HTML).
+    import html as _html
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             await client.post(
@@ -816,8 +825,8 @@ async def _forward_attachments_to_telegram(
                     "chat_id": chat_id,
                     "text": (
                         f"📎 <b>{len(attachments)} Anhang/Anhaenge</b> "
-                        f"von {sender_label}\n"
-                        f"Subject: {subject[:80]}"
+                        f"von {_html.escape(sender_label)}\n"
+                        f"Subject: {_html.escape(subject[:80])}"
                     ),
                     "parse_mode": "HTML",
                 },
