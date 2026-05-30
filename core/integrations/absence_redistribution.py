@@ -528,6 +528,12 @@ async def cron_loop() -> None:
 
 async def _run_cron_for_today(today: dt.date) -> None:
     """Iteriert alle Tenants → alle aktiven Krank-Absences → umverteilen."""
+    # _processed_events dedupt nur INNERHALB eines Laufs (ein Event kann bei
+    # mehreren kranken Mitarbeitern auftauchen). Zu Lauf-Beginn leeren: sonst
+    # waechst das Set unbegrenzt (Memory-Leak) UND ein in einem frueheren Lauf
+    # NICHT verschobenes Event (z.B. damals kein Ziel-MA frei) koennte nie
+    # wieder umverteilt werden.
+    _processed_events.clear()
     # Wir laden alle Tenants und je Tenant alle aktiven Krank-Absences heute.
     async with AsyncSessionLocal() as s:
         tenants = (await s.execute(select(Tenant))).scalars().all()
