@@ -36,7 +36,12 @@ import sys
 from sqlalchemy import and_, delete, or_, select
 
 from core.database import AsyncSessionLocal
-from core.models import AnfrageToken, GeocodeCache, Kundengespraech
+from core.models import (
+    AnfrageToken,
+    GeocodeCache,
+    Kundengespraech,
+    Visualisierung,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -123,6 +128,37 @@ async def cleanup_anfragen(
         return res.rowcount
 
 
+async def cleanup_visualisierungen(
+    retention_days: int, execute: bool, *, tenant_id=None,
+) -> int:
+    """Loescht Foto-Visualisierungen aelter als retention_days.
+
+    Enthaelt kunde_email/kunde_name + Original-/Ergebnis-Foto des Kunden
+    (BYTEA) — alles PII. Anker ist created_at. Tabelle hat tenant_id,
+    laeuft also pro Tenant wenn tenant_id gesetzt ist.
+    """
+    cutoff = _cutoff(retention_days)
+    async with AsyncSessionLocal() as s:
+        stmt = select(Visualisierung.id).where(Visualisierung.created_at < cutoff)
+        if tenant_id is not None:
+            stmt = stmt.where(Visualisierung.tenant_id == tenant_id)
+        ids = list((await s.execute(stmt)).scalars())
+
+        if not execute:
+            logger.info(
+                f"[visualisierungen] Trockenlauf: {len(ids)} Kandidaten "
+                f"(cutoff={cutoff.date().isoformat()})"
+            )
+            return 0
+        if not ids:
+            return 0
+        res = await s.execute(
+            delete(Visualisierung).where(Visualisierung.id.in_(ids))
+        )
+        await s.commit()
+        return res.rowcount
+
+
 async def cleanup_geocode_cache(retention_days: int, execute: bool) -> int:
     """Loescht Geocode-Cache-Eintraege (Kundenadressen) aelter als
     retention_days. Tabelle ist tenant-uebergreifend (kein tenant_id) —
@@ -157,11 +193,12 @@ def main() -> int:
     async def _run() -> None:
         g = await cleanup_kundengespraeche(args.days, args.execute)
         a = await cleanup_anfragen(args.days, args.execute)
+        v = await cleanup_visualisierungen(args.days, args.execute)
         c = await cleanup_geocode_cache(args.days, args.execute)
         if args.execute:
             logger.info(
                 f"Geloescht: {g} Gespraeche, {a} Anfragen, "
-                f"{c} Geocode-Eintraege."
+                f"{v} Visualisierungen, {c} Geocode-Eintraege."
             )
 
     asyncio.run(_run())

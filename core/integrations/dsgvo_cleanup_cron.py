@@ -70,6 +70,7 @@ async def _maybe_run_cleanup() -> None:
             cleanup_anfragen,
             cleanup_geocode_cache,
             cleanup_kundengespraeche,
+            cleanup_visualisierungen,
         )
 
         async with AsyncSessionLocal() as s:
@@ -82,6 +83,7 @@ async def _maybe_run_cleanup() -> None:
         total_mails = 0
         total_gespraeche = 0
         total_anfragen = 0
+        total_visualisierungen = 0
         # Laengste Retention bestimmt, wie lange der globale Geocode-Cache
         # gehalten wird (kein Eintrag soll geloescht werden, solange noch
         # irgendein Tenant ihn innerhalb seiner Frist nutzen darf).
@@ -97,15 +99,20 @@ async def _maybe_run_cleanup() -> None:
                 anfragen = await cleanup_anfragen(
                     r_days, execute=True, tenant_id=t_id
                 )
-                if mails or gespraeche or anfragen:
+                visualisierungen = await cleanup_visualisierungen(
+                    r_days, execute=True, tenant_id=t_id
+                )
+                if mails or gespraeche or anfragen or visualisierungen:
                     logger.info(
                         f"  tenant={slug} retention={r_days}d: "
                         f"{mails} Konversationen, {gespraeche} Gespraeche, "
-                        f"{anfragen} Anfragen geloescht"
+                        f"{anfragen} Anfragen, "
+                        f"{visualisierungen} Visualisierungen geloescht"
                     )
                 total_mails += mails
                 total_gespraeche += gespraeche
                 total_anfragen += anfragen
+                total_visualisierungen += visualisierungen
             except Exception as t_exc:  # noqa: BLE001
                 logger.exception(
                     f"DSGVO-Cleanup Tenant {slug} fehlgeschlagen: {t_exc}"
@@ -124,8 +131,9 @@ async def _maybe_run_cleanup() -> None:
         logger.info(
             f"DSGVO-Cleanup fertig ueber {len(tenants)} Tenants: "
             f"{total_mails} Konversationen, {total_gespraeche} Gespraeche, "
-            f"{total_anfragen} Anfragen, {geocode_deleted} Geocode-Eintraege "
-            f"geloescht"
+            f"{total_anfragen} Anfragen, "
+            f"{total_visualisierungen} Visualisierungen, "
+            f"{geocode_deleted} Geocode-Eintraege geloescht"
         )
         # Nur bei Erfolg merken — bei Fehler retried der naechste Tick
         _last_run_date = today

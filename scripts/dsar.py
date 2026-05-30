@@ -45,6 +45,7 @@ from core.models import (
     Kundengespraech,
     Tenant,
     TenantKundeDrive,
+    Visualisierung,
 )
 from core.utils.phone import normalize_phone
 
@@ -88,11 +89,14 @@ async def collect(
         "anfragen": [],
         "drive_folders": [],
         "kundengespraeche_name_match": [],
+        "visualisierungen": [],
         "_ids": {
             "email_conversations": [],
             "anfragen": [],
             "drive": [],
             "kundengespraeche": [],
+            "visualisierungen": [],         # praezise (E-Mail-Match)
+            "visualisierungen_name": [],    # unscharf (nur Name-Match)
         },
     }
 
@@ -170,6 +174,36 @@ async def collect(
                 })
                 out["_ids"]["kundengespraeche"].append(r.id)
 
+        # --- Visualisierungen (kunde_email-Match ODER name-Match) ---
+        # Enthaelt kunde_email/kunde_name + Original-/Ergebnis-Foto (PII).
+        if email_norm or name_norm:
+            vcand = (await s.execute(
+                select(Visualisierung)
+                .where(Visualisierung.tenant_id == tenant_id)
+            )).scalars().all()
+            for r in vcand:
+                match_email = bool(email_norm and _email_matches(r.kunde_email, email_norm))
+                match_name = bool(
+                    name_norm and (r.kunde_name or "").strip().lower() == name_norm
+                )
+                if match_email or match_name:
+                    out["visualisierungen"].append({
+                        "id": str(r.id),
+                        "kunde_email": r.kunde_email,
+                        "kunde_name": r.kunde_name,
+                        "status": r.status,
+                        "hat_original_foto": r.original_image_data is not None,
+                        "hat_ergebnis_foto": r.result_image_data is not None,
+                        "created_at": getattr(r, "created_at", None),
+                        "match": "email" if match_email else "name",
+                    })
+                    # E-Mail-Match ist praezise (sofort loeschbar), reiner
+                    # Name-Match ist unscharf -> nur mit --name-match loeschen.
+                    if match_email:
+                        out["_ids"]["visualisierungen"].append(r.id)
+                    else:
+                        out["_ids"]["visualisierungen_name"].append(r.id)
+
     return out
 
 
@@ -233,6 +267,10 @@ async def erase(
     af_ids = found["_ids"]["anfragen"]
     drive = found["_ids"]["drive"]
     gespraech_ids = found["_ids"]["kundengespraeche"]
+    vis_ids = found["_ids"]["visualisierungen"]
+    vis_name_ids = found["_ids"]["visualisierungen_name"]
+    # Praezise (E-Mail) immer; reiner Name-Match nur mit --name-match.
+    vis_delete_ids = vis_ids + (vis_name_ids if name_match else [])
 
     stats = {
         "email_conversations": len(ec_ids),
@@ -240,6 +278,7 @@ async def erase(
         "drive_db": len(drive),
         "drive_folders_deleted": 0,
         "kundengespraeche": len(gespraech_ids) if name_match else 0,
+        "visualisierungen": len(vis_delete_ids),
     }
 
     if not execute:
@@ -260,6 +299,11 @@ async def erase(
             await s.execute(
                 delete(Kundengespraech)
                 .where(Kundengespraech.id.in_(gespraech_ids))
+            )
+        if vis_delete_ids:
+            await s.execute(
+                delete(Visualisierung)
+                .where(Visualisierung.id.in_(vis_delete_ids))
             )
         # Drive: erst den echten Ordner, dann die Mapping-Zeile.
         for row_id, folder_id in drive:
@@ -315,9 +359,12 @@ async def _main(args) -> int:
     n_af = len(found["anfragen"])
     n_dr = len(found["drive_folders"])
     n_ge = len(found["kundengespraeche_name_match"])
+    n_vi = len(found["visualisierungen"])
+    n_vi_name = len(found["_ids"]["visualisierungen_name"])
     logger.info(
         f"Gefunden: {n_ec} Mail-Konversationen, {n_af} Anfragen, "
         f"{n_dr} Drive-Ordner, {n_ge} Transkripte (Name-Match), "
+        f"{n_vi} Visualisierungen, "
         f"{len(lex)} Lexware-Kontakte (nur Report)."
     )
 
@@ -347,6 +394,11 @@ async def _main(args) -> int:
         logger.info(
             f"Hinweis: {n_ge} Transkript(e) per Name gefunden — werden NUR "
             f"mit --name-match geloescht (Name-Match ist unscharf)."
+        )
+    if n_vi_name and not args.name_match:
+        logger.info(
+            f"Hinweis: {n_vi_name} Visualisierung(en) NUR per Name (ohne "
+            f"E-Mail-Match) gefunden — werden NUR mit --name-match geloescht."
         )
     if n_dr and not args.with_drive:
         logger.info(
