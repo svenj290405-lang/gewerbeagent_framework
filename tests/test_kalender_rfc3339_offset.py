@@ -44,9 +44,21 @@ def test_rfc3339_tz_aware_non_utc_keeps_own_offset():
     assert not _DOUBLE_OFFSET.search(out)
 
 
-def test_rfc3339_naive_gets_local_offset_appended():
-    """naive -> als lokale Zeit interpretiert, konfigurierter Offset dran."""
+def test_rfc3339_naive_summer_gets_cest_offset():
+    """naive im Sommer -> lokale Zeit (Europe/Berlin) = CEST +02:00."""
     naive = dt.datetime(2026, 5, 26, 8, 36)
     out = _adapter()._rfc3339(naive)
     assert out == "2026-05-26T08:36:00+02:00"
+    assert not _DOUBLE_OFFSET.search(out)
+
+
+def test_rfc3339_naive_winter_gets_cet_offset():
+    """naive im Winter -> DST-korrekt CET +01:00 (NICHT fix +02:00).
+
+    Regression: ein fester Offset-String haengte ganzjaehrig +02:00 an
+    -> alle Google-FreeBusy-/Suchfenster waren Okt-Maerz um 1h verschoben.
+    """
+    naive = dt.datetime(2026, 1, 15, 8, 36)
+    out = _adapter()._rfc3339(naive)
+    assert out == "2026-01-15T08:36:00+01:00"
     assert not _DOUBLE_OFFSET.search(out)

@@ -26,8 +26,14 @@ import logging
 import uuid
 from abc import ABC, abstractmethod
 from typing import Any
+from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
+
+# Lokale Zeitzone fuer naive Datetimes. ZoneInfo liefert den Offset
+# DST-korrekt (CET +01:00 im Winter, CEST +02:00 im Sommer) — ein fixer
+# String wie "+02:00" verschoebe alle Winter-Fenster um eine Stunde.
+_LOCAL_TZ = ZoneInfo("Europe/Berlin")
 
 
 # Footer-Marker aus kalender/handler.py _book_appointment. Der Drive-Link
@@ -164,23 +170,18 @@ class GoogleCalendarAdapter(CalendarAdapter):
             )
         return self._service
 
-    @staticmethod
-    def _tz_offset() -> str:
-        # TODO: aus tenant-Config; pragmatisch jetzt "+02:00" wie bisher
-        return "+02:00"
-
     def _rfc3339(self, value: dt.datetime) -> str:
         """Google verlangt einen RFC3339-Zeitstempel mit GENAU EINEM
         Offset. Ist ``value`` bereits tz-aware, traegt ``.isoformat()``
-        den Offset schon selbst — dann darf ``_tz_offset()`` NICHT
-        zusaetzlich angeklebt werden, sonst entsteht ein doppelter
-        Offset (z.B. ``...+00:00+02:00``) und Google antwortet mit
-        HTTP 400 ``Bad Request``. Naive Werte interpretieren wir als
-        lokale Zeit und haengen den konfigurierten Offset an (bisheriges
-        Verhalten)."""
+        den Offset schon selbst — dann darf NICHT zusaetzlich einer
+        angeklebt werden, sonst entsteht ein doppelter Offset (z.B.
+        ``...+00:00+02:00``) und Google antwortet mit HTTP 400
+        ``Bad Request``. Naive Werte interpretieren wir als lokale Zeit
+        (Europe/Berlin) und haengen via ZoneInfo den DST-korrekten
+        Offset an — so verschieben sich Winter-Fenster nicht um 1h."""
         if value.tzinfo is not None:
             return value.isoformat()
-        return value.isoformat() + self._tz_offset()
+        return value.replace(tzinfo=_LOCAL_TZ).isoformat()
 
     async def is_slot_busy(self, start, end) -> bool:
         service = await self._get_service()
