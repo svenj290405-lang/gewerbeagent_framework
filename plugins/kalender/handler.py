@@ -44,7 +44,6 @@ logger = logging.getLogger(__name__)
 # gleichzeitig. Verhindert Doppelbuchung wenn z.B. Mail-Pipeline und
 # Voice-Pipeline parallel auf den gleichen Slot zielen.
 _SLOT_LOCKS: dict[tuple[UUID, datetime], asyncio.Lock] = {}
-_SLOT_LOCKS_GUARD = asyncio.Lock()
 
 
 # Idempotency-Cache: bei wiederholtem _book_appointment-Aufruf mit
@@ -66,7 +65,10 @@ def _get_slot_lock(tenant_id: UUID, slot_start: datetime) -> asyncio.Lock:
     key = (tenant_id, minute_key)
     lock = _SLOT_LOCKS.get(key)
     if lock is None:
-        # Garde gegen Race beim Lock-Erstellen selbst (sehr klein, aber sauber)
+        # Kein zusaetzliches Guard-Lock noetig: diese Funktion ist synchron
+        # und enthaelt keinen await-Punkt -> in asyncios Single-Thread-Loop
+        # laeuft das get-check-set atomar, zwei Coroutinen koennen hier nicht
+        # interleaven und versehentlich zwei Locks fuer denselben Slot bauen.
         lock = asyncio.Lock()
         _SLOT_LOCKS[key] = lock
     return lock
