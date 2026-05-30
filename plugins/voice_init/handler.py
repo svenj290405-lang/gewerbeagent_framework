@@ -1900,27 +1900,62 @@ class Plugin(BasePlugin):
                 tenant_id = t.id
 
         # Anruf protokollieren (fuer /anrufe). BEWUSST vor dem
-        # duration<=0-Return: auch ein 5-Sekunden-/Stille-Anruf soll
-        # auftauchen ("jemand hat angerufen"). Nur wenn der Tenant
-        # zugeordnet werden konnte — sonst wuessten wir nicht, wem.
+        # duration<=0-Return: auch ein 5-Sekunden-/Stille-Anruf (Kunde
+        # legt sofort wieder auf) soll auftauchen ("jemand hat angerufen").
         if tenant_id is not None:
             try:
                 from core.models.voice_call import VoiceCall
+                conv_id = payload.get("conversation_id")
                 async with AsyncSessionLocal() as s:
-                    s.add(VoiceCall(
-                        tenant_id=tenant_id,
-                        caller_number=(caller_number or None),
-                        called_number=(called_number or None),
-                        duration_seconds=int(duration_s) if duration_s else None,
-                        outcome=outcome,
-                        conversation_id=payload.get("conversation_id"),
-                        kunde_name=call_kunde_name,
-                        anliegen=call_anliegen,
-                        zusammenfassung=call_summary,
-                    ))
+                    existing = None
+                    if conv_id:
+                        # Dedup: ElevenLabs kann call_ended bei Abbruch/Retry
+                        # mehrfach feuern — pro conversation_id nur EINE Zeile.
+                        existing = (await s.execute(
+                            select(VoiceCall).where(
+                                VoiceCall.conversation_id == conv_id,
+                            )
+                        )).scalar_one_or_none()
+                    if existing is not None:
+                        # Spaeterer Webhook kann mehr Daten liefern: Felder
+                        # auffrischen, aber keine zweite Zeile anlegen.
+                        existing.caller_number = caller_number or existing.caller_number
+                        existing.called_number = called_number or existing.called_number
+                        if duration_s:
+                            existing.duration_seconds = int(duration_s)
+                        existing.outcome = outcome or existing.outcome
+                        existing.kunde_name = call_kunde_name or existing.kunde_name
+                        existing.anliegen = call_anliegen or existing.anliegen
+                        existing.zusammenfassung = (
+                            call_summary or existing.zusammenfassung
+                        )
+                    else:
+                        s.add(VoiceCall(
+                            tenant_id=tenant_id,
+                            caller_number=(caller_number or None),
+                            called_number=(called_number or None),
+                            duration_seconds=int(duration_s) if duration_s else None,
+                            outcome=outcome,
+                            conversation_id=conv_id,
+                            kunde_name=call_kunde_name,
+                            anliegen=call_anliegen,
+                            zusammenfassung=call_summary,
+                        ))
                     await s.commit()
             except Exception as exc:  # noqa: BLE001
                 logger.warning(f"voice_call protokollieren fehlgeschlagen: {exc}")
+        else:
+            # Tenant nicht aufloesbar (weder tenant_slug noch bekannte
+            # called_number im Payload) — Anruf kann keinem Betrieb
+            # zugeordnet werden. NICHT stillschweigend verschlucken: sichtbar
+            # ins Log, damit wir ElevenLabs-Payload-Luecken bemerken.
+            logger.warning(
+                "call_ended: Anruf keinem Tenant zuordenbar — nicht geloggt "
+                f"(tenant_slug={tenant_slug!r}, called_number={called_number!r}, "
+                f"caller={caller_number!r}, "
+                f"conversation_id={payload.get('conversation_id')!r}, "
+                f"outcome={outcome!r})"
+            )
 
         if duration_s <= 0:
             logger.info(
