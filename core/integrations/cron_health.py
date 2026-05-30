@@ -32,6 +32,8 @@ EXPECTED_CRONS = {
     "mail_retry_cron": 10,         # Tick alle 5min, Toleranz 10
     "db_maintenance_cron": 5,      # Tick jede Minute (wartet bis 02:00)
     "daily_health_check": 5,       # Tick jede Minute (wartet bis morgens)
+    "absence_redistribution": 5,   # Tick alle 60s, Toleranz 5
+    "anfrage_reminder": 70,        # Tick stuendlich, Toleranz 70min
 }
 
 

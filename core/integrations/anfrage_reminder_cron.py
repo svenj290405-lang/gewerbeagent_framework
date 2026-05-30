@@ -212,9 +212,11 @@ async def cron_loop() -> None:
         f"(Intervall {TICK_INTERVAL_SECONDS}s, Fenster "
         f"{REMINDER_WINDOW_MIN_HOURS}-{REMINDER_WINDOW_MAX_HOURS}h vor Termin)"
     )
+    from core.integrations.cron_health import record_heartbeat
     while True:
         try:
             await _tick()
         except Exception as e:
             logger.exception(f"Reminder-Cron Tick fehlgeschlagen: {e}")
+        record_heartbeat("anfrage_reminder")
         await asyncio.sleep(TICK_INTERVAL_SECONDS)
