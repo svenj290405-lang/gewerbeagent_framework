@@ -372,15 +372,21 @@ async def _send_via_microsoft_graph(
     """
     from core.integrations.microsoft import send_tracked_mail
 
-    # Attachments zurueck-base64-decoden + ins Microsoft-Graph-Schema mappen
+    # Attachments ins Schema von send_tracked_mail/_build_attachment_payload
+    # mappen: {filename, bytes (ROH, decoded), content_type}. WICHTIG —
+    # _build_attachment_payload liest a["bytes"] und base64-kodiert selbst;
+    # ein Dict ohne "bytes"-Key wird dort STILL uebersprungen (-> Anhang
+    # ginge verloren, die Mail gilt aber als erfolgreich). Daher hier
+    # data_base64 zurueck-decoden und als "bytes" liefern.
+    import base64 as _b64
     attachments_payload = payload.get("attachments") or []
     graph_attachments = []
     for a in attachments_payload:
         try:
             graph_attachments.append({
-                "name": a.get("filename", "anhang"),
-                "contentType": a.get("mime_type", "application/octet-stream"),
-                "contentBytes": a.get("data_base64", ""),
+                "filename": a.get("filename", "anhang"),
+                "content_type": a.get("mime_type", "application/octet-stream"),
+                "bytes": _b64.b64decode(a.get("data_base64", "")),
             })
         except Exception as e:
             logger.warning(f"graph-attachment skip (decode-fail): {e}")
