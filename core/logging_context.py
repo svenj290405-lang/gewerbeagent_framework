@@ -129,8 +129,12 @@ _REDACTION_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     # damit der Greedy-Match das "%40" nicht selbst verschluckt.)
     (re.compile(r"(?i)([a-z0-9._+-])[a-z0-9._+-]*%40([a-z0-9.-]+\.[a-z]{2,})"),
      r"\1***%40\2"),
-    (re.compile(r"(?<!\d)(?:\+|00)\d{9,14}(?!\d)"), "<tel-redacted>"),
-    (re.compile(r"(?<!\d)0\d{9,13}(?!\d)"), "<tel-redacted>"),
+    # Telefon: kontiguiert ODER mit Trennzeichen (Leerzeichen, /, -,
+    # Klammern) zwischen den Zifferngruppen, z.B. "0211 / 87 65 43" oder
+    # "+49 211 8765432". Punkt ist KEIN Trennzeichen (sonst wuerden
+    # Versionsstrings wie 0.1.2.3.4.5.6.7.8.9 faelschlich maskiert).
+    (re.compile(r"(?<!\d)(?:\+|00)(?:[\s/()-]{0,4}\d){9,14}(?!\d)"), "<tel-redacted>"),
+    (re.compile(r"(?<!\d)0(?:[\s/()-]{0,4}\d){9,13}(?!\d)"), "<tel-redacted>"),
 )
 
 

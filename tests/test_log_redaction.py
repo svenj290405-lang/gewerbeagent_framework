@@ -41,6 +41,20 @@ def test_phone_redacted():
     assert "<tel-redacted>" in out
 
 
+def test_phone_formatted_with_separators_redacted():
+    # Formatierte Nummern (Leerzeichen/Slash) wurden vorher NICHT maskiert.
+    for raw in ("0211 / 87 65 43 21", "+49 211 8765432", "(0211) 876-543"):
+        out = _redact_secrets(f"Kunde Telefon {raw} notiert")
+        assert "<tel-redacted>" in out, raw
+        assert "876" not in out, raw
+
+
+def test_version_string_not_redacted_as_phone():
+    # Punkt-getrennte Zahlenketten (Versionen) duerfen NICHT als Tel gelten.
+    txt = "Build-Version 0.1.2.3.4.5.6.7.8.9 geladen"
+    assert _redact_secrets(txt) == txt
+
+
 def test_telegram_token_redacted():
     out = _redact_secrets(
         "GET api.telegram.org/bot7654321:AAFhijklmnopqrstuvwxyz0123456789abcd/x"
