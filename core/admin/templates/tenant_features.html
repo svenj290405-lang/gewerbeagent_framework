@@ -52,7 +52,7 @@
                             <form method="post"
                                   action="/admin/tenants/{{ tenant.id }}/features/{{ row.key }}/toggle"
                                   style="display:inline;">
-                                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                                <input type="hidden" name="_csrf" value="{{ csrf_token }}">
                                 <button type="submit"
                                         class="btn btn"
                                         style="font-size: 12px; padding: 4px 12px;">

@@ -30,7 +30,7 @@
 <form method="post"
       action="/admin/tenants/{{ tenant.id }}/retention"
       style="display:flex; gap:8px; align-items:center; margin-bottom:24px;">
-    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <input type="hidden" name="_csrf" value="{{ csrf_token }}">
     <label style="font-size:13px;color:var(--ink-muted);">
         Mail-Konversationen loeschen nach
     </label>
@@ -54,7 +54,7 @@
 <form method="post"
       action="/admin/tenants/{{ tenant.id }}/telegram-bot"
       style="display:flex; gap:8px; align-items:center; margin-bottom:6px; flex-wrap:wrap;">
-    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <input type="hidden" name="_csrf" value="{{ csrf_token }}">
     <label style="font-size:13px;color:var(--ink-muted);">BotFather-Token</label>
     <input type="text" name="bot_token" autocomplete="off"
            placeholder="{% if telegram_bot_set %}gesetzt ({{ telegram_bot_hint }}) — neuen Token eingeben zum Ersetzen{% else %}123456:ABC-DEF…  (leer = geteilter globaler Bot){% endif %}"
