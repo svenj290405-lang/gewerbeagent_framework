@@ -42,6 +42,11 @@ from core.models import (
     Kundengespraech,
     Visualisierung,
 )
+from core.models.failed_mail_queue import (
+    FAILED_MAIL_DEAD,
+    FAILED_MAIL_SENT,
+    FailedMailQueue,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -159,6 +164,42 @@ async def cleanup_visualisierungen(
         return res.rowcount
 
 
+async def cleanup_failed_mail_queue(
+    retention_days: int, execute: bool, *, tenant_id=None,
+) -> int:
+    """Loescht abgeschlossene Mail-Retry-Eintraege aelter als retention_days.
+
+    failed_mail_queue speichert recipient_email + den vollen Mail-Payload
+    (html_body, Anhaenge base64) — PII. Nur TERMINALE Eintraege (sent/dead)
+    werden geloescht; 'pending' bleibt unberuehrt, damit laufende Retries
+    nicht verschwinden. Anker ist created_at.
+    """
+    cutoff = _cutoff(retention_days)
+    async with AsyncSessionLocal() as s:
+        cond = and_(
+            FailedMailQueue.created_at < cutoff,
+            FailedMailQueue.status.in_([FAILED_MAIL_SENT, FAILED_MAIL_DEAD]),
+        )
+        stmt = select(FailedMailQueue.id).where(cond)
+        if tenant_id is not None:
+            stmt = stmt.where(FailedMailQueue.tenant_id == tenant_id)
+        ids = list((await s.execute(stmt)).scalars())
+
+        if not execute:
+            logger.info(
+                f"[failed_mail_queue] Trockenlauf: {len(ids)} Kandidaten "
+                f"(sent/dead, cutoff={cutoff.date().isoformat()})"
+            )
+            return 0
+        if not ids:
+            return 0
+        res = await s.execute(
+            delete(FailedMailQueue).where(FailedMailQueue.id.in_(ids))
+        )
+        await s.commit()
+        return res.rowcount
+
+
 async def cleanup_geocode_cache(retention_days: int, execute: bool) -> int:
     """Loescht Geocode-Cache-Eintraege (Kundenadressen) aelter als
     retention_days. Tabelle ist tenant-uebergreifend (kein tenant_id) —
@@ -194,11 +235,13 @@ def main() -> int:
         g = await cleanup_kundengespraeche(args.days, args.execute)
         a = await cleanup_anfragen(args.days, args.execute)
         v = await cleanup_visualisierungen(args.days, args.execute)
+        f = await cleanup_failed_mail_queue(args.days, args.execute)
         c = await cleanup_geocode_cache(args.days, args.execute)
         if args.execute:
             logger.info(
                 f"Geloescht: {g} Gespraeche, {a} Anfragen, "
-                f"{v} Visualisierungen, {c} Geocode-Eintraege."
+                f"{v} Visualisierungen, {f} Mail-Queue-Eintraege, "
+                f"{c} Geocode-Eintraege."
             )
 
     asyncio.run(_run())

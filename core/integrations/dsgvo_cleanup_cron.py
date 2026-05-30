@@ -68,6 +68,7 @@ async def _maybe_run_cleanup() -> None:
         from scripts.cleanup_email_conversations import cleanup
         from scripts.cleanup_pii import (
             cleanup_anfragen,
+            cleanup_failed_mail_queue,
             cleanup_geocode_cache,
             cleanup_kundengespraeche,
             cleanup_visualisierungen,
@@ -84,6 +85,7 @@ async def _maybe_run_cleanup() -> None:
         total_gespraeche = 0
         total_anfragen = 0
         total_visualisierungen = 0
+        total_mailq = 0
         # Laengste Retention bestimmt, wie lange der globale Geocode-Cache
         # gehalten wird (kein Eintrag soll geloescht werden, solange noch
         # irgendein Tenant ihn innerhalb seiner Frist nutzen darf).
@@ -102,17 +104,22 @@ async def _maybe_run_cleanup() -> None:
                 visualisierungen = await cleanup_visualisierungen(
                     r_days, execute=True, tenant_id=t_id
                 )
-                if mails or gespraeche or anfragen or visualisierungen:
+                mailq = await cleanup_failed_mail_queue(
+                    r_days, execute=True, tenant_id=t_id
+                )
+                if mails or gespraeche or anfragen or visualisierungen or mailq:
                     logger.info(
                         f"  tenant={slug} retention={r_days}d: "
                         f"{mails} Konversationen, {gespraeche} Gespraeche, "
                         f"{anfragen} Anfragen, "
-                        f"{visualisierungen} Visualisierungen geloescht"
+                        f"{visualisierungen} Visualisierungen, "
+                        f"{mailq} Mail-Queue-Eintraege geloescht"
                     )
                 total_mails += mails
                 total_gespraeche += gespraeche
                 total_anfragen += anfragen
                 total_visualisierungen += visualisierungen
+                total_mailq += mailq
             except Exception as t_exc:  # noqa: BLE001
                 logger.exception(
                     f"DSGVO-Cleanup Tenant {slug} fehlgeschlagen: {t_exc}"
@@ -133,6 +140,7 @@ async def _maybe_run_cleanup() -> None:
             f"{total_mails} Konversationen, {total_gespraeche} Gespraeche, "
             f"{total_anfragen} Anfragen, "
             f"{total_visualisierungen} Visualisierungen, "
+            f"{total_mailq} Mail-Queue-Eintraege, "
             f"{geocode_deleted} Geocode-Eintraege geloescht"
         )
         # Nur bei Erfolg merken — bei Fehler retried der naechste Tick
