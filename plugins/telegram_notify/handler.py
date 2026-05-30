@@ -911,6 +911,9 @@ async def _handle_help_command(chat_id=None):
         ("/aufnahmen",
          "Liste deiner letzten aufgenommenen Kundengespraeche "
          "(via /aufnahme) mit KI-Briefing und erkannten Kunden-Daten."),
+        ("/anrufe",
+         "Eingehende Telefonate des KI-Telefon-Agenten seit dem letzten "
+         "Aufruf — mit Anrufer-Nummer, Dauer und Ergebnis."),
     ]
     kunden_items_active: list[tuple[str, str]] = []
     kunden_items_locked: list[tuple[str, str]] = []
@@ -2245,11 +2248,12 @@ async def _dispatch_update(payload):
     elif text == "/neue_termine":
         await _clear_state(chat_id)
         reply = await _handle_neue_termine_command(chat_id)
-    elif text in ("/aufnahmen", "/anrufe"):
-        # /anrufe = alter Name, als stiller Alias erhalten (Muscle-Memory),
-        # nicht mehr in der Befehlsliste beworben.
+    elif text == "/aufnahmen":
         await _clear_state(chat_id)
         reply = await _handle_aufnahmen_command(chat_id)
+    elif text == "/anrufe":
+        await _clear_state(chat_id)
+        reply = await _handle_eingehende_anrufe_command(chat_id)
     elif text.startswith("/kunde"):
         await _clear_state(chat_id)
         # Argumente nach '/kunde' extrahieren
@@ -5027,6 +5031,121 @@ async def _handle_aufnahmen_command(chat_id):
 
     msg += "\nDetails mit <code>/kunde [Name]</code>"
     return msg
+
+
+# ----------------------------------------------------------------------
+# /anrufe — eingehende ElevenLabs-Telefonate seit letztem Aufruf
+# ----------------------------------------------------------------------
+# Bewusst getrennt von /aufnahmen (= via /aufnahme aufgenommene Gespraeche).
+# Das hier sind die echten eingehenden Telefonate, die der Voice-Agent
+# entgegengenommen hat — geschrieben vom /call_ended-Webhook in voice_calls.
+ANRUFE_MAX_ENTRIES = 15
+
+
+async def _get_anrufe_last_seen(chat_id):
+    """Zeitpunkt des letzten /anrufe-Aufrufs fuer diesen Chat (None = erstmals)."""
+    from core.models.telegram_anrufe_seen import TelegramAnrufeSeen
+    async with AsyncSessionLocal() as s:
+        row = (await s.execute(
+            select(TelegramAnrufeSeen).where(
+                TelegramAnrufeSeen.chat_id == chat_id,
+            )
+        )).scalar_one_or_none()
+        return row.last_seen_at if row else None
+
+
+async def _set_anrufe_last_seen(chat_id, ts):
+    """Merkt den aktuellen Wasserstand (Upsert)."""
+    from core.models.telegram_anrufe_seen import TelegramAnrufeSeen
+    async with AsyncSessionLocal() as s:
+        row = (await s.execute(
+            select(TelegramAnrufeSeen).where(
+                TelegramAnrufeSeen.chat_id == chat_id,
+            )
+        )).scalar_one_or_none()
+        if row is None:
+            s.add(TelegramAnrufeSeen(chat_id=chat_id, last_seen_at=ts))
+        else:
+            row.last_seen_at = ts
+        await s.commit()
+
+
+async def _handle_eingehende_anrufe_command(chat_id):
+    """Zeigt eingehende Telefonate (Voice-Agent) seit dem letzten Aufruf.
+
+    Diff-Logik wie /neue_termine: Anrufe mit created_at > last_seen gelten
+    als neu, danach wird der Wasserstand auf jetzt gesetzt. Erster Aufruf
+    (kein Wasserstand): zeigt die letzten Anrufe und legt die Baseline an.
+    """
+    from datetime import datetime, timezone
+    from core.models.voice_call import VoiceCall
+
+    res = await _get_current_employee(chat_id)
+    if res is None:
+        return "Dieser Chat ist noch keinem Betrieb zugeordnet."
+    tenant, current_emp = res
+
+    last_seen = await _get_anrufe_last_seen(chat_id)
+    is_first = last_seen is None
+
+    async with AsyncSessionLocal() as s:
+        stmt = select(VoiceCall).where(VoiceCall.tenant_id == tenant.id)
+        if last_seen is not None:
+            stmt = stmt.where(VoiceCall.created_at > last_seen)
+        stmt = stmt.order_by(VoiceCall.created_at.desc()).limit(
+            ANRUFE_MAX_ENTRIES + 1
+        )
+        calls = (await s.execute(stmt)).scalars().all()
+
+    truncated = len(calls) > ANRUFE_MAX_ENTRIES
+    calls = calls[:ANRUFE_MAX_ENTRIES]
+
+    # Wasserstand IMMER aktualisieren — auch wenn nichts neu war, sonst
+    # bleiben alte Anrufe beim naechsten Mal "neu".
+    await _set_anrufe_last_seen(chat_id, datetime.now(timezone.utc))
+
+    try:
+        from zoneinfo import ZoneInfo
+        local_tz = ZoneInfo("Europe/Berlin")
+    except Exception:
+        local_tz = timezone.utc
+
+    if not calls:
+        scope = "" if is_first else " seit dem letzten Aufruf"
+        return (
+            f"📞 <b>Keine neuen Anrufe{scope}</b>.\n\n"
+            "<i>Hier landen eingehende Telefonate, die der KI-Telefon-Agent "
+            "entgegengenommen hat. Selbst aufgenommene Kundengespraeche "
+            "stehen unter /aufnahmen.</i>"
+        )
+
+    outcome_emoji = {
+        "completed": "✅",
+        "incomplete": "⚠️",
+        "no_audio": "🔇",
+    }
+
+    header = (
+        f"📞 <b>{len(calls)} neue Anrufe</b>"
+        if not is_first
+        else f"📞 <b>Letzte {len(calls)} Anrufe</b>"
+    )
+    lines = [header + "\n"]
+    for c in calls:
+        when = c.created_at.astimezone(local_tz).strftime("%d.%m %H:%M")
+        nummer = _h_safe(c.caller_number) if c.caller_number else "unbekannt"
+        em = outcome_emoji.get((c.outcome or "").lower(), "📞")
+        dauer = f"{c.duration_seconds}s" if c.duration_seconds else "—"
+        lines.append(f"{em} <b>{when}</b>  ·  ☎️ {nummer}  ·  {dauer}")
+        info = c.kunde_name or c.anliegen or c.zusammenfassung
+        if info:
+            info = info if len(info) <= 120 else info[:118] + "..."
+            lines.append(f"   <i>{_h_safe(info)}</i>")
+    if truncated:
+        lines.append(
+            f"\n<i>… nur die neuesten {ANRUFE_MAX_ENTRIES} gezeigt.</i>"
+        )
+    return "\n".join(lines)
 
 
 

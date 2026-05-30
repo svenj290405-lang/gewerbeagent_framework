@@ -1871,9 +1871,19 @@ class Plugin(BasePlugin):
         """
         tenant_slug = (payload.get("tenant_slug") or "").strip()
         called_number = payload.get("called_number") or payload.get("to_number")
+        caller_number = payload.get("caller_id") or payload.get("from_number")
         duration_s = float(payload.get("duration_seconds") or 0)
         char_count = int(payload.get("char_count") or 0)
         outcome = (payload.get("call_outcome") or "completed").lower()
+        # Optionale Inhalts-Felder, falls ElevenLabs sie mitschickt
+        call_kunde_name = (payload.get("kunde_name") or "").strip() or None
+        call_anliegen = (payload.get("anliegen") or "").strip() or None
+        call_summary = (
+            payload.get("summary")
+            or payload.get("call_summary")
+            or payload.get("transcript_summary")
+            or None
+        )
 
         # Tenant-Lookup: erst via slug, sonst via called_number
         tenant_id = None
@@ -1888,6 +1898,29 @@ class Plugin(BasePlugin):
             t = await _find_tenant_by_phone(called_number)
             if t:
                 tenant_id = t.id
+
+        # Anruf protokollieren (fuer /anrufe). BEWUSST vor dem
+        # duration<=0-Return: auch ein 5-Sekunden-/Stille-Anruf soll
+        # auftauchen ("jemand hat angerufen"). Nur wenn der Tenant
+        # zugeordnet werden konnte — sonst wuessten wir nicht, wem.
+        if tenant_id is not None:
+            try:
+                from core.models.voice_call import VoiceCall
+                async with AsyncSessionLocal() as s:
+                    s.add(VoiceCall(
+                        tenant_id=tenant_id,
+                        caller_number=(caller_number or None),
+                        called_number=(called_number or None),
+                        duration_seconds=int(duration_s) if duration_s else None,
+                        outcome=outcome,
+                        conversation_id=payload.get("conversation_id"),
+                        kunde_name=call_kunde_name,
+                        anliegen=call_anliegen,
+                        zusammenfassung=call_summary,
+                    ))
+                    await s.commit()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"voice_call protokollieren fehlgeschlagen: {exc}")
 
         if duration_s <= 0:
             logger.info(

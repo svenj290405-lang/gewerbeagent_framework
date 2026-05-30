@@ -10,6 +10,13 @@ from core.models.email_conversation import (
 )
 from core.models.oauth_state import OAuthState
 from core.models.telegram_termine_seen import TelegramTermineSeen
+from core.models.telegram_anrufe_seen import TelegramAnrufeSeen
+from core.models.voice_call import (
+    VoiceCall,
+    CALL_OUTCOME_COMPLETED,
+    CALL_OUTCOME_INCOMPLETE,
+    CALL_OUTCOME_NO_AUDIO,
+)
 from core.models.telegram_state import (
     TelegramState,
     STATE_WISSEN_KATEGORIE,
@@ -242,6 +249,11 @@ __all__ = [
     "OAuthState",
     "TelegramState",
     "TelegramTermineSeen",
+    "TelegramAnrufeSeen",
+    "VoiceCall",
+    "CALL_OUTCOME_COMPLETED",
+    "CALL_OUTCOME_INCOMPLETE",
+    "CALL_OUTCOME_NO_AUDIO",
     "STATE_WISSEN_KATEGORIE",
     "STATE_WISSEN_TEXT",
     "STATE_WISSEN_LOESCHEN",
