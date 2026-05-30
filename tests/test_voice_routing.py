@@ -499,6 +499,51 @@ async def test_buche_termin_invalid_slot_id():
 
 
 # =====================================================================
+# call_ended — Billing-Dedup
+# =====================================================================
+
+
+@pytest.mark.asyncio
+async def test_call_ended_dedups_by_conversation_id(monkeypatch):
+    """Doppeltes call_ended (Webhook-Retry) fuer dieselbe conversation_id
+    darf die Anruf-Dauer nicht zweimal billen."""
+    import core.billing as billing
+    voice_handler._PROCESSED_CALLS.clear()
+
+    tenant = _make_tenant("demo")
+    monkeypatch.setattr(
+        voice_handler, "AsyncSessionLocal",
+        # je Aufruf ein frischer Tenant-Lookup-Treffer
+        lambda: _make_session_factory([tenant, tenant])(),
+    )
+    calls = {"deepgram": 0, "sipgate": 0}
+    monkeypatch.setattr(
+        billing, "track_deepgram_seconds",
+        AsyncMock(side_effect=lambda *a, **k: calls.__setitem__("deepgram", calls["deepgram"] + 1)),
+    )
+    monkeypatch.setattr(billing, "track_elevenlabs_chars", AsyncMock())
+    monkeypatch.setattr(
+        billing, "track_api_usage",
+        AsyncMock(side_effect=lambda *a, **k: calls.__setitem__("sipgate", calls["sipgate"] + 1)),
+    )
+
+    plugin = _make_plugin()
+    payload = {
+        "tenant_slug": "demo",
+        "duration_seconds": 142,
+        "conversation_id": "conv-abc-123",
+    }
+    first = await plugin._handle_call_ended(payload)
+    second = await plugin._handle_call_ended(dict(payload))
+
+    assert first["tracked"] is True
+    assert second.get("deduped") is True and second["tracked"] is False
+    # Tracking genau einmal — nicht doppelt gebillt.
+    assert calls["deepgram"] == 1
+    assert calls["sipgate"] == 1
+
+
+# =====================================================================
 # Async-Terminsuche — starte_terminsuche + hole_terminvorschlaege
 # =====================================================================
 

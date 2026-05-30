@@ -236,6 +236,32 @@ def _split_wunschzeit(wunschzeit):
 _SLOT_ID_SEP = "|"
 
 
+# Dedup fuer call_ended-Billing: ElevenLabs/FreeSWITCH koennen den
+# call_ended-Webhook bei Retries oder doppelten Hangup-Events mehrfach
+# schicken -> ohne Idempotenz wuerde dieselbe Anruf-Dauer/Zeichenzahl
+# mehrfach in die Usage/Billing gezaehlt. In-Memory (gebounded) reicht:
+# Retries kommen innerhalb von Minuten, ein Container-Restart dazwischen
+# ist unkritisch (dann lieber 1x doppelt als Dauer-Leak).
+from collections import OrderedDict  # noqa: E402
+
+_PROCESSED_CALLS: "OrderedDict[str, None]" = OrderedDict()
+_PROCESSED_CALLS_MAX = 5000
+
+
+def _mark_call_processed(conversation_id: str) -> bool:
+    """Markiert die conversation_id als getrackt. Returnt True wenn sie
+    schon vorher getrackt wurde (Dedup-Hit -> Caller soll NICHT erneut
+    billen). Ohne ID: kein Dedup moeglich, immer False."""
+    if not conversation_id:
+        return False
+    if conversation_id in _PROCESSED_CALLS:
+        return True
+    _PROCESSED_CALLS[conversation_id] = None
+    if len(_PROCESSED_CALLS) > _PROCESSED_CALLS_MAX:
+        _PROCESSED_CALLS.popitem(last=False)  # aeltesten Eintrag verdraengen
+    return False
+
+
 def _encode_slot_id(datum, uhrzeit, dauer_min):
     return f"{datum}{_SLOT_ID_SEP}{uhrzeit}{_SLOT_ID_SEP}{int(dauer_min)}"
 
@@ -1914,6 +1940,16 @@ class Plugin(BasePlugin):
                 f"(tenant={tenant_slug}, outcome={outcome})"
             )
             return {"success": True, "tracked": False}
+
+        # Idempotenz: doppelte call_ended-Events (Webhook-Retry / doppelter
+        # Hangup) fuer dieselbe conversation_id NICHT zweimal billen.
+        conversation_id = (payload.get("conversation_id") or "").strip()
+        if _mark_call_processed(conversation_id):
+            logger.info(
+                f"call_ended dedup: conversation_id={conversation_id} "
+                f"bereits getrackt — skip (tenant={tenant_slug})"
+            )
+            return {"success": True, "tracked": False, "deduped": True}
 
         # Failsafe Usage-Tracking
         try:
