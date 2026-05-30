@@ -118,7 +118,7 @@ FEATURES: dict[str, Feature] = {
         label="Telefon-Annahme",
         description="KI-Telefonbeantworter mit Termin-Buchung im Anruf.",
         requires=("kalender",),
-        telegram_commands=("/aufnahme", "/anrufe"),
+        telegram_commands=("/aufnahme", "/aufnahmen"),
     ),
     "drive_archiv": Feature(
         key="drive_archiv",

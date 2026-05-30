@@ -908,9 +908,9 @@ async def _handle_help_command(chat_id=None):
          "Sprachnachricht zum Kundengespraech schicken — Bot "
          "transkribiert, extrahiert Kunde + Anliegen und legt "
          "optional ein Lexware-Angebot mit Preisen direkt an."),
-        ("/anrufe",
-         "Letzte eingehende Anrufe mit KI-Zusammenfassung und "
-         "erkannten Kunden-Daten."),
+        ("/aufnahmen",
+         "Liste deiner letzten aufgenommenen Kundengespraeche "
+         "(via /aufnahme) mit KI-Briefing und erkannten Kunden-Daten."),
     ]
     kunden_items_active: list[tuple[str, str]] = []
     kunden_items_locked: list[tuple[str, str]] = []
@@ -2245,9 +2245,11 @@ async def _dispatch_update(payload):
     elif text == "/neue_termine":
         await _clear_state(chat_id)
         reply = await _handle_neue_termine_command(chat_id)
-    elif text == "/anrufe":
+    elif text in ("/aufnahmen", "/anrufe"):
+        # /anrufe = alter Name, als stiller Alias erhalten (Muscle-Memory),
+        # nicht mehr in der Befehlsliste beworben.
         await _clear_state(chat_id)
-        reply = await _handle_anrufe_command(chat_id)
+        reply = await _handle_aufnahmen_command(chat_id)
     elif text.startswith("/kunde"):
         await _clear_state(chat_id)
         # Argumente nach '/kunde' extrahieren
@@ -4191,7 +4193,7 @@ async def _handle_rechnung_input_received(
 # ==============================================================
 
 # =====================================================================
-# Briefing-Befehle: /briefing, /kunde X, /anrufe
+# Briefing-Befehle: /briefing, /kunde X, /aufnahmen
 # =====================================================================
 
 def _format_kundengespraech_short(g) -> str:
@@ -4982,7 +4984,7 @@ async def _handle_kunde_command(chat_id, args):
     return msg
 
 
-async def _handle_anrufe_command(chat_id):
+async def _handle_aufnahmen_command(chat_id):
     """Zeigt die letzten 10 Kundengespraeche.
 
     Phase-4-Filter: Default-Employee sieht alle, andere nur eigene
