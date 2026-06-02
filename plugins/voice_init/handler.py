@@ -434,6 +434,8 @@ class Plugin(BasePlugin):
             return await self._handle_initiation(payload)
         if endpoint == "save_contact":
             return await self._handle_save_contact(payload)
+        if endpoint == "rueckruf_anfordern":
+            return await self._handle_rueckruf_anfordern(payload)
         if endpoint == "checke_kalender":
             return await self._handle_checke_kalender(payload)
         if endpoint == "starte_terminsuche":
@@ -1593,6 +1595,144 @@ class Plugin(BasePlugin):
             "action": action,
             "message": f"Kontakt {action}",
             "mail": mail_status,
+            "routing": _routing_to_response(routing),
+        }
+
+    async def _handle_rueckruf_anfordern(self, payload):
+        """
+        Webhook von ElevenLabs wenn der Voice-Agent das Tool
+        'rueckruf_anfordern' aufruft.
+
+        Ausgeloest wenn der Anrufer ausdruecklich einen Menschen/
+        Mitarbeiter verlangt oder veraergert ist, ODER wenn das Anliegen
+        etwas ist, das die KI nicht selbst erledigen kann. KEINE
+        Live-Weiterleitung (Sipgate kann SIP REFER nicht zuverlaessig) —
+        stattdessen strukturierte Rueckrufbitte erfassen + Tenant pushen.
+
+        Erwartet payload:
+          {
+            "kunde_name": "Frau Mueller",
+            "kunde_telefon": "+49 651 1234",
+            "anliegen": "Reklamation Kuechenfront",
+            "kunde_email": "..." | null,
+            "tenant_slug": "pilot"
+          }
+        """
+        kunde_name = (payload.get("kunde_name") or "").strip()
+        kunde_telefon = (payload.get("kunde_telefon") or "").strip()
+        anliegen = (payload.get("anliegen") or "").strip()
+        kunde_email = (payload.get("kunde_email") or "").strip() or None
+        tenant_slug = (payload.get("tenant_slug") or "").strip()
+
+        # Pflichtfelder. Anders als bei save_contact wenden wir KEINEN
+        # aggressiven "suspicious name"-Skip an: eine Rueckrufbitte mit
+        # Telefonnummer + Anliegen ist auch dann handlungsrelevant, wenn
+        # der Name vom Agent unsauber erfasst wurde — die wollen wir nicht
+        # still verwerfen. Fehlt aber Telefon ODER Anliegen, ist der
+        # Rueckruf nutzlos.
+        if not tenant_slug:
+            logger.warning("rueckruf: tenant_slug fehlt")
+            return {"success": False, "error": "tenant_slug ist Pflicht"}
+        if not kunde_telefon or not anliegen:
+            logger.warning(
+                f"rueckruf: telefon/anliegen fehlt slug={tenant_slug!r} "
+                f"telefon={bool(kunde_telefon)} anliegen={bool(anliegen)}"
+            )
+            return {
+                "success": False,
+                "error": "kunde_telefon und anliegen sind Pflicht",
+            }
+        if not kunde_name:
+            kunde_name = "Unbekannt"
+
+        # Tenant laden
+        async with AsyncSessionLocal() as s:
+            tenant = (await s.execute(
+                select(Tenant).where(Tenant.slug == tenant_slug)
+            )).scalar_one_or_none()
+            if not tenant:
+                logger.warning(f"rueckruf: Tenant {tenant_slug!r} nicht gefunden")
+                return {"success": False, "error": f"Tenant {tenant_slug} unbekannt"}
+            tenant_id = tenant.id
+
+        # Skill-Routing: passenden Mitarbeiter fuer das Anliegen waehlen
+        # (gleiches Muster wie save_contact). Failsafe: Routing-Fehler
+        # darf die Rueckruf-Erfassung nicht verhindern.
+        routing = None
+        try:
+            routing = await choose_employee(
+                tenant_id=tenant_id,
+                anliegen_text=anliegen,
+            )
+        except Exception as e:
+            logger.warning(f"rueckruf: choose_employee crashed: {e}")
+        assigned_employee_id = routing.employee_id if routing else None
+
+        # Rueckrufbitte persistieren (Status 'offen').
+        from core.models.rueckruf import Rueckruf, RUECKRUF_STATUS_OFFEN
+        async with AsyncSessionLocal() as s:
+            rueckruf = Rueckruf(
+                tenant_id=tenant_id,
+                kunde_name=kunde_name,
+                kunde_telefon=kunde_telefon,
+                anliegen=anliegen,
+                kunde_email=kunde_email,
+                status=RUECKRUF_STATUS_OFFEN,
+                assigned_employee_id=assigned_employee_id,
+            )
+            s.add(rueckruf)
+            await s.commit()
+            await s.refresh(rueckruf)
+            rueckruf_id = rueckruf.id
+
+        logger.info(
+            f"rueckruf OK: tenant={tenant_slug} id={rueckruf_id} "
+            f"assigned={assigned_employee_id}"
+        )
+
+        # Telegram-Push an den zustaendigen Mitarbeiter. Alle User-Inputs
+        # HTML-escapen (parse_mode=HTML) — sonst koennte ein Anrufer mit
+        # praepariertem Namen/Anliegen Markup einschleusen.
+        from html import escape as _h
+        from zoneinfo import ZoneInfo
+        try:
+            now_local = datetime.now(ZoneInfo("Europe/Berlin"))
+        except Exception:
+            now_local = datetime.now(timezone.utc)
+        eingegangen = now_local.strftime("%d.%m.%Y %H:%M")
+        email_str = (
+            f"\n<b>Mail:</b> <code>{_h(kunde_email)}</code>" if kunde_email else ""
+        )
+        msg = (
+            f"📞 <b>Rückrufbitte</b>\n\n"
+            f"<b>{_h(kunde_name)}</b> bittet um Rückruf unter "
+            f"<code>{_h(kunde_telefon)}</code>."
+            f"{email_str}\n"
+            f"<b>Anliegen:</b> {_h(anliegen)}\n"
+            f"<b>Eingegangen:</b> {eingegangen}"
+        )
+        keyboard = {
+            "inline_keyboard": [[
+                {
+                    "text": "✅ Erledigt",
+                    "callback_data": f"rueckruf:erledigt:{rueckruf_id}",
+                }
+            ]]
+        }
+        try:
+            from plugins.telegram_notify.handler import TelegramNotifier
+            await TelegramNotifier.send_for_employee_with_keyboard(
+                tenant_id, msg, keyboard,
+                employee_id=assigned_employee_id,
+            )
+        except Exception as e:
+            logger.exception(f"rueckruf: Telegram-Push fehlgeschlagen: {e}")
+
+        return {
+            "success": True,
+            "rueckruf_id": str(rueckruf_id),
+            "status": RUECKRUF_STATUS_OFFEN,
+            "message": "Rueckrufbitte erfasst",
             "routing": _routing_to_response(routing),
         }
 

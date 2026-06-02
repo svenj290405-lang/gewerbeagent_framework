@@ -22,6 +22,7 @@ MANIFEST = PluginManifest(
     webhook_endpoints=[
         {"path": "/initiation", "method": "POST"},
         {"path": "/save_contact", "method": "POST"},
+        {"path": "/rueckruf_anfordern", "method": "POST"},
         {"path": "/checke_kalender", "method": "POST"},
         {"path": "/starte_terminsuche", "method": "POST"},
         {"path": "/hole_terminvorschlaege", "method": "POST"},
