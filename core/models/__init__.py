@@ -311,6 +311,11 @@ __all__ = [
     "STATE_ARCHIV_AWAIT_CHOICE",
     "STATE_ARCHIV_AWAIT_NEW_CONFIRM",
     "TenantKundeDrive",
+    "Rueckruf",
+    "RUECKRUF_STATUS_OFFEN",
+    "RUECKRUF_STATUS_ERLEDIGT",
+    "RUECKRUF_STATUS_VALID",
+    "RUECKRUF_STATUS_LABEL",
 ]
 from core.models.tenant_leistung import TenantLeistung
 from core.models.angebot import (
@@ -338,6 +343,13 @@ from core.models.anfrage import (
     FORMULAR_STATUS_OFFEN,
     FORMULAR_STATUS_VALID,
     FORMULAR_STATUS_LABEL,
+)
+from core.models.rueckruf import (
+    Rueckruf,
+    RUECKRUF_STATUS_OFFEN,
+    RUECKRUF_STATUS_ERLEDIGT,
+    RUECKRUF_STATUS_VALID,
+    RUECKRUF_STATUS_LABEL,
 )
 from core.models.tenant_anfrage_schema import TenantAnfrageSchema
 from core.models.admin import (
