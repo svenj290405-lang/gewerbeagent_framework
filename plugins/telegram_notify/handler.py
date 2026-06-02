@@ -334,6 +334,34 @@ class TelegramNotifier:
             return False
 
     @staticmethod
+    async def send_for_employee_with_keyboard(
+        tenant_id, text, keyboard_dict, *, employee_id, employee_label=None,
+    ):
+        """Wie send_for_employee, aber mit Inline-Keyboard (reply_markup).
+
+        Fuer Pushes mit Aktions-Button (z.B. Rueckrufbitte mit
+        '✅ Erledigt'). Routing identisch zu send_for_employee via
+        resolve_employee_push_target. Returns True bei Versand.
+        """
+        try:
+            bot_token, chat_id, prefix = (
+                await TelegramNotifier.resolve_employee_push_target(
+                    tenant_id, employee_id, employee_label=employee_label,
+                )
+            )
+            if not bot_token or not chat_id:
+                return False
+            final = f"{prefix}{text}" if prefix else text
+            return await _send_with_keyboard(
+                chat_id, final, keyboard_dict, bot_token=bot_token,
+            )
+        except Exception as e:
+            logger.exception(
+                f"send_for_employee_with_keyboard fehlgeschlagen: {e}"
+            )
+            return False
+
+    @staticmethod
     async def resolve_employee_push_target(
         tenant_id, employee_id, *, employee_label=None,
     ):
@@ -911,6 +939,10 @@ async def _handle_help_command(chat_id=None):
         ("/aufnahmen",
          "Liste deiner letzten aufgenommenen Kundengespraeche "
          "(via /aufnahme) mit KI-Briefing und erkannten Kunden-Daten."),
+        ("/rueckrufe",
+         "Offene Rückrufbitten vom Telefon-Assistenten — wenn ein "
+         "Anrufer einen Rückruf wünscht. Pro Eintrag ein "
+         "„✅ Erledigt\"-Button zum Abhaken."),
     ]
     kunden_items_active: list[tuple[str, str]] = []
     kunden_items_locked: list[tuple[str, str]] = []
@@ -1916,6 +1948,8 @@ async def _dispatch_update(payload):
             await _handle_arbeitszeit_callback(cq_chat_id, cq_data, cq_id, bot_token)
         elif cq_data and cq_data.startswith("formular:"):
             await _handle_formular_callback(cq_chat_id, cq_data, cq_id, bot_token)
+        elif cq_data and cq_data.startswith("rueckruf:"):
+            await _handle_rueckruf_callback(cq_chat_id, cq_data, cq_id, bot_token)
         elif cq_data and cq_data.startswith("kal:"):
             await _handle_kalender_callback(cq_chat_id, cq_data, cq_id, bot_token)
         elif cq_data and cq_data.startswith("viz:"):
@@ -2245,6 +2279,13 @@ async def _dispatch_update(payload):
     elif text == "/neue_termine":
         await _clear_state(chat_id)
         reply = await _handle_neue_termine_command(chat_id)
+    elif text == "/rueckrufe":
+        await _clear_state(chat_id)
+        reply_or_none = await _handle_rueckrufe_command(chat_id)
+        if reply_or_none is None:
+            # Liste wurde schon per _send_with_keyboard verschickt
+            return {"ok": True}
+        reply = reply_or_none
     elif text == "/aufnahmen":
         await _clear_state(chat_id)
         reply = await _handle_aufnahmen_command(chat_id)
@@ -4497,9 +4538,29 @@ async def _handle_briefing_command(chat_id):
     except Exception as _e:  # noqa: BLE001
         logger.warning(f"briefing absence header failed: {_e}")
 
+    # Offene Rueckrufe (Voice-Tool 'rueckruf_anfordern') oben im Briefing
+    # anzeigen — abhaken laeuft ueber /rueckrufe (Inline-Buttons), da
+    # /briefing reinen Text zurueckgibt.
+    rueckruf_block = ""
+    try:
+        offene_rr = await _load_open_rueckrufe(tenant.id, current_emp)
+        if offene_rr:
+            rr_lines = [f"📞 <b>Offene Rückrufe ({len(offene_rr)})</b>"]
+            for r in offene_rr[:5]:
+                rr_lines.append(
+                    f"  · <b>{_h_safe(r.kunde_name)}</b> · "
+                    f"<code>{_h_safe(r.kunde_telefon)}</code>"
+                )
+            if len(offene_rr) > 5:
+                rr_lines.append(f"  · … und {len(offene_rr) - 5} weitere")
+            rr_lines.append("<i>Abhaken: /rueckrufe</i>")
+            rueckruf_block = "\n".join(rr_lines) + "\n\n"
+    except Exception as _e:  # noqa: BLE001
+        logger.warning(f"briefing rueckruf block failed: {_e}")
+
     if eintraege:
         datum_str = today_start.strftime("%A, %d.%m.%Y")
-        lines = [abwesenheit_header + f"🔔 <b>Termine heute</b> — {datum_str}{cal_source_label}\n"]
+        lines = [abwesenheit_header + rueckruf_block + f"🔔 <b>Termine heute</b> — {datum_str}{cal_source_label}\n"]
         for e in eintraege:
             ort_suffix = f"  ·  {_h_safe(e['ort'])}" if e["ort"] else ""
             lines.append(
@@ -4542,6 +4603,8 @@ async def _handle_briefing_command(chat_id):
     lines = []
     if abwesenheit_header:
         lines.append(abwesenheit_header.rstrip())
+    if rueckruf_block:
+        lines.append(rueckruf_block.rstrip())
     datum_str = today_start.strftime("%A, %d.%m.%Y")
     lines.append(f"📅 <b>Heute kein Termin</b> — {datum_str}")
     if provider_label:
@@ -4569,6 +4632,142 @@ async def _handle_briefing_command(chat_id):
         "Drive-Ordner.</i>"
     )
     return "\n".join(lines)
+
+
+# ----------------------------------------------------------------------
+# /rueckrufe — offene Rueckrufbitten aus dem Voice-Agent abhaken
+# ----------------------------------------------------------------------
+# Erfasst werden Rueckrufe vom Voice-Tool 'rueckruf_anfordern'
+# (plugins/voice_init/handler.py). Hier listet der Handwerker die noch
+# offenen Bitten und hakt sie per Inline-Button ab. Default-Employee
+# sieht alle, Nicht-Default nur die ihm zugewiesenen (wie /briefing).
+async def _load_open_rueckrufe(tenant_id, current_emp):
+    """Offene Rueckrufe eines Tenants, nach Eingang (aelteste zuerst)."""
+    from core.models.rueckruf import Rueckruf, RUECKRUF_STATUS_OFFEN
+    async with AsyncSessionLocal() as s:
+        q = (
+            select(Rueckruf)
+            .where(
+                Rueckruf.tenant_id == tenant_id,
+                Rueckruf.status == RUECKRUF_STATUS_OFFEN,
+            )
+            .order_by(Rueckruf.created_at.asc())
+        )
+        if current_emp is not None and not current_emp.is_default:
+            q = q.where(Rueckruf.assigned_employee_id == current_emp.id)
+        rows = (await s.execute(q)).scalars().all()
+        for r in rows:
+            s.expunge(r)
+    return list(rows)
+
+
+def _format_rueckruf_line(r) -> str:
+    """Eine Rueckruf-Zeile fuer Briefing/Liste (HTML-escaped)."""
+    try:
+        from zoneinfo import ZoneInfo
+        local = r.created_at.astimezone(ZoneInfo("Europe/Berlin"))
+    except Exception:
+        local = r.created_at
+    stamp = local.strftime("%d.%m. %H:%M")
+    anliegen = r.anliegen or ""
+    if len(anliegen) > 120:
+        anliegen = anliegen[:118] + "..."
+    return (
+        f"📞 <b>{_h_safe(r.kunde_name)}</b> · "
+        f"<code>{_h_safe(r.kunde_telefon)}</code>\n"
+        f"  <i>{_h_safe(anliegen)}</i>\n"
+        f"  <i>eingegangen {stamp}</i>"
+    )
+
+
+async def _handle_rueckrufe_command(chat_id):
+    """Listet offene Rueckrufe, jeder als eigene Nachricht mit
+    '✅ Erledigt'-Button. Gibt None zurueck (Antwort erfolgt direkt per
+    _send_with_keyboard) oder einen Text wenn nichts offen / kein Tenant.
+    """
+    res = await _get_current_employee(chat_id)
+    if res is None:
+        return "Dieser Chat ist noch keinem Betrieb zugeordnet."
+    tenant, current_emp = res
+
+    rueckrufe = await _load_open_rueckrufe(tenant.id, current_emp)
+    if not rueckrufe:
+        return (
+            "✅ <b>Keine offenen Rückrufe.</b>\n\n"
+            "<i>Rückrufbitten landen hier automatisch, wenn ein Anrufer "
+            "am Telefon einen Rückruf wünscht.</i>"
+        )
+
+    await _send_to_chat(
+        chat_id,
+        f"📞 <b>Offene Rückrufe ({len(rueckrufe)})</b> — "
+        f"tippe „✅ Erledigt“ zum Abhaken:",
+    )
+    for r in rueckrufe:
+        keyboard = {
+            "inline_keyboard": [[
+                {"text": "✅ Erledigt", "callback_data": f"rueckruf:erledigt:{r.id}"}
+            ]]
+        }
+        await _send_with_keyboard(chat_id, _format_rueckruf_line(r), keyboard)
+    return None
+
+
+async def _handle_rueckruf_callback(chat_id, callback_data, callback_query_id, bot_token):
+    """Inline-Button-Dispatcher fuer Rueckrufe: rueckruf:erledigt:<id>."""
+    from core.models.rueckruf import (
+        Rueckruf, RUECKRUF_STATUS_OFFEN, RUECKRUF_STATUS_ERLEDIGT,
+    )
+    parts = callback_data.split(":")
+    if len(parts) != 3 or parts[1] != "erledigt":
+        await _answer_callback_query(callback_query_id, "Ungueltig", bot_token)
+        return
+    try:
+        rueckruf_id = uuid.UUID(parts[2])
+    except (ValueError, AttributeError):
+        await _answer_callback_query(callback_query_id, "Ungueltige ID", bot_token)
+        return
+
+    # Tenant des Chats aufloesen — verhindert, dass ein fremder Chat per
+    # erratener UUID einen Rueckruf eines anderen Betriebs abhakt.
+    res = await _get_current_employee(chat_id)
+    if res is None:
+        await _answer_callback_query(callback_query_id, "Kein Betrieb", bot_token)
+        return
+    tenant, current_emp = res
+
+    async with AsyncSessionLocal() as s:
+        r = (await s.execute(
+            select(Rueckruf).where(Rueckruf.id == rueckruf_id).with_for_update()
+        )).scalar_one_or_none()
+        if r is None or r.tenant_id != tenant.id:
+            await _answer_callback_query(
+                callback_query_id, "Rückruf nicht gefunden", bot_token
+            )
+            return
+        if r.status == RUECKRUF_STATUS_ERLEDIGT:
+            await _answer_callback_query(
+                callback_query_id, "Schon erledigt", bot_token
+            )
+            await _send_to_chat(
+                chat_id,
+                f"ℹ️ Rückruf von <b>{_h_safe(r.kunde_name)}</b> war "
+                f"bereits als erledigt markiert.",
+            )
+            return
+        kunde_name = r.kunde_name
+        r.status = RUECKRUF_STATUS_ERLEDIGT
+        r.erledigt_at = dt.datetime.now(dt.timezone.utc)
+        r.erledigt_by_employee_id = (
+            current_emp.id if current_emp is not None else None
+        )
+        await s.commit()
+
+    await _answer_callback_query(callback_query_id, "Erledigt ✅", bot_token)
+    await _send_to_chat(
+        chat_id,
+        f"✅ Rückruf von <b>{_h_safe(kunde_name)}</b> als erledigt markiert.",
+    )
 
 
 # ----------------------------------------------------------------------
