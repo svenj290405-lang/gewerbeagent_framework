@@ -157,6 +157,7 @@ const SCREENS = {
       `<div style="display:flex;align-items:center;justify-content:space-between;margin:4px 4px 14px">
          <h1 style="font-size:22px;margin:0">Büro</h1>
          <div style="display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end">
+           <button class="btn-sm btn-ghost" id="auftraege-btn" style="padding:8px 12px">🛠 Aufträge</button>
            <button class="btn-sm" id="beleg-new-btn" style="padding:8px 12px">📄 Beleg</button>
            ${isInhaber ? `
            <button class="btn-sm btn-ghost" id="rechnung-new-btn" style="padding:8px 12px">+ Rechnung</button>
@@ -180,6 +181,7 @@ const SCREENS = {
     const aBtn = document.getElementById("angebot-new-btn");
     const rBtn = document.getElementById("rechnung-new-btn");
     document.getElementById("beleg-new-btn").addEventListener("click", showBelegUpload);
+    document.getElementById("auftraege-btn").addEventListener("click", showAuftraege);
     if (aBtn) aBtn.addEventListener("click", () => showAngebotForm());
     if (rBtn) rBtn.addEventListener("click", () => showRechnungForm());
   },
@@ -1205,6 +1207,71 @@ async function showDiktatForm() {
       if (Diktat.recording) stopAndUpload();
     }, DIKTAT_MAX_SECONDS * 1000);
   });
+}
+
+// ---------- Aufträge-Lifecycle-Board ----------
+// Vorwaerts-Schritt je Status. arbeit_fertig -> rechnung_gesendet fehlt
+// bewusst: das ist der Geld-Pfad (Lexware finalisieren + Rechnung mailen),
+// der über den Rechnungs-Flow läuft, nicht hier.
+const AUFTRAG_NEXT = {
+  rechnung_erstellt: { status: "accepted", label: "✅ Angenommen" },
+  accepted: { status: "arbeit_laeuft", label: "🔨 Arbeit läuft" },
+  arbeit_laeuft: { status: "arbeit_fertig", label: "🏁 Fertig" },
+};
+
+function auftragCard(a, isInhaber) {
+  const pill = a.abgebrochen ? "danger" : (a.status === "rechnung_gesendet" ? "ok" : "warn");
+  const progress = (a.schritt != null) ? ` · Schritt ${a.schritt + 1}/${a.schritte_gesamt}` : "";
+  let actions = "";
+  if (isInhaber && !a.abgebrochen && a.status !== "rechnung_gesendet") {
+    const next = AUFTRAG_NEXT[a.status];
+    const btns = [];
+    if (next) {
+      btns.push(`<button class="btn-sm" data-auftrag="${esc(a.id)}" data-status="${next.status}" style="padding:6px 10px">${next.label}</button>`);
+    } else if (a.status === "arbeit_fertig") {
+      btns.push(`<span class="sub">Rechnung über „Rechnungen" senden</span>`);
+    }
+    btns.push(`<button class="btn-sm btn-ghost" data-auftrag="${esc(a.id)}" data-status="abgebrochen" style="padding:6px 10px">Abbrechen</button>`);
+    actions = `<div style="margin-top:8px;display:flex;gap:6px;flex-wrap:wrap;align-items:center">${btns.join("")}</div>`;
+  }
+  return `<div class="card">
+    <div class="row"><div><div><b>${esc(a.kunde)}</b></div><div class="sub">${esc(a.betrag)}${esc(progress)} · ${esc(a.zeit)}</div></div>
+    <span class="pill ${pill}">${esc(a.status_label)}</span></div>
+    ${actions}
+  </div>`;
+}
+
+function bindAuftragActions() {
+  document.querySelectorAll("[data-auftrag]").forEach((b) =>
+    b.addEventListener("click", async () => {
+      const status = b.dataset.status;
+      if (status === "abgebrochen" && !confirm("Auftrag wirklich abbrechen?")) return;
+      b.disabled = true;
+      const res = await api("/app/api/auftraege/" + encodeURIComponent(b.dataset.auftrag) + "/status",
+        { method: "POST", body: JSON.stringify({ status }) });
+      if (res && res.ok) {
+        const j = await res.json();
+        if (j.ok) { showAuftraege(); return; }
+        alert(j.error || "Konnte Status nicht setzen.");
+      } else {
+        alert("Konnte Status nicht setzen.");
+      }
+      b.disabled = false;
+    }));
+}
+
+async function showAuftraege() {
+  App.view.innerHTML = `<div class="loading">Lädt …</div>`;
+  const res = await api("/app/api/auftraege");
+  const d = res && res.ok ? await res.json() : { auftraege: [] };
+  const isInhaber = App.me.employee.is_inhaber;
+  const list = (d.auftraege || []).map((a) => auftragCard(a, isInhaber)).join("");
+  App.view.innerHTML =
+    `<button class="btn-sm btn-ghost" id="back-buchhaltung" style="margin-bottom:10px">← Zurück</button>` +
+    `<h1 style="font-size:22px;margin:4px 4px 14px">Aufträge</h1>` +
+    (list || `<div class="card">${emptyRow("Keine laufenden Aufträge")}</div>`);
+  document.getElementById("back-buchhaltung").addEventListener("click", () => navigate("buchhaltung"));
+  if (isInhaber) bindAuftragActions();
 }
 
 // ---------- Belege (Foto/PDF → Lexware-Voucher) ----------

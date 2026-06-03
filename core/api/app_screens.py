@@ -20,7 +20,15 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import func, select
 
 from core.database.connection import get_session
-from core.models.angebot import Angebot
+from core.models.angebot import (
+    Angebot,
+    ANGEBOT_STATUS_ABGEBROCHEN,
+    ANGEBOT_STATUS_ACCEPTED,
+    ANGEBOT_STATUS_WORK_DONE,
+    ANGEBOT_STATUS_WORK_IN_PROGRESS,
+    AUFTRAG_LIFECYCLE,
+    AUFTRAG_LIFECYCLE_LABELS,
+)
 from core.models.employee import Employee, get_employees_for_tenant
 from core.models.employee_absence import (
     get_active_absences,
@@ -242,6 +250,96 @@ async def api_rechnungen(request: Request, _e=Depends(require_app_user)) -> JSON
             "zeit": _fmt_dt(r.created_at),
         })
     return JSONResponse({"rechnungen": out})
+
+
+# =====================================================================
+# Aufträge-Lifecycle-Board (Angebot >= rechnung_erstellt = laufender Auftrag)
+# =====================================================================
+
+# Status, die das Board direkt setzen darf. Der finale Schritt
+# ``rechnung_gesendet`` ist BEWUSST ausgeschlossen: er loest in der
+# Telegram-Pipeline (_run_rechnung_versand_pipeline) die Lexware-
+# Finalisierung + Rechnungs-Mail aus — ein Geld-Pfad, der hier nicht
+# dupliziert wird. Rechnung versenden laeuft ueber den eigenen
+# Rechnungs-Flow.
+_AUFTRAG_SETTABLE = {
+    ANGEBOT_STATUS_ACCEPTED,
+    ANGEBOT_STATUS_WORK_IN_PROGRESS,
+    ANGEBOT_STATUS_WORK_DONE,
+    ANGEBOT_STATUS_ABGEBROCHEN,
+}
+
+
+@router.get("/auftraege")
+async def api_auftraege(
+    request: Request, _e=Depends(require_app_user),
+) -> JSONResponse:
+    """Laufende Auftraege = Angebote, deren Status im Lifecycle liegt
+    (inkl. abgebrochen). Tenant-gescoped."""
+    tid = current_tenant_id(request)
+    relevante = set(AUFTRAG_LIFECYCLE) | {ANGEBOT_STATUS_ABGEBROCHEN}
+    async with get_session() as s:
+        rows = (await s.execute(
+            select(Angebot)
+            .where(Angebot.tenant_id == tid, Angebot.status.in_(relevante))
+            .order_by(Angebot.created_at.desc())
+            .limit(50)
+        )).scalars().all()
+    out = []
+    for a in rows:
+        out.append({
+            "id": str(a.id),
+            "kunde": a.kunde_name,
+            "betrag": _fmt_eur(a.gesamtbetrag_brutto_eur),
+            "status": a.status,
+            "status_label": AUFTRAG_LIFECYCLE_LABELS.get(a.status, a.status),
+            "schritt": AUFTRAG_LIFECYCLE.index(a.status) if a.status in AUFTRAG_LIFECYCLE else None,
+            "schritte_gesamt": len(AUFTRAG_LIFECYCLE),
+            "abgebrochen": a.status == ANGEBOT_STATUS_ABGEBROCHEN,
+            "zeit": _fmt_dt(a.created_at),
+        })
+    return JSONResponse({"auftraege": out})
+
+
+@router.post("/auftraege/{angebot_id}/status")
+async def api_auftrag_status(
+    angebot_id: str,
+    request: Request,
+    _e=Depends(require_app_inhaber),
+    _c=Depends(require_app_csrf),
+) -> JSONResponse:
+    """Setzt den Auftrags-Status (reines DB-Update, spiegelt
+    _handle_auftrag_callback). Erlaubt: accepted, arbeit_laeuft,
+    arbeit_fertig, abgebrochen. ``rechnung_gesendet`` ist ausgeschlossen
+    (Geld-Pfad, siehe _AUFTRAG_SETTABLE). Inhaber-only, CSRF, harte
+    Tenant-Isolation."""
+    tid = current_tenant_id(request)
+    try:
+        aid = uuid.UUID(angebot_id)
+    except (ValueError, TypeError):
+        return JSONResponse({"ok": False, "error": "ungueltige id"}, status_code=400)
+    body = await request.json()
+    new_status = (body.get("status") or "").strip()
+    if new_status not in _AUFTRAG_SETTABLE:
+        return JSONResponse(
+            {"ok": False, "error": "Dieser Status kann hier nicht gesetzt werden."},
+            status_code=400,
+        )
+    async with get_session() as s:
+        a = (await s.execute(
+            select(Angebot).where(Angebot.id == aid, Angebot.tenant_id == tid)
+        )).scalar_one_or_none()
+        if a is None:
+            return JSONResponse({"ok": False, "error": "Auftrag nicht gefunden."}, status_code=404)
+        a.status = new_status
+        if new_status == ANGEBOT_STATUS_ACCEPTED and not a.accepted_at:
+            a.accepted_at = dt.datetime.now(dt.timezone.utc)
+        await s.commit()
+    logger.info("PWA-Auftrag Status gesetzt: id=%s tenant=%s status=%s", aid, tid, new_status)
+    return JSONResponse({
+        "ok": True, "status": new_status,
+        "status_label": AUFTRAG_LIFECYCLE_LABELS.get(new_status, new_status),
+    })
 
 
 # =====================================================================
