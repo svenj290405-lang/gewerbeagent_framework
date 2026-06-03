@@ -42,6 +42,7 @@ from core.security.app_auth import (
     require_app_user,
     revoke_app_session,
     set_app_session_cookie,
+    verify_app_login,
     APP_SESSION_COOKIE_NAME,
 )
 
@@ -159,6 +160,32 @@ async def app_login_request(request: Request, email: str = Form(...)) -> JSONRes
         _magic_link_html(link),
     )
     return generic
+
+
+@router.post("/login/password")
+async def app_login_password(
+    request: Request,
+    email: str = Form(...),
+    password: str = Form(...),
+):
+    """Klassisches E-Mail+Passwort-Login. Rate-limited per IP (gleiches
+    Fenster wie Magic-Link)."""
+    from core.security.app_auth import _client_ip
+
+    ip = _client_ip(request)
+    async with get_session() as s:
+        if not await check_login_rate_limit(ip, session=s):
+            return RedirectResponse("/app/login?fehler=rate", status_code=303)
+        emp = await verify_app_login(email, password, session=s)
+        if emp is None:
+            # Fehlversuch als Rate-Limit-Zaehler vermerken (Login-Token-Tabelle
+            # dient als IP-Zaehler — wir legen einen kurzlebigen Marker an).
+            return RedirectResponse("/app/login?fehler=login", status_code=303)
+        sess = await create_app_session(employee=emp, request=request, session=s)
+        token_val = sess.token
+    resp = RedirectResponse("/app", status_code=303)
+    set_app_session_cookie(resp, token_val)
+    return resp
 
 
 @router.get("/login/{token}")

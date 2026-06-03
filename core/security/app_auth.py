@@ -28,7 +28,11 @@ from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from config.settings import settings
-from core.admin.auth import _client_ip  # IP-Extraktion respektiert Caddy-Header
+from core.admin.auth import (  # bewaehrte Auth-Bausteine wiederverwenden
+    _client_ip,  # IP-Extraktion respektiert Caddy-Header
+    hash_password,
+    verify_password,
+)
 from core.database.connection import get_session
 from core.models.app_account import (
     APP_LOGIN_TOKEN_LIFETIME,
@@ -85,6 +89,29 @@ async def find_employee_by_email(
         .where(func.lower(Employee.contact_email) == norm)
     )
     return (await session.execute(stmt)).scalars().first()
+
+
+async def verify_app_login(
+    email: str, password: str, *, session: AsyncSession,
+) -> Optional[Employee]:
+    """Klassisches E-Mail+Passwort-Login. Liefert den Employee oder None.
+
+    None bei: keine Mail-Zuordnung, kein Passwort gesetzt, falsches Passwort,
+    inaktiver Account (find_employee_by_email filtert is_active).
+    """
+    if not email or not password:
+        return None
+    emp = await find_employee_by_email(email, session=session)
+    if emp is None or not emp.app_password_hash:
+        return None
+    if not verify_password(password, emp.app_password_hash):
+        return None
+    return emp
+
+
+def set_app_password_hash(employee: Employee, password: str) -> None:
+    """Setzt den bcrypt-Hash des PWA-Passworts auf einem Employee."""
+    employee.app_password_hash = hash_password(password)
 
 
 async def create_login_token(

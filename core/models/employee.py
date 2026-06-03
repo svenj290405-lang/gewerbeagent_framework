@@ -114,6 +114,9 @@ class Employee(Base):
     slug: Mapped[str] = mapped_column(String(64), nullable=False)
     name: Mapped[str] = mapped_column(String(200), nullable=False)
     contact_email: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    # PWA-Login (optional): bcrypt-Hash fuer klassisches E-Mail+Passwort-Login.
+    # NULL = kein Passwort gesetzt (dann nur Magic-Link/Login-Link moeglich).
+    app_password_hash: Mapped[str | None] = mapped_column(String(255), nullable=True)
     is_default: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default="false", default=False,
     )

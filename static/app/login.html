@@ -13,42 +13,61 @@
   <main class="login-card">
     <img src="/app/static/icon.svg" alt="" width="64" height="64" />
     <h1>Gewerbeagent</h1>
-    <p class="muted">Melde dich mit deiner E-Mail-Adresse an. Wir schicken dir
-      einen einmaligen Login-Link — kein Passwort nötig.</p>
-
-    <form id="login-form">
-      <label for="email">E-Mail</label>
-      <input id="email" name="email" type="email" autocomplete="email"
-             required placeholder="du@betrieb.de" />
-      <button type="submit" id="submit-btn">Login-Link senden</button>
-    </form>
 
     <p id="msg" class="msg" role="status" aria-live="polite"></p>
+
+    <!-- Passwort-Login (Standard) -->
+    <form id="pw-form" method="post" action="/app/login/password">
+      <label for="email">E-Mail</label>
+      <input id="email" name="email" type="email" autocomplete="username"
+             required placeholder="du@betrieb.de" />
+      <label for="password">Passwort</label>
+      <input id="password" name="password" type="password"
+             autocomplete="current-password" required placeholder="••••••••" />
+      <button type="submit">Anmelden</button>
+    </form>
+
+    <p class="muted" id="magic-toggle" style="margin-top:18px">
+      Kein Passwort? <a href="#" id="show-magic">Link per E-Mail anfordern</a>
+    </p>
+
+    <!-- Magic-Link (Fallback, versteckt) -->
+    <form id="magic-form" hidden>
+      <label for="memail">E-Mail</label>
+      <input id="memail" name="email" type="email" autocomplete="email"
+             placeholder="du@betrieb.de" />
+      <button type="submit" id="magic-btn">Login-Link senden</button>
+    </form>
   </main>
 
   <script>
     const params = new URLSearchParams(location.search);
-    if (params.get("fehler") === "link") {
-      document.getElementById("msg").textContent =
-        "Der Link ist abgelaufen oder wurde schon benutzt. Fordere einen neuen an.";
-    }
-    const form = document.getElementById("login-form");
     const msg = document.getElementById("msg");
-    const btn = document.getElementById("submit-btn");
-    form.addEventListener("submit", async (e) => {
+    const fehler = params.get("fehler");
+    if (fehler === "login") msg.textContent = "E-Mail oder Passwort falsch.";
+    else if (fehler === "rate") msg.textContent = "Zu viele Versuche. Bitte kurz warten.";
+    else if (fehler === "link") msg.textContent = "Der Link ist abgelaufen oder schon benutzt.";
+
+    document.getElementById("show-magic").addEventListener("click", (e) => {
       e.preventDefault();
-      btn.disabled = true;
-      msg.textContent = "Wird gesendet …";
-      const body = new URLSearchParams({ email: document.getElementById("email").value });
+      document.getElementById("pw-form").hidden = true;
+      document.getElementById("magic-toggle").hidden = true;
+      document.getElementById("magic-form").hidden = false;
+      msg.textContent = "";
+    });
+
+    document.getElementById("magic-form").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const btn = document.getElementById("magic-btn");
+      btn.disabled = true; msg.textContent = "Wird gesendet …";
+      const body = new URLSearchParams({ email: document.getElementById("memail").value });
       try {
         const res = await fetch("/app/login", { method: "POST", body });
         const data = await res.json();
         msg.textContent = data.message || "Bitte E-Mail-Postfach prüfen.";
       } catch (err) {
         msg.textContent = "Es gab ein Problem. Bitte später erneut versuchen.";
-      } finally {
-        btn.disabled = false;
-      }
+      } finally { btn.disabled = false; }
     });
   </script>
 </body>
