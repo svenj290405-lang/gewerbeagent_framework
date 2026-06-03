@@ -1849,6 +1849,98 @@ async def api_material_toggle(
     return JSONResponse({"ok": True, "aktiv": new_active})
 
 
+@router.post("/material/{mid}/bestellen")
+async def api_material_bestellen(
+    mid: str,
+    request: Request,
+    emp: Employee = Depends(require_app_user),
+    _c=Depends(require_app_csrf),
+) -> JSONResponse:
+    """Loest eine Material-Bestellung aus: schreibt den Audit-Log-Eintrag
+    (MaterialBestellung) und gibt den Bestell-Link zurueck, den die App
+    oeffnet. Spiegelt den Telegram-/bestellen-Flow (_ausloesen_bestellung):
+    nur Link + Log, kein Auto-Mail.
+
+    Body (optional): { menge }. require_app_user (kein Inhaber-Gate) — der
+    Monteur bestellt im Feld. HARTE Tenant-Isolation ueber current_tenant_id.
+    """
+    from core.models.tenant_material import (
+        TenantMaterial, MaterialBestellung, BESTELL_ART_LINK,
+    )
+
+    tid = current_tenant_id(request)
+    try:
+        mid_uuid = uuid.UUID(mid)
+    except (ValueError, TypeError):
+        return JSONResponse({"ok": False, "error": "ungueltige id"}, status_code=400)
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    try:
+        menge = int(body.get("menge") or 0)
+    except (TypeError, ValueError):
+        menge = 0
+
+    async with get_session() as s:
+        m = (await s.execute(
+            select(TenantMaterial)
+            .where(TenantMaterial.id == mid_uuid)
+            .where(TenantMaterial.tenant_id == tid)
+        )).scalar_one_or_none()
+        if m is None:
+            return JSONResponse({"ok": False, "error": "Material nicht gefunden."}, status_code=404)
+        if not m.aktiv:
+            return JSONResponse({"ok": False, "error": "Material ist deaktiviert."}, status_code=409)
+        if menge < 1:
+            menge = m.standard_menge or 1
+        s.add(MaterialBestellung(
+            tenant_id=tid,
+            material_id=m.id,
+            employee_id=emp.id,
+            material_name=m.name,
+            bestell_link=m.bestell_link,
+            menge=menge,
+            einheit=m.einheit,
+            bestell_art=BESTELL_ART_LINK,
+        ))
+        await s.commit()
+        bestell_link = m.bestell_link
+        material_name = m.name
+    logger.info("PWA-Bestellung: material=%s tenant=%s mitarbeiter=%s menge=%s", mid_uuid, tid, emp.id, menge)
+    return JSONResponse({
+        "ok": True, "bestell_link": bestell_link,
+        "material": material_name, "menge": menge,
+    })
+
+
+@router.get("/material/bestellungen")
+async def api_material_bestellungen(
+    request: Request, _e=Depends(require_app_user),
+) -> JSONResponse:
+    """Bestellhistorie (letzte 20), tenant-gescoped. Spiegelt
+    /bestellungen."""
+    from core.models.tenant_material import MaterialBestellung
+    tid = current_tenant_id(request)
+    async with get_session() as s:
+        rows = (await s.execute(
+            select(MaterialBestellung)
+            .where(MaterialBestellung.tenant_id == tid)
+            .order_by(MaterialBestellung.created_at.desc())
+            .limit(20)
+        )).scalars().all()
+    return JSONResponse({"bestellungen": [
+        {
+            "id": str(o.id),
+            "material": o.material_name,
+            "menge": o.menge,
+            "einheit": o.einheit,
+            "zeit": _fmt_dt(o.created_at),
+        } for o in rows
+    ]})
+
+
 @router.post("/team/{slug}/abwesenheit")
 async def api_team_abwesenheit(
     slug: str, request: Request,

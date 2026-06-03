@@ -372,7 +372,7 @@ const SCREENS = {
            </div>
          </div>
          <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap">
-           ${m.bestell_link ? `<a class="btn-sm" href="${esc(m.bestell_link)}" target="_blank" rel="noopener" style="text-decoration:none">🛒 Bestellen</a>` : ""}
+           ${m.bestell_link && m.aktiv ? `<button class="btn-sm" data-mat-order="${esc(m.id)}" data-link="${esc(m.bestell_link)}">🛒 Bestellen</button>` : ""}
            ${isInhaber ? `<button class="btn-sm btn-ghost" data-mat-toggle="${esc(m.id)}">${m.aktiv ? "Deaktivieren" : "Aktivieren"}</button>` : ""}
          </div>
        </div>`;
@@ -381,13 +381,17 @@ const SCREENS = {
       `<button class="btn-sm btn-ghost" id="back-mehr" style="margin-bottom:10px">← Zurück</button>` +
       `<div style="display:flex;align-items:center;justify-content:space-between;margin:4px 4px 14px">
          <h1 style="font-size:22px;margin:0">Material</h1>
-         ${isInhaber ? `<button class="btn-sm" id="mat-new-btn" style="padding:8px 14px">+ Neu</button>` : ""}
+         <div style="display:flex;gap:6px">
+           <button class="btn-sm btn-ghost" id="mat-verlauf-btn" style="padding:8px 12px">🧾 Verlauf</button>
+           ${isInhaber ? `<button class="btn-sm" id="mat-new-btn" style="padding:8px 12px">+ Neu</button>` : ""}
+         </div>
        </div>` +
       `<div class="section-title">Aktiv (${active.length})</div>` +
       (active.length ? active.map(render).join("") : emptyRow("Noch kein aktives Material.")) +
       (inactive.length ? `<details class="card"><summary style="cursor:pointer;font-weight:600">Inaktiv (${inactive.length})</summary>${inactive.map(render).join("")}</details>` : "");
 
     document.getElementById("back-mehr").addEventListener("click", () => navigate("mehr"));
+    document.getElementById("mat-verlauf-btn").addEventListener("click", showMaterialBestellungen);
     const newBtn = document.getElementById("mat-new-btn");
     if (newBtn) newBtn.addEventListener("click", showNewMaterialForm);
     document.querySelectorAll("[data-mat-toggle]").forEach((b) =>
@@ -396,6 +400,15 @@ const SCREENS = {
         const r = await api(`/app/api/material/${b.dataset.matToggle}/toggle`,
           { method: "POST", body: "{}" });
         if (r && r.ok) navigate("material"); else { b.disabled = false; alert("Konnte nicht ändern."); }
+      }));
+    // Bestellen: Link sofort im Klick-Gesture öffnen (kein Popup-Blocker),
+    // Bestellung im Hintergrund protokollieren.
+    document.querySelectorAll("[data-mat-order]").forEach((b) =>
+      b.addEventListener("click", () => {
+        if (b.dataset.link) window.open(b.dataset.link, "_blank", "noopener");
+        b.disabled = true; b.textContent = "✓ Bestellt";
+        api(`/app/api/material/${b.dataset.matOrder}/bestellen`, { method: "POST", body: "{}" })
+          .catch(() => {});
       }));
   },
 
@@ -1207,6 +1220,22 @@ async function showDiktatForm() {
       if (Diktat.recording) stopAndUpload();
     }, DIKTAT_MAX_SECONDS * 1000);
   });
+}
+
+// ---------- Material-Bestellverlauf ----------
+async function showMaterialBestellungen() {
+  App.view.innerHTML = `<div class="loading">Lädt …</div>`;
+  const res = await api("/app/api/material/bestellungen");
+  const d = res && res.ok ? await res.json() : { bestellungen: [] };
+  const list = (d.bestellungen || []).map((o) =>
+    row(o.material, `${o.menge} ${o.einheit}`, o.zeit)).join("");
+  App.view.innerHTML =
+    `<button class="btn-sm btn-ghost" id="back-material" style="margin-bottom:10px">← Zurück</button>` +
+    `<h1 style="font-size:22px;margin:4px 4px 14px">Bestellverlauf</h1>` +
+    `<div class="card"><h2>Letzte Bestellungen</h2>${
+      list || emptyRow("Noch keine Bestellungen")
+    }</div>`;
+  document.getElementById("back-material").addEventListener("click", () => navigate("material"));
 }
 
 // ---------- Aufträge-Lifecycle-Board ----------

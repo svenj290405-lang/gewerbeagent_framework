@@ -8,9 +8,9 @@
  *  - Minimaler Offline-Shell-Cache (App-Rahmen laedt auch ohne Netz; die
  *    eigentlichen Daten kommen immer frisch vom Server).
  */
-// v10: Aufträge-Lifecycle-Board (Status angenommen→Arbeit läuft→fertig→
-// abgebrochen), zusaetzlich zu Belege (v9) + Diktat (v8).
-const CACHE = "ga-app-v10";
+// v11: Material-Bestellungen (Bestellen-Aktion mit Audit-Log + Verlauf),
+// zusaetzlich zu Aufträge-Board (v10) + Belege (v9) + Diktat (v8).
+const CACHE = "ga-app-v11";
 const SHELL = [
   "/app",
   "/app/static/app.css",
