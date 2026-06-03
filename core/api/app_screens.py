@@ -17,7 +17,7 @@ import uuid
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from core.database.connection import get_session
 from core.models.angebot import Angebot
@@ -26,8 +26,15 @@ from core.models.employee_absence import (
     get_active_absences,
     get_upcoming_absences,
 )
+from core.models.email_conversation import (
+    CLASSIFICATION_NICHT_RELEVANT,
+    CLASSIFICATION_PRIVAT,
+    EmailConversation,
+    STATE_CLOSED,
+)
 from core.models.kundengespraech import Kundengespraech
 from core.models.rechnung import Rechnung
+from core.models.tenant_knowledge import KATEGORIE_LABELS, TenantKnowledge
 from core.models.rueckruf import (
     RUECKRUF_STATUS_ERLEDIGT,
     RUECKRUF_STATUS_OFFEN,
@@ -475,3 +482,398 @@ async def api_termin_storno(
         logger.warning("app storno mail crash: %s", exc)
 
     return JSONResponse({"ok": True, "mail_sent": mail_sent})
+
+
+# =====================================================================
+# Aufnahme-Detail
+# =====================================================================
+
+@router.get("/aufnahmen/{kid}")
+async def api_aufnahme_detail(
+    kid: str, request: Request, _e=Depends(require_app_user),
+) -> JSONResponse:
+    tid = current_tenant_id(request)
+    try:
+        kid_uuid = uuid.UUID(kid)
+    except (ValueError, TypeError):
+        return JSONResponse({"ok": False, "error": "ungueltige id"}, status_code=400)
+    async with get_session() as s:
+        k = (await s.execute(
+            select(Kundengespraech)
+            .where(Kundengespraech.id == kid_uuid)
+            .where(Kundengespraech.tenant_id == tid)
+        )).scalar_one_or_none()
+    if k is None:
+        return JSONResponse({"ok": False, "error": "nicht gefunden"}, status_code=404)
+    dauer = ""
+    if k.audio_dauer_sekunden:
+        m, sec = divmod(int(k.audio_dauer_sekunden), 60)
+        dauer = f"{m}:{sec:02d} min"
+    return JSONResponse({
+        "id": str(k.id),
+        "kunde": k.kunde_name,
+        "zeit": _fmt_dt(k.gespraech_datum),
+        "dauer": dauer,
+        "briefing": k.briefing_kurz or "",
+        "notizen": k.notizen_lang or "",
+        "todos": list(k.todos or []),
+        "transkript": k.raw_transcript or "",
+        "termin": _fmt_dt(k.termin_datum) if k.termin_datum else "",
+        "termin_ort": k.termin_ort or "",
+    })
+
+
+# =====================================================================
+# Kunden-Suche (über Gespräche, Angebote, Rechnungen)
+# =====================================================================
+
+@router.get("/kunden")
+async def api_kunden(
+    request: Request, q: str = "", _e=Depends(require_app_user),
+) -> JSONResponse:
+    tid = current_tenant_id(request)
+    query = (q or "").strip()
+    if len(query) < 2:
+        return JSONResponse({"q": query, "gespraeche": [], "angebote": [],
+                             "rechnungen": [], "hint": "Mind. 2 Zeichen eingeben."})
+    like = f"%{query}%"
+    async with get_session() as s:
+        g = (await s.execute(
+            select(Kundengespraech)
+            .where(Kundengespraech.tenant_id == tid)
+            .where(Kundengespraech.kunde_name.ilike(like))
+            .order_by(Kundengespraech.gespraech_datum.desc()).limit(25)
+        )).scalars().all()
+        a = (await s.execute(
+            select(Angebot).where(Angebot.tenant_id == tid)
+            .where(Angebot.kunde_name.ilike(like))
+            .order_by(Angebot.created_at.desc()).limit(25)
+        )).scalars().all()
+        r = (await s.execute(
+            select(Rechnung).where(Rechnung.tenant_id == tid)
+            .where(Rechnung.kunde_name.ilike(like))
+            .order_by(Rechnung.created_at.desc()).limit(25)
+        )).scalars().all()
+    return JSONResponse({
+        "q": query,
+        "gespraeche": [{"id": str(x.id), "kunde": x.kunde_name,
+                        "briefing": (x.briefing_kurz or "")[:140],
+                        "zeit": _fmt_dt(x.gespraech_datum)} for x in g],
+        "angebote": [{"kunde": x.kunde_name, "betrag": _fmt_eur(x.gesamtbetrag_brutto_eur),
+                      "zeit": _fmt_dt(x.created_at)} for x in a],
+        "rechnungen": [{"kunde": x.kunde_name or "—", "betrag": _fmt_eur(x.betrag_brutto_eur),
+                        "nummer": x.lexware_voucher_number or "",
+                        "zeit": _fmt_dt(x.created_at)} for x in r],
+    })
+
+
+# =====================================================================
+# Wissensdatenbank (lesen / anlegen / löschen)
+# =====================================================================
+
+@router.get("/wissen")
+async def api_wissen(request: Request, _e=Depends(require_app_user)) -> JSONResponse:
+    tid = current_tenant_id(request)
+    async with get_session() as s:
+        rows = (await s.execute(
+            select(TenantKnowledge).where(TenantKnowledge.tenant_id == tid)
+            .order_by(TenantKnowledge.kategorie, TenantKnowledge.created_at.desc())
+        )).scalars().all()
+    eintraege = [{
+        "id": str(w.id),
+        "kategorie": w.kategorie,
+        "kategorie_label": KATEGORIE_LABELS.get(w.kategorie, w.kategorie),
+        "text": w.text,
+    } for w in rows]
+    kategorien = [{"key": k, "label": v} for k, v in KATEGORIE_LABELS.items()]
+    return JSONResponse({"eintraege": eintraege, "kategorien": kategorien})
+
+
+@router.post("/wissen")
+async def api_wissen_add(
+    request: Request, _e=Depends(require_app_user), _c=Depends(require_app_csrf),
+) -> JSONResponse:
+    tid = current_tenant_id(request)
+    body = await request.json() or {}
+    kategorie = (body.get("kategorie") or "").strip()
+    text = (body.get("text") or "").strip()
+    if kategorie not in KATEGORIE_LABELS:
+        return JSONResponse({"ok": False, "error": "unbekannte Kategorie"}, status_code=400)
+    if not (3 <= len(text) <= 2000):
+        return JSONResponse({"ok": False, "error": "Text 3–2000 Zeichen"}, status_code=400)
+    async with get_session() as s:
+        s.add(TenantKnowledge(tenant_id=tid, kategorie=kategorie, text=text))
+    return JSONResponse({"ok": True})
+
+
+@router.post("/wissen/{wid}/loeschen")
+async def api_wissen_delete(
+    wid: str, request: Request,
+    _e=Depends(require_app_inhaber), _c=Depends(require_app_csrf),
+) -> JSONResponse:
+    tid = current_tenant_id(request)
+    try:
+        wid_uuid = uuid.UUID(wid)
+    except (ValueError, TypeError):
+        return JSONResponse({"ok": False, "error": "ungueltige id"}, status_code=400)
+    async with get_session() as s:
+        w = (await s.execute(
+            select(TenantKnowledge)
+            .where(TenantKnowledge.id == wid_uuid)
+            .where(TenantKnowledge.tenant_id == tid)
+        )).scalar_one_or_none()
+        if w is None:
+            return JSONResponse({"ok": False, "error": "nicht gefunden"}, status_code=404)
+        await s.delete(w)
+    return JSONResponse({"ok": True})
+
+
+# =================== Anfragen-Inbox (Welle 2: Telegram-Ersatz) ===================
+#
+# Datenmodell: EmailConversation (eine pro (Tenant, Kunden-Mail)). Die KI hat
+# pro Conversation classification + classification_confidence, der State zeigt
+# den Bearbeitungsstand (awaiting_confirmation, proposing_slots, booked,
+# closed). Eine Anfrage ist hier eine EmailConversation, deren classification
+# RELEVANT_KUNDE oder RELEVANT_GESCHAEFT ist (Privat/Spam ausgefiltert).
+#
+# UX-Konzept: zwei-Spalten-Layout in der PWA, Inbox links, Detail rechts —
+# wie Mail.app auf macOS/iPadOS. Mobile: Inbox first, Detail als Push-Screen.
+
+
+# Anfrage-Filter — Klassifikationen die wir in der Inbox zeigen. Privat +
+# NICHT_RELEVANT bleiben aus damit der Inhaber nicht jeden Spam sieht.
+_RELEVANT_CLASSIFICATIONS = (
+    "RELEVANT_KUNDE",
+    "RELEVANT_GESCHAEFT",
+    "UNSICHER",
+    None,  # noch nicht klassifiziert — defensiv anzeigen
+)
+
+
+def _classification_label(c: str | None) -> tuple[str, str]:
+    """(label, pill-style) — Pill-style passt zu app.css: ok | warn | danger | ""."""
+    return {
+        "RELEVANT_KUNDE": ("Kunde", "ok"),
+        "RELEVANT_GESCHAEFT": ("Geschaeftlich", "ok"),
+        "UNSICHER": ("Unsicher", "warn"),
+        "PRIVAT": ("Privat", ""),
+        "NICHT_RELEVANT": ("Nicht relevant", ""),
+    }.get(c or "", ("Neu", "warn"))
+
+
+def _state_label(state: str) -> tuple[str, str]:
+    return {
+        "awaiting_confirmation": ("Wartet auf Antwort", "warn"),
+        "proposing_slots": ("Slots vorgeschlagen", "warn"),
+        "booked": ("Termin gebucht", "ok"),
+        "closed": ("Erledigt", ""),
+        "storniert": ("Storniert", "danger"),
+        "zustellung_fehlgeschlagen": ("Zustellung fehlgeschlagen", "danger"),
+        "dialog": ("Im Dialog", "warn"),
+    }.get(state, (state, ""))
+
+
+@router.get("/anfragen")
+async def api_anfragen_list(
+    request: Request,
+    _e=Depends(require_app_user),
+) -> JSONResponse:
+    """Inbox-Liste der EmailConversations dieses Tenants.
+
+    Sortiert: nicht-geschlossene + juengste zuerst (typische Mail-App-UX).
+    Geschlossene werden inkludiert, aber unten — der Inhaber kann sie
+    weiter sehen falls Rueckblick gewuenscht.
+    """
+    tid = current_tenant_id(request)
+    async with get_session() as s:
+        rows = (await s.execute(
+            select(EmailConversation)
+            .where(EmailConversation.tenant_id == tid)
+            .where(
+                (EmailConversation.classification.in_(
+                    [c for c in _RELEVANT_CLASSIFICATIONS if c is not None]
+                ))
+                | (EmailConversation.classification.is_(None))
+            )
+            .order_by(EmailConversation.updated_at.desc())
+            .limit(200)
+        )).scalars().all()
+
+    items = []
+    for c in rows:
+        cls_label, cls_style = _classification_label(c.classification)
+        state_label, state_style = _state_label(c.state)
+        # Preview = letzte User-Mail (~140 Zeichen), Fallback letzter Q-Reply.
+        preview = (c.last_user_message or c.last_q_reply or "").strip()
+        if len(preview) > 160:
+            preview = preview[:160] + "…"
+        items.append({
+            "id": str(c.id),
+            "kunde_email": c.kunde_email,
+            "kunde_name": c.kunde_name or "",
+            "subject": c.last_subject or "(kein Betreff)",
+            "preview": preview,
+            "state": c.state,
+            "state_label": state_label,
+            "state_style": state_style,
+            "classification": c.classification or "",
+            "classification_label": cls_label,
+            "classification_style": cls_style,
+            "termin_datum": c.termin_datum.isoformat() if c.termin_datum else None,
+            "drive_folder_url": c.drive_folder_url,
+            "updated_at": c.updated_at.isoformat() if c.updated_at else None,
+            "updated_at_fmt": _fmt_dt(c.updated_at),
+            "closed": c.state == STATE_CLOSED,
+        })
+
+    return JSONResponse({"items": items})
+
+
+@router.get("/anfragen/{anfrage_id}")
+async def api_anfrage_detail(
+    anfrage_id: str, request: Request,
+    _e=Depends(require_app_user),
+) -> JSONResponse:
+    """Detail einer Anfrage: letzte User-Mail im Klartext + letzte Q-Antwort +
+    Klassifikations-Begruendung + Slots-Vorschlaege falls da."""
+    tid = current_tenant_id(request)
+    try:
+        cid = uuid.UUID(anfrage_id)
+    except (ValueError, TypeError):
+        return JSONResponse({"ok": False, "error": "ungueltige id"}, status_code=400)
+
+    async with get_session() as s:
+        c = (await s.execute(
+            select(EmailConversation)
+            .where(EmailConversation.id == cid)
+            .where(EmailConversation.tenant_id == tid)  # Tenant-Isolation
+        )).scalar_one_or_none()
+
+    if c is None:
+        return JSONResponse({"ok": False, "error": "Anfrage nicht gefunden"}, status_code=404)
+
+    cls_label, cls_style = _classification_label(c.classification)
+    state_label, state_style = _state_label(c.state)
+    return JSONResponse({
+        "id": str(c.id),
+        "kunde_email": c.kunde_email,
+        "kunde_name": c.kunde_name or "",
+        "subject": c.last_subject or "(kein Betreff)",
+        "last_user_message": c.last_user_message or "",
+        "last_q_reply": c.last_q_reply or "",
+        "classification": c.classification or "",
+        "classification_label": cls_label,
+        "classification_style": cls_style,
+        "classification_reason": c.classification_reason or "",
+        "classification_confidence": c.classification_confidence or "",
+        "state": c.state,
+        "state_label": state_label,
+        "state_style": state_style,
+        "proposed_slots": c.proposed_slots or [],
+        "termin_datum": c.termin_datum.isoformat() if c.termin_datum else None,
+        "drive_folder_url": c.drive_folder_url,
+        "updated_at_fmt": _fmt_dt(c.updated_at),
+        "created_at_fmt": _fmt_dt(c.created_at),
+        "closed": c.state == STATE_CLOSED,
+    })
+
+
+@router.post("/anfragen/{anfrage_id}/reply")
+async def api_anfrage_reply(
+    anfrage_id: str, request: Request,
+    _e=Depends(require_app_user),
+    _c=Depends(require_app_csrf),
+) -> JSONResponse:
+    """Sendet eine Antwort auf eine Anfrage via Microsoft Graph (send_tracked_mail)
+    und aktualisiert die EmailConversation (last_message_id, last_q_reply,
+    state). Threading-konform: die naechste Kundenantwort wird ueber
+    In-Reply-To wieder auf diese Conversation gemappt.
+
+    Body: { "body": "Antwort-Text", "close": true|false }
+    - close=true setzt state=closed (Inhaber sagt "Thema erledigt").
+    """
+    tid = current_tenant_id(request)
+    employee = request.state.app_employee  # vom require_app_user gesetzt
+
+    try:
+        cid = uuid.UUID(anfrage_id)
+    except (ValueError, TypeError):
+        return JSONResponse({"ok": False, "error": "ungueltige id"}, status_code=400)
+
+    body_data = await request.json()
+    reply_text = ((body_data or {}).get("body") or "").strip()
+    if not reply_text:
+        return JSONResponse({"ok": False, "error": "Leere Antwort."}, status_code=400)
+    close_after = bool((body_data or {}).get("close", False))
+
+    async with get_session() as s:
+        conv = (await s.execute(
+            select(EmailConversation)
+            .where(EmailConversation.id == cid)
+            .where(EmailConversation.tenant_id == tid)
+        )).scalar_one_or_none()
+    if conv is None:
+        return JSONResponse({"ok": False, "error": "Anfrage nicht gefunden"}, status_code=404)
+
+    # Subject mit Re:-Prefix (RFC 5322 — nur 1x „Re:" zu Beginn).
+    base_subject = (conv.last_subject or "Ihre Anfrage").strip()
+    if not base_subject.lower().startswith("re:"):
+        reply_subject = f"Re: {base_subject}"
+    else:
+        reply_subject = base_subject
+
+    # Plain → einfacher HTML-Body (Zeilenumbruch zu <br>, leere Zeilen zu <p>).
+    paragraphs = [p.strip() for p in reply_text.split("\n\n") if p.strip()]
+    body_html = "".join(
+        "<p>" + p.replace("\n", "<br>") + "</p>" for p in paragraphs
+    )
+
+    # Send via send_tracked_mail (Draft-Create + Send, damit wir die
+    # internetMessageId fuer das Threading bekommen). employee_id liefert
+    # den richtigen Postfach-Owner falls Multi-OAuth aktiv ist.
+    from core.integrations.microsoft import send_tracked_mail
+    from core.integrations.mail_pipeline import (
+        record_outbound_q_reply,
+        set_conversation_state,
+    )
+
+    try:
+        send_result = await send_tracked_mail(
+            tenant_id=tid,
+            to_email=conv.kunde_email,
+            subject=reply_subject,
+            body_html=body_html,
+            body_text=reply_text,
+            employee_id=getattr(employee, "id", None),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("anfrage-reply send_tracked_mail crash: %s", exc)
+        return JSONResponse(
+            {"ok": False, "error": "Mail-Versand fehlgeschlagen."},
+            status_code=500,
+        )
+
+    if not send_result.get("success"):
+        return JSONResponse({
+            "ok": False,
+            "error": send_result.get("error") or "Mail-Versand fehlgeschlagen.",
+        }, status_code=502)
+
+    # Conversation-Threading aktualisieren — last_message_id auf die
+    # neue internetMessageId, damit der Kunden-Reply darauf zurueck-
+    # gemappt wird.
+    await record_outbound_q_reply(
+        conv_id=cid,
+        internet_message_id=send_result.get("internet_message_id"),
+        microsoft_conversation_id=send_result.get("conversation_id"),
+        q_reply_text=reply_text,
+        subject=reply_subject,
+    )
+    if close_after:
+        await set_conversation_state(cid, STATE_CLOSED)
+
+    return JSONResponse({
+        "ok": True,
+        "internet_message_id": send_result.get("internet_message_id"),
+        "closed": close_after,
+    })

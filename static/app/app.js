@@ -40,11 +40,12 @@ function notifGranted() { return notifSupported() && Notification.permission ===
 
 // ---------- Tabs ----------
 const TABS = [
-  { key: "start",       label: "Start",   ico: "🏠" },
-  { key: "termine",     label: "Termine", ico: "📅", feature: "kalender" },
-  { key: "anrufe",      label: "Anrufe",  ico: "📞", feature: "voice_init" },
-  { key: "buchhaltung", label: "Büro",    ico: "🧾", feature: "lexware" },
-  { key: "mehr",        label: "Mehr",    ico: "⋯" },
+  { key: "start",       label: "Start",    ico: "🏠" },
+  { key: "anfragen",    label: "Anfragen", ico: "✉️", feature: "mail_intake" },
+  { key: "termine",     label: "Termine",  ico: "📅", feature: "kalender" },
+  { key: "anrufe",      label: "Anrufe",   ico: "📞", feature: "voice_init" },
+  { key: "buchhaltung", label: "Büro",     ico: "🧾", feature: "lexware" },
+  { key: "mehr",        label: "Mehr",     ico: "⋯" },
 ];
 
 function buildTabbar() {
@@ -92,12 +93,13 @@ const SCREENS = {
     }</div>`);
 
     parts.push(`<div class="card"><h2>Neue Aufnahmen (${(d.aufnahmen || []).length})</h2>${
-      (d.aufnahmen || []).length ? d.aufnahmen.map((a) => row(a.kunde || "Aufnahme", a.briefing || "", a.zeit)).join("") : emptyRow("Keine neuen Aufnahmen")
+      (d.aufnahmen || []).length ? d.aufnahmen.map((a) => rowTap(a.kunde || "Aufnahme", a.briefing || "", a.zeit, a.id)).join("") : emptyRow("Keine neuen Aufnahmen")
     }</div>`);
 
     App.view.innerHTML = parts.join("");
     const inline = document.getElementById("enable-notif-inline");
     if (inline) inline.addEventListener("click", enablePush);
+    bindAufnahmen();
   },
 
   async termine() {
@@ -121,10 +123,11 @@ const SCREENS = {
         : emptyRow("Keine offenen Rückrufe")
       }</div>` +
       `<div class="card"><h2>Letzte Aufnahmen</h2>${
-        (ad.aufnahmen || []).length ? ad.aufnahmen.map((x) => row(x.kunde || "Aufnahme", x.briefing || "", x.zeit)).join("")
+        (ad.aufnahmen || []).length ? ad.aufnahmen.map((x) => rowTap(x.kunde || "Aufnahme", x.briefing || "", x.zeit, x.id)).join("")
         : emptyRow("Noch keine Aufnahmen")
       }</div>`;
     bindRueckrufDone();
+    bindAufnahmen();
   },
 
   async buchhaltung() {
@@ -182,10 +185,114 @@ const SCREENS = {
       }));
   },
 
+  async kunden() {
+    App.view.innerHTML =
+      `<button class="btn-sm btn-ghost" id="back-mehr" style="margin-bottom:10px">← Zurück</button>` +
+      `<div class="card"><input id="kunde-q" type="text" placeholder="Kundenname suchen …" autocomplete="off" /></div>` +
+      `<div id="kunde-res"><p class="empty">Mind. 2 Zeichen eingeben.</p></div>`;
+    document.getElementById("back-mehr").addEventListener("click", () => navigate("mehr"));
+    const input = document.getElementById("kunde-q");
+    const res = document.getElementById("kunde-res");
+    let timer = null;
+    input.focus();
+    input.addEventListener("input", () => {
+      clearTimeout(timer);
+      const q = input.value.trim();
+      if (q.length < 2) { res.innerHTML = `<p class="empty">Mind. 2 Zeichen eingeben.</p>`; return; }
+      timer = setTimeout(async () => {
+        res.innerHTML = `<div class="loading">Suche …</div>`;
+        const r = await api("/app/api/kunden?q=" + encodeURIComponent(q));
+        const d = r && r.ok ? await r.json() : {};
+        const blocks = [];
+        if ((d.gespraeche || []).length) blocks.push(`<div class="card"><h2>Gespräche</h2>${d.gespraeche.map((x) => rowTap(x.kunde, x.briefing, x.zeit, x.id)).join("")}</div>`);
+        if ((d.angebote || []).length) blocks.push(`<div class="card"><h2>Angebote</h2>${d.angebote.map((x) => row(x.kunde, x.betrag, x.zeit)).join("")}</div>`);
+        if ((d.rechnungen || []).length) blocks.push(`<div class="card"><h2>Rechnungen</h2>${d.rechnungen.map((x) => row(x.kunde + (x.nummer ? " · " + esc(x.nummer) : ""), x.betrag, x.zeit)).join("")}</div>`);
+        res.innerHTML = blocks.length ? blocks.join("") : `<p class="empty">Nichts gefunden für „${esc(q)}".</p>`;
+        bindAufnahmen();
+      }, 300);
+    });
+  },
+
+  async anfragen() {
+    const res = await api("/app/api/anfragen");
+    const d = res && res.ok ? await res.json() : { items: [] };
+    const items = d.items || [];
+    // Aufteilung: offene oben, erledigte unten (collapsed). Erledigte-
+    // Liste ist in der Klinik-/Buero-Realitaet sehr lang — separat sortiert.
+    const open = items.filter((x) => !x.closed);
+    const closed = items.filter((x) => x.closed);
+
+    const renderItem = (x) => {
+      const head = `<div class="row" style="align-items:flex-start">
+        <div style="flex:1;min-width:0">
+          <div><b>${esc(x.kunde_name || x.kunde_email)}</b></div>
+          <div class="sub" style="margin-top:2px">${esc(x.subject)}</div>
+          ${x.preview ? `<div class="sub" style="margin-top:4px;opacity:.8">${esc(x.preview)}</div>` : ""}
+        </div>
+        <div style="text-align:right;margin-left:8px;display:flex;flex-direction:column;gap:4px;align-items:flex-end">
+          ${x.classification_label ? `<span class="pill ${x.classification_style || ""}">${esc(x.classification_label)}</span>` : ""}
+          <span class="sub">${esc(x.updated_at_fmt)}</span>
+        </div>
+      </div>
+      <div style="margin-top:6px"><span class="pill ${x.state_style || ""}">${esc(x.state_label)}</span></div>`;
+      return `<button class="row menu-item" data-anfrage="${esc(x.id)}" style="display:block;text-align:left;padding:14px">${head}</button>`;
+    };
+
+    let html =
+      `<h1 style="font-size:22px;margin:4px 4px 14px">Anfragen</h1>` +
+      `<div class="card"><h2>Offen (${open.length})</h2>` +
+      (open.length ? open.map(renderItem).join("") : emptyRow("Keine offenen Anfragen.")) +
+      `</div>`;
+    if (closed.length) {
+      html += `<details class="card"><summary style="cursor:pointer;font-weight:600">Erledigt (${closed.length})</summary>` +
+        closed.slice(0, 50).map(renderItem).join("") +
+        `</details>`;
+    }
+    App.view.innerHTML = html;
+    document.querySelectorAll("[data-anfrage]").forEach((b) =>
+      b.addEventListener("click", () => showAnfrage(b.dataset.anfrage)));
+  },
+
+  async wissen() {
+    const res = await api("/app/api/wissen");
+    const d = res && res.ok ? await res.json() : { eintraege: [], kategorien: [] };
+    const isInhaber = App.me.employee.is_inhaber;
+    // nach Kategorie gruppieren
+    const byCat = {};
+    (d.eintraege || []).forEach((e) => { (byCat[e.kategorie_label] = byCat[e.kategorie_label] || []).push(e); });
+    const groups = Object.keys(byCat).map((label) =>
+      `<div class="card"><h2>${esc(label)}</h2>${byCat[label].map((e) =>
+        `<div class="row"><div>${esc(e.text)}</div>${isInhaber ? `<button class="btn-sm btn-ghost" data-del-wissen="${e.id}">✕</button>` : ""}</div>`).join("")}</div>`).join("");
+    const opts = (d.kategorien || []).map((k) => `<option value="${k.key}">${esc(k.label)}</option>`).join("");
+    App.view.innerHTML =
+      `<button class="btn-sm btn-ghost" id="back-mehr" style="margin-bottom:10px">← Zurück</button>` +
+      (groups || `<p class="empty">Noch keine Einträge.</p>`) +
+      `<div class="card"><h2>Neuer Eintrag</h2>
+         <select id="w-kat" style="width:100%;padding:12px;border:1px solid var(--line);border-radius:10px;margin-bottom:8px">${opts}</select>
+         <textarea id="w-text" rows="3" placeholder="Wissen eingeben (z.B. Preise, Anfahrt, Öffnungszeiten) …" style="width:100%;padding:12px;border:1px solid var(--line);border-radius:10px;font-size:16px"></textarea>
+         <button class="btn-sm" id="w-add" style="margin-top:8px;width:100%">Hinzufügen</button></div>`;
+    document.getElementById("back-mehr").addEventListener("click", () => navigate("mehr"));
+    document.getElementById("w-add").addEventListener("click", async () => {
+      const kategorie = document.getElementById("w-kat").value;
+      const text = document.getElementById("w-text").value.trim();
+      if (text.length < 3) { alert("Bitte etwas mehr Text eingeben."); return; }
+      const r = await api("/app/api/wissen", { method: "POST", body: JSON.stringify({ kategorie, text }) });
+      if (r && r.ok) navigate("wissen"); else alert("Konnte nicht speichern.");
+    });
+    document.querySelectorAll("[data-del-wissen]").forEach((b) =>
+      b.addEventListener("click", async () => {
+        if (!confirm("Eintrag löschen?")) return;
+        const r = await api(`/app/api/wissen/${b.dataset.delWissen}/loeschen`, { method: "POST", body: "{}" });
+        if (r && r.ok) navigate("wissen"); else alert("Konnte nicht löschen.");
+      }));
+  },
+
   async mehr() {
     const m = App.me;
     const feats = new Set(m.features || []);
     const menu = [];
+    menu.push(`<button class="row menu-item" data-go="kunden"><span>🔍 Kunden suchen</span><span class="sub">›</span></button>`);
+    menu.push(`<button class="row menu-item" data-go="wissen"><span>📚 Wissensdatenbank</span><span class="sub">›</span></button>`);
     if (feats.has("mitarbeiter")) menu.push(`<button class="row menu-item" data-go="team"><span>👥 Team</span><span class="sub">›</span></button>`);
     App.view.innerHTML =
       `<div class="card"><h2>${esc(m.tenant.company_name || "Mein Betrieb")}</h2>
@@ -217,7 +324,133 @@ function rowPill(a, b, status, pill) {
   return `<div class="row"><div><div>${esc(a)}</div>${b ? `<div class="sub">${esc(b)}</div>` : ""}</div>` +
     `<span class="pill ${pill || ""}">${esc(status)}</span></div>`;
 }
+function rowTap(a, b, c, id) {
+  return `<button class="row menu-item" data-aufnahme="${esc(id)}" style="align-items:flex-start">` +
+    `<div style="text-align:left"><div>${esc(a)}</div>${b ? `<div class="sub">${esc(b)}</div>` : ""}</div>` +
+    `<span class="sub">${esc(c)} ›</span></button>`;
+}
 function emptyRow(txt) { return `<div class="empty">${esc(txt)}</div>`; }
+
+async function showAnfrage(id) {
+  App.view.innerHTML = `<div class="loading">Lädt …</div>`;
+  const r = await api("/app/api/anfragen/" + encodeURIComponent(id));
+  if (!r || !r.ok) {
+    App.view.innerHTML = `<div class="card"><p class="empty">Konnte nicht laden.</p></div>`;
+    return;
+  }
+  const d = await r.json();
+
+  // Slots-Block: wenn Q dem Kunden schon Termine vorgeschlagen hat, hier
+  // sichtbar machen. Der Inhaber sieht sofort: "Ah, der Bot hat schon
+  // diese 3 Slots vorgeschlagen, ich brauch nur zu warten" oder kann
+  // alternativ direkt antworten.
+  const slots = (d.proposed_slots || []);
+  const slotsHtml = slots.length
+    ? `<div class="card"><h2>Bot hat vorgeschlagen</h2>${slots.map(
+        (s) => `<div class="row"><div>${esc(s.datum || "")} ${esc(s.uhrzeit || "")}</div></div>`).join("")}</div>`
+    : "";
+
+  // Klassifikations-Begruendung als zusammenklappbarer Block — fuer den
+  // Inhaber spannend wenn er der KI hinterher schauen will.
+  const reasonHtml = d.classification_reason
+    ? `<details class="card"><summary style="cursor:pointer;font-weight:600">KI-Einschätzung (${esc(d.classification_label || "")}${d.classification_confidence ? " · " + esc(d.classification_confidence) : ""})</summary>
+       <div class="sub" style="margin-top:8px;white-space:pre-wrap">${esc(d.classification_reason)}</div></details>`
+    : "";
+
+  // Drive-Link: wenn der Kunde das Anfrage-Formular ausgefuellt hat, gibt's
+  // einen Google-Drive-Ordner mit Fotos/Uploads. Direkt-Link spart ein
+  // separates Plugin-Hopping.
+  const driveHtml = d.drive_folder_url
+    ? `<div class="card"><div class="row"><span>📂 Kunden-Uploads</span><a href="${esc(d.drive_folder_url)}" target="_blank" rel="noopener">Drive öffnen ›</a></div></div>`
+    : "";
+
+  // Letzte Q-Antwort einklappbar — Kontext wenn der Inhaber pruefen will
+  // was der Bot zuletzt geschrieben hat, bevor er selbst antwortet.
+  const qReplyHtml = d.last_q_reply
+    ? `<details class="card"><summary style="cursor:pointer;font-weight:600">Letzte Bot-Antwort an Kunden</summary>
+       <div style="margin-top:8px;white-space:pre-wrap">${esc(d.last_q_reply)}</div></details>`
+    : "";
+
+  const lastMsgBlock = d.last_user_message
+    ? `<div class="card"><h2>Letzte Nachricht vom Kunden</h2>
+       <div style="white-space:pre-wrap">${esc(d.last_user_message)}</div></div>`
+    : `<div class="card"><p class="empty">Noch keine Kunden-Nachricht in dieser Konversation.</p></div>`;
+
+  App.view.innerHTML =
+    `<button class="btn-sm btn-ghost" id="back-anfragen" style="margin-bottom:10px">← Zurück</button>` +
+    `<div class="card">
+      <div class="row"><div><b>${esc(d.kunde_name || d.kunde_email)}</b><div class="sub">${esc(d.kunde_email)}</div></div>
+      <span class="pill ${d.state_style || ""}">${esc(d.state_label)}</span></div>
+      <div class="sub" style="margin-top:6px">${esc(d.subject || "")} · ${esc(d.updated_at_fmt || "")}</div>
+    </div>` +
+    lastMsgBlock +
+    qReplyHtml +
+    slotsHtml +
+    driveHtml +
+    reasonHtml +
+    (d.closed
+      ? `<div class="card"><p class="muted">Diese Anfrage ist als erledigt markiert. Antworten ist nicht mehr möglich.</p></div>`
+      : `<div class="card"><h2>Antworten</h2>
+         <textarea id="reply-body" rows="6" placeholder="Schreibe deine Antwort an den Kunden …"
+           style="width:100%;padding:12px;border:1px solid var(--line);border-radius:10px;font-size:16px;font-family:inherit"></textarea>
+         <label style="display:flex;align-items:center;gap:8px;margin-top:10px;font-size:14px">
+           <input type="checkbox" id="reply-close"> Nach dem Senden als erledigt markieren
+         </label>
+         <button class="btn-sm" id="reply-send" style="margin-top:12px;width:100%">Antwort senden</button>
+         <p class="muted" style="margin-top:8px;font-size:12px">Die Mail wird im Namen deines Mailpostfachs versendet — der Kunde sieht deinen Absender.</p>
+       </div>`);
+
+  document.getElementById("back-anfragen").addEventListener("click", () => navigate("anfragen"));
+  const sendBtn = document.getElementById("reply-send");
+  if (sendBtn) {
+    sendBtn.addEventListener("click", async () => {
+      const body = document.getElementById("reply-body").value.trim();
+      const close = document.getElementById("reply-close").checked;
+      if (body.length < 2) { alert("Bitte einen Antwort-Text eingeben."); return; }
+      sendBtn.disabled = true;
+      sendBtn.textContent = "Sende …";
+      const res = await api("/app/api/anfragen/" + encodeURIComponent(id) + "/reply",
+        { method: "POST", body: JSON.stringify({ body, close }) });
+      if (res && res.ok) {
+        const okJson = await res.json();
+        if (okJson.ok) {
+          alert(close ? "Antwort gesendet. Anfrage als erledigt markiert." : "Antwort gesendet.");
+          navigate("anfragen");
+          return;
+        }
+        alert("Mail-Versand fehlgeschlagen: " + (okJson.error || "unbekannter Fehler"));
+      } else {
+        alert("Mail-Versand fehlgeschlagen.");
+      }
+      sendBtn.disabled = false;
+      sendBtn.textContent = "Antwort senden";
+    });
+  }
+}
+
+function bindAufnahmen() {
+  document.querySelectorAll("[data-aufnahme]").forEach((b) =>
+    b.addEventListener("click", () => showAufnahme(b.dataset.aufnahme)));
+}
+
+async function showAufnahme(id) {
+  App.view.innerHTML = `<div class="loading">Lädt …</div>`;
+  const r = await api("/app/api/aufnahmen/" + encodeURIComponent(id));
+  if (!r || !r.ok) { App.view.innerHTML = `<div class="card"><p class="empty">Konnte nicht laden.</p></div>`; return; }
+  const d = await r.json();
+  const todos = (d.todos || []).length
+    ? `<div class="card"><h2>To-dos</h2>${d.todos.map((t) => `<div class="row"><div>☐ ${esc(t)}</div></div>`).join("")}</div>` : "";
+  const termin = d.termin ? `<div class="row"><span>Termin</span><span class="sub">${esc(d.termin)}${d.termin_ort ? " · " + esc(d.termin_ort) : ""}</span></div>` : "";
+  App.view.innerHTML =
+    `<button class="btn-sm btn-ghost" id="back-anrufe" style="margin-bottom:10px">← Zurück</button>` +
+    `<div class="card"><h2>${esc(d.kunde || "Aufnahme")}</h2>
+       <div class="row"><span>Zeitpunkt</span><span class="sub">${esc(d.zeit)}${d.dauer ? " · " + esc(d.dauer) : ""}</span></div>${termin}</div>` +
+    (d.briefing ? `<div class="card"><h2>Briefing</h2><div>${esc(d.briefing)}</div></div>` : "") +
+    (d.notizen ? `<div class="card"><h2>Notizen</h2><div>${esc(d.notizen)}</div></div>` : "") +
+    todos +
+    (d.transkript ? `<div class="card"><h2>Transkript</h2><div class="sub" style="white-space:pre-wrap">${esc(d.transkript)}</div></div>` : "");
+  document.getElementById("back-anrufe").addEventListener("click", () => navigate(App.current || "anrufe"));
+}
 
 function bindStorno() {
   document.querySelectorAll('[data-action="storno"]').forEach((b) =>
