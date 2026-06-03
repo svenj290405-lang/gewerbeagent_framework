@@ -52,6 +52,34 @@ gewerbeagent.de {
     }
 }
 
+# Inhaber-/Mitarbeiter-PWA (loest den Telegram-Bot als Oberflaeche ab).
+# Alle App-Routen liegen unter /app im selben Framework-Backend; diese
+# Subdomain leitet die Wurzel auf /app um, damit app.gewerbeagent.de
+# direkt die App oeffnet. APP_BASE_URL=https://app.gewerbeagent.de in .env.
+app.gewerbeagent.de {
+    encode gzip
+
+    import security_headers
+
+    redir / /app 308
+
+    reverse_proxy framework:8001 {
+        header_up Host {host}
+        header_up X-Real-IP {remote}
+        header_up X-Forwarded-For {remote}
+        header_up X-Forwarded-Proto {scheme}
+    }
+
+    log {
+        output file /var/log/caddy/app-access.log {
+            roll_size 10mb
+            roll_keep 5
+            roll_keep_for 336h
+        }
+        format console
+    }
+}
+
 www.gewerbeagent.de {
     encode gzip
 

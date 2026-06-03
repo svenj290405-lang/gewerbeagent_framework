@@ -1,0 +1,96 @@
+:root {
+  --primary: #0066cc;
+  --bg: #f4f6f9;
+  --card: #ffffff;
+  --text: #1a2230;
+  --muted: #6b7686;
+  --line: #e3e8ef;
+  --ok: #1a9e5f;
+  --warn: #e0a800;
+  --danger: #d9453f;
+  --radius: 14px;
+}
+* { box-sizing: border-box; }
+html, body {
+  margin: 0; padding: 0;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  background: var(--bg); color: var(--text);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ---------- Login ---------- */
+.login-body {
+  display: flex; align-items: center; justify-content: center;
+  min-height: 100vh; padding: 24px;
+}
+.login-card {
+  background: var(--card); border-radius: 20px; padding: 32px 24px;
+  max-width: 380px; width: 100%; text-align: center;
+  box-shadow: 0 8px 30px rgba(0,0,0,.08);
+}
+.login-card h1 { margin: 12px 0 4px; font-size: 24px; }
+.login-card form { display: flex; flex-direction: column; gap: 8px; margin-top: 20px; text-align: left; }
+.login-card label { font-size: 13px; color: var(--muted); }
+input[type=email], input[type=text] {
+  padding: 14px; border: 1px solid var(--line); border-radius: 10px; font-size: 16px;
+}
+button {
+  background: var(--primary); color: #fff; border: 0; border-radius: 10px;
+  padding: 14px; font-size: 16px; font-weight: 600; cursor: pointer;
+}
+button:disabled { opacity: .6; }
+.muted { color: var(--muted); font-size: 14px; }
+.msg { margin-top: 16px; font-size: 14px; min-height: 20px; color: var(--text); }
+
+/* ---------- App-Shell ---------- */
+.app-header {
+  position: sticky; top: 0; z-index: 10;
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 14px 18px; padding-top: max(14px, env(safe-area-inset-top));
+  background: var(--primary); color: #fff; font-weight: 700; font-size: 18px;
+}
+.icon-btn { background: rgba(255,255,255,.18); padding: 6px 10px; font-size: 16px; }
+.view { padding: 16px; padding-bottom: 88px; max-width: 720px; margin: 0 auto; }
+.loading { color: var(--muted); text-align: center; padding: 40px 0; }
+
+.card {
+  background: var(--card); border-radius: var(--radius); padding: 16px;
+  margin-bottom: 12px; box-shadow: 0 1px 3px rgba(0,0,0,.05);
+}
+.card h2 { margin: 0 0 10px; font-size: 16px; }
+.row { display: flex; justify-content: space-between; align-items: center; gap: 12px;
+  padding: 10px 0; border-bottom: 1px solid var(--line); }
+.row:last-child { border-bottom: 0; }
+.row .sub { color: var(--muted); font-size: 13px; }
+.pill { font-size: 12px; padding: 3px 9px; border-radius: 999px; background: #eef2f7; color: var(--muted); }
+.pill.ok { background: #e3f6ec; color: var(--ok); }
+.pill.warn { background: #fdf3da; color: var(--warn); }
+.pill.danger { background: #fce6e5; color: var(--danger); }
+.empty { color: var(--muted); text-align: center; padding: 28px 0; }
+.btn-sm { display: inline-block; padding: 8px 14px; font-size: 14px; border-radius: 8px; width: auto; }
+.btn-ghost { background: #eef2f7; color: var(--primary); }
+.section-title { font-size: 13px; text-transform: uppercase; letter-spacing: .04em;
+  color: var(--muted); margin: 18px 4px 8px; }
+
+/* ---------- Tabbar ---------- */
+.tabbar {
+  position: fixed; bottom: 0; left: 0; right: 0; z-index: 10;
+  display: flex; background: var(--card); border-top: 1px solid var(--line);
+  padding-bottom: env(safe-area-inset-bottom);
+}
+.tabbar button {
+  flex: 1; background: none; color: var(--muted); border: 0; border-radius: 0;
+  padding: 8px 0 10px; font-size: 11px; font-weight: 500;
+  display: flex; flex-direction: column; align-items: center; gap: 3px; cursor: pointer;
+}
+.tabbar button .ico { font-size: 20px; }
+.tabbar button.active { color: var(--primary); }
+
+.banner { background: #fff7e0; border: 1px solid #f0dca0; color: #7a5c00;
+  border-radius: 10px; padding: 12px 14px; font-size: 14px; margin-bottom: 12px; }
+
+/* Menü-Zeile (Button, der wie eine Listenzeile aussieht) */
+.menu-item { width: 100%; background: none; color: var(--text); border: 0;
+  border-bottom: 1px solid var(--line); border-radius: 0; padding: 12px 0;
+  font-size: 15px; font-weight: 500; cursor: pointer; text-align: left; }
+.menu-item:last-child { border-bottom: 0; }

@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#0066cc" />
+  <title>Gewerbeagent</title>
+  <link rel="icon" href="/app/static/icon.svg" />
+  <link rel="apple-touch-icon" href="/app/static/icon.svg" />
+  <link rel="manifest" href="/app/manifest.webmanifest" />
+  <link rel="stylesheet" href="/app/static/app.css" />
+</head>
+<body>
+  <header class="app-header">
+    <span id="hdr-title">Gewerbeagent</span>
+    <button id="notif-btn" class="icon-btn" title="Benachrichtigungen aktivieren" hidden>🔔</button>
+  </header>
+
+  <main id="view" class="view">
+    <div class="loading">Lädt …</div>
+  </main>
+
+  <nav class="tabbar" id="tabbar"><!-- wird per JS gefüllt --></nav>
+
+  <script src="/app/static/app.js" defer></script>
+</body>
+</html>

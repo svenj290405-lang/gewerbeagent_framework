@@ -23,6 +23,8 @@ from core.plugin_system import (
     get_plugin_for_tenant,
 )
 from core.api.anfrage_routes import router as anfrage_router
+from core.api.app_routes import router as app_router, mount_app_static
+from core.api.app_screens import router as app_screens_router
 from core.admin.routes import router as admin_router, mount_static as mount_admin_static
 from core.admin.onboarding_routes import router as admin_onboarding_router
 from core.integrations.microsoft_cron import cron_loop as microsoft_cron_loop
@@ -160,6 +162,9 @@ app = FastAPI(
 # ============================================================
 
 app.include_router(anfrage_router)
+app.include_router(app_router)
+app.include_router(app_screens_router)
+mount_app_static(app)
 app.include_router(admin_router)
 app.include_router(admin_onboarding_router)
 mount_admin_static(app)
@@ -177,6 +182,16 @@ from core.admin.auth import _AdminRedirect
 async def _admin_redirect_handler(request: Request, exc: _AdminRedirect):
     from fastapi.responses import RedirectResponse
     target = exc.headers.get("Location", "/admin/login") if exc.headers else "/admin/login"
+    return RedirectResponse(target, status_code=303)
+
+
+# App-Redirect-Exception (PWA /app) → 303 zur App-Login-Seite
+from core.security.app_auth import _AppRedirect
+
+@app.exception_handler(_AppRedirect)
+async def _app_redirect_handler(request: Request, exc: _AppRedirect):
+    from fastapi.responses import RedirectResponse
+    target = exc.headers.get("Location", "/app/login") if exc.headers else "/app/login"
     return RedirectResponse(target, status_code=303)
 
 

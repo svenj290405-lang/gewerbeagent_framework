@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#0066cc" />
+  <title>Gewerbeagent — Anmelden</title>
+  <link rel="icon" href="/app/static/icon.svg" />
+  <link rel="manifest" href="/app/manifest.webmanifest" />
+  <link rel="stylesheet" href="/app/static/app.css" />
+</head>
+<body class="login-body">
+  <main class="login-card">
+    <img src="/app/static/icon.svg" alt="" width="64" height="64" />
+    <h1>Gewerbeagent</h1>
+    <p class="muted">Melde dich mit deiner E-Mail-Adresse an. Wir schicken dir
+      einen einmaligen Login-Link — kein Passwort nötig.</p>
+
+    <form id="login-form">
+      <label for="email">E-Mail</label>
+      <input id="email" name="email" type="email" autocomplete="email"
+             required placeholder="du@betrieb.de" />
+      <button type="submit" id="submit-btn">Login-Link senden</button>
+    </form>
+
+    <p id="msg" class="msg" role="status" aria-live="polite"></p>
+  </main>
+
+  <script>
+    const params = new URLSearchParams(location.search);
+    if (params.get("fehler") === "link") {
+      document.getElementById("msg").textContent =
+        "Der Link ist abgelaufen oder wurde schon benutzt. Fordere einen neuen an.";
+    }
+    const form = document.getElementById("login-form");
+    const msg = document.getElementById("msg");
+    const btn = document.getElementById("submit-btn");
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      btn.disabled = true;
+      msg.textContent = "Wird gesendet …";
+      const body = new URLSearchParams({ email: document.getElementById("email").value });
+      try {
+        const res = await fetch("/app/login", { method: "POST", body });
+        const data = await res.json();
+        msg.textContent = data.message || "Bitte E-Mail-Postfach prüfen.";
+      } catch (err) {
+        msg.textContent = "Es gab ein Problem. Bitte später erneut versuchen.";
+      } finally {
+        btn.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>

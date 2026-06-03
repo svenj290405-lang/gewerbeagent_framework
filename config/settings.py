@@ -82,6 +82,24 @@ class Settings(BaseSettings):
 
     public_url: str = "http://localhost:8000"
 
+    # --- Inhaber-/Mitarbeiter-PWA (loest den Telegram-Bot als Oberflaeche ab) ---
+    # Basis-URL der App (fuer Magic-Link-Mails + Service-Worker-Scope).
+    # Leer = public_url verwenden. Prod: https://app.gewerbeagent.de
+    app_base_url: str = ""
+
+    # Web-Push (VAPID). Schluesselpaar via `python -m core.integrations.push_notifier
+    # --genkey` erzeugen und in .env hinterlegen. Leer = Push deaktiviert
+    # (App funktioniert, schickt nur keine Benachrichtigungen).
+    vapid_public_key: str = ""
+    vapid_private_key: str = ""
+    # 'sub'-Claim fuer VAPID — eine Kontakt-Mailadresse des Betreibers.
+    vapid_subject: str = "mailto:datenschutz@gewerbeagent.de"
+
+    @property
+    def app_url(self) -> str:
+        """Basis-URL der PWA — app_base_url falls gesetzt, sonst public_url."""
+        return (self.app_base_url or self.public_url).rstrip("/")
+
     # Cron-Loops im Dev-Stack abschalten. Verhindert dass Dev-Stack echte
     # API-Quoten verbraucht (Gemini, Vertex), Test-Mails verschickt
     # (Brevo) oder Bezahl-Polls fuer Prod-Tenants ausloest. Standard:
