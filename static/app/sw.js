@@ -8,9 +8,9 @@
  *  - Minimaler Offline-Shell-Cache (App-Rahmen laedt auch ohne Netz; die
  *    eigentlichen Daten kommen immer frisch vom Server).
  */
-// v6: Krank/Urlaub/Zurueck-Buttons im Team, Material-Screen + Anlegen,
-// Werkstatt-/Lager-Adress-Label im Einstellungen-Screen.
-const CACHE = "ga-app-v6";
+// v7: Angebot + Rechnung anlegen aus der PWA (mit KI-Extract + Pauschal/
+// Positionen + Lexware-Draft + Mail-Versand).
+const CACHE = "ga-app-v7";
 const SHELL = [
   "/app",
   "/app/static/app.css",

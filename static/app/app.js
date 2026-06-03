@@ -142,10 +142,18 @@ const SCREENS = {
   },
 
   async buchhaltung() {
+    const isInhaber = App.me.employee.is_inhaber;
     const [a, r] = await Promise.all([api("/app/api/angebote"), api("/app/api/rechnungen")]);
     const ad = a && a.ok ? await a.json() : { angebote: [] };
     const rd = r && r.ok ? await r.json() : { rechnungen: [] };
     App.view.innerHTML =
+      `<div style="display:flex;align-items:center;justify-content:space-between;margin:4px 4px 14px">
+         <h1 style="font-size:22px;margin:0">Büro</h1>
+         ${isInhaber ? `<div style="display:flex;gap:6px">
+           <button class="btn-sm" id="rechnung-new-btn" style="padding:8px 12px">+ Rechnung</button>
+           <button class="btn-sm btn-ghost" id="angebot-new-btn" style="padding:8px 12px">+ Angebot</button>
+         </div>` : ""}
+       </div>` +
       `<div class="card"><h2>Rechnungen</h2>${
         (rd.rechnungen || []).length ? rd.rechnungen.map((x) =>
           rowPill(x.kunde + (x.nummer ? " · " + esc(x.nummer) : ""), x.betrag + " · " + x.zeit, x.status, x.pill)).join("")
@@ -155,8 +163,11 @@ const SCREENS = {
         (ad.angebote || []).length ? ad.angebote.map((x) =>
           rowPill(x.kunde, x.betrag + " · " + x.zeit, x.status, x.pill)).join("")
         : emptyRow("Noch keine Angebote")
-      }</div>` +
-      `<p class="muted" style="text-align:center;margin-top:10px">Anlegen per Diktat/Foto folgt in einer späteren Version.</p>`;
+      }</div>`;
+    const aBtn = document.getElementById("angebot-new-btn");
+    const rBtn = document.getElementById("rechnung-new-btn");
+    if (aBtn) aBtn.addEventListener("click", () => showAngebotForm());
+    if (rBtn) rBtn.addEventListener("click", () => showRechnungForm());
   },
 
   async team() {
@@ -492,6 +503,332 @@ function rowTap(a, b, c, id) {
     `<span class="sub">${esc(c)} ›</span></button>`;
 }
 function emptyRow(txt) { return `<div class="empty">${esc(txt)}</div>`; }
+
+// =================== Angebot / Rechnung Composer ===================
+//
+// Beide Composer teilen die gleiche Positionen-UI + KI-Extract-Optik.
+// Rechnung hat zusaetzlich einen Pauschal-Modus (1 Titel + Brutto-Betrag),
+// weil das im Handwerker-Alltag dominiert.
+
+let _composerPositionen = [];
+let _composerMode = "angebot"; // "angebot" | "rechnung"
+let _rechnungInputMode = "pauschal"; // pauschal | positionen
+
+function _composerPositionRow(p, idx) {
+  return `<div class="card" style="padding:12px;margin-bottom:8px" data-pos="${idx}">
+    <div class="row" style="align-items:flex-start">
+      <div style="flex:1;min-width:0">
+        <input type="text" data-fld="name" value="${esc(p.name || "")}" placeholder="Position-Name (z.B. Parkett verlegen)"
+          style="width:100%;padding:8px;border:1px solid var(--line);border-radius:8px;margin-bottom:6px;font-size:15px" />
+        <input type="text" data-fld="beschreibung" value="${esc(p.beschreibung || "")}" placeholder="Beschreibung (optional)"
+          style="width:100%;padding:8px;border:1px solid var(--line);border-radius:8px;margin-bottom:6px;font-size:14px" />
+        <div style="display:flex;gap:6px">
+          <input type="number" data-fld="menge" value="${esc(p.menge || 1)}" step="0.01" min="0.01"
+            style="flex:1;padding:8px;border:1px solid var(--line);border-radius:8px;font-size:14px" placeholder="Menge" />
+          <input type="text" data-fld="einheit" value="${esc(p.einheit || 'Stueck')}"
+            style="flex:1;padding:8px;border:1px solid var(--line);border-radius:8px;font-size:14px" placeholder="Einheit" />
+          <input type="number" data-fld="preis_brutto_eur" value="${esc(p.preis_brutto_eur || '')}" step="0.01" min="0"
+            style="flex:1.2;padding:8px;border:1px solid var(--line);border-radius:8px;font-size:14px" placeholder="EUR brutto" />
+        </div>
+      </div>
+      <button class="btn-sm btn-ghost" data-del-pos="${idx}" style="padding:4px 8px;margin-left:6px" title="Entfernen">✕</button>
+    </div>
+  </div>`;
+}
+
+function _renderPositionen() {
+  const wrap = document.getElementById("pos-list");
+  if (!wrap) return;
+  wrap.innerHTML = _composerPositionen.map((p, i) => _composerPositionRow(p, i)).join("");
+  // Klick-Handler für Delete
+  wrap.querySelectorAll("[data-del-pos]").forEach((b) =>
+    b.addEventListener("click", () => {
+      _composerPositionen.splice(parseInt(b.dataset.delPos, 10), 1);
+      _renderPositionen();
+      _updateSumme();
+    }));
+  // Input-Sync zurück in _composerPositionen
+  wrap.querySelectorAll("[data-pos]").forEach((card) => {
+    const idx = parseInt(card.dataset.pos, 10);
+    card.querySelectorAll("[data-fld]").forEach((inp) =>
+      inp.addEventListener("input", () => {
+        const k = inp.dataset.fld;
+        let v = inp.value;
+        if (k === "menge" || k === "preis_brutto_eur") v = parseFloat(v) || 0;
+        _composerPositionen[idx][k] = v;
+        _updateSumme();
+      }));
+  });
+  _updateSumme();
+}
+
+function _updateSumme() {
+  const el = document.getElementById("pos-summe");
+  if (!el) return;
+  const summe = _composerPositionen.reduce((s, p) =>
+    s + (parseFloat(p.menge) || 0) * (parseFloat(p.preis_brutto_eur) || 0), 0);
+  el.textContent = summe.toLocaleString("de-DE", { style: "currency", currency: "EUR" });
+}
+
+function _composerKundenFields() {
+  return `<div class="card"><h2>Kunde</h2>
+    <label class="sub">Name *</label>
+    <input type="text" id="c-kunde-name" style="width:100%;padding:12px;border:1px solid var(--line);border-radius:10px;margin:4px 0 10px;font-size:16px" />
+    <label class="sub">E-Mail (für PDF-Versand)</label>
+    <input type="email" id="c-kunde-mail" style="width:100%;padding:12px;border:1px solid var(--line);border-radius:10px;margin:4px 0 10px;font-size:16px" />
+    <label class="sub">Straße + Nr.</label>
+    <input type="text" id="c-kunde-str" style="width:100%;padding:12px;border:1px solid var(--line);border-radius:10px;margin:4px 0 10px;font-size:16px" />
+    <div style="display:flex;gap:8px">
+      <input type="text" id="c-kunde-plz" placeholder="PLZ" style="flex:0 0 30%;padding:12px;border:1px solid var(--line);border-radius:10px;margin:4px 0 10px;font-size:16px" />
+      <input type="text" id="c-kunde-ort" placeholder="Ort" style="flex:1;padding:12px;border:1px solid var(--line);border-radius:10px;margin:4px 0 10px;font-size:16px" />
+    </div>
+  </div>`;
+}
+
+function _kiExtractCard(prefilledLabel) {
+  return `<div class="card"><h2>KI-Hilfe (optional)</h2>
+    <p class="muted" style="margin-top:0;font-size:13px">Tippe oder diktiere frei — die KI extrahiert ${esc(prefilledLabel)} und füllt die Felder unten vor.</p>
+    <textarea id="ki-text" rows="3" placeholder="z.B. «Müller Bad Schwalbach Heizung reparieren 350 Euro»"
+      style="width:100%;padding:12px;border:1px solid var(--line);border-radius:10px;font-family:inherit;font-size:16px"></textarea>
+    <button class="btn-sm btn-ghost" id="ki-extract" style="margin-top:8px">KI ausfüllen lassen</button>
+  </div>`;
+}
+
+function _bindKiExtract(endpoint, applyFn) {
+  const btn = document.getElementById("ki-extract");
+  if (!btn) return;
+  btn.addEventListener("click", async () => {
+    const text = document.getElementById("ki-text").value.trim();
+    if (text.length < 5) { alert("Bitte mehr Text eingeben."); return; }
+    btn.disabled = true; btn.textContent = "KI denkt nach …";
+    const r = await api(endpoint, { method: "POST", body: JSON.stringify({ text }) });
+    if (r && r.ok) {
+      const j = await r.json();
+      if (j.ok && j.extracted) applyFn(j.extracted);
+      else alert("KI: " + (j.error || "keine Daten"));
+    } else {
+      alert("KI-Aufruf fehlgeschlagen.");
+    }
+    btn.disabled = false; btn.textContent = "KI ausfüllen lassen";
+  });
+}
+
+function _applyExtractedToKunde(ex) {
+  if (ex.kunde_name) document.getElementById("c-kunde-name").value = ex.kunde_name;
+  if (ex.kunde_email) document.getElementById("c-kunde-mail").value = ex.kunde_email;
+  if (ex.kunde_strasse) document.getElementById("c-kunde-str").value = ex.kunde_strasse;
+  if (ex.kunde_plz) document.getElementById("c-kunde-plz").value = ex.kunde_plz;
+  if (ex.kunde_ort) document.getElementById("c-kunde-ort").value = ex.kunde_ort;
+}
+
+function showAngebotForm() {
+  _composerMode = "angebot";
+  _composerPositionen = [];
+  App.view.innerHTML =
+    `<button class="btn-sm btn-ghost" id="back-buero" style="margin-bottom:10px">← Zurück</button>` +
+    `<h1 style="font-size:22px;margin:4px 4px 14px">Neues Angebot</h1>` +
+    _kiExtractCard("Kunde + Positionen mit Preisen") +
+    _composerKundenFields() +
+    `<div class="card"><h2>Positionen</h2>
+       <div id="pos-list"></div>
+       <button class="btn-sm btn-ghost" id="pos-add" style="margin-top:6px;width:100%">+ Position</button>
+       <div class="row" style="margin-top:12px;padding-top:10px;border-top:1px solid var(--line)">
+         <b>Gesamt brutto</b><b id="pos-summe">0,00 €</b>
+       </div>
+     </div>` +
+    `<div class="card"><h2>Texte (optional)</h2>
+       <label class="sub">Anschreiben</label>
+       <textarea id="c-intro" rows="3" placeholder="z.B. Sehr geehrte Frau Müller, vielen Dank für Ihre Anfrage …"
+         style="width:100%;padding:12px;border:1px solid var(--line);border-radius:10px;font-family:inherit;font-size:16px"></textarea>
+       <label class="sub" style="margin-top:8px;display:block">Schluss-Bemerkung</label>
+       <textarea id="c-remark" rows="2" placeholder="z.B. Wir freuen uns auf Ihren Auftrag!"
+         style="width:100%;padding:12px;border:1px solid var(--line);border-radius:10px;font-family:inherit;font-size:16px"></textarea>
+     </div>` +
+    `<button class="btn-sm" id="c-save" style="width:100%;margin-top:8px">Angebot anlegen</button>`;
+
+  document.getElementById("back-buero").addEventListener("click", () => navigate("buchhaltung"));
+  _renderPositionen();
+  document.getElementById("pos-add").addEventListener("click", () => {
+    _composerPositionen.push({ name: "", menge: 1, einheit: "Stueck", preis_brutto_eur: 0 });
+    _renderPositionen();
+  });
+
+  _bindKiExtract("/app/api/angebote/extrahieren", (ex) => {
+    _applyExtractedToKunde(ex);
+    if (Array.isArray(ex.positionen)) {
+      _composerPositionen = ex.positionen.map((p) => ({
+        name: p.name || "", beschreibung: p.beschreibung || "",
+        menge: p.menge || 1, einheit: p.einheit || "Stueck",
+        preis_brutto_eur: p.preis_brutto_eur || 0,
+        mwst_prozent: p.mwst_prozent || 19,
+      }));
+      _renderPositionen();
+    }
+  });
+
+  document.getElementById("c-save").addEventListener("click", _submitAngebot);
+}
+
+async function _submitAngebot() {
+  const body = {
+    kunde_name: document.getElementById("c-kunde-name").value.trim(),
+    kunde_email: document.getElementById("c-kunde-mail").value.trim() || null,
+    kunde_strasse: document.getElementById("c-kunde-str").value.trim() || null,
+    kunde_plz: document.getElementById("c-kunde-plz").value.trim() || null,
+    kunde_ort: document.getElementById("c-kunde-ort").value.trim() || null,
+    intro_text: document.getElementById("c-intro").value.trim() || null,
+    remark_text: document.getElementById("c-remark").value.trim() || null,
+    positionen: _composerPositionen,
+  };
+  if (!body.kunde_name) { alert("Kundenname ist Pflicht."); return; }
+  if (!body.positionen.length) { alert("Mindestens 1 Position hinzufügen."); return; }
+  const btn = document.getElementById("c-save");
+  btn.disabled = true; btn.textContent = "Lege an + Lexware …";
+  const r = await api("/app/api/angebote/anlegen", { method: "POST", body: JSON.stringify(body) });
+  if (r && r.ok) {
+    const j = await r.json();
+    if (j.ok) { _showAccountingResult("Angebot", j, "angebote"); return; }
+    alert("Konnte nicht anlegen: " + (j.error || "unbekannt"));
+  } else {
+    alert("Konnte nicht anlegen.");
+  }
+  btn.disabled = false; btn.textContent = "Angebot anlegen";
+}
+
+function showRechnungForm() {
+  _composerMode = "rechnung";
+  _composerPositionen = [];
+  _rechnungInputMode = "pauschal";
+  App.view.innerHTML =
+    `<button class="btn-sm btn-ghost" id="back-buero" style="margin-bottom:10px">← Zurück</button>` +
+    `<h1 style="font-size:22px;margin:4px 4px 14px">Neue Rechnung</h1>` +
+    _kiExtractCard("Kunde + Leistung + Betrag") +
+    _composerKundenFields() +
+    `<div class="card">
+       <h2>Leistung</h2>
+       <div style="display:flex;gap:6px;margin-bottom:10px">
+         <button class="btn-sm" data-rmode="pauschal" id="rmode-pauschal" style="flex:1">Pauschal</button>
+         <button class="btn-sm btn-ghost" data-rmode="positionen" id="rmode-pos" style="flex:1">Positionen</button>
+       </div>
+       <div id="rmode-pauschal-body">
+         <label class="sub">Leistungs-Titel *</label>
+         <input type="text" id="r-titel" placeholder="z.B. Heizungsreparatur" style="width:100%;padding:12px;border:1px solid var(--line);border-radius:10px;margin:4px 0 10px;font-size:16px" />
+         <label class="sub">Beschreibung (optional)</label>
+         <textarea id="r-besch" rows="2" style="width:100%;padding:12px;border:1px solid var(--line);border-radius:10px;font-family:inherit;font-size:16px"></textarea>
+         <label class="sub" style="margin-top:8px;display:block">Brutto-Betrag (EUR) *</label>
+         <input type="number" id="r-betrag" step="0.01" min="0" style="width:100%;padding:12px;border:1px solid var(--line);border-radius:10px;margin:4px 0 0;font-size:16px" />
+       </div>
+       <div id="rmode-pos-body" style="display:none">
+         <div id="pos-list"></div>
+         <button class="btn-sm btn-ghost" id="pos-add" style="margin-top:6px;width:100%">+ Position</button>
+         <div class="row" style="margin-top:12px;padding-top:10px;border-top:1px solid var(--line)">
+           <b>Gesamt brutto</b><b id="pos-summe">0,00 €</b>
+         </div>
+       </div>
+     </div>` +
+    `<button class="btn-sm" id="c-save" style="width:100%;margin-top:8px">Rechnung anlegen</button>`;
+
+  document.getElementById("back-buero").addEventListener("click", () => navigate("buchhaltung"));
+
+  document.querySelectorAll("[data-rmode]").forEach((b) =>
+    b.addEventListener("click", () => {
+      _rechnungInputMode = b.dataset.rmode;
+      document.getElementById("rmode-pauschal-body").style.display =
+        _rechnungInputMode === "pauschal" ? "" : "none";
+      document.getElementById("rmode-pos-body").style.display =
+        _rechnungInputMode === "positionen" ? "" : "none";
+      document.getElementById("rmode-pauschal").className =
+        "btn-sm " + (_rechnungInputMode === "pauschal" ? "" : "btn-ghost");
+      document.getElementById("rmode-pos").className =
+        "btn-sm " + (_rechnungInputMode === "positionen" ? "" : "btn-ghost");
+      if (_rechnungInputMode === "positionen") _renderPositionen();
+    }));
+
+  const addBtn = document.getElementById("pos-add");
+  if (addBtn) addBtn.addEventListener("click", () => {
+    _composerPositionen.push({ name: "", menge: 1, einheit: "Stueck", preis_brutto_eur: 0 });
+    _renderPositionen();
+  });
+
+  _bindKiExtract("/app/api/rechnungen/extrahieren", (ex) => {
+    _applyExtractedToKunde(ex);
+    if (ex.leistung_titel) document.getElementById("r-titel").value = ex.leistung_titel;
+    if (ex.leistung_beschreibung) document.getElementById("r-besch").value = ex.leistung_beschreibung;
+    if (ex.betrag_brutto_eur) document.getElementById("r-betrag").value = ex.betrag_brutto_eur;
+  });
+
+  document.getElementById("c-save").addEventListener("click", _submitRechnung);
+}
+
+async function _submitRechnung() {
+  const body = {
+    kunde_name: document.getElementById("c-kunde-name").value.trim(),
+    kunde_email: document.getElementById("c-kunde-mail").value.trim() || null,
+    kunde_strasse: document.getElementById("c-kunde-str").value.trim() || null,
+    kunde_plz: document.getElementById("c-kunde-plz").value.trim() || null,
+    kunde_ort: document.getElementById("c-kunde-ort").value.trim() || null,
+  };
+  if (_rechnungInputMode === "pauschal") {
+    body.leistung_titel = document.getElementById("r-titel").value.trim();
+    body.leistung_beschreibung = document.getElementById("r-besch").value.trim() || null;
+    body.betrag_brutto_eur = parseFloat(document.getElementById("r-betrag").value || 0);
+    if (!body.leistung_titel || !body.betrag_brutto_eur) {
+      alert("Leistungs-Titel und Brutto-Betrag sind Pflicht."); return;
+    }
+  } else {
+    body.positionen = _composerPositionen;
+    if (!body.positionen.length) { alert("Mindestens 1 Position hinzufügen."); return; }
+  }
+  if (!body.kunde_name) { alert("Kundenname ist Pflicht."); return; }
+  const btn = document.getElementById("c-save");
+  btn.disabled = true; btn.textContent = "Lege an + Lexware …";
+  const r = await api("/app/api/rechnungen/anlegen", { method: "POST", body: JSON.stringify(body) });
+  if (r && r.ok) {
+    const j = await r.json();
+    if (j.ok) { _showAccountingResult("Rechnung", j, "rechnungen"); return; }
+    alert("Konnte nicht anlegen: " + (j.error || "unbekannt"));
+  } else {
+    alert("Konnte nicht anlegen.");
+  }
+  btn.disabled = false; btn.textContent = "Rechnung anlegen";
+}
+
+function _showAccountingResult(typ, j, sendPath) {
+  // Quittungs-Screen: zeigt Lexware-Status, Deeplink, Sende-Button
+  const lex = j.lexware_voucher_number
+    ? `<div class="row"><span>Lexware-Nummer</span><span class="sub">${esc(j.lexware_voucher_number)}</span></div>
+       <a class="btn-sm btn-ghost" href="${esc(j.lexware_deeplink || '#')}" target="_blank" rel="noopener" style="text-decoration:none;margin-top:8px;display:inline-block">→ In Lexware öffnen</a>`
+    : `<p class="muted">${esc(j.warning || 'Nicht in Lexware angelegt — bitte später nachreichen.')}</p>`;
+  App.view.innerHTML =
+    `<div class="card">
+       <h2 style="margin-top:0">✓ ${esc(typ)} angelegt</h2>
+       ${lex}
+     </div>
+     ${j.lexware_voucher_number ? `<div class="card">
+       <h2>Per Mail an Kunden senden</h2>
+       <p class="muted" style="font-size:13px;margin-top:0">Schickt das PDF aus Lexware an die hinterlegte Mail-Adresse.</p>
+       <button class="btn-sm" id="send-pdf" style="width:100%">PDF jetzt senden</button>
+     </div>` : ""}
+     <button class="btn-sm btn-ghost" id="back-buero" style="width:100%;margin-top:8px">Zurück zum Büro</button>`;
+  document.getElementById("back-buero").addEventListener("click", () => navigate("buchhaltung"));
+  const sendBtn = document.getElementById("send-pdf");
+  if (sendBtn) sendBtn.addEventListener("click", async () => {
+    sendBtn.disabled = true; sendBtn.textContent = "Sende …";
+    const r = await api(`/app/api/${sendPath}/${encodeURIComponent(j.id)}/senden`,
+      { method: "POST", body: "{}" });
+    if (r && r.ok) {
+      const k = await r.json();
+      if (k.ok) {
+        alert("Mail erfolgreich gesendet.");
+        navigate("buchhaltung"); return;
+      }
+      alert("Versand fehlgeschlagen: " + (k.error || "unbekannt"));
+    } else {
+      alert("Versand fehlgeschlagen.");
+    }
+    sendBtn.disabled = false; sendBtn.textContent = "PDF jetzt senden";
+  });
+}
 
 async function showNewMaterialForm() {
   App.view.innerHTML =
