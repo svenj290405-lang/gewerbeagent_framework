@@ -8,9 +8,9 @@
  *  - Minimaler Offline-Shell-Cache (App-Rahmen laedt auch ohne Netz; die
  *    eigentlichen Daten kommen immer frisch vom Server).
  */
-// v7: Angebot + Rechnung anlegen aus der PWA (mit KI-Extract + Pauschal/
-// Positionen + Lexware-Draft + Mail-Versand).
-const CACHE = "ga-app-v7";
+// v8: Sprach-Diktat im Browser (Web-Audio → WAV 16 kHz mono → Gemini-
+// Analyse → Kundengespraech), Telegram-/aufnahme-Ersatz.
+const CACHE = "ga-app-v8";
 const SHELL = [
   "/app",
   "/app/static/app.css",

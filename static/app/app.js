@@ -125,7 +125,10 @@ const SCREENS = {
     App.view.innerHTML =
       `<div style="display:flex;align-items:center;justify-content:space-between;margin:4px 4px 14px">
         <h1 style="font-size:22px;margin:0">Anrufe</h1>
-        <button class="btn-sm" id="rueckruf-new-btn" style="padding:8px 14px">+ Rückruf</button>
+        <div style="display:flex;gap:6px">
+          <button class="btn-sm" id="diktat-btn" style="padding:8px 12px">🎤 Diktat</button>
+          <button class="btn-sm btn-ghost" id="rueckruf-new-btn" style="padding:8px 12px">+ Rückruf</button>
+        </div>
       </div>` +
       `<div class="card"><h2>Offene Rückrufe</h2>${
         (rd.rueckrufe || []).length ? rd.rueckrufe.map((x) =>
@@ -139,6 +142,7 @@ const SCREENS = {
     bindRueckrufDone();
     bindAufnahmen();
     document.getElementById("rueckruf-new-btn").addEventListener("click", showNewRueckrufForm);
+    document.getElementById("diktat-btn").addEventListener("click", showDiktatForm);
   },
 
   async buchhaltung() {
@@ -989,6 +993,208 @@ function showEmployeeActivationLink(j, name) {
     document.getElementById("copy-url").textContent = "Kopiert!";
   });
   document.getElementById("back-team-2").addEventListener("click", () => navigate("team"));
+}
+
+// ---------- Sprach-Diktat (Browser-Aufnahme → WAV → Gemini) ----------
+// Wir nehmen per Web-Audio auf und kodieren CLIENT-SEITIG zu WAV 16 kHz
+// mono. Grund: Gemini akzeptiert wav/ogg/mp3/flac/aac nativ, aber NICHT das
+// webm/opus, das Chrome-MediaRecorder per Default liefert. WAV vermeidet
+// jede Server-Konvertierung (kein ffmpeg im Stack) und laeuft auf Chrome
+// (Android) wie iOS-Safari.
+const DIKTAT_TARGET_RATE = 16000;
+const DIKTAT_MAX_SECONDS = 15 * 60; // Auto-Stopp; 15 min WAV ≈ 28 MB < 50 MB
+
+const Diktat = {
+  ctx: null, source: null, node: null, zero: null, stream: null,
+  chunks: [], length: 0, inRate: DIKTAT_TARGET_RATE,
+  recording: false, startTs: 0, tick: null, autostop: null,
+};
+
+function _diktatFlatten() {
+  const out = new Float32Array(Diktat.length);
+  let o = 0;
+  for (const c of Diktat.chunks) { out.set(c, o); o += c.length; }
+  return out;
+}
+
+function _diktatResample(input, inRate, outRate) {
+  if (inRate === outRate) return input;
+  const ratio = inRate / outRate;
+  const outLen = Math.floor(input.length / ratio);
+  const out = new Float32Array(outLen);
+  for (let i = 0; i < outLen; i++) {
+    const idx = i * ratio;
+    const lo = Math.floor(idx);
+    const hi = Math.min(lo + 1, input.length - 1);
+    out[i] = input[lo] + (input[hi] - input[lo]) * (idx - lo);
+  }
+  return out;
+}
+
+function _diktatEncodeWav(samples, rate) {
+  const buf = new ArrayBuffer(44 + samples.length * 2);
+  const v = new DataView(buf);
+  const ws = (off, s) => { for (let i = 0; i < s.length; i++) v.setUint8(off + i, s.charCodeAt(i)); };
+  ws(0, "RIFF"); v.setUint32(4, 36 + samples.length * 2, true); ws(8, "WAVE");
+  ws(12, "fmt "); v.setUint32(16, 16, true); v.setUint16(20, 1, true);
+  v.setUint16(22, 1, true); v.setUint32(24, rate, true);
+  v.setUint32(28, rate * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+  ws(36, "data"); v.setUint32(40, samples.length * 2, true);
+  let off = 44;
+  for (let i = 0; i < samples.length; i++, off += 2) {
+    const s = Math.max(-1, Math.min(1, samples[i]));
+    v.setInt16(off, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+  }
+  return new Blob([buf], { type: "audio/wav" });
+}
+
+async function _diktatStartRecording() {
+  Diktat.stream = await navigator.mediaDevices.getUserMedia({
+    audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
+  });
+  const Ctx = window.AudioContext || window.webkitAudioContext;
+  Diktat.ctx = new Ctx();
+  if (Diktat.ctx.state === "suspended") await Diktat.ctx.resume();
+  Diktat.inRate = Diktat.ctx.sampleRate;
+  Diktat.source = Diktat.ctx.createMediaStreamSource(Diktat.stream);
+  Diktat.node = Diktat.ctx.createScriptProcessor(4096, 1, 1);
+  Diktat.chunks = []; Diktat.length = 0;
+  Diktat.node.onaudioprocess = (e) => {
+    if (!Diktat.recording) return;
+    const d = e.inputBuffer.getChannelData(0);
+    Diktat.chunks.push(new Float32Array(d));
+    Diktat.length += d.length;
+  };
+  // ScriptProcessor feuert in Chrome nur, wenn er bis zur destination
+  // verdrahtet ist — ueber eine Gain=0-Node, damit nichts hoerbar
+  // zurueckgespielt wird (sonst Rueckkopplung).
+  Diktat.zero = Diktat.ctx.createGain();
+  Diktat.zero.gain.value = 0;
+  Diktat.source.connect(Diktat.node);
+  Diktat.node.connect(Diktat.zero);
+  Diktat.zero.connect(Diktat.ctx.destination);
+  Diktat.recording = true;
+  Diktat.startTs = Date.now();
+}
+
+function _diktatTeardown() {
+  Diktat.recording = false;
+  try { if (Diktat.node) { Diktat.node.disconnect(); Diktat.node.onaudioprocess = null; } } catch (e) {}
+  try { if (Diktat.zero) Diktat.zero.disconnect(); } catch (e) {}
+  try { if (Diktat.source) Diktat.source.disconnect(); } catch (e) {}
+  try { if (Diktat.stream) Diktat.stream.getTracks().forEach((t) => t.stop()); } catch (e) {}
+  try { if (Diktat.ctx && Diktat.ctx.state !== "closed") Diktat.ctx.close(); } catch (e) {}
+  if (Diktat.tick) { clearInterval(Diktat.tick); Diktat.tick = null; }
+  if (Diktat.autostop) { clearTimeout(Diktat.autostop); Diktat.autostop = null; }
+}
+
+function _diktatFinish() {
+  const durationSec = Math.round((Date.now() - Diktat.startTs) / 1000);
+  const raw = _diktatFlatten();
+  const resampled = _diktatResample(raw, Diktat.inRate, DIKTAT_TARGET_RATE);
+  _diktatTeardown();
+  return { blob: _diktatEncodeWav(resampled, DIKTAT_TARGET_RATE), durationSec };
+}
+
+async function showDiktatForm() {
+  App.view.innerHTML =
+    `<button class="btn-sm btn-ghost" id="back-anrufe" style="margin-bottom:10px">← Zurück</button>` +
+    `<h1 style="font-size:22px;margin:4px 4px 6px">Gespräch diktieren</h1>` +
+    `<p class="muted" style="margin:0 4px 14px">Sprich das Gespräch ein — Kundenname, was zu tun ist, Preise, Termin. Die KI erstellt daraus automatisch ein Briefing.</p>` +
+    `<div class="card" style="text-align:center;padding:24px 16px">
+       <div id="dk-timer" style="font-size:32px;font-variant-numeric:tabular-nums;margin-bottom:14px">0:00</div>
+       <button class="btn-sm" id="dk-toggle" style="padding:14px 24px;font-size:17px">🎤 Aufnahme starten</button>
+       <p class="muted" id="dk-status" style="margin-top:14px;min-height:20px"></p>
+     </div>
+     <div id="dk-result"></div>`;
+  document.getElementById("back-anrufe").addEventListener("click", () => {
+    if (Diktat.recording) _diktatTeardown();
+    navigate("anrufe");
+  });
+
+  const toggle = document.getElementById("dk-toggle");
+  const timerEl = document.getElementById("dk-timer");
+  const statusEl = document.getElementById("dk-status");
+  const resultEl = document.getElementById("dk-result");
+
+  const fmtT = (s) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+
+  async function stopAndUpload() {
+    if (!Diktat.recording) return;
+    const { blob, durationSec } = _diktatFinish();
+    toggle.disabled = true;
+    toggle.textContent = "🎤 Aufnahme starten";
+    statusEl.textContent = "Analysiere das Gespräch … (kann 30–60 Sek dauern)";
+    if (durationSec < 1 || blob.size < 2000) {
+      statusEl.textContent = "Aufnahme war zu kurz. Bitte erneut versuchen.";
+      toggle.disabled = false;
+      return;
+    }
+    let res;
+    try {
+      res = await fetch("/app/api/aufnahmen/diktat", {
+        method: "POST",
+        headers: {
+          "X-CSRF-Token": App.me.csrf,
+          "Content-Type": "audio/wav",
+          "X-Audio-Duration": String(durationSec),
+        },
+        body: blob,
+      });
+    } catch (e) {
+      statusEl.textContent = "Netzwerkfehler. Bitte erneut versuchen.";
+      toggle.disabled = false;
+      return;
+    }
+    if (res.status === 303 || res.status === 401 || res.redirected) {
+      location.href = "/app/login"; return;
+    }
+    let j = null;
+    try { j = await res.json(); } catch (e) {}
+    if (res.ok && j && j.ok) {
+      statusEl.textContent = "";
+      const todos = (j.todos || []).length
+        ? `<div class="card"><h2>To-dos</h2>${j.todos.map((t) => `<div class="row"><div>☐ ${esc(t)}</div></div>`).join("")}</div>` : "";
+      resultEl.innerHTML =
+        `<div class="card"><h2>✓ Gespeichert: ${esc(j.kunde)}</h2>` +
+        (j.briefing ? `<p style="margin:6px 0 0">${esc(j.briefing)}</p>` : `<p class="muted" style="margin:6px 0 0">Kein Briefing erkannt.</p>`) +
+        `</div>` + todos +
+        `<button class="btn-sm" id="dk-open" style="width:100%;margin-top:4px">Zur Aufnahme</button>` +
+        `<button class="btn-sm btn-ghost" id="dk-again" style="width:100%;margin-top:8px">Weiteres Gespräch diktieren</button>`;
+      const open = document.getElementById("dk-open");
+      if (open) open.addEventListener("click", () => showAufnahme(j.id));
+      document.getElementById("dk-again").addEventListener("click", showDiktatForm);
+      toggle.style.display = "none";
+      timerEl.textContent = "0:00";
+    } else {
+      statusEl.textContent = (j && j.error) || "Konnte nicht verarbeiten. Bitte erneut versuchen.";
+      toggle.disabled = false;
+    }
+  }
+
+  toggle.addEventListener("click", async () => {
+    if (Diktat.recording) { await stopAndUpload(); return; }
+    resultEl.innerHTML = "";
+    statusEl.textContent = "";
+    try {
+      await _diktatStartRecording();
+    } catch (e) {
+      statusEl.textContent = (e && e.name === "NotAllowedError")
+        ? "Mikrofon-Zugriff wurde abgelehnt. Bitte in den Browser-Einstellungen erlauben."
+        : "Mikrofon nicht verfügbar.";
+      _diktatTeardown();
+      return;
+    }
+    toggle.textContent = "⏹ Stoppen & analysieren";
+    timerEl.textContent = "0:00";
+    Diktat.tick = setInterval(() => {
+      const s = Math.round((Date.now() - Diktat.startTs) / 1000);
+      timerEl.textContent = fmtT(s);
+    }, 500);
+    Diktat.autostop = setTimeout(() => {
+      if (Diktat.recording) stopAndUpload();
+    }, DIKTAT_MAX_SECONDS * 1000);
+  });
 }
 
 async function showNewRueckrufForm() {

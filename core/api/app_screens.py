@@ -525,6 +525,176 @@ async def api_aufnahme_detail(
 
 
 # =====================================================================
+# Sprach-Diktat aus dem Browser (Telegram-/aufnahme-Ersatz)
+# =====================================================================
+
+# Maximale Audio-Groesse — spiegelt das Telegram-Limit
+# (AUFNAHME_MAX_AUDIO_BYTES = 50 MB). Der Browser kodiert client-seitig zu
+# WAV 16 kHz mono (~1,9 MB/min), das Gemini nativ versteht; ein Diktat
+# bleibt damit problemlos unter dem Limit.
+_DIKTAT_MAX_AUDIO_BYTES = 50_000_000
+
+# Audio-MIME-Typen, die die Gemini-Analyse nativ verarbeitet. Wird ein
+# anderer Typ geschickt (z.B. webm aus einem Roh-MediaRecorder), lehnen wir
+# klar ab, statt Gemini einen nicht unterstuetzten Container zu fuettern.
+_DIKTAT_ALLOWED_MIMES = {
+    "audio/wav", "audio/x-wav", "audio/wave",
+    "audio/ogg", "audio/mpeg", "audio/mp3", "audio/flac", "audio/aac",
+}
+
+
+def _validate_diktat_audio(audio_bytes: bytes) -> tuple[str, int] | None:
+    """Prueft die Roh-Audiodaten. Returnt (fehlertext, status) oder None."""
+    if not audio_bytes:
+        return ("Keine Audiodaten empfangen.", 400)
+    if len(audio_bytes) > _DIKTAT_MAX_AUDIO_BYTES:
+        mb = len(audio_bytes) // 1024 // 1024
+        maxmb = _DIKTAT_MAX_AUDIO_BYTES // 1024 // 1024
+        return (
+            f"Aufnahme zu lang ({mb} MB, max {maxmb} MB). "
+            "Bitte in mehrere kuerzere Aufnahmen aufteilen.",
+            413,
+        )
+    return None
+
+
+def _normalize_diktat_mime(raw: str | None) -> str | None:
+    """Content-Type → erlaubter Audio-MIME oder None (= nicht unterstuetzt)."""
+    mime = (raw or "").split(";")[0].strip().lower()
+    return mime if mime in _DIKTAT_ALLOWED_MIMES else None
+
+
+def _parse_diktat_duration(raw: str | None) -> int | None:
+    """Header-Wert (Sekunden) → int, mit Plausibilitaets-Cap (≤ 24 h)."""
+    if not raw:
+        return None
+    try:
+        v = int(float(raw))
+    except (TypeError, ValueError):
+        return None
+    return v if 0 <= v <= 24 * 3600 else None
+
+
+def _parse_diktat_termin(termin_str: str | None) -> dt.datetime | None:
+    """ISO-/Datums-String aus der Gemini-Extraktion → aware datetime (UTC)."""
+    if not termin_str:
+        return None
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return dt.datetime.strptime(termin_str[:19], fmt).replace(
+                tzinfo=dt.timezone.utc
+            )
+        except ValueError:
+            continue
+    logger.warning("Diktat: termin_datum nicht parsbar: %r", termin_str)
+    return None
+
+
+async def _save_diktat_gespraech(
+    tenant_id: uuid.UUID,
+    employee_id: uuid.UUID | None,
+    kunde_name: str,
+    dauer: int | None,
+    extracted: dict,
+) -> uuid.UUID:
+    """Speichert ein Kundengespraech aus der Diktat-Extraktion.
+
+    Spiegelt exakt das Mapping aus dem Telegram-Flow
+    (_handle_aufnahme_audio_received); zusaetzlich wird der diktierende
+    Mitarbeiter als created_by/assigned vermerkt.
+    """
+    g = Kundengespraech(
+        tenant_id=tenant_id,
+        kunde_name=kunde_name[:300],
+        audio_dauer_sekunden=dauer,
+        raw_transcript=extracted.get("transcript"),
+        briefing_kurz=extracted.get("briefing_kurz"),
+        notizen_lang=extracted.get("notizen_lang"),
+        todos=extracted.get("todos") or [],
+        termin_ort=extracted.get("termin_ort"),
+        termin_datum=_parse_diktat_termin(extracted.get("termin_datum")),
+        confidence=extracted.get("extraction_confidence"),
+        status="erfasst",
+        created_by_employee_id=employee_id,
+        assigned_employee_id=employee_id,
+    )
+    async with get_session() as s:
+        s.add(g)
+        await s.commit()
+        return g.id
+
+
+@router.post("/aufnahmen/diktat")
+async def api_aufnahme_diktat(
+    request: Request,
+    emp: Employee = Depends(require_app_user),
+    _c=Depends(require_app_csrf),
+) -> JSONResponse:
+    """Sprach-Diktat aus dem Browser → Gemini-Analyse → Kundengespraech.
+
+    Der Browser nimmt das Gespraech per Web-Audio auf, kodiert es
+    client-seitig zu WAV (16 kHz mono — von Gemini nativ unterstuetzt) und
+    schickt die rohen Bytes als Request-Body. mime kommt aus Content-Type,
+    die optionale Dauer (Sekunden) aus dem Header X-Audio-Duration.
+
+    Spiegelt exakt den Telegram-/aufnahme-Flow: gleiche Gemini-Funktion,
+    gleiches Datenmodell, gleiche Pflichtfeld-Pruefung (kunde_name). HARTE
+    Tenant-Isolation — gespeichert wird ausschliesslich auf
+    current_tenant_id(request).
+    """
+    from core.ai import analyse_kundengespraech_from_audio
+
+    audio_bytes = await request.body()
+    err = _validate_diktat_audio(audio_bytes)
+    if err:
+        return JSONResponse({"ok": False, "error": err[0]}, status_code=err[1])
+
+    mime = _normalize_diktat_mime(request.headers.get("content-type"))
+    if mime is None:
+        return JSONResponse(
+            {"ok": False, "error": "Audioformat wird nicht unterstuetzt."},
+            status_code=415,
+        )
+    dauer = _parse_diktat_duration(request.headers.get("x-audio-duration"))
+    tid = current_tenant_id(request)
+
+    try:
+        extracted = await analyse_kundengespraech_from_audio(
+            audio_bytes, mime_type=mime, tenant_id=tid,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("PWA-Diktat: Gemini-Analyse fehlgeschlagen: %s", exc)
+        return JSONResponse(
+            {"ok": False, "error": "Analyse fehlgeschlagen. Bitte erneut versuchen."},
+            status_code=502,
+        )
+
+    kunde_name = (extracted.get("kunde_name") or "").strip()
+    if not kunde_name:
+        return JSONResponse(
+            {"ok": False, "error": (
+                "Kein Kundenname erkannt. Bitte erneut aufnehmen und den "
+                "Namen klar nennen."
+            )},
+            status_code=422,
+        )
+
+    g_id = await _save_diktat_gespraech(tid, emp.id, kunde_name, dauer, extracted)
+    logger.info(
+        "PWA-Diktat gespeichert: id=%s tenant=%s mitarbeiter=%s kunde=%r todos=%d",
+        g_id, tid, emp.id, kunde_name, len(extracted.get("todos") or []),
+    )
+    return JSONResponse({
+        "ok": True,
+        "id": str(g_id),
+        "kunde": kunde_name,
+        "briefing": (extracted.get("briefing_kurz") or "")[:300],
+        "todos": list(extracted.get("todos") or []),
+        "confidence": extracted.get("extraction_confidence"),
+    })
+
+
+# =====================================================================
 # Kunden-Suche (über Gespräche, Angebote, Rechnungen)
 # =====================================================================
 
