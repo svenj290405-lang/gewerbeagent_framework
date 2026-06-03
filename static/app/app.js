@@ -271,10 +271,21 @@ const SCREENS = {
         const r = await api("/app/api/kunden?q=" + encodeURIComponent(q));
         const d = r && r.ok ? await r.json() : {};
         const blocks = [];
+        // Eindeutige Kundennamen → tappbar zum Profil
+        const namen = [];
+        const seen = new Set();
+        [...(d.gespraeche || []), ...(d.angebote || []), ...(d.rechnungen || [])].forEach((x) => {
+          const n = (x.kunde || "").trim();
+          if (n && n !== "—" && !seen.has(n.toLowerCase())) { seen.add(n.toLowerCase()); namen.push(n); }
+        });
+        if (namen.length) blocks.push(`<div class="card"><h2>Kunden</h2>${namen.map((n) =>
+          `<button class="row menu-item" data-kunde="${esc(n)}"><span>👤 ${esc(n)}</span><span class="sub">Profil ›</span></button>`).join("")}</div>`);
         if ((d.gespraeche || []).length) blocks.push(`<div class="card"><h2>Gespräche</h2>${d.gespraeche.map((x) => rowTap(x.kunde, x.briefing, x.zeit, x.id)).join("")}</div>`);
         if ((d.angebote || []).length) blocks.push(`<div class="card"><h2>Angebote</h2>${d.angebote.map((x) => row(x.kunde, x.betrag, x.zeit)).join("")}</div>`);
         if ((d.rechnungen || []).length) blocks.push(`<div class="card"><h2>Rechnungen</h2>${d.rechnungen.map((x) => row(x.kunde + (x.nummer ? " · " + esc(x.nummer) : ""), x.betrag, x.zeit)).join("")}</div>`);
         res.innerHTML = blocks.length ? blocks.join("") : `<p class="empty">Nichts gefunden für „${esc(q)}".</p>`;
+        res.querySelectorAll("[data-kunde]").forEach((b) =>
+          b.addEventListener("click", () => showKundenProfil(b.dataset.kunde)));
         bindAufnahmen();
       }, 300);
     });
@@ -1310,6 +1321,37 @@ async function showDiktatForm() {
       if (Diktat.recording) stopAndUpload();
     }, DIKTAT_MAX_SECONDS * 1000);
   });
+}
+
+// ---------- Kunden-Profil (gebündelte Historie) ----------
+async function showKundenProfil(name) {
+  App.view.innerHTML = `<div class="loading">Lädt …</div>`;
+  const res = await api("/app/api/kunden/profil?name=" + encodeURIComponent(name));
+  const d = res && res.ok ? await res.json() : null;
+  if (!d || !d.ok) {
+    App.view.innerHTML = `<button class="btn-sm btn-ghost" id="back-kunden" style="margin-bottom:10px">← Zurück</button><div class="card"><p class="empty">Konnte Profil nicht laden.</p></div>`;
+    document.getElementById("back-kunden").addEventListener("click", () => navigate("kunden"));
+    return;
+  }
+  const parts = [`<button class="btn-sm btn-ghost" id="back-kunden" style="margin-bottom:10px">← Zurück</button>`];
+  parts.push(`<div class="card"><h2>👤 ${esc(d.name)}</h2>${d.email ? `<div class="row"><span>E-Mail</span><span class="sub">${esc(d.email)}</span></div>` : ""}</div>`);
+  if (d.drive) {
+    parts.push(`<div class="card"><h2>Ablage (Drive)</h2>
+      <a class="row" href="${esc(d.drive.url)}" target="_blank" rel="noopener" style="text-decoration:none;color:inherit"><div><div>Ordner öffnen</div><div class="sub">${esc(String(d.drive.anzahl || 0))} Datei(en)${d.drive.letzter ? " · zuletzt " + esc(d.drive.letzter) : ""}</div></div><span class="sub">›</span></a>
+    </div>`);
+  }
+  parts.push(`<div class="card"><h2>Gespräche (${(d.gespraeche || []).length})</h2>${
+    (d.gespraeche || []).length ? d.gespraeche.map((x) => rowTap(x.briefing || "Aufnahme", "", x.zeit, x.id)).join("") : emptyRow("Keine Gespräche")
+  }</div>`);
+  parts.push(`<div class="card"><h2>Angebote / Aufträge (${(d.angebote || []).length})</h2>${
+    (d.angebote || []).length ? d.angebote.map((x) => rowPill(x.betrag, x.zeit, x.status, x.pill)).join("") : emptyRow("Keine Angebote")
+  }</div>`);
+  parts.push(`<div class="card"><h2>Rechnungen (${(d.rechnungen || []).length})</h2>${
+    (d.rechnungen || []).length ? d.rechnungen.map((x) => rowPill(x.betrag + (x.nummer ? " · " + esc(x.nummer) : ""), x.zeit, x.status, x.pill)).join("") : emptyRow("Keine Rechnungen")
+  }</div>`);
+  App.view.innerHTML = parts.join("");
+  document.getElementById("back-kunden").addEventListener("click", () => navigate("kunden"));
+  bindAufnahmen();
 }
 
 // ---------- Material-Bestellverlauf ----------

@@ -8,9 +8,10 @@
  *  - Minimaler Offline-Shell-Cache (App-Rahmen laedt auch ohne Netz; die
  *    eigentlichen Daten kommen immer frisch vom Server).
  */
-// v12: Visualisierung (Foto → KI-Rendering via Gemini), zusaetzlich zu
-// Material-Bestellungen (v11) + Aufträge (v10) + Belege (v9) + Diktat (v8).
-const CACHE = "ga-app-v12";
+// v13: Kunden-Profil (gebündelte Historie + Drive-Ordner), zusaetzlich zu
+// Visualisierung (v12) + Material-Bestellungen (v11) + Aufträge (v10) +
+// Belege (v9) + Diktat (v8).
+const CACHE = "ga-app-v13";
 const SHELL = [
   "/app",
   "/app/static/app.css",

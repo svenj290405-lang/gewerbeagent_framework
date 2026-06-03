@@ -994,6 +994,66 @@ async def api_kunden(
     })
 
 
+@router.get("/kunden/profil")
+async def api_kunde_profil(
+    request: Request, name: str = "", _e=Depends(require_app_user),
+) -> JSONResponse:
+    """Gebuendeltes Kundenprofil zu einem (exakten) Namen: Gespraeche,
+    Angebote, Rechnungen + Drive-Ordner. Read-only, tenant-gescoped."""
+    from core.models.tenant_kunde_drive import TenantKundeDrive
+    tid = current_tenant_id(request)
+    nm = (name or "").strip()
+    if len(nm) < 2:
+        return JSONResponse({"ok": False, "error": "Name fehlt."}, status_code=400)
+    async with get_session() as s:
+        g = (await s.execute(
+            select(Kundengespraech)
+            .where(Kundengespraech.tenant_id == tid, Kundengespraech.kunde_name.ilike(nm))
+            .order_by(Kundengespraech.gespraech_datum.desc()).limit(25)
+        )).scalars().all()
+        a = (await s.execute(
+            select(Angebot)
+            .where(Angebot.tenant_id == tid, Angebot.kunde_name.ilike(nm))
+            .order_by(Angebot.created_at.desc()).limit(25)
+        )).scalars().all()
+        r = (await s.execute(
+            select(Rechnung)
+            .where(Rechnung.tenant_id == tid, Rechnung.kunde_name.ilike(nm))
+            .order_by(Rechnung.created_at.desc()).limit(25)
+        )).scalars().all()
+        drv = (await s.execute(
+            select(TenantKundeDrive)
+            .where(TenantKundeDrive.tenant_id == tid, TenantKundeDrive.kunde_name.ilike(nm))
+            .limit(1)
+        )).scalar_one_or_none()
+
+    email = next((x.kunde_email for x in a if getattr(x, "kunde_email", None)), "") or ""
+    drive = None
+    if drv:
+        drive = {
+            "url": drv.drive_folder_url,
+            "anzahl": drv.upload_count,
+            "letzter": _fmt_dt(drv.last_upload_at),
+        }
+    return JSONResponse({
+        "ok": True,
+        "name": nm,
+        "email": email,
+        "gespraeche": [{"id": str(x.id), "briefing": (x.briefing_kurz or "")[:160],
+                        "zeit": _fmt_dt(x.gespraech_datum)} for x in g],
+        "angebote": [{"betrag": _fmt_eur(x.gesamtbetrag_brutto_eur),
+                      "status": _label(_ANGEBOT_LABELS, x.status)[0],
+                      "pill": _label(_ANGEBOT_LABELS, x.status)[1],
+                      "zeit": _fmt_dt(x.created_at)} for x in a],
+        "rechnungen": [{"betrag": _fmt_eur(x.betrag_brutto_eur),
+                        "nummer": x.lexware_voucher_number or "",
+                        "status": _label(_RECHNUNG_LABELS, x.status)[0],
+                        "pill": _label(_RECHNUNG_LABELS, x.status)[1],
+                        "zeit": _fmt_dt(x.created_at)} for x in r],
+        "drive": drive,
+    })
+
+
 # =====================================================================
 # Wissensdatenbank (lesen / anlegen / löschen)
 # =====================================================================
