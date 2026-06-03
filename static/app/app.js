@@ -176,9 +176,22 @@ const SCREENS = {
       if (isInhaber && !e.is_inhaber) {
         actions = `<button class="btn-sm btn-ghost" data-act="toggle" data-slug="${esc(e.slug)}" data-active="${e.is_active ? "1" : "0"}">${e.is_active ? "Deaktivieren" : "Aktivieren"}</button>`;
       }
+      // Inhaber-Aktions-Zeile: Krank/Urlaub melden, oder bei laufender
+      // Abwesenheit "Wieder da". Aktiv nur fuer aktive Mitarbeiter.
+      let absenceActions = "";
+      if (isInhaber && e.is_active) {
+        if (e.abwesend_heute) {
+          absenceActions = `<button class="btn-sm" data-act="zurueck" data-slug="${esc(e.slug)}" style="padding:6px 10px">Wieder da</button>`;
+        } else {
+          absenceActions =
+            `<button class="btn-sm btn-ghost" data-act="absence" data-slug="${esc(e.slug)}" data-name="${esc(e.name)}" data-typ="krank" style="padding:6px 10px">Krankmelden</button>` +
+            `<button class="btn-sm btn-ghost" data-act="absence" data-slug="${esc(e.slug)}" data-name="${esc(e.name)}" data-typ="urlaub" style="padding:6px 10px">Urlaub</button>`;
+        }
+      }
       return `<div class="card">
         <div class="row"><div><div><b>${esc(e.name)}</b>${e.is_inhaber ? " · Inhaber" : (e.job_title ? " · " + esc(e.job_title) : "")}</div>${skills}${up}</div><div>${actions}</div></div>
         <div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap">${tags.join("")}</div>
+        ${absenceActions ? `<div style="margin-top:8px;display:flex;gap:6px;flex-wrap:wrap">${absenceActions}</div>` : ""}
       </div>`;
     }).join("");
     App.view.innerHTML =
@@ -197,6 +210,18 @@ const SCREENS = {
         const res = await api(`/app/api/team/${encodeURIComponent(b.dataset.slug)}/aktiv`,
           { method: "POST", body: JSON.stringify({ active: b.dataset.active !== "1" }) });
         if (res && res.ok) navigate("team"); else { b.disabled = false; alert("Aktion fehlgeschlagen."); }
+      }));
+    // Krank/Urlaub-Buttons → kleines Date-Picker-Dialog
+    document.querySelectorAll('[data-act="absence"]').forEach((b) =>
+      b.addEventListener("click", () => showAbsenceDialog(b.dataset.slug, b.dataset.name, b.dataset.typ)));
+    // Zurueck-Button → einfach senden mit confirm
+    document.querySelectorAll('[data-act="zurueck"]').forEach((b) =>
+      b.addEventListener("click", async () => {
+        if (!confirm("Mitarbeiter als zurueck markieren?")) return;
+        b.disabled = true;
+        const res = await api(`/app/api/team/${encodeURIComponent(b.dataset.slug)}/zurueck`,
+          { method: "POST", body: "{}" });
+        if (res && res.ok) navigate("team"); else { b.disabled = false; alert("Konnte nicht aktualisieren."); }
       }));
   },
 
@@ -302,6 +327,51 @@ const SCREENS = {
       }));
   },
 
+  async material() {
+    const res = await api("/app/api/material");
+    const d = res && res.ok ? await res.json() : { items: [] };
+    const isInhaber = App.me.employee.is_inhaber;
+    const items = d.items || [];
+    const active = items.filter((m) => m.aktiv);
+    const inactive = items.filter((m) => !m.aktiv);
+
+    const render = (m) =>
+      `<div class="card">
+         <div class="row" style="align-items:flex-start">
+           <div style="flex:1;min-width:0">
+             <div><b>${esc(m.name)}</b>${m.lieferant ? " · " + esc(m.lieferant) : ""}</div>
+             ${m.notes ? `<div class="sub" style="margin-top:2px">${esc(m.notes)}</div>` : ""}
+             <div class="sub" style="margin-top:4px">${esc(String(m.standard_menge))} ${esc(m.einheit)}</div>
+           </div>
+         </div>
+         <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap">
+           ${m.bestell_link ? `<a class="btn-sm" href="${esc(m.bestell_link)}" target="_blank" rel="noopener" style="text-decoration:none">🛒 Bestellen</a>` : ""}
+           ${isInhaber ? `<button class="btn-sm btn-ghost" data-mat-toggle="${esc(m.id)}">${m.aktiv ? "Deaktivieren" : "Aktivieren"}</button>` : ""}
+         </div>
+       </div>`;
+
+    App.view.innerHTML =
+      `<button class="btn-sm btn-ghost" id="back-mehr" style="margin-bottom:10px">← Zurück</button>` +
+      `<div style="display:flex;align-items:center;justify-content:space-between;margin:4px 4px 14px">
+         <h1 style="font-size:22px;margin:0">Material</h1>
+         ${isInhaber ? `<button class="btn-sm" id="mat-new-btn" style="padding:8px 14px">+ Neu</button>` : ""}
+       </div>` +
+      `<div class="section-title">Aktiv (${active.length})</div>` +
+      (active.length ? active.map(render).join("") : emptyRow("Noch kein aktives Material.")) +
+      (inactive.length ? `<details class="card"><summary style="cursor:pointer;font-weight:600">Inaktiv (${inactive.length})</summary>${inactive.map(render).join("")}</details>` : "");
+
+    document.getElementById("back-mehr").addEventListener("click", () => navigate("mehr"));
+    const newBtn = document.getElementById("mat-new-btn");
+    if (newBtn) newBtn.addEventListener("click", showNewMaterialForm);
+    document.querySelectorAll("[data-mat-toggle]").forEach((b) =>
+      b.addEventListener("click", async () => {
+        b.disabled = true;
+        const r = await api(`/app/api/material/${b.dataset.matToggle}/toggle`,
+          { method: "POST", body: "{}" });
+        if (r && r.ok) navigate("material"); else { b.disabled = false; alert("Konnte nicht ändern."); }
+      }));
+  },
+
   async einstellungen() {
     const res = await api("/app/api/einstellungen");
     const d = res && res.ok ? await res.json() : { stammdaten: {}, features: [] };
@@ -341,8 +411,8 @@ const SCREENS = {
         fld("Kontakt-E-Mail", "contact_email", "email") +
         fld("Kontakt-Telefon", "contact_phone", "tel") +
       `</div>` +
-      `<div class="card"><h2>Heimat-Adresse</h2>
-        <p class="muted" style="font-size:12px;margin-top:0">Wird für Fahrtzeit-Berechnung beim Terminbuchen benötigt.</p>` +
+      `<div class="card"><h2>Werkstatt-/Lager-Adresse</h2>
+        <p class="muted" style="font-size:12px;margin-top:0">Wird für Fahrtzeit-Berechnung beim Terminbuchen benötigt (Start- und Endpunkt der täglichen Touren).</p>` +
         fld("Straße + Nr.", "heimat_strasse") +
         fld("PLZ", "heimat_plz") +
         fld("Ort", "heimat_ort") +
@@ -383,6 +453,7 @@ const SCREENS = {
     const menu = [];
     menu.push(`<button class="row menu-item" data-go="kunden"><span>🔍 Kunden suchen</span><span class="sub">›</span></button>`);
     menu.push(`<button class="row menu-item" data-go="wissen"><span>📚 Wissensdatenbank</span><span class="sub">›</span></button>`);
+    menu.push(`<button class="row menu-item" data-go="material"><span>🧰 Material</span><span class="sub">›</span></button>`);
     if (feats.has("mitarbeiter")) menu.push(`<button class="row menu-item" data-go="team"><span>👥 Team</span><span class="sub">›</span></button>`);
     menu.push(`<button class="row menu-item" data-go="einstellungen"><span>⚙️ Einstellungen</span><span class="sub">›</span></button>`);
     App.view.innerHTML =
@@ -421,6 +492,94 @@ function rowTap(a, b, c, id) {
     `<span class="sub">${esc(c)} ›</span></button>`;
 }
 function emptyRow(txt) { return `<div class="empty">${esc(txt)}</div>`; }
+
+async function showNewMaterialForm() {
+  App.view.innerHTML =
+    `<button class="btn-sm btn-ghost" id="back-material" style="margin-bottom:10px">← Zurück</button>` +
+    `<h1 style="font-size:22px;margin:4px 4px 14px">Neues Material</h1>` +
+    `<div class="card">
+       <label class="sub">Name *</label>
+       <input type="text" id="mat-name" placeholder="z.B. Kupferrohr 22 mm" style="width:100%;padding:12px;border:1px solid var(--line);border-radius:10px;margin:4px 0 10px;font-size:16px" />
+       <label class="sub">Bestell-Link *</label>
+       <input type="url" id="mat-link" placeholder="https://…" style="width:100%;padding:12px;border:1px solid var(--line);border-radius:10px;margin:4px 0 10px;font-size:16px" />
+       <label class="sub">Lieferant (optional)</label>
+       <input type="text" id="mat-lief" placeholder="z.B. Wilhelm Mauder" style="width:100%;padding:12px;border:1px solid var(--line);border-radius:10px;margin:4px 0 10px;font-size:16px" />
+       <label class="sub">Einheit</label>
+       <input type="text" id="mat-einheit" value="Stück" style="width:100%;padding:12px;border:1px solid var(--line);border-radius:10px;margin:4px 0 10px;font-size:16px" />
+       <label class="sub">Standard-Menge</label>
+       <input type="number" id="mat-menge" value="1" min="1" style="width:100%;padding:12px;border:1px solid var(--line);border-radius:10px;margin:4px 0 10px;font-size:16px" />
+       <label class="sub">Notiz (optional)</label>
+       <textarea id="mat-notes" rows="2" style="width:100%;padding:12px;border:1px solid var(--line);border-radius:10px;font-family:inherit;font-size:16px"></textarea>
+       <button class="btn-sm" id="mat-save" style="margin-top:12px;width:100%">Material anlegen</button>
+    </div>`;
+  document.getElementById("back-material").addEventListener("click", () => navigate("material"));
+  document.getElementById("mat-save").addEventListener("click", async () => {
+    const name = document.getElementById("mat-name").value.trim();
+    const link = document.getElementById("mat-link").value.trim();
+    if (!name || !link) { alert("Name und Bestell-Link sind Pflicht."); return; }
+    const body = {
+      name, bestell_link: link,
+      lieferant: document.getElementById("mat-lief").value.trim() || null,
+      einheit: document.getElementById("mat-einheit").value.trim() || "Stück",
+      standard_menge: parseInt(document.getElementById("mat-menge").value || "1", 10),
+      notes: document.getElementById("mat-notes").value.trim() || null,
+    };
+    const btn = document.getElementById("mat-save");
+    btn.disabled = true; btn.textContent = "Speichere …";
+    const res = await api("/app/api/material/anlegen", { method: "POST", body: JSON.stringify(body) });
+    if (res && res.ok) {
+      const j = await res.json();
+      if (j.ok) { navigate("material"); return; }
+      alert("Konnte nicht anlegen: " + (j.error || "unbekannt"));
+    } else {
+      alert("Konnte nicht anlegen.");
+    }
+    btn.disabled = false; btn.textContent = "Material anlegen";
+  });
+}
+
+function showAbsenceDialog(slug, name, typ) {
+  // Mini-Modal als Overlay — vermeidet Navigation away aus dem Team-Screen.
+  const todayIso = new Date().toISOString().slice(0, 10);
+  const typLabel = typ === "krank" ? "Krankmelden" : (typ === "urlaub" ? "Urlaub eintragen" : "Abwesenheit");
+  const html =
+    `<div id="abs-modal" style="position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;z-index:1000;padding:16px">
+       <div class="card" style="max-width:420px;width:100%;margin:0">
+         <h2 style="margin-top:0">${esc(typLabel)} — ${esc(name)}</h2>
+         <label class="sub">Start</label>
+         <input type="date" id="abs-start" value="${todayIso}" style="width:100%;padding:12px;border:1px solid var(--line);border-radius:10px;margin:4px 0 10px;font-size:16px" />
+         <label class="sub">Ende (leer = unbestimmt)</label>
+         <input type="date" id="abs-ende" style="width:100%;padding:12px;border:1px solid var(--line);border-radius:10px;margin:4px 0 10px;font-size:16px" />
+         <label class="sub">Notiz (optional)</label>
+         <input type="text" id="abs-notes" style="width:100%;padding:12px;border:1px solid var(--line);border-radius:10px;margin:4px 0 10px;font-size:16px" />
+         <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:10px">
+           <button class="btn-sm btn-ghost" id="abs-cancel">Abbrechen</button>
+           <button class="btn-sm" id="abs-save">Speichern</button>
+         </div>
+       </div>
+     </div>`;
+  document.body.insertAdjacentHTML("beforeend", html);
+  const close = () => document.getElementById("abs-modal")?.remove();
+  document.getElementById("abs-cancel").addEventListener("click", close);
+  document.getElementById("abs-save").addEventListener("click", async () => {
+    const start = document.getElementById("abs-start").value;
+    const ende = document.getElementById("abs-ende").value || null;
+    const notes = document.getElementById("abs-notes").value.trim() || null;
+    if (!start) { alert("Start-Datum fehlt."); return; }
+    const btn = document.getElementById("abs-save");
+    btn.disabled = true; btn.textContent = "Speichere …";
+    const res = await api(`/app/api/team/${encodeURIComponent(slug)}/abwesenheit`,
+      { method: "POST", body: JSON.stringify({ typ, start, ende, notes }) });
+    if (res && res.ok) {
+      const j = await res.json();
+      if (j.ok) { close(); navigate("team"); return; }
+      alert("Konnte nicht speichern: " + (j.error || "unbekannt"));
+    } else {
+      alert("Konnte nicht speichern.");
+    }
+    btn.disabled = false; btn.textContent = "Speichern";
+  });
+}
 
 async function showNewEmployeeForm() {
   App.view.innerHTML =

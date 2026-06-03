@@ -797,6 +797,194 @@ async def api_anfrage_detail(
     })
 
 
+@router.get("/material")
+async def api_material_list(
+    request: Request, _e=Depends(require_app_user),
+) -> JSONResponse:
+    tid = current_tenant_id(request)
+    from core.models.tenant_material import TenantMaterial
+    async with get_session() as s:
+        rows = (await s.execute(
+            select(TenantMaterial)
+            .where(TenantMaterial.tenant_id == tid)
+            .order_by(TenantMaterial.aktiv.desc(), TenantMaterial.name)
+        )).scalars().all()
+    items = [
+        {
+            "id": str(m.id),
+            "slug": m.slug,
+            "name": m.name,
+            "lieferant": m.lieferant_name or "",
+            "bestell_link": m.bestell_link or "",
+            "einheit": m.einheit,
+            "standard_menge": m.standard_menge,
+            "notes": m.notes or "",
+            "aktiv": bool(m.aktiv),
+        } for m in rows
+    ]
+    return JSONResponse({"items": items})
+
+
+@router.post("/material/anlegen")
+async def api_material_anlegen(
+    request: Request,
+    _e=Depends(require_app_inhaber),
+    _c=Depends(require_app_csrf),
+) -> JSONResponse:
+    """Inhaber legt ein neues Material an. slug-Eindeutigkeit pro Tenant.
+
+    Body: { name, bestell_link, lieferant?, einheit?, standard_menge?, notes? }
+    """
+    tid = current_tenant_id(request)
+    body = await request.json()
+    name = (body.get("name") or "").strip()
+    bestell_link = (body.get("bestell_link") or "").strip()
+    if not name or not bestell_link:
+        return JSONResponse(
+            {"ok": False, "error": "Name und Bestell-Link sind Pflicht."},
+            status_code=400,
+        )
+
+    import re
+    base_slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or "material"
+
+    from core.models.tenant_material import TenantMaterial
+    async with get_session() as s:
+        slug_candidate = base_slug
+        i = 2
+        while (await s.execute(
+            select(TenantMaterial).where(TenantMaterial.tenant_id == tid).where(TenantMaterial.slug == slug_candidate)
+        )).scalar_one_or_none() is not None:
+            slug_candidate = f"{base_slug}-{i}"
+            i += 1
+            if i > 30:
+                return JSONResponse({"ok": False, "error": "Slug-Konflikt."}, status_code=409)
+        m = TenantMaterial(
+            tenant_id=tid,
+            slug=slug_candidate,
+            name=name,
+            bestell_link=bestell_link,
+            lieferant_name=(body.get("lieferant") or "").strip() or None,
+            einheit=(body.get("einheit") or "Stück").strip() or "Stück",
+            standard_menge=int(body.get("standard_menge") or 1),
+            notes=(body.get("notes") or "").strip() or None,
+            aktiv=True,
+        )
+        s.add(m)
+        await s.commit()
+        await s.refresh(m)
+    return JSONResponse({"ok": True, "id": str(m.id), "slug": m.slug})
+
+
+@router.post("/material/{mid}/toggle")
+async def api_material_toggle(
+    mid: str, request: Request,
+    _e=Depends(require_app_inhaber),
+    _c=Depends(require_app_csrf),
+) -> JSONResponse:
+    """Toggelt aktiv-Flag. Material wird nicht geloescht — bleibt als
+    Historie in Voice-/Telegram-Auto-Bestellungen referenzierbar."""
+    tid = current_tenant_id(request)
+    try:
+        mid_uuid = uuid.UUID(mid)
+    except (ValueError, TypeError):
+        return JSONResponse({"ok": False, "error": "ungueltige id"}, status_code=400)
+    from core.models.tenant_material import TenantMaterial
+    async with get_session() as s:
+        m = (await s.execute(
+            select(TenantMaterial)
+            .where(TenantMaterial.id == mid_uuid)
+            .where(TenantMaterial.tenant_id == tid)
+        )).scalar_one_or_none()
+        if m is None:
+            return JSONResponse({"ok": False, "error": "nicht gefunden"}, status_code=404)
+        m.aktiv = not m.aktiv
+        await s.commit()
+        new_active = m.aktiv
+    return JSONResponse({"ok": True, "aktiv": new_active})
+
+
+@router.post("/team/{slug}/abwesenheit")
+async def api_team_abwesenheit(
+    slug: str, request: Request,
+    _e=Depends(require_app_inhaber),
+    _c=Depends(require_app_csrf),
+) -> JSONResponse:
+    """Inhaber meldet einen Mitarbeiter krank / im Urlaub. Spiegel der
+    Telegram-Befehle /krank + /urlaub.
+
+    Body: { typ: 'krank'|'urlaub'|'sonstiges', start: 'YYYY-MM-DD',
+            ende?: 'YYYY-MM-DD' (None = offen), notes?: str }
+    """
+    tid = current_tenant_id(request)
+    inhaber = request.state.app_employee
+    body = await request.json()
+    typ = (body.get("typ") or "krank").strip()
+    if typ not in ("krank", "urlaub", "sonstiges"):
+        return JSONResponse(
+            {"ok": False, "error": "Typ muss krank, urlaub oder sonstiges sein."},
+            status_code=400,
+        )
+    start_iso = (body.get("start") or "").strip()
+    end_iso = (body.get("ende") or "").strip() or None
+    try:
+        start_date = dt.date.fromisoformat(start_iso) if start_iso else dt.date.today()
+    except ValueError:
+        return JSONResponse({"ok": False, "error": "Start-Datum ungueltig."}, status_code=400)
+    try:
+        end_date = dt.date.fromisoformat(end_iso) if end_iso else None
+    except ValueError:
+        return JSONResponse({"ok": False, "error": "End-Datum ungueltig."}, status_code=400)
+
+    from core.models.employee import Employee
+    from core.models.employee_absence import create_absence
+    async with get_session() as s:
+        emp = (await s.execute(
+            select(Employee)
+            .where(Employee.tenant_id == tid)
+            .where(Employee.slug == slug)
+        )).scalar_one_or_none()
+    if emp is None:
+        return JSONResponse({"ok": False, "error": "Mitarbeiter nicht gefunden."}, status_code=404)
+
+    try:
+        ab = await create_absence(
+            employee_id=emp.id,
+            start_date=start_date,
+            end_date=end_date,
+            absence_type=typ,
+            notes=(body.get("notes") or "").strip() or None,
+            created_by_employee_id=inhaber.id,
+        )
+    except ValueError as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+    return JSONResponse({"ok": True, "absence_id": str(ab.id)})
+
+
+@router.post("/team/{slug}/zurueck")
+async def api_team_zurueck(
+    slug: str, request: Request,
+    _e=Depends(require_app_inhaber),
+    _c=Depends(require_app_csrf),
+) -> JSONResponse:
+    """Beendet die aktive Abwesenheit eines Mitarbeiters mit heutigem Datum.
+    Spiegel des Telegram-Befehls /zurueck.
+    """
+    tid = current_tenant_id(request)
+    from core.models.employee import Employee
+    from core.models.employee_absence import close_absence
+    async with get_session() as s:
+        emp = (await s.execute(
+            select(Employee)
+            .where(Employee.tenant_id == tid)
+            .where(Employee.slug == slug)
+        )).scalar_one_or_none()
+    if emp is None:
+        return JSONResponse({"ok": False, "error": "Mitarbeiter nicht gefunden."}, status_code=404)
+    closed = await close_absence(emp.id, dt.date.today())
+    return JSONResponse({"ok": True, "had_open_absence": closed is not None})
+
+
 @router.get("/einstellungen")
 async def api_einstellungen_get(
     request: Request, _e=Depends(require_app_user),

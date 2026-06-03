@@ -8,9 +8,9 @@
  *  - Minimaler Offline-Shell-Cache (App-Rahmen laedt auch ohne Netz; die
  *    eigentlichen Daten kommen immer frisch vom Server).
  */
-// v5: Rueckruf manuell anlegen, Mitarbeiter-Anlage mit Aktivierungs-Link,
-// Einstellungs-Screen (Stammdaten editierbar fuer Inhaber).
-const CACHE = "ga-app-v5";
+// v6: Krank/Urlaub/Zurueck-Buttons im Team, Material-Screen + Anlegen,
+// Werkstatt-/Lager-Adress-Label im Einstellungen-Screen.
+const CACHE = "ga-app-v6";
 const SHELL = [
   "/app",
   "/app/static/app.css",
