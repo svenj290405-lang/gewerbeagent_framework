@@ -8,9 +8,9 @@
  *  - Minimaler Offline-Shell-Cache (App-Rahmen laedt auch ohne Netz; die
  *    eigentlichen Daten kommen immer frisch vom Server).
  */
-// v8: Sprach-Diktat im Browser (Web-Audio → WAV 16 kHz mono → Gemini-
-// Analyse → Kundengespraech), Telegram-/aufnahme-Ersatz.
-const CACHE = "ga-app-v8";
+// v9: Belege erfassen (Foto/PDF → Lexware-Voucher-Upload), zusaetzlich zum
+// Sprach-Diktat (v8).
+const CACHE = "ga-app-v9";
 const SHELL = [
   "/app",
   "/app/static/app.css",

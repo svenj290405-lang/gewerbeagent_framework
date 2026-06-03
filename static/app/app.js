@@ -147,16 +147,21 @@ const SCREENS = {
 
   async buchhaltung() {
     const isInhaber = App.me.employee.is_inhaber;
-    const [a, r] = await Promise.all([api("/app/api/angebote"), api("/app/api/rechnungen")]);
+    const [a, r, b] = await Promise.all([
+      api("/app/api/angebote"), api("/app/api/rechnungen"), api("/app/api/belege"),
+    ]);
     const ad = a && a.ok ? await a.json() : { angebote: [] };
     const rd = r && r.ok ? await r.json() : { rechnungen: [] };
+    const bd = b && b.ok ? await b.json() : { belege: [] };
     App.view.innerHTML =
       `<div style="display:flex;align-items:center;justify-content:space-between;margin:4px 4px 14px">
          <h1 style="font-size:22px;margin:0">Büro</h1>
-         ${isInhaber ? `<div style="display:flex;gap:6px">
-           <button class="btn-sm" id="rechnung-new-btn" style="padding:8px 12px">+ Rechnung</button>
-           <button class="btn-sm btn-ghost" id="angebot-new-btn" style="padding:8px 12px">+ Angebot</button>
-         </div>` : ""}
+         <div style="display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end">
+           <button class="btn-sm" id="beleg-new-btn" style="padding:8px 12px">📄 Beleg</button>
+           ${isInhaber ? `
+           <button class="btn-sm btn-ghost" id="rechnung-new-btn" style="padding:8px 12px">+ Rechnung</button>
+           <button class="btn-sm btn-ghost" id="angebot-new-btn" style="padding:8px 12px">+ Angebot</button>` : ""}
+         </div>
        </div>` +
       `<div class="card"><h2>Rechnungen</h2>${
         (rd.rechnungen || []).length ? rd.rechnungen.map((x) =>
@@ -167,9 +172,14 @@ const SCREENS = {
         (ad.angebote || []).length ? ad.angebote.map((x) =>
           rowPill(x.kunde, x.betrag + " · " + x.zeit, x.status, x.pill)).join("")
         : emptyRow("Noch keine Angebote")
+      }</div>` +
+      `<div class="card"><h2>Belege</h2>${
+        (bd.belege || []).length ? bd.belege.map(belegRow).join("")
+        : emptyRow("Noch keine Belege")
       }</div>`;
     const aBtn = document.getElementById("angebot-new-btn");
     const rBtn = document.getElementById("rechnung-new-btn");
+    document.getElementById("beleg-new-btn").addEventListener("click", showBelegUpload);
     if (aBtn) aBtn.addEventListener("click", () => showAngebotForm());
     if (rBtn) rBtn.addEventListener("click", () => showRechnungForm());
   },
@@ -1194,6 +1204,103 @@ async function showDiktatForm() {
     Diktat.autostop = setTimeout(() => {
       if (Diktat.recording) stopAndUpload();
     }, DIKTAT_MAX_SECONDS * 1000);
+  });
+}
+
+// ---------- Belege (Foto/PDF → Lexware-Voucher) ----------
+const _BELEG_STATUS = {
+  uploaded: ["In Lexware", "ok"],
+  uploading: ["Wird hochgeladen", "warn"],
+  pending: ["Wartet", "warn"],
+  error: ["Fehler", "danger"],
+};
+const BELEG_ALLOWED = ["image/jpeg", "image/png", "application/pdf"];
+const BELEG_MAX_BYTES = 10 * 1024 * 1024;
+
+function belegRow(b) {
+  const meta = _BELEG_STATUS[b.status] || [b.status, ""];
+  const title = b.caption || "Beleg";
+  const sub = `${b.zeit} · ${b.groesse_kb} KB` + (b.fehler ? " · " + b.fehler : "");
+  if (b.lexware_link) {
+    return `<a class="row" href="${esc(b.lexware_link)}" target="_blank" rel="noopener" style="text-decoration:none;color:inherit">` +
+      `<div><div>${esc(title)}</div><div class="sub">${esc(sub)}</div></div>` +
+      `<span class="pill ${meta[1]}">${esc(meta[0])} ›</span></a>`;
+  }
+  return `<div class="row"><div><div>${esc(title)}</div><div class="sub">${esc(sub)}</div></div>` +
+    `<span class="pill ${meta[1]}">${esc(meta[0])}</span></div>`;
+}
+
+async function showBelegUpload() {
+  const inputStyle = "width:100%;padding:12px;border:1px solid var(--line);border-radius:10px;margin:4px 0 10px;font-size:16px";
+  App.view.innerHTML =
+    `<button class="btn-sm btn-ghost" id="back-buchhaltung" style="margin-bottom:10px">← Zurück</button>` +
+    `<h1 style="font-size:22px;margin:4px 4px 6px">Beleg erfassen</h1>` +
+    `<p class="muted" style="margin:0 4px 14px">Foto einer Quittung/Rechnung machen oder ein PDF wählen. Der Beleg landet unverbucht in Lexware — dort prüfst und buchst du ihn.</p>` +
+    `<div class="card">
+       <label class="sub">Beleg (JPEG, PNG oder PDF, max 10 MB)</label>
+       <input type="file" id="bl-file" accept="image/jpeg,image/png,application/pdf" style="${inputStyle}" />
+       <label class="sub">Notiz (optional)</label>
+       <input type="text" id="bl-caption" placeholder="z.B. Bauhaus Schrauben" style="${inputStyle}" />
+       <button class="btn-sm" id="bl-upload" style="width:100%;margin-top:8px" disabled>Beleg hochladen</button>
+       <p class="muted" id="bl-status" style="margin-top:12px;min-height:20px"></p>
+     </div>
+     <div id="bl-result"></div>`;
+  document.getElementById("back-buchhaltung").addEventListener("click", () => navigate("buchhaltung"));
+
+  const fileEl = document.getElementById("bl-file");
+  const upBtn = document.getElementById("bl-upload");
+  const statusEl = document.getElementById("bl-status");
+  const resultEl = document.getElementById("bl-result");
+
+  fileEl.addEventListener("change", () => {
+    const f = fileEl.files && fileEl.files[0];
+    if (!f) { upBtn.disabled = true; statusEl.textContent = ""; return; }
+    if (BELEG_ALLOWED.indexOf(f.type) === -1) {
+      statusEl.textContent = "Nicht unterstützt: bitte JPEG, PNG oder PDF (kein HEIC).";
+      upBtn.disabled = true; return;
+    }
+    if (f.size > BELEG_MAX_BYTES) {
+      statusEl.textContent = `Datei zu groß (${Math.round(f.size / 1024 / 1024)} MB, max 10 MB).`;
+      upBtn.disabled = true; return;
+    }
+    statusEl.textContent = `${f.name} · ${Math.round(f.size / 1024)} KB`;
+    upBtn.disabled = false;
+  });
+
+  upBtn.addEventListener("click", async () => {
+    const f = fileEl.files && fileEl.files[0];
+    if (!f) return;
+    const caption = document.getElementById("bl-caption").value.trim();
+    upBtn.disabled = true;
+    statusEl.textContent = "Lade an Lexware hoch …";
+    let res;
+    try {
+      const qs = "?caption=" + encodeURIComponent(caption) + "&filename=" + encodeURIComponent(f.name);
+      res = await fetch("/app/api/belege/upload" + qs, {
+        method: "POST",
+        headers: { "X-CSRF-Token": App.me.csrf, "Content-Type": f.type },
+        body: f,
+      });
+    } catch (e) {
+      statusEl.textContent = "Netzwerkfehler. Bitte erneut versuchen.";
+      upBtn.disabled = false; return;
+    }
+    if (res.status === 303 || res.status === 401 || res.redirected) { location.href = "/app/login"; return; }
+    let j = null;
+    try { j = await res.json(); } catch (e) {}
+    if (res.ok && j && j.ok) {
+      statusEl.textContent = "";
+      const dup = j.duplikat ? `<p class="muted" style="margin:6px 0 0">Dieser Beleg war schon in Lexware.</p>` : "";
+      const link = j.lexware_link
+        ? `<a class="btn-sm" href="${esc(j.lexware_link)}" target="_blank" rel="noopener" style="display:block;text-align:center;width:100%;margin-top:4px;text-decoration:none">In Lexware öffnen & verbuchen</a>` : "";
+      resultEl.innerHTML =
+        `<div class="card"><h2>✓ Beleg übergeben</h2>${dup}</div>` + link +
+        `<button class="btn-sm btn-ghost" id="bl-again" style="width:100%;margin-top:8px">Nächsten Beleg</button>`;
+      document.getElementById("bl-again").addEventListener("click", showBelegUpload);
+    } else {
+      statusEl.textContent = (j && j.error) || "Upload fehlgeschlagen. Bitte erneut versuchen.";
+      upBtn.disabled = false;
+    }
   });
 }
 

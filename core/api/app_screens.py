@@ -1440,6 +1440,210 @@ async def api_rechnung_senden(
     return JSONResponse({"ok": True, "message_id": result.get("message_id")})
 
 
+# =================== Belege (Lexware-Voucher-Upload) ===================
+# Spiegelt die Telegram-/beleg-Logik (_handle_beleg_photo_received): gleiche
+# MIME-Whitelist, gleiches 10-MB-Limit, Hash-Idempotenz, gleiche
+# provider.upload_voucher_file()-Logik und dasselbe Beleg-Modell.
+
+_BELEG_ALLOWED_MIMES = {"image/jpeg", "image/png", "application/pdf"}
+_BELEG_MAX_SIZE_BYTES = 10_000_000  # 10 MB (Lexware-File-Limit)
+_BELEG_EXT = {"image/jpeg": ".jpg", "image/png": ".png", "application/pdf": ".pdf"}
+
+
+def _normalize_beleg_mime(raw: str | None) -> str | None:
+    """Content-Type → erlaubter Beleg-MIME oder None (= nicht unterstuetzt)."""
+    mime = (raw or "").split(";")[0].strip().lower()
+    return mime if mime in _BELEG_ALLOWED_MIMES else None
+
+
+async def _recent_belege(tenant_id: uuid.UUID, limit: int = 20) -> list[dict]:
+    from core.models.beleg import (
+        Beleg, BELEG_STATUS_ERROR, BELEG_STATUS_UPLOADED,
+    )
+    from core.integrations.lexware import LexwareProvider
+    async with get_session() as s:
+        rows = (await s.execute(
+            select(Beleg)
+            .where(Beleg.tenant_id == tenant_id)
+            .order_by(Beleg.created_at.desc())
+            .limit(limit)
+        )).scalars().all()
+    out = []
+    for b in rows:
+        link = (
+            LexwareProvider.voucher_deeplink(b.lexware_voucher_id)
+            if b.status == BELEG_STATUS_UPLOADED and b.lexware_voucher_id else None
+        )
+        out.append({
+            "id": str(b.id),
+            "zeit": _fmt_dt(b.created_at),
+            "groesse_kb": (b.file_size or 0) // 1024,
+            "status": b.status,
+            "caption": b.caption or "",
+            "lexware_link": link,
+            "fehler": (b.error_message or "")[:160] if b.status == BELEG_STATUS_ERROR else "",
+        })
+    return out
+
+
+async def _mark_beleg_error(beleg_id: uuid.UUID, msg: str) -> None:
+    from core.models.beleg import Beleg, BELEG_STATUS_ERROR
+    async with get_session() as s:
+        b = (await s.execute(
+            select(Beleg).where(Beleg.id == beleg_id)
+        )).scalar_one_or_none()
+        if b:
+            b.status = BELEG_STATUS_ERROR
+            b.error_message = msg
+            await s.commit()
+
+
+@router.get("/belege")
+async def api_belege_list(
+    request: Request, _e=Depends(require_app_user),
+) -> JSONResponse:
+    return JSONResponse({"belege": await _recent_belege(current_tenant_id(request))})
+
+
+@router.post("/belege/upload")
+async def api_beleg_upload(
+    request: Request,
+    emp: Employee = Depends(require_app_user),
+    _c=Depends(require_app_csrf),
+) -> JSONResponse:
+    """Beleg-Foto/PDF aus der PWA → Lexware-Voucher-Upload.
+
+    Body = rohe Datei-Bytes; Content-Type bestimmt den MIME; optionale Notiz
+    als ?caption=. Spiegelt exakt den Telegram-/beleg-Flow: MIME-Whitelist,
+    10-MB-Limit, Hash-Idempotenz (selber Datei-Inhalt → kein Doppel-Upload),
+    gleiche provider.upload_voucher_file()-Logik, gleiches Beleg-Modell.
+
+    require_app_user (KEIN Inhaber-Gate): Belege werden oft vom Monteur im
+    Feld fotografiert; verbucht wird ohnehin manuell in Lexware, hier wird
+    nur abgelegt. HARTE Tenant-Isolation ueber current_tenant_id.
+    """
+    import hashlib
+    from core.integrations.accounting_base import AccountingError
+    from core.integrations.lexware import LexwareProvider
+    from core.models.beleg import (
+        Beleg, BELEG_SOURCE_API,
+        BELEG_STATUS_UPLOADED, BELEG_STATUS_UPLOADING,
+    )
+
+    file_bytes = await request.body()
+    if not file_bytes:
+        return JSONResponse({"ok": False, "error": "Keine Datei empfangen."}, status_code=400)
+    if len(file_bytes) > _BELEG_MAX_SIZE_BYTES:
+        mb = len(file_bytes) // 1024 // 1024
+        return JSONResponse(
+            {"ok": False, "error": f"Datei zu gross ({mb} MB, max 10 MB)."},
+            status_code=413,
+        )
+    mime = _normalize_beleg_mime(request.headers.get("content-type"))
+    if mime is None:
+        return JSONResponse(
+            {"ok": False, "error": "Nur JPEG-, PNG- oder PDF-Belege erlaubt."},
+            status_code=415,
+        )
+
+    caption = (request.query_params.get("caption") or "").strip()[:500] or None
+    filename = (
+        (request.query_params.get("filename") or "").strip()[:255]
+        or f"beleg{_BELEG_EXT.get(mime, '.bin')}"
+    )
+
+    tid = current_tenant_id(request)
+    provider = await _build_lexware_provider(tid)
+    if provider is None:
+        return JSONResponse(
+            {"ok": False, "error": (
+                "Lexware ist nicht verbunden. Bitte in den Einstellungen verbinden."
+            )},
+            status_code=409,
+        )
+
+    file_hash = hashlib.sha256(file_bytes).hexdigest()
+
+    # Idempotenz + DB-Eintrag (Status uploading). Gleicher Datei-Inhalt schon
+    # erfolgreich → sofort den vorhandenen Lexware-Link zurueckgeben.
+    async with get_session() as s:
+        existing = (await s.execute(
+            select(Beleg).where(
+                Beleg.tenant_id == tid, Beleg.file_hash == file_hash,
+            )
+        )).scalar_one_or_none()
+        if (existing and existing.status == BELEG_STATUS_UPLOADED
+                and existing.lexware_voucher_id):
+            return JSONResponse({
+                "ok": True, "duplikat": True, "id": str(existing.id),
+                "lexware_link": LexwareProvider.voucher_deeplink(
+                    existing.lexware_voucher_id
+                ),
+            })
+        if existing:
+            beleg = existing
+            beleg.file_data = file_bytes
+            beleg.file_mime = mime
+            beleg.file_size = len(file_bytes)
+            beleg.original_filename = filename
+            beleg.caption = caption
+            beleg.source = BELEG_SOURCE_API
+            beleg.status = BELEG_STATUS_UPLOADING
+            beleg.upload_attempts = (beleg.upload_attempts or 0) + 1
+            beleg.error_message = None
+        else:
+            beleg = Beleg(
+                tenant_id=tid, file_data=file_bytes, file_mime=mime,
+                file_hash=file_hash, file_size=len(file_bytes),
+                original_filename=filename, caption=caption,
+                source=BELEG_SOURCE_API, status=BELEG_STATUS_UPLOADING,
+                upload_attempts=1,
+            )
+        s.add(beleg)
+        await s.commit()
+        await s.refresh(beleg)
+        beleg_id = beleg.id
+
+    try:
+        result = await provider.upload_voucher_file(
+            file_bytes=file_bytes, mime_type=mime, filename=filename,
+        )
+    except AccountingError as e:
+        await _mark_beleg_error(beleg_id, str(e)[:500])
+        return JSONResponse(
+            {"ok": False, "error": f"Lexware-Upload fehlgeschlagen (HTTP {e.status_code})."},
+            status_code=502,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.exception("PWA-Beleg: Lexware-Upload fehlgeschlagen: %s", e)
+        await _mark_beleg_error(beleg_id, f"Unerwartet: {str(e)[:400]}")
+        return JSONResponse(
+            {"ok": False, "error": "Lexware-Upload fehlgeschlagen. Bitte erneut versuchen."},
+            status_code=502,
+        )
+
+    async with get_session() as s:
+        beleg = (await s.execute(
+            select(Beleg).where(Beleg.id == beleg_id)
+        )).scalar_one_or_none()
+        if beleg:
+            beleg.status = BELEG_STATUS_UPLOADED
+            beleg.lexware_file_id = result.file_id
+            beleg.lexware_voucher_id = result.voucher_id
+            beleg.uploaded_at = dt.datetime.now(dt.timezone.utc)
+            await s.commit()
+
+    logger.info(
+        "PWA-Beleg hochgeladen: id=%s tenant=%s mitarbeiter=%s mime=%s",
+        beleg_id, tid, emp.id, mime,
+    )
+    deeplink = (
+        LexwareProvider.voucher_deeplink(result.voucher_id)
+        if result.voucher_id else None
+    )
+    return JSONResponse({"ok": True, "id": str(beleg_id), "lexware_link": deeplink})
+
+
 @router.get("/material")
 async def api_material_list(
     request: Request, _e=Depends(require_app_user),
