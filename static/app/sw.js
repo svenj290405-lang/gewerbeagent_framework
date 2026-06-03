@@ -8,9 +8,9 @@
  *  - Minimaler Offline-Shell-Cache (App-Rahmen laedt auch ohne Netz; die
  *    eigentlichen Daten kommen immer frisch vom Server).
  */
-// v4: Push bei neuer Anfrage, Termin-Anlage-Composer, Anrufen-Link.
-// Cache-Bump damit neuer JS + die zusaetzlichen Routes durchschlagen.
-const CACHE = "ga-app-v4";
+// v5: Rueckruf manuell anlegen, Mitarbeiter-Anlage mit Aktivierungs-Link,
+// Einstellungs-Screen (Stammdaten editierbar fuer Inhaber).
+const CACHE = "ga-app-v5";
 const SHELL = [
   "/app",
   "/app/static/app.css",

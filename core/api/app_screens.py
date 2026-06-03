@@ -797,6 +797,200 @@ async def api_anfrage_detail(
     })
 
 
+@router.get("/einstellungen")
+async def api_einstellungen_get(
+    request: Request, _e=Depends(require_app_user),
+) -> JSONResponse:
+    """Stammdaten + verbundene Dienste. Schreiben in api_einstellungen_set."""
+    tid = current_tenant_id(request)
+    tenant = request.state.app_tenant
+    is_inhaber = bool(request.state.app_is_inhaber)
+
+    # Heimat-Adresse aus Tenant zusammensetzen — die App-UI zeigt eine
+    # einzelne Zeile fuer einfaches Editieren.
+    adresse_parts = [tenant.heimat_strasse, " · ".join(
+        [p for p in [tenant.heimat_plz, tenant.heimat_ort] if p]
+    )]
+    adresse_join = " · ".join([p for p in adresse_parts if p])
+
+    return JSONResponse({
+        "stammdaten": {
+            "company_name": tenant.company_name or "",
+            "contact_name": tenant.contact_name or "",
+            "contact_email": tenant.contact_email or "",
+            "contact_phone": tenant.contact_phone or "",
+            "branche": tenant.branche or "",
+            "voice_phone_number": tenant.voice_phone_number or "",
+            "heimat_strasse": tenant.heimat_strasse or "",
+            "heimat_plz": tenant.heimat_plz or "",
+            "heimat_ort": tenant.heimat_ort or "",
+            "fahrtzeit_puffer_min": tenant.fahrtzeit_puffer_min,
+            "adresse_join": adresse_join,
+        },
+        "features": list(getattr(tenant, "features", []) or []),
+        "package_tier": tenant.package_tier or "",
+        "data_retention_days": tenant.data_retention_days,
+        "is_inhaber": is_inhaber,
+    })
+
+
+@router.post("/einstellungen")
+async def api_einstellungen_set(
+    request: Request,
+    _e=Depends(require_app_inhaber),
+    _c=Depends(require_app_csrf),
+) -> JSONResponse:
+    """Schreibt nur die Felder die fuer den Inhaber im Self-Service Sinn
+    machen — OAuth/Voice-Konfig laeuft weiterhin ueber den Setup-Wizard
+    bzw. das Admin-UI.
+
+    Body: { company_name?, contact_name?, contact_email?, contact_phone?,
+            heimat_strasse?, heimat_plz?, heimat_ort?, branche? }
+    """
+    tid = current_tenant_id(request)
+    body = await request.json()
+    allowed = {
+        "company_name", "contact_name", "contact_email", "contact_phone",
+        "heimat_strasse", "heimat_plz", "heimat_ort", "branche",
+    }
+    from core.models.tenant import Tenant
+    async with get_session() as s:
+        t = (await s.execute(select(Tenant).where(Tenant.id == tid))).scalar_one_or_none()
+        if t is None:
+            return JSONResponse({"ok": False, "error": "Tenant nicht gefunden."}, status_code=404)
+        for k, v in (body or {}).items():
+            if k in allowed:
+                val = (v or "").strip() if isinstance(v, str) else v
+                setattr(t, k, val or None)
+        await s.commit()
+    return JSONResponse({"ok": True})
+
+
+@router.post("/team/anlegen")
+async def api_team_anlegen(
+    request: Request,
+    _e=Depends(require_app_inhaber),
+    _c=Depends(require_app_csrf),
+) -> JSONResponse:
+    """Inhaber legt einen neuen Employee an + erzeugt einen einmaligen
+    Aktivierungs-Link. Der Link wird zurueckgegeben — Inhaber kopiert
+    ihn aus dem Browser und schickt ihn dem Mitarbeiter (per WhatsApp/SMS).
+
+    Body: { name, contact_email?, job_title?, skills?: list[str] }
+    """
+    tid = current_tenant_id(request)
+    body = await request.json()
+    name = (body.get("name") or "").strip()
+    if not name:
+        return JSONResponse({"ok": False, "error": "Name ist Pflicht."}, status_code=400)
+
+    contact_email = (body.get("contact_email") or "").strip() or None
+    job_title = (body.get("job_title") or "").strip() or None
+    skills_raw = body.get("skills")
+    if isinstance(skills_raw, str):
+        # Bequemlichkeit fuers Frontend: komma-getrennt OK.
+        skills = [s.strip() for s in skills_raw.split(",") if s.strip()]
+    elif isinstance(skills_raw, list):
+        skills = [str(s).strip() for s in skills_raw if str(s).strip()]
+    else:
+        skills = None
+
+    # Slug = name normalisiert (Leerzeichen → "-", lowercase). Wenn schon
+    # vergeben, suffix mit der id-Praefix.
+    import re
+    base_slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or "mitarbeiter"
+
+    from core.models.employee import Employee
+    async with get_session() as s:
+        # Slug-Eindeutigkeit pro Tenant: bei Konflikt zaehlt eine Zahl hoch.
+        slug_candidate = base_slug
+        i = 2
+        while (await s.execute(
+            select(Employee).where(Employee.tenant_id == tid).where(Employee.slug == slug_candidate)
+        )).scalar_one_or_none() is not None:
+            slug_candidate = f"{base_slug}-{i}"
+            i += 1
+            if i > 30:
+                return JSONResponse({"ok": False, "error": "Zu viele aehnliche Slugs."}, status_code=409)
+
+        emp = Employee(
+            tenant_id=tid,
+            slug=slug_candidate,
+            name=name,
+            contact_email=contact_email,
+            job_title=job_title,
+            skills=skills,
+            is_default=False,
+            is_active=True,
+        )
+        s.add(emp)
+        await s.commit()
+        await s.refresh(emp)
+        new_emp_id = emp.id
+
+    # Aktivierungs-Link erzeugen.
+    from core.models.employee_activation_token import create_activation_token
+    tok = await create_activation_token(tid, new_emp_id)
+    base_url = str(request.base_url).rstrip("/")
+    activation_url = f"{base_url}/app/activate?token={tok.token}"
+
+    return JSONResponse({
+        "ok": True,
+        "employee_id": str(new_emp_id),
+        "slug": slug_candidate,
+        "activation_url": activation_url,
+        "activation_short_code": tok.short_code,
+        "expires_at": tok.expires_at.isoformat() if tok.expires_at else None,
+    })
+
+
+@router.post("/rueckrufe/anlegen")
+async def api_rueckruf_anlegen(
+    request: Request,
+    _e=Depends(require_app_user),
+    _c=Depends(require_app_csrf),
+) -> JSONResponse:
+    """Inhaber/Mitarbeiter legt manuell einen Rueckruf an (z.B. nachdem
+    er telefonisch eine Bitte aufgenommen hat). Spiegel der Voice-Pipeline,
+    aber ohne Audio-Quelle.
+
+    Body: { kunde_name, kunde_telefon, anliegen, kunde_email? }
+    """
+    tid = current_tenant_id(request)
+    employee = request.state.app_employee
+    body = await request.json()
+    kunde_name = (body.get("kunde_name") or "").strip()
+    kunde_telefon = (body.get("kunde_telefon") or "").strip()
+    anliegen = (body.get("anliegen") or "").strip()
+    kunde_email = (body.get("kunde_email") or "").strip() or None
+
+    if not kunde_name or not kunde_telefon:
+        return JSONResponse(
+            {"ok": False, "error": "Name und Telefon sind Pflicht."},
+            status_code=400,
+        )
+    # Anliegen kann leer sein — wir defaulten auf einen Hinweis, damit
+    # die UI-Liste nicht "leere Zeile" wird.
+    if not anliegen:
+        anliegen = f"Manuell angelegt von {employee.name or 'Mitarbeiter'}"
+
+    async with get_session() as s:
+        r = Rueckruf(
+            tenant_id=tid,
+            kunde_name=kunde_name,
+            kunde_telefon=kunde_telefon,
+            kunde_email=kunde_email,
+            anliegen=anliegen,
+            status=RUECKRUF_STATUS_OFFEN,
+            assigned_employee_id=getattr(employee, "id", None),
+        )
+        s.add(r)
+        await s.commit()
+        await s.refresh(r)
+
+    return JSONResponse({"ok": True, "id": str(r.id)})
+
+
 @router.get("/termine/freie-slots")
 async def api_freie_slots(
     request: Request, _e=Depends(require_app_user),

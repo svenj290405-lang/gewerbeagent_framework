@@ -123,6 +123,10 @@ const SCREENS = {
     const ad = a && a.ok ? await a.json() : { aufnahmen: [] };
     const rd = r && r.ok ? await r.json() : { rueckrufe: [] };
     App.view.innerHTML =
+      `<div style="display:flex;align-items:center;justify-content:space-between;margin:4px 4px 14px">
+        <h1 style="font-size:22px;margin:0">Anrufe</h1>
+        <button class="btn-sm" id="rueckruf-new-btn" style="padding:8px 14px">+ Rückruf</button>
+      </div>` +
       `<div class="card"><h2>Offene Rückrufe</h2>${
         (rd.rueckrufe || []).length ? rd.rueckrufe.map((x) =>
           rowAction(x.kunde, x.telefon + (x.anliegen ? " · " + esc(x.anliegen) : ""), "", x.id, "rueckruf-done", "Erledigt")).join("")
@@ -134,6 +138,7 @@ const SCREENS = {
       }</div>`;
     bindRueckrufDone();
     bindAufnahmen();
+    document.getElementById("rueckruf-new-btn").addEventListener("click", showNewRueckrufForm);
   },
 
   async buchhaltung() {
@@ -178,10 +183,14 @@ const SCREENS = {
     }).join("");
     App.view.innerHTML =
       `<button class="btn-sm btn-ghost" id="back-mehr" style="margin-bottom:10px">← Zurück</button>` +
-      `<div class="section-title">Team (${(d.team || []).length})</div>` +
-      (cards || emptyRow("Keine Mitarbeiter")) +
-      (isInhaber ? `<p class="muted" style="text-align:center;margin-top:6px">Mitarbeiter anlegen sowie Krank-/Urlaubsmeldung folgen in einer späteren Version.</p>` : "");
+      `<div style="display:flex;align-items:center;justify-content:space-between;margin:4px 4px 14px">
+        <div class="section-title" style="margin:0">Team (${(d.team || []).length})</div>` +
+       (isInhaber ? `<button class="btn-sm" id="team-new-btn" style="padding:8px 14px">+ Mitarbeiter</button>` : "") +
+       `</div>` +
+      (cards || emptyRow("Keine Mitarbeiter"));
     document.getElementById("back-mehr").addEventListener("click", () => navigate("mehr"));
+    const newBtn = document.getElementById("team-new-btn");
+    if (newBtn) newBtn.addEventListener("click", showNewEmployeeForm);
     document.querySelectorAll('[data-act="toggle"]').forEach((b) =>
       b.addEventListener("click", async () => {
         b.disabled = true;
@@ -293,6 +302,81 @@ const SCREENS = {
       }));
   },
 
+  async einstellungen() {
+    const res = await api("/app/api/einstellungen");
+    const d = res && res.ok ? await res.json() : { stammdaten: {}, features: [] };
+    const st = d.stammdaten || {};
+    const isInhaber = !!d.is_inhaber;
+
+    // Read-Only-View fuer Mitarbeiter, Editierbar fuer Inhaber. Felder die
+    // OAuth/Voice betreffen sind hier nicht editierbar — der Setup-Wizard
+    // bzw. Admin-UI bleibt zustaendig (Microsoft-Login, Drive-Anbindung,
+    // Sipgate-Nummer-Routing).
+    const fld = (label, key, type = "text", hint = "") => {
+      const val = st[key] || "";
+      if (!isInhaber) {
+        return `<div class="row"><span>${esc(label)}</span><span class="sub">${esc(val) || "—"}</span></div>`;
+      }
+      return `<label class="sub">${esc(label)}</label>
+        <input type="${type}" id="set-${key}" value="${esc(val)}" style="width:100%;padding:12px;border:1px solid var(--line);border-radius:10px;margin:4px 0 10px;font-size:16px" />${
+        hint ? `<p class="muted" style="margin:-6px 0 8px;font-size:12px">${esc(hint)}</p>` : ""
+      }`;
+    };
+
+    const readOnlyBlock = `<div class="card"><h2>Verbundene Dienste</h2>
+      <div class="row"><span>Funktionen aktiv</span><span class="sub">${(d.features || []).length}</span></div>
+      ${(d.features || []).length ? `<div class="sub" style="margin-top:6px">${(d.features || []).map(esc).join(", ")}</div>` : ""}
+      <div class="row"><span>Paket</span><span class="sub">${esc(d.package_tier || "—")}</span></div>
+      <div class="row"><span>Daten-Retention</span><span class="sub">${esc(String(d.data_retention_days || ""))} Tage</span></div>
+      <p class="muted" style="margin-top:8px">Microsoft, Google, Lexware und die Telefonnummer (Sipgate) verwalte über den Setup-Bereich auf gewerbeagent.de.</p>
+    </div>`;
+
+    App.view.innerHTML =
+      `<button class="btn-sm btn-ghost" id="back-mehr" style="margin-bottom:10px">← Zurück</button>` +
+      `<h1 style="font-size:22px;margin:4px 4px 14px">Einstellungen</h1>` +
+      `<div class="card"><h2>Firma & Kontakt</h2>` +
+        fld("Firmenname", "company_name") +
+        fld("Branche", "branche", "text", "z.B. Heizungsbau, Elektro, Sanitär") +
+        fld("Ansprechpartner", "contact_name") +
+        fld("Kontakt-E-Mail", "contact_email", "email") +
+        fld("Kontakt-Telefon", "contact_phone", "tel") +
+      `</div>` +
+      `<div class="card"><h2>Heimat-Adresse</h2>
+        <p class="muted" style="font-size:12px;margin-top:0">Wird für Fahrtzeit-Berechnung beim Terminbuchen benötigt.</p>` +
+        fld("Straße + Nr.", "heimat_strasse") +
+        fld("PLZ", "heimat_plz") +
+        fld("Ort", "heimat_ort") +
+      `</div>` +
+      readOnlyBlock +
+      (isInhaber ? `<button class="btn-sm" id="set-save" style="width:100%;margin-top:8px">Speichern</button>` : "");
+
+    document.getElementById("back-mehr").addEventListener("click", () => navigate("mehr"));
+    const saveBtn = document.getElementById("set-save");
+    if (saveBtn) {
+      saveBtn.addEventListener("click", async () => {
+        const keys = ["company_name", "branche", "contact_name", "contact_email", "contact_phone",
+                      "heimat_strasse", "heimat_plz", "heimat_ort"];
+        const body = {};
+        keys.forEach((k) => { body[k] = (document.getElementById("set-" + k).value || "").trim(); });
+        saveBtn.disabled = true; saveBtn.textContent = "Speichere …";
+        const r = await api("/app/api/einstellungen",
+          { method: "POST", body: JSON.stringify(body) });
+        if (r && r.ok) {
+          const j = await r.json();
+          if (j.ok) {
+            saveBtn.textContent = "✓ Gespeichert";
+            setTimeout(() => { saveBtn.textContent = "Speichern"; saveBtn.disabled = false; }, 1500);
+            return;
+          }
+          alert("Konnte nicht speichern: " + (j.error || "unbekannt"));
+        } else {
+          alert("Konnte nicht speichern.");
+        }
+        saveBtn.disabled = false; saveBtn.textContent = "Speichern";
+      });
+    }
+  },
+
   async mehr() {
     const m = App.me;
     const feats = new Set(m.features || []);
@@ -300,6 +384,7 @@ const SCREENS = {
     menu.push(`<button class="row menu-item" data-go="kunden"><span>🔍 Kunden suchen</span><span class="sub">›</span></button>`);
     menu.push(`<button class="row menu-item" data-go="wissen"><span>📚 Wissensdatenbank</span><span class="sub">›</span></button>`);
     if (feats.has("mitarbeiter")) menu.push(`<button class="row menu-item" data-go="team"><span>👥 Team</span><span class="sub">›</span></button>`);
+    menu.push(`<button class="row menu-item" data-go="einstellungen"><span>⚙️ Einstellungen</span><span class="sub">›</span></button>`);
     App.view.innerHTML =
       `<div class="card"><h2>${esc(m.tenant.company_name || "Mein Betrieb")}</h2>
         <div class="row"><span>Angemeldet als</span><span class="sub">${esc(m.employee.name)}${m.employee.is_inhaber ? " (Inhaber)" : ""}</span></div>
@@ -336,6 +421,119 @@ function rowTap(a, b, c, id) {
     `<span class="sub">${esc(c)} ›</span></button>`;
 }
 function emptyRow(txt) { return `<div class="empty">${esc(txt)}</div>`; }
+
+async function showNewEmployeeForm() {
+  App.view.innerHTML =
+    `<button class="btn-sm btn-ghost" id="back-team" style="margin-bottom:10px">← Zurück</button>` +
+    `<h1 style="font-size:22px;margin:4px 4px 14px">Mitarbeiter anlegen</h1>` +
+    `<div class="card">
+       <label class="sub">Name *</label>
+       <input type="text" id="emp-name" style="width:100%;padding:12px;border:1px solid var(--line);border-radius:10px;margin:4px 0 10px;font-size:16px" />
+       <label class="sub">Job-Titel (optional)</label>
+       <input type="text" id="emp-job" placeholder="z.B. Geselle, Auszubildender" style="width:100%;padding:12px;border:1px solid var(--line);border-radius:10px;margin:4px 0 10px;font-size:16px" />
+       <label class="sub">E-Mail (optional, für App-Login)</label>
+       <input type="email" id="emp-mail" style="width:100%;padding:12px;border:1px solid var(--line);border-radius:10px;margin:4px 0 10px;font-size:16px" />
+       <label class="sub">Skills (komma-getrennt, optional)</label>
+       <input type="text" id="emp-skills" placeholder="z.B. Heizung, Sanitär, Elektro" style="width:100%;padding:12px;border:1px solid var(--line);border-radius:10px;margin:4px 0 10px;font-size:16px" />
+       <button class="btn-sm" id="emp-save" style="margin-top:12px;width:100%">Mitarbeiter anlegen</button>
+       <p class="muted" style="margin-top:8px;font-size:12px">Nach dem Anlegen bekommst du einen einmaligen Aktivierungs-Link zum Weitergeben.</p>
+    </div>`;
+  document.getElementById("back-team").addEventListener("click", () => navigate("team"));
+  document.getElementById("emp-save").addEventListener("click", async () => {
+    const name = document.getElementById("emp-name").value.trim();
+    if (!name) { alert("Name ist Pflicht."); return; }
+    const body = {
+      name,
+      job_title: document.getElementById("emp-job").value.trim() || null,
+      contact_email: document.getElementById("emp-mail").value.trim() || null,
+      skills: document.getElementById("emp-skills").value.trim() || null,
+    };
+    const btn = document.getElementById("emp-save");
+    btn.disabled = true; btn.textContent = "Speichere …";
+    const res = await api("/app/api/team/anlegen",
+      { method: "POST", body: JSON.stringify(body) });
+    if (res && res.ok) {
+      const j = await res.json();
+      if (j.ok) {
+        showEmployeeActivationLink(j, name);
+        return;
+      }
+      alert("Konnte nicht anlegen: " + (j.error || "unbekannt"));
+    } else {
+      alert("Konnte nicht anlegen.");
+    }
+    btn.disabled = false; btn.textContent = "Mitarbeiter anlegen";
+  });
+}
+
+function showEmployeeActivationLink(j, name) {
+  // Eigene Erfolgs-Seite mit dem Aktivierungs-Link prominent als Quasi-
+  // Quittung. Inhaber kopiert + schickt den Link via WhatsApp / SMS.
+  const expires = j.expires_at ? new Date(j.expires_at) : null;
+  const expiresFmt = expires ? expires.toLocaleDateString("de-DE", { day: "2-digit", month: "2-digit", year: "numeric" }) : "";
+  App.view.innerHTML =
+    `<div class="card">
+       <h2 style="margin-top:0">✓ ${esc(name)} angelegt</h2>
+       <p>Schicke ${esc(name)} diesen einmaligen Aktivierungs-Link — der Account ist erst aktiv, sobald der Mitarbeiter ihn geöffnet und ein Passwort gesetzt hat.</p>
+       <label class="sub">Aktivierungs-Link</label>
+       <input type="text" id="act-url" readonly value="${esc(j.activation_url)}" style="width:100%;padding:12px;border:1px solid var(--line);border-radius:10px;margin:4px 0 8px;font-size:13px;font-family:monospace" />
+       <div style="display:flex;gap:8px;flex-wrap:wrap">
+         <button class="btn-sm" id="copy-url">Link kopieren</button>
+         <a class="btn-sm btn-ghost" href="https://wa.me/?text=${encodeURIComponent('Hier ist dein Aktivierungs-Link für die Gewerbeagent-App: ' + j.activation_url)}" target="_blank" rel="noopener">WhatsApp</a>
+         <a class="btn-sm btn-ghost" href="sms:?body=${encodeURIComponent('Aktivierungs-Link: ' + j.activation_url)}">SMS</a>
+       </div>
+       ${j.activation_short_code ? `<p class="muted" style="margin-top:10px">Kurzcode als Alternative: <b>${esc(j.activation_short_code)}</b></p>` : ""}
+       ${expiresFmt ? `<p class="muted">Gültig bis ${esc(expiresFmt)}.</p>` : ""}
+       <button class="btn-sm btn-ghost" id="back-team-2" style="margin-top:12px;width:100%">Zurück zum Team</button>
+    </div>`;
+  document.getElementById("copy-url").addEventListener("click", () => {
+    const inp = document.getElementById("act-url");
+    inp.select(); inp.setSelectionRange(0, 99999);
+    navigator.clipboard.writeText(inp.value).catch(() => { document.execCommand("copy"); });
+    document.getElementById("copy-url").textContent = "Kopiert!";
+  });
+  document.getElementById("back-team-2").addEventListener("click", () => navigate("team"));
+}
+
+async function showNewRueckrufForm() {
+  App.view.innerHTML =
+    `<button class="btn-sm btn-ghost" id="back-anrufe" style="margin-bottom:10px">← Zurück</button>` +
+    `<h1 style="font-size:22px;margin:4px 4px 14px">Rückruf anlegen</h1>` +
+    `<div class="card">
+       <label class="sub">Kundenname *</label>
+       <input type="text" id="rr-name" style="width:100%;padding:12px;border:1px solid var(--line);border-radius:10px;margin:4px 0 10px;font-size:16px" />
+       <label class="sub">Telefon *</label>
+       <input type="tel" id="rr-tel" placeholder="+49 …" style="width:100%;padding:12px;border:1px solid var(--line);border-radius:10px;margin:4px 0 10px;font-size:16px" />
+       <label class="sub">E-Mail (optional)</label>
+       <input type="email" id="rr-mail" placeholder="kunde@…" style="width:100%;padding:12px;border:1px solid var(--line);border-radius:10px;margin:4px 0 10px;font-size:16px" />
+       <label class="sub">Anliegen</label>
+       <textarea id="rr-anliegen" rows="4" placeholder="Worum geht's? z.B. Termin verschieben, Angebot besprechen …" style="width:100%;padding:12px;border:1px solid var(--line);border-radius:10px;font-family:inherit;font-size:16px"></textarea>
+       <button class="btn-sm" id="rr-save" style="margin-top:12px;width:100%">Rückruf anlegen</button>
+    </div>`;
+  document.getElementById("back-anrufe").addEventListener("click", () => navigate("anrufe"));
+  document.getElementById("rr-save").addEventListener("click", async () => {
+    const name = document.getElementById("rr-name").value.trim();
+    const tel = document.getElementById("rr-tel").value.trim();
+    if (!name || !tel) { alert("Name und Telefon sind Pflicht."); return; }
+    const body = {
+      kunde_name: name, kunde_telefon: tel,
+      anliegen: document.getElementById("rr-anliegen").value.trim() || null,
+      kunde_email: document.getElementById("rr-mail").value.trim() || null,
+    };
+    const btn = document.getElementById("rr-save");
+    btn.disabled = true; btn.textContent = "Speichere …";
+    const res = await api("/app/api/rueckrufe/anlegen",
+      { method: "POST", body: JSON.stringify(body) });
+    if (res && res.ok) {
+      const j = await res.json();
+      if (j.ok) { navigate("anrufe"); return; }
+      alert("Konnte nicht anlegen: " + (j.error || "unbekannt"));
+    } else {
+      alert("Konnte nicht anlegen.");
+    }
+    btn.disabled = false; btn.textContent = "Rückruf anlegen";
+  });
+}
 
 async function showNewTerminForm() {
   // Erst freie Slots holen (schnell, lokal vom Plugin) — als Vorschlaege.
