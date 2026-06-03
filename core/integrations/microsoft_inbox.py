@@ -2231,6 +2231,36 @@ async def process_relevant_kunde_mail(
                 subject=reply_subject,
             )
             result["conv_id"] = str(conv_id)
+
+            # Web-Push an alle Inhaber/Mitarbeiter-PWAs: nur bei NEUER
+            # Konversation. Folge-Mails sind in der bestehenden Inbox
+            # sichtbar — kein weiterer Push noetig (Geraeusch-Reduktion).
+            # Inhaltsloser Payload + Deep-Link auf den Anfragen-Tab.
+            if is_new_conv and conv_id is not None:
+                try:
+                    from core.integrations.push_notifier import (
+                        send_push_to_tenant,
+                    )
+                    title_who = sender_name or sender_email
+                    cls = (classification_result or {}).get("classification") or ""
+                    body_preview = (subject or "").strip() or "Neue Mail"
+                    if len(body_preview) > 80:
+                        body_preview = body_preview[:80] + "…"
+                    push_title = (
+                        "Neue Anfrage" if cls in ("RELEVANT_KUNDE", "RELEVANT_GESCHAEFT")
+                        else f"Neue Mail · {title_who}"
+                    )
+                    await send_push_to_tenant(
+                        tenant_id,
+                        title=push_title,
+                        body=f"{title_who}: {body_preview}",
+                        url=f"/app#anfragen",
+                        tag=f"anfrage:{conv_id}",
+                    )
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(
+                        f"push-on-new-anfrage skip (tenant={tenant_id}): {e}"
+                    )
         except Exception as e:
             # Persistierung darf den Mail-Versand-Erfolg nicht killen
             # — Mail ist raus, Token existiert, Anhang-Forward folgt.

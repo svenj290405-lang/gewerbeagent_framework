@@ -114,6 +114,48 @@ async def send_push_to_employee(
 
 
 # =====================================================================
+# Tenant-Fanout
+# =====================================================================
+
+async def send_push_to_tenant(
+    tenant_id: uuid.UUID,
+    *,
+    title: str,
+    body: str,
+    url: str = "/app",
+    tag: Optional[str] = None,
+    inhaber_only: bool = False,
+) -> int:
+    """Schickt Push an alle Employees eines Tenants. Liefert die Anzahl
+    zugestellter Pushes ueber alle Empfaenger zusammen.
+
+    Wird vom Mail-Pipeline-Worker aufgerufen wenn eine neue Anfrage
+    eingeht (Telegram-Ersatz). ``inhaber_only=True`` schraenkt auf
+    is_default-Employees ein — sinnvoll fuer geschaeftliche Eskalations-
+    Events. Default geht an alle (Pflege/Aerztin sehen auch was los ist).
+    """
+    if not push_enabled():
+        return 0
+
+    from core.models.employee import Employee
+    async with get_session() as s:
+        q = select(Employee).where(Employee.tenant_id == tenant_id)
+        if inhaber_only:
+            q = q.where(Employee.is_default == True)  # noqa: E712
+        emps = (await s.execute(q)).scalars().all()
+
+    sent_total = 0
+    for emp in emps:
+        try:
+            sent_total += await send_push_to_employee(
+                emp.id, title=title, body=body, url=url, tag=tag,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("send_push_to_tenant: emp=%s skip — %s", emp.id, e)
+    return sent_total
+
+
+# =====================================================================
 # CLI: VAPID-Keys erzeugen
 # =====================================================================
 

@@ -8,9 +8,9 @@
  *  - Minimaler Offline-Shell-Cache (App-Rahmen laedt auch ohne Netz; die
  *    eigentlichen Daten kommen immer frisch vom Server).
  */
-// v3: Anfragen-Inbox + Mail-Reply-Composer. Bump invalidiert den alten Cache
-// damit der Tab "Anfragen" beim naechsten Reload sichtbar wird.
-const CACHE = "ga-app-v3";
+// v4: Push bei neuer Anfrage, Termin-Anlage-Composer, Anrufen-Link.
+// Cache-Bump damit neuer JS + die zusaetzlichen Routes durchschlagen.
+const CACHE = "ga-app-v4";
 const SHELL = [
   "/app",
   "/app/static/app.css",

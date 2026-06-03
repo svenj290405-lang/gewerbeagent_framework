@@ -26,6 +26,7 @@ from core.models.employee_absence import (
     get_active_absences,
     get_upcoming_absences,
 )
+from core.models.anfrage import AnfrageToken
 from core.models.email_conversation import (
     CLASSIFICATION_NICHT_RELEVANT,
     CLASSIFICATION_PRIVAT,
@@ -752,12 +753,30 @@ async def api_anfrage_detail(
     if c is None:
         return JSONResponse({"ok": False, "error": "Anfrage nicht gefunden"}, status_code=404)
 
+    # Telefon-Lookup: AnfrageToken mit gleicher kunde_email hat ggf. den
+    # vom Voice-Bot oder Formular eingegebenen Phone. Wir nehmen den
+    # juengsten (created_at desc) — relevant wenn ein Kunde mit der
+    # gleichen Mail verschiedene Tokens haben sollte.
+    phone = None
+    async with get_session() as s:
+        tok = (await s.execute(
+            select(AnfrageToken)
+            .where(AnfrageToken.tenant_id == tid)
+            .where(AnfrageToken.kunde_email == c.kunde_email)
+            .where(AnfrageToken.kunde_telefon.is_not(None))
+            .order_by(AnfrageToken.created_at.desc())
+            .limit(1)
+        )).scalar_one_or_none()
+        if tok is not None:
+            phone = tok.kunde_telefon
+
     cls_label, cls_style = _classification_label(c.classification)
     state_label, state_style = _state_label(c.state)
     return JSONResponse({
         "id": str(c.id),
         "kunde_email": c.kunde_email,
         "kunde_name": c.kunde_name or "",
+        "kunde_telefon": phone or "",
         "subject": c.last_subject or "(kein Betreff)",
         "last_user_message": c.last_user_message or "",
         "last_q_reply": c.last_q_reply or "",
@@ -775,6 +794,89 @@ async def api_anfrage_detail(
         "updated_at_fmt": _fmt_dt(c.updated_at),
         "created_at_fmt": _fmt_dt(c.created_at),
         "closed": c.state == STATE_CLOSED,
+    })
+
+
+@router.get("/termine/freie-slots")
+async def api_freie_slots(
+    request: Request, _e=Depends(require_app_user),
+) -> JSONResponse:
+    """Schlaegt freie Slots fuer die kommenden N Tage vor — fuer den
+    Termin-Anlage-Composer der PWA. Wrappt das Kalender-Plugin
+    find_free_slots; gibt eine flache Liste {datum, uhrzeit, dauer}
+    zurueck (gleiche Form wie EmailConversation.proposed_slots)."""
+    tid = current_tenant_id(request)
+    tenant = request.state.app_tenant
+    kalender = await get_plugin_for_tenant(tenant.slug, "kalender")
+    if kalender is None:
+        return JSONResponse({"slots": [], "error": "Kalender nicht eingerichtet."}, status_code=200)
+    try:
+        days_ahead = int(request.query_params.get("days", "7"))
+    except (ValueError, TypeError):
+        days_ahead = 7
+    try:
+        out = await kalender.on_webhook("find_free_slots", {"days_ahead": days_ahead})
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("freie-slots crash: %s", exc)
+        return JSONResponse({"slots": [], "error": "Kalender-Suche fehlgeschlagen."}, status_code=200)
+    return JSONResponse({"slots": out.get("slots") or []})
+
+
+@router.post("/termine/anlegen")
+async def api_termin_anlegen(
+    request: Request,
+    _e=Depends(require_app_user),
+    _c=Depends(require_app_csrf),
+) -> JSONResponse:
+    """Legt einen Termin direkt im Google-Kalender an — Inhaber-Workflow.
+
+    Body: { datum: 'DD.MM.YYYY', uhrzeit: 'HH:MM', dauer_minuten: int,
+            name: str, anliegen?: str, adresse?: str, telefon?: str,
+            kunde_email?: str }
+    """
+    tid = current_tenant_id(request)
+    tenant = request.state.app_tenant
+    body = await request.json()
+    name = (body.get("name") or "").strip()
+    datum = (body.get("datum") or "").strip()
+    uhrzeit = (body.get("uhrzeit") or "").strip()
+    if not name or not datum or not uhrzeit:
+        return JSONResponse(
+            {"ok": False, "error": "Name, Datum und Uhrzeit sind Pflichtfelder."},
+            status_code=400,
+        )
+
+    kalender = await get_plugin_for_tenant(tenant.slug, "kalender")
+    if kalender is None:
+        return JSONResponse(
+            {"ok": False, "error": "Kalender nicht eingerichtet."}, status_code=400,
+        )
+
+    payload = {
+        "name": name,
+        "datum": datum,
+        "uhrzeit": uhrzeit,
+        "dauer_minuten": int(body.get("dauer_minuten") or 60),
+        "anliegen": (body.get("anliegen") or "").strip() or None,
+        "adresse": (body.get("adresse") or "").strip() or None,
+        "telefon": (body.get("telefon") or "").strip() or None,
+        "kunde_email": (body.get("kunde_email") or "").strip() or None,
+    }
+    try:
+        res = await kalender.on_webhook("book_appointment", payload)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("termin anlegen crash: %s", exc)
+        return JSONResponse({"ok": False, "error": "Buchung fehlgeschlagen."}, status_code=500)
+
+    # book_appointment liefert je nach Plugin-Stand verschiedene Form-Strings;
+    # gewohnte Felder: event_id oder erfolg=True
+    if res.get("error"):
+        return JSONResponse({"ok": False, "error": res.get("error")}, status_code=409)
+    return JSONResponse({
+        "ok": True,
+        "event_id": res.get("event_id"),
+        "datum": payload["datum"],
+        "uhrzeit": payload["uhrzeit"],
     })
 
 

@@ -106,10 +106,16 @@ const SCREENS = {
     const res = await api("/app/api/termine");
     const d = res && res.ok ? await res.json() : { termine: [] };
     const list = d.termine || [];
-    App.view.innerHTML = `<div class="card"><h2>Anstehende Termine</h2>${
-      list.length ? list.map((t) => rowAction(t.zeit, t.kunde, t.ort, t.id, "storno", "Stornieren")).join("") : emptyRow("Keine anstehenden Termine")
-    }</div>`;
+    App.view.innerHTML =
+      `<div style="display:flex;align-items:center;justify-content:space-between;margin:4px 4px 14px">
+        <h1 style="font-size:22px;margin:0">Termine</h1>
+        <button class="btn-sm" id="termin-new-btn" style="padding:8px 14px">+ Neu</button>
+      </div>` +
+      `<div class="card"><h2>Anstehende Termine</h2>${
+        list.length ? list.map((t) => rowAction(t.zeit, t.kunde, t.ort, t.id, "storno", "Stornieren")).join("") : emptyRow("Keine anstehenden Termine")
+      }</div>`;
     bindStorno();
+    document.getElementById("termin-new-btn").addEventListener("click", showNewTerminForm);
   },
 
   async anrufe() {
@@ -331,6 +337,99 @@ function rowTap(a, b, c, id) {
 }
 function emptyRow(txt) { return `<div class="empty">${esc(txt)}</div>`; }
 
+async function showNewTerminForm() {
+  // Erst freie Slots holen (schnell, lokal vom Plugin) — als Vorschlaege.
+  App.view.innerHTML = `<div class="loading">Slots werden gesucht …</div>`;
+  const slotsRes = await api("/app/api/termine/freie-slots?days=7");
+  const slotsJson = slotsRes && slotsRes.ok ? await slotsRes.json() : { slots: [] };
+  const suggestions = (slotsJson.slots || []).slice(0, 8);
+
+  const todayIso = new Date().toISOString().slice(0, 10);
+  const suggHtml = suggestions.length
+    ? `<div class="card"><h2>Vorschlaege</h2>` +
+      suggestions.map((s) =>
+        `<button class="row menu-item" data-suggest='${esc(JSON.stringify(s))}' style="text-align:left">
+          <div>${esc(s.datum || "")} · ${esc(s.uhrzeit || "")}</div>
+          <span class="sub">${esc(s.dauer || "60 Min")} ›</span>
+        </button>`).join("") +
+      `</div>`
+    : `<div class="card"><p class="muted">Keine freien Slots in den naechsten 7 Tagen — bitte unten manuell eingeben.</p></div>`;
+
+  App.view.innerHTML =
+    `<button class="btn-sm btn-ghost" id="back-termine" style="margin-bottom:10px">← Zurück</button>` +
+    `<h1 style="font-size:22px;margin:4px 4px 14px">Neuer Termin</h1>` +
+    suggHtml +
+    `<div class="card"><h2>Manuell</h2>
+       <label class="sub">Datum</label>
+       <input type="date" id="t-datum" min="${todayIso}" style="width:100%;padding:12px;border:1px solid var(--line);border-radius:10px;margin:4px 0 10px;font-size:16px" />
+       <label class="sub">Uhrzeit</label>
+       <input type="time" id="t-uhrzeit" value="09:00" style="width:100%;padding:12px;border:1px solid var(--line);border-radius:10px;margin:4px 0 10px;font-size:16px" />
+       <label class="sub">Dauer (Minuten)</label>
+       <input type="number" id="t-dauer" value="60" min="15" step="15" style="width:100%;padding:12px;border:1px solid var(--line);border-radius:10px;margin:4px 0 10px;font-size:16px" />
+       <label class="sub">Kundenname *</label>
+       <input type="text" id="t-name" placeholder="z.B. Max Müller" style="width:100%;padding:12px;border:1px solid var(--line);border-radius:10px;margin:4px 0 10px;font-size:16px" />
+       <label class="sub">Telefon (optional)</label>
+       <input type="tel" id="t-tel" placeholder="+49 …" style="width:100%;padding:12px;border:1px solid var(--line);border-radius:10px;margin:4px 0 10px;font-size:16px" />
+       <label class="sub">E-Mail (optional)</label>
+       <input type="email" id="t-mail" placeholder="kunde@…" style="width:100%;padding:12px;border:1px solid var(--line);border-radius:10px;margin:4px 0 10px;font-size:16px" />
+       <label class="sub">Adresse (optional)</label>
+       <input type="text" id="t-adresse" style="width:100%;padding:12px;border:1px solid var(--line);border-radius:10px;margin:4px 0 10px;font-size:16px" />
+       <label class="sub">Anliegen</label>
+       <textarea id="t-anliegen" rows="3" style="width:100%;padding:12px;border:1px solid var(--line);border-radius:10px;font-family:inherit;font-size:16px"></textarea>
+       <button class="btn-sm" id="t-save" style="margin-top:12px;width:100%">Termin anlegen</button>
+    </div>`;
+
+  document.getElementById("back-termine").addEventListener("click", () => navigate("termine"));
+
+  // Vorschlag-Klick fuellt Datum/Uhrzeit vor
+  document.querySelectorAll("[data-suggest]").forEach((b) =>
+    b.addEventListener("click", () => {
+      try {
+        const s = JSON.parse(b.dataset.suggest);
+        // datum kommt als "DD.MM.YYYY" -> in ISO "YYYY-MM-DD"
+        const m = String(s.datum || "").match(/^(\d{2})\.(\d{2})\.(\d{4})$/);
+        if (m) document.getElementById("t-datum").value = `${m[3]}-${m[2]}-${m[1]}`;
+        if (s.uhrzeit) document.getElementById("t-uhrzeit").value = s.uhrzeit;
+        document.getElementById("t-name").focus();
+      } catch (e) { /* malformed suggestion — egal, User tippt eh selbst */ }
+    }));
+
+  document.getElementById("t-save").addEventListener("click", async () => {
+    const datumIso = document.getElementById("t-datum").value;
+    const uhrzeit = document.getElementById("t-uhrzeit").value;
+    const name = document.getElementById("t-name").value.trim();
+    if (!datumIso || !uhrzeit || !name) {
+      alert("Datum, Uhrzeit und Name sind Pflicht."); return;
+    }
+    // ISO → DD.MM.YYYY damit das Kalender-Plugin parsen kann
+    const [Y, Mo, D] = datumIso.split("-");
+    const datum = `${D}.${Mo}.${Y}`;
+    const body = {
+      datum, uhrzeit, name,
+      dauer_minuten: parseInt(document.getElementById("t-dauer").value || "60", 10),
+      telefon: document.getElementById("t-tel").value.trim() || null,
+      kunde_email: document.getElementById("t-mail").value.trim() || null,
+      adresse: document.getElementById("t-adresse").value.trim() || null,
+      anliegen: document.getElementById("t-anliegen").value.trim() || null,
+    };
+    const btn = document.getElementById("t-save");
+    btn.disabled = true; btn.textContent = "Lege an …";
+    const res = await api("/app/api/termine/anlegen",
+      { method: "POST", body: JSON.stringify(body) });
+    if (res && res.ok) {
+      const j = await res.json();
+      if (j.ok) {
+        alert(`Termin angelegt: ${j.datum} · ${j.uhrzeit}`);
+        navigate("termine"); return;
+      }
+      alert("Konnte nicht anlegen: " + (j.error || "unbekannt"));
+    } else {
+      alert("Konnte nicht anlegen.");
+    }
+    btn.disabled = false; btn.textContent = "Termin anlegen";
+  });
+}
+
 async function showAnfrage(id) {
   App.view.innerHTML = `<div class="loading">Lädt …</div>`;
   const r = await api("/app/api/anfragen/" + encodeURIComponent(id));
@@ -376,12 +475,22 @@ async function showAnfrage(id) {
        <div style="white-space:pre-wrap">${esc(d.last_user_message)}</div></div>`
     : `<div class="card"><p class="empty">Noch keine Kunden-Nachricht in dieser Konversation.</p></div>`;
 
+  // Quick-Actions: Anrufen + Mail-Adresse copy. Telefon kommt aus dem
+  // AnfrageToken (Voice-/Formular-Eingang); wenn null, zeigen wir nur Mail.
+  const phone = (d.kunde_telefon || "").trim();
+  const telLink = phone
+    ? `<a class="btn-sm" href="tel:${esc(phone)}" style="padding:10px 14px;text-decoration:none;display:inline-flex;align-items:center;gap:6px">📞 ${esc(phone)}</a>`
+    : "";
+  const mailLink = `<a class="btn-sm btn-ghost" href="mailto:${esc(d.kunde_email)}" style="padding:10px 14px;text-decoration:none;display:inline-flex;align-items:center;gap:6px">✉️ Mail</a>`;
+  const quickActions = `<div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">${telLink}${mailLink}</div>`;
+
   App.view.innerHTML =
     `<button class="btn-sm btn-ghost" id="back-anfragen" style="margin-bottom:10px">← Zurück</button>` +
     `<div class="card">
       <div class="row"><div><b>${esc(d.kunde_name || d.kunde_email)}</b><div class="sub">${esc(d.kunde_email)}</div></div>
       <span class="pill ${d.state_style || ""}">${esc(d.state_label)}</span></div>
       <div class="sub" style="margin-top:6px">${esc(d.subject || "")} · ${esc(d.updated_at_fmt || "")}</div>
+      ${quickActions}
     </div>` +
     lastMsgBlock +
     qReplyHtml +
