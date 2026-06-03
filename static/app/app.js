@@ -412,6 +412,95 @@ const SCREENS = {
       }));
   },
 
+  async visualisierung() {
+    const res = await api("/app/api/visualisierungen");
+    const d = res && res.ok ? await res.json() : { visualisierungen: [] };
+    const inputStyle = "width:100%;padding:12px;border:1px solid var(--line);border-radius:10px;margin:4px 0 10px;font-size:16px";
+    const recent = (d.visualisierungen || []).map((v) => {
+      const label = v.prompt || "Visualisierung";
+      if (v.fertig) {
+        return `<a class="row" href="/app/api/visualisierungen/${esc(v.id)}/bild" target="_blank" rel="noopener" style="text-decoration:none;color:inherit"><div><div>${esc(label)}</div><div class="sub">${esc(v.zeit)}</div></div><span class="pill ok">ansehen ›</span></a>`;
+      }
+      const pill = v.status === "failed" ? `<span class="pill danger">fehlgeschlagen</span>` : `<span class="pill warn">${esc(v.status)}</span>`;
+      return `<div class="row"><div><div>${esc(label)}</div><div class="sub">${esc(v.zeit)}</div></div>${pill}</div>`;
+    }).join("");
+
+    App.view.innerHTML =
+      `<button class="btn-sm btn-ghost" id="back-mehr" style="margin-bottom:10px">← Zurück</button>` +
+      `<h1 style="font-size:22px;margin:4px 4px 6px">Visualisierung</h1>` +
+      `<p class="muted" style="margin:0 4px 14px">Foto eines Raums/Objekts hochladen und beschreiben, was verändert werden soll — die KI rendert eine fotorealistische Vorschau.</p>` +
+      `<div class="card">
+         <label class="sub">Foto (JPEG/PNG, max 15 MB)</label>
+         <input type="file" id="viz-file" accept="image/jpeg,image/png" style="${inputStyle}" />
+         <label class="sub">Was soll verändert werden?</label>
+         <textarea id="viz-prompt" rows="3" placeholder="z.B. Wände in warmem Grau streichen, Eichenparkett verlegen" style="${inputStyle};font-family:inherit"></textarea>
+         <button class="btn-sm" id="viz-go" style="width:100%;margin-top:4px" disabled>Visualisierung erstellen</button>
+         <p class="muted" id="viz-status" style="margin-top:12px;min-height:20px"></p>
+       </div>
+       <div id="viz-result"></div>` +
+      (recent ? `<div class="card"><h2>Bisherige</h2>${recent}</div>` : "");
+
+    document.getElementById("back-mehr").addEventListener("click", () => navigate("mehr"));
+    const fileEl = document.getElementById("viz-file");
+    const promptEl = document.getElementById("viz-prompt");
+    const goBtn = document.getElementById("viz-go");
+    const statusEl = document.getElementById("viz-status");
+    const resultEl = document.getElementById("viz-result");
+
+    const refresh = () => {
+      const f = fileEl.files && fileEl.files[0];
+      goBtn.disabled = !(f && promptEl.value.trim().length >= 5);
+    };
+    fileEl.addEventListener("change", () => {
+      const f = fileEl.files && fileEl.files[0];
+      if (f && ["image/jpeg", "image/png"].indexOf(f.type) === -1) {
+        statusEl.textContent = "Nur JPEG oder PNG."; fileEl.value = "";
+      } else if (f && f.size > 15 * 1024 * 1024) {
+        statusEl.textContent = `Foto zu groß (${Math.round(f.size / 1024 / 1024)} MB, max 15 MB).`; fileEl.value = "";
+      } else {
+        statusEl.textContent = "";
+      }
+      refresh();
+    });
+    promptEl.addEventListener("input", refresh);
+
+    goBtn.addEventListener("click", async () => {
+      const f = fileEl.files && fileEl.files[0];
+      const prompt = promptEl.value.trim();
+      if (!f || prompt.length < 5) return;
+      goBtn.disabled = true;
+      resultEl.innerHTML = "";
+      statusEl.textContent = "Rendert das Bild … (ca. 10–20 Sek)";
+      let res2;
+      try {
+        res2 = await fetch("/app/api/visualisierungen?prompt=" + encodeURIComponent(prompt), {
+          method: "POST",
+          headers: { "X-CSRF-Token": App.me.csrf, "Content-Type": f.type },
+          body: f,
+        });
+      } catch (e) {
+        statusEl.textContent = "Netzwerkfehler. Bitte erneut versuchen.";
+        goBtn.disabled = false; return;
+      }
+      if (res2.status === 303 || res2.status === 401 || res2.redirected) { location.href = "/app/login"; return; }
+      let j = null;
+      try { j = await res2.json(); } catch (e) {}
+      if (res2.ok && j && j.ok) {
+        statusEl.textContent = "";
+        resultEl.innerHTML =
+          `<div class="card"><h2>✓ Fertig</h2>
+             <img src="${esc(j.bild_url)}" alt="Visualisierung" style="width:100%;border-radius:10px;margin-top:8px" />
+             <a class="btn-sm" href="${esc(j.bild_url)}" target="_blank" rel="noopener" style="display:block;text-align:center;width:100%;margin-top:10px;text-decoration:none">In voller Größe öffnen</a>
+           </div>
+           <button class="btn-sm btn-ghost" id="viz-again" style="width:100%;margin-top:8px">Weitere Visualisierung</button>`;
+        document.getElementById("viz-again").addEventListener("click", () => navigate("visualisierung"));
+      } else {
+        statusEl.textContent = (j && j.error) || "Konnte kein Bild erstellen. Bitte erneut versuchen.";
+        goBtn.disabled = false;
+      }
+    });
+  },
+
   async einstellungen() {
     const res = await api("/app/api/einstellungen");
     const d = res && res.ok ? await res.json() : { stammdaten: {}, features: [] };
@@ -494,6 +583,7 @@ const SCREENS = {
     menu.push(`<button class="row menu-item" data-go="kunden"><span>🔍 Kunden suchen</span><span class="sub">›</span></button>`);
     menu.push(`<button class="row menu-item" data-go="wissen"><span>📚 Wissensdatenbank</span><span class="sub">›</span></button>`);
     menu.push(`<button class="row menu-item" data-go="material"><span>🧰 Material</span><span class="sub">›</span></button>`);
+    if (feats.has("visualisierung")) menu.push(`<button class="row menu-item" data-go="visualisierung"><span>🎨 Visualisierung</span><span class="sub">›</span></button>`);
     if (feats.has("mitarbeiter")) menu.push(`<button class="row menu-item" data-go="team"><span>👥 Team</span><span class="sub">›</span></button>`);
     menu.push(`<button class="row menu-item" data-go="einstellungen"><span>⚙️ Einstellungen</span><span class="sub">›</span></button>`);
     App.view.innerHTML =

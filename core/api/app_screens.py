@@ -793,6 +793,164 @@ async def api_aufnahme_diktat(
 
 
 # =====================================================================
+# Visualisierung (Foto → KI-Rendering via Gemini)
+# =====================================================================
+
+_VIZ_MAX_BYTES = 15_000_000  # 15 MB Eingangsfoto
+_VIZ_ALLOWED_MIMES = {"image/jpeg", "image/png"}
+# Stil-Boilerplate analog zum Telegram-Flow (dort VIZ_PROMPT_BOILERPLATE):
+# fotorealistisch, gleiche Perspektive, nur das Beschriebene aendern.
+_VIZ_BOILERPLATE = (
+    "Erstelle eine fotorealistische Visualisierung auf Basis dieses Fotos. "
+    "Behalte Perspektive, Raum und Proportionen bei und aendere nur das "
+    "Beschriebene. Kein Text und kein Wasserzeichen im Bild."
+)
+
+
+def _normalize_viz_mime(raw: str | None) -> str | None:
+    mime = (raw or "").split(";")[0].strip().lower()
+    return mime if mime in _VIZ_ALLOWED_MIMES else None
+
+
+async def _feature_enabled(tenant_id: uuid.UUID, key: str) -> bool:
+    from core.features.check import enabled_features_for_tenant
+    return key in await enabled_features_for_tenant(tenant_id)
+
+
+@router.get("/visualisierungen")
+async def api_visualisierungen(
+    request: Request, _e=Depends(require_app_user),
+) -> JSONResponse:
+    """Letzte 20 Visualisierungen (tenant-gescoped)."""
+    from core.models.visualisierung import Visualisierung, VIZ_STATUS_DONE
+    tid = current_tenant_id(request)
+    async with get_session() as s:
+        rows = (await s.execute(
+            select(Visualisierung)
+            .where(Visualisierung.tenant_id == tid)
+            .order_by(Visualisierung.created_at.desc())
+            .limit(20)
+        )).scalars().all()
+    return JSONResponse({"visualisierungen": [
+        {
+            "id": str(v.id),
+            "prompt": (v.prompt or "")[:140],
+            "status": v.status,
+            "fertig": v.status == VIZ_STATUS_DONE and v.result_image_data is not None,
+            "zeit": _fmt_dt(v.created_at),
+        } for v in rows
+    ]})
+
+
+@router.get("/visualisierungen/{vid}/bild")
+async def api_visualisierung_bild(
+    vid: str, request: Request, _e=Depends(require_app_user),
+):
+    """Liefert das gerenderte Ergebnisbild als Bytes (tenant-gescoped)."""
+    from fastapi.responses import Response
+    from core.models.visualisierung import Visualisierung
+    tid = current_tenant_id(request)
+    try:
+        vid_uuid = uuid.UUID(vid)
+    except (ValueError, TypeError):
+        return JSONResponse({"ok": False, "error": "ungueltige id"}, status_code=400)
+    async with get_session() as s:
+        v = (await s.execute(
+            select(Visualisierung)
+            .where(Visualisierung.id == vid_uuid, Visualisierung.tenant_id == tid)
+        )).scalar_one_or_none()
+    if v is None or not v.result_image_data:
+        return JSONResponse({"ok": False, "error": "nicht gefunden"}, status_code=404)
+    data = bytes(v.result_image_data)
+    media = "image/jpeg" if data[:2] == b"\xff\xd8" else "image/png"
+    return Response(content=data, media_type=media)
+
+
+@router.post("/visualisierungen")
+async def api_visualisierung_erstellen(
+    request: Request,
+    emp: Employee = Depends(require_app_user),
+    _c=Depends(require_app_csrf),
+) -> JSONResponse:
+    """Foto + Beschreibung → Gemini-Rendering → Visualisierung gespeichert.
+
+    Body = rohe Bild-Bytes; Content-Type = MIME (jpeg/png); ?prompt= die
+    Beschreibung. Spiegelt _handle_viz_description_input: gleiche
+    generate_image_from_image-Fn, gleiche Boilerplate, gleiches Modell.
+
+    Feature-gegated (visualisierung; Bildgenerierung kostet Tokens),
+    require_app_user + CSRF, HARTE Tenant-Isolation.
+    """
+    from core.ai import generate_image_from_image
+    from core.models.visualisierung import (
+        Visualisierung, VIZ_STATUS_DONE, VIZ_STATUS_FAILED, VIZ_STATUS_GENERATING,
+    )
+
+    tid = current_tenant_id(request)
+    if not await _feature_enabled(tid, "visualisierung"):
+        return JSONResponse({"ok": False, "error": "Funktion nicht freigeschaltet."}, status_code=403)
+
+    image_bytes = await request.body()
+    if not image_bytes:
+        return JSONResponse({"ok": False, "error": "Kein Foto empfangen."}, status_code=400)
+    if len(image_bytes) > _VIZ_MAX_BYTES:
+        mb = len(image_bytes) // 1024 // 1024
+        return JSONResponse({"ok": False, "error": f"Foto zu gross ({mb} MB, max 15 MB)."}, status_code=413)
+    mime = _normalize_viz_mime(request.headers.get("content-type"))
+    if mime is None:
+        return JSONResponse({"ok": False, "error": "Nur JPEG- oder PNG-Fotos."}, status_code=415)
+    prompt = (request.query_params.get("prompt") or "").strip()
+    if len(prompt) < 5:
+        return JSONResponse({"ok": False, "error": "Bitte etwas mehr beschreiben (min. 5 Zeichen)."}, status_code=400)
+    prompt = prompt[:500]
+
+    async with get_session() as s:
+        viz = Visualisierung(
+            tenant_id=tid, original_image_data=image_bytes,
+            prompt=prompt, status=VIZ_STATUS_GENERATING,
+        )
+        s.add(viz)
+        await s.commit()
+        await s.refresh(viz)
+        viz_id = viz.id
+
+    try:
+        result = await generate_image_from_image(
+            image_bytes=image_bytes,
+            prompt=f"{prompt}. {_VIZ_BOILERPLATE}",
+            mime_type=mime,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("PWA-Visualisierung: Generierung fehlgeschlagen: %s", exc)
+        result = None
+
+    async with get_session() as s:
+        viz = (await s.execute(
+            select(Visualisierung).where(Visualisierung.id == viz_id)
+        )).scalar_one_or_none()
+        if viz:
+            if result:
+                viz.result_image_data = result
+                viz.status = VIZ_STATUS_DONE
+                viz.completed_at = dt.datetime.now(dt.timezone.utc)
+            else:
+                viz.status = VIZ_STATUS_FAILED
+                viz.error_message = "Modell hat kein Bild zurueckgegeben (evtl. Sicherheits-Block)"
+            await s.commit()
+
+    if not result:
+        return JSONResponse({"ok": False, "error": (
+            "Konnte kein Bild erzeugen (evtl. Sicherheits-Block oder unklares "
+            "Foto). Bitte mit anderem Foto/Beschreibung erneut versuchen."
+        )}, status_code=502)
+    logger.info("PWA-Visualisierung fertig: id=%s tenant=%s mitarbeiter=%s", viz_id, tid, emp.id)
+    return JSONResponse({
+        "ok": True, "id": str(viz_id),
+        "bild_url": f"/app/api/visualisierungen/{viz_id}/bild",
+    })
+
+
+# =====================================================================
 # Kunden-Suche (über Gespräche, Angebote, Rechnungen)
 # =====================================================================
 
