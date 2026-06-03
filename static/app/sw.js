@@ -8,7 +8,7 @@
  *  - Minimaler Offline-Shell-Cache (App-Rahmen laedt auch ohne Netz; die
  *    eigentlichen Daten kommen immer frisch vom Server).
  */
-const CACHE = "ga-app-v1";
+const CACHE = "ga-app-v2";
 const SHELL = [
   "/app",
   "/app/static/app.css",
@@ -33,12 +33,20 @@ self.addEventListener("activate", (event) => {
 
 self.addEventListener("fetch", (event) => {
   const req = event.request;
-  // Nur GETs cachen; API/Login nie aus dem Cache bedienen.
+  // API/Login nie aus dem Cache; nur GETs behandeln.
   if (req.method !== "GET" || req.url.includes("/app/api/") || req.url.includes("/app/login")) {
     return;
   }
+  // Network-first: immer die frische Version holen (verhindert, dass ein
+  // alter Cache kaputtes JS/HTML festhaelt), Cache nur als Offline-Fallback.
   event.respondWith(
-    caches.match(req).then((hit) => hit || fetch(req))
+    fetch(req)
+      .then((res) => {
+        const copy = res.clone();
+        caches.open(CACHE).then((c) => c.put(req, copy)).catch(() => {});
+        return res;
+      })
+      .catch(() => caches.match(req))
   );
 });
 

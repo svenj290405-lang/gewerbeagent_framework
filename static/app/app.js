@@ -32,6 +32,12 @@ function esc(s) {
 }
 function el(html) { const t = document.createElement("template"); t.innerHTML = html.trim(); return t.content.firstChild; }
 
+// Notification-API ist nicht überall da (z.B. iOS Safari ohne Home-Screen-
+// Installation) — defensiv prüfen, sonst wirft ein blanker Zugriff und die
+// App bleibt beim Laden hängen.
+function notifSupported() { return typeof Notification !== "undefined"; }
+function notifGranted() { return notifSupported() && Notification.permission === "granted"; }
+
 // ---------- Tabs ----------
 const TABS = [
   { key: "start",       label: "Start",   ico: "🏠" },
@@ -72,7 +78,7 @@ const SCREENS = {
     const parts = [];
     parts.push(`<h1 style="font-size:22px;margin:4px 4px 14px">Hallo${App.me.employee.name ? ", " + esc(App.me.employee.name.split(" ")[0]) : ""} 👋</h1>`);
 
-    if (Notification.permission !== "granted") {
+    if (notifSupported() && !notifGranted()) {
       parts.push(`<div class="banner">Aktiviere Benachrichtigungen, damit du neue Buchungen und Rückrufe sofort siehst. <button class="btn-sm btn-ghost" id="enable-notif-inline">Aktivieren</button></div>`);
     }
 
@@ -188,8 +194,8 @@ const SCREENS = {
       </div>` +
       (menu.length ? `<div class="card"><h2>Verwaltung</h2>${menu.join("")}</div>` : "") +
       `<div class="card"><h2>Benachrichtigungen</h2>
-        <div class="row"><span>Push auf diesem Gerät</span><span class="pill ${Notification.permission === "granted" ? "ok" : "warn"}">${Notification.permission === "granted" ? "aktiv" : "aus"}</span></div>
-        <button class="btn-sm btn-ghost" id="enable-notif-more" style="margin-top:8px">Push aktivieren</button>
+        <div class="row"><span>Push auf diesem Gerät</span><span class="pill ${notifGranted() ? "ok" : "warn"}">${notifGranted() ? "aktiv" : (notifSupported() ? "aus" : "nicht unterstützt")}</span></div>
+        ${notifSupported() ? `<button class="btn-sm btn-ghost" id="enable-notif-more" style="margin-top:8px">Push aktivieren</button>` : `<p class="muted" style="margin-top:6px">Auf dem iPhone: erst „Zum Home-Bildschirm" hinzufügen, dann sind Benachrichtigungen möglich.</p>`}
       </div>
       <div class="card"><form method="post" action="/app/logout"><button type="submit">Abmelden</button></form></div>
       <p class="muted" style="text-align:center;margin-top:14px">Weitere Funktionen (Material, Formulare, Wissen …) folgen.</p>`;
@@ -241,8 +247,8 @@ function urlBase64ToUint8Array(base64) {
 
 async function enablePush() {
   try {
-    if (!("serviceWorker" in navigator) || !("PushManager" in window)) {
-      alert("Dein Gerät unterstützt keine Push-Benachrichtigungen."); return;
+    if (!notifSupported() || !("serviceWorker" in navigator) || !("PushManager" in window)) {
+      alert("Dein Gerät unterstützt hier keine Push-Benachrichtigungen. Auf dem iPhone die App erst zum Home-Bildschirm hinzufügen."); return;
     }
     if (!App.me.vapid_public_key) { alert("Push ist serverseitig noch nicht konfiguriert."); return; }
     const perm = await Notification.requestPermission();
@@ -268,7 +274,7 @@ async function boot() {
   App.me = await res.json();
   document.getElementById("hdr-title").textContent = App.me.tenant.company_name || "Gewerbeagent";
   const nb = document.getElementById("notif-btn");
-  if (Notification && Notification.permission !== "granted") { nb.hidden = false; nb.addEventListener("click", enablePush); }
+  if (notifSupported() && !notifGranted()) { nb.hidden = false; nb.addEventListener("click", enablePush); }
   buildTabbar();
   navigate("start");
 }
