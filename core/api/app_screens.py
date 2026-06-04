@@ -2616,3 +2616,119 @@ async def api_anfrage_reply(
         "internet_message_id": send_result.get("internet_message_id"),
         "closed": close_after,
     })
+
+
+# =====================================================================
+# Assistent — Gemini-Kommando-Zentrale
+# =====================================================================
+#
+# Der Handwerker tippt oder spricht einen Befehl; Gemini entscheidet per
+# Function-Calling, welches Tool auszufuehren ist (siehe
+# core/ai/command_center.py). Read-Tools laufen sofort, Write-Tools werden
+# erst nach Bestaetigung ausgefuehrt — daher zwei Endpunkte.
+
+async def _build_command_ctx(request: Request):
+    """Baut den Ausfuehrungskontext (tenant-isoliert) fuer das command_center."""
+    from core.ai.command_center import Ctx
+    from core.features.check import enabled_features_for_tenant
+
+    tid = current_tenant_id(request)
+    feats = await enabled_features_for_tenant(tid)
+    return Ctx(
+        tenant=request.state.app_tenant,
+        employee=request.state.app_employee,
+        tid=tid,
+        features=set(feats),
+    )
+
+
+@router.post("/assistent")
+async def api_assistent(
+    request: Request,
+    _e=Depends(require_app_user),
+    _c=Depends(require_app_csrf),
+) -> JSONResponse:
+    """Nimmt einen natuersprachlichen Befehl entgegen und laesst Gemini das
+    passende Tool waehlen.
+
+    Body: { "text": "..." }
+    Antwort (eines von):
+      { "type": "message", "text": ... }                 — Antwort/Rueckfrage
+      { "type": "confirm", "tool", "args", "summary", "frage" } — Bestaetigung noetig
+      { "type": "error",  "text": ... }
+    """
+    from core.ai.command_center import run_command
+
+    body = await request.json()
+    text = ((body or {}).get("text") or "").strip()
+    if not text:
+        return JSONResponse({"type": "error", "text": "Bitte einen Befehl eingeben."}, status_code=400)
+    if len(text) > 1000:
+        text = text[:1000]
+
+    ctx = await _build_command_ctx(request)
+    result = await run_command(text, ctx)
+    return JSONResponse(result)
+
+
+@router.post("/assistent/ausfuehren")
+async def api_assistent_ausfuehren(
+    request: Request,
+    _e=Depends(require_app_user),
+    _c=Depends(require_app_csrf),
+) -> JSONResponse:
+    """Fuehrt eine zuvor vom /assistent vorgeschlagene Write-Aktion aus —
+    NACH ausdruecklicher Bestaetigung des Nutzers.
+
+    Body: { "tool": "...", "args": {...} }
+    """
+    from core.ai.command_center import execute_confirmed
+
+    body = await request.json()
+    tool = ((body or {}).get("tool") or "").strip()
+    args = (body or {}).get("args") or {}
+    if not tool:
+        return JSONResponse({"type": "error", "text": "Keine Aktion angegeben."}, status_code=400)
+    if not isinstance(args, dict):
+        return JSONResponse({"type": "error", "text": "Ungueltige Argumente."}, status_code=400)
+
+    ctx = await _build_command_ctx(request)
+    result = await execute_confirmed(tool, args, ctx)
+    status = 200 if result.get("type") == "done" else 400
+    return JSONResponse(result, status_code=status)
+
+
+@router.post("/assistent/transkript")
+async def api_assistent_transkript(
+    request: Request,
+    _e=Depends(require_app_user),
+    _c=Depends(require_app_csrf),
+) -> JSONResponse:
+    """Sprachbefehl → Text. Der Browser nimmt auf (WAV 16 kHz, wie beim
+    Diktat) und schickt die rohen Bytes; wir transkribieren WORTGETREU
+    (kein Schema, keine DB-Speicherung) und geben den Text zurueck, den
+    die App dann ins Befehlsfeld setzt.
+
+    Body: rohe Audio-Bytes. Content-Type = MIME. Antwort: { "text": ... }
+    """
+    from core.ai.gemini import transcribe_audio
+
+    audio_bytes = await request.body()
+    err = _validate_diktat_audio(audio_bytes)
+    if err:
+        return JSONResponse({"ok": False, "error": err[0]}, status_code=err[1])
+    mime = _normalize_diktat_mime(request.headers.get("content-type"))
+    if mime is None:
+        return JSONResponse(
+            {"ok": False, "error": "Audioformat wird nicht unterstuetzt."},
+            status_code=415,
+        )
+    try:
+        text = await transcribe_audio(audio_bytes, mime_type=mime)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Assistent-Transkript fehlgeschlagen: %s", exc)
+        return JSONResponse(
+            {"ok": False, "error": "Konnte nicht transkribieren. Bitte erneut."},
+            status_code=502,
+        )
+    return JSONResponse({"ok": True, "text": (text or "").strip()})

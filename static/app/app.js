@@ -41,6 +41,7 @@ function notifGranted() { return notifSupported() && Notification.permission ===
 // ---------- Tabs ----------
 const TABS = [
   { key: "start",       label: "Start",    ico: "🏠" },
+  { key: "assistent",   label: "Assistent", ico: "🤖" },
   { key: "anfragen",    label: "Anfragen", ico: "✉️", feature: "mail_intake" },
   { key: "termine",     label: "Termine",  ico: "📅", feature: "kalender" },
   { key: "anrufe",      label: "Anrufe",   ico: "📞", feature: "voice_init" },
@@ -613,6 +614,152 @@ const SCREENS = {
     if (b) b.addEventListener("click", enablePush);
     document.querySelectorAll(".menu-item").forEach((mi) =>
       mi.addEventListener("click", () => navigate(mi.dataset.go)));
+  },
+
+  async assistent() {
+    App.view.innerHTML =
+      `<h1 style="font-size:22px;margin:4px 4px 6px">Assistent 🤖</h1>` +
+      `<p class="muted" style="margin:0 4px 14px">Sag oder tipp, was zu tun ist — z.B. „Trag Frau Meier morgen 14 Uhr für eine Heizungswartung ein", „Bestell 20 Meter Kupferrohr" oder „Tobias ist die ganze Woche krank".</p>` +
+      `<div class="card" style="padding:14px">
+         <textarea id="as-input" rows="2" placeholder="Befehl eingeben …"
+           style="width:100%;padding:10px;border:1px solid var(--line);border-radius:10px;font-size:16px;resize:vertical;box-sizing:border-box"></textarea>
+         <div style="display:flex;gap:8px;margin-top:10px">
+           <button class="btn-sm" id="as-send" style="flex:1;padding:12px">Senden</button>
+           <button class="btn-sm btn-ghost" id="as-mic" style="padding:12px 16px" title="Sprechen">🎤</button>
+         </div>
+         <p class="muted" id="as-status" style="margin:10px 0 0;min-height:18px"></p>
+       </div>
+       <div id="as-result" style="margin-top:14px"></div>`;
+
+    const input = document.getElementById("as-input");
+    const sendBtn = document.getElementById("as-send");
+    const micBtn = document.getElementById("as-mic");
+    const statusEl = document.getElementById("as-status");
+    const resultEl = document.getElementById("as-result");
+
+    function setBusy(on, msg) {
+      sendBtn.disabled = on; micBtn.disabled = on;
+      statusEl.textContent = msg || "";
+    }
+
+    async function send() {
+      const text = (input.value || "").trim();
+      if (!text) { input.focus(); return; }
+      resultEl.innerHTML = "";
+      setBusy(true, "Denkt nach …");
+      let res, j = null;
+      try {
+        res = await fetch("/app/api/assistent", {
+          method: "POST",
+          headers: { "X-CSRF-Token": App.me.csrf, "Content-Type": "application/json" },
+          body: JSON.stringify({ text }),
+        });
+      } catch (e) { setBusy(false, "Netzwerkfehler. Bitte erneut."); return; }
+      if (res.status === 303 || res.status === 401 || res.redirected) { location.href = "/app/login"; return; }
+      try { j = await res.json(); } catch (e) {}
+      setBusy(false, "");
+      renderResult(j);
+    }
+
+    function renderResult(j) {
+      if (!j || !j.type) { resultEl.innerHTML = card("Konnte den Befehl nicht verarbeiten."); return; }
+      if (j.type === "message") { resultEl.innerHTML = card(esc(j.text)); return; }
+      if (j.type === "error") { resultEl.innerHTML = card(`<span style="color:var(--danger,#c0392b)">${esc(j.text)}</span>`); return; }
+      if (j.type === "confirm") {
+        resultEl.innerHTML =
+          `<div class="card">
+             ${j.frage ? `<p style="margin:0 0 10px">${esc(j.frage)}</p>` : ""}
+             <p style="margin:0 0 14px;font-weight:600">${esc(j.summary)}</p>
+             <div style="display:flex;gap:8px">
+               <button class="btn-sm" id="as-confirm" style="flex:1;padding:12px">Ausführen</button>
+               <button class="btn-sm btn-ghost" id="as-cancel" style="flex:1;padding:12px">Abbrechen</button>
+             </div>
+           </div>`;
+        document.getElementById("as-cancel").addEventListener("click", () => { resultEl.innerHTML = ""; });
+        document.getElementById("as-confirm").addEventListener("click", () => confirmAction(j.tool, j.args));
+      }
+    }
+
+    async function confirmAction(tool, args) {
+      const cBtn = document.getElementById("as-confirm");
+      const xBtn = document.getElementById("as-cancel");
+      if (cBtn) { cBtn.disabled = true; cBtn.textContent = "Führt aus …"; }
+      if (xBtn) xBtn.disabled = true;
+      let res, j = null;
+      try {
+        res = await fetch("/app/api/assistent/ausfuehren", {
+          method: "POST",
+          headers: { "X-CSRF-Token": App.me.csrf, "Content-Type": "application/json" },
+          body: JSON.stringify({ tool, args }),
+        });
+      } catch (e) { resultEl.innerHTML = card("Netzwerkfehler. Bitte erneut."); return; }
+      if (res.status === 303 || res.status === 401 || res.redirected) { location.href = "/app/login"; return; }
+      try { j = await res.json(); } catch (e) {}
+      if (j && j.type === "done" && j.result && j.result.ok) {
+        resultEl.innerHTML = card(`✓ ${esc(resultText(tool, j.result))}`);
+        input.value = "";
+      } else {
+        const msg = (j && (j.text || (j.result && j.result.error))) || "Aktion fehlgeschlagen.";
+        resultEl.innerHTML = card(`<span style="color:var(--danger,#c0392b)">${esc(msg)}</span>`);
+      }
+    }
+
+    function resultText(tool, r) {
+      if (tool === "termin_anlegen") return `Termin für ${r.kunde} am ${r.datum} um ${r.uhrzeit} angelegt.`;
+      if (tool === "termin_stornieren") return `Termin von ${r.kunde} storniert${r.mail_sent ? " (Kunde per Mail informiert)" : ""}.`;
+      if (tool === "rueckruf_anlegen") return `Rückruf für ${r.kunde} angelegt.`;
+      if (tool === "material_bestellen") return `${r.menge}× ${r.material} bestellt.`;
+      if (tool === "abwesenheit_melden") return `${r.mitarbeiter} ist als ${r.typ} eingetragen.`;
+      return "Erledigt.";
+    }
+
+    function card(html) { return `<div class="card">${html}</div>`; }
+
+    sendBtn.addEventListener("click", send);
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
+    });
+
+    // ---- Sprach-Befehl: aufnehmen → transkribieren → ins Feld → senden ----
+    micBtn.addEventListener("click", async () => {
+      if (Diktat.recording) {
+        const { blob, durationSec } = _diktatFinish();
+        micBtn.textContent = "🎤";
+        if (durationSec < 1 || blob.size < 2000) { setBusy(false, "Zu kurz. Bitte erneut."); return; }
+        setBusy(true, "Höre zu …");
+        let res, j = null;
+        try {
+          res = await fetch("/app/api/assistent/transkript", {
+            method: "POST",
+            headers: { "X-CSRF-Token": App.me.csrf, "Content-Type": "audio/wav" },
+            body: blob,
+          });
+        } catch (e) { setBusy(false, "Netzwerkfehler. Bitte erneut."); return; }
+        if (res.status === 303 || res.status === 401 || res.redirected) { location.href = "/app/login"; return; }
+        try { j = await res.json(); } catch (e) {}
+        if (res.ok && j && j.ok && j.text) {
+          input.value = j.text;
+          setBusy(false, "");
+          send();
+        } else {
+          setBusy(false, (j && j.error) || "Nichts verstanden. Bitte erneut.");
+        }
+        return;
+      }
+      // Aufnahme starten
+      try { await _diktatStartRecording(); }
+      catch (e) {
+        statusEl.textContent = (e && e.name === "NotAllowedError")
+          ? "Mikrofon-Zugriff abgelehnt. Bitte im Browser erlauben."
+          : "Mikrofon nicht verfügbar.";
+        _diktatTeardown(); return;
+      }
+      micBtn.textContent = "⏹";
+      statusEl.textContent = "Sprich jetzt …";
+      Diktat.autostop = setTimeout(() => { if (Diktat.recording) micBtn.click(); }, 60 * 1000);
+    });
+
+    input.focus();
   },
 };
 
