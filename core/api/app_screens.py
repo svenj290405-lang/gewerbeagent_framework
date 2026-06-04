@@ -2298,6 +2298,189 @@ async def api_verbindungen_trennen(
     return JSONResponse({"ok": False, "error": "Unbekannter Anbieter."}, status_code=400)
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Anfrage-Formular-Editor (Einstellungen → Anfrage-Formular)
+#
+# Telegram-Paritaet zum /formular-Wizard: der Inhaber bearbeitet die Felder
+# seines oeffentlichen Anfrage-Formulars (TenantAnfrageSchema) aus der App.
+# Wiederverwendung: get_schema_for_tenant / upsert_tenant_schema /
+# delete_tenant_schema / validate_schema_fields aus core.integrations.
+# anfrage_forms — hier liegt nur die Bedienoberflaeche + eine harte
+# Namens-Normalisierung obendrauf (validate_schema_fields prueft das
+# name-Format NICHT, der name landet aber als HTML-Attribut im oeffentlichen
+# Formular → wir erzwingen ^[a-z][a-z0-9_]*$ und generieren bei Bedarf aus
+# dem Label, damit der Inhaber sich um „technische Namen" gar nicht kuemmern
+# muss).
+# ─────────────────────────────────────────────────────────────────────
+
+_ANFRAGE_FORMULAR_FEATURE = "anfrage_formular"
+
+# Feldtypen mit Anzeige-Label (Reihenfolge wie im Telegram-Wizard)
+_FIELD_TYPE_CHOICES = [
+    {"value": "text", "label": "Text (eine Zeile)"},
+    {"value": "textarea", "label": "Mehrzeiliger Text"},
+    {"value": "tel", "label": "Telefonnummer"},
+    {"value": "date", "label": "Datum"},
+    {"value": "radio", "label": "Auswahl (eine Option)"},
+    {"value": "checkbox_multi", "label": "Mehrfachauswahl"},
+    {"value": "select", "label": "Dropdown"},
+    {"value": "masse", "label": "Maße (Höhe/Breite/Tiefe)"},
+    {"value": "file", "label": "Datei-Upload"},
+]
+_OPTION_FIELD_TYPES = {"radio", "checkbox_multi", "select"}
+_ANFRAGE_TYP_CHOICES = [
+    {"value": "allgemein", "label": "Allgemein"},
+    {"value": "tischler", "label": "Tischler / Schreiner"},
+]
+
+
+def _slug_field_name(label: str, fallback: str, seen: set, reserved: set) -> str:
+    """Erzeugt einen technischen Feldnamen (^[a-z][a-z0-9_]*$) aus dem Label,
+    eindeutig gegen `seen` und nicht in `reserved`."""
+    import re
+    s = (label or fallback or "feld").lower()
+    for a, b in (("ä", "ae"), ("ö", "oe"), ("ü", "ue"), ("ß", "ss")):
+        s = s.replace(a, b)
+    s = re.sub(r"[^a-z0-9]+", "_", s).strip("_")
+    s = re.sub(r"^[0-9_]+", "", s)
+    if not s:
+        s = "feld"
+    s = s[:28]
+    base, name, i = s, s, 2
+    while name in seen or name in reserved:
+        name = f"{base}_{i}"
+        i += 1
+    return name
+
+
+def _normalize_formular_fields(raw_fields: list) -> tuple[list | None, str]:
+    """Saeubert die vom Client kommende Feld-Liste auf eine Whitelist von
+    Keys und erzwingt saubere Feldnamen. Die fachliche Pruefung (min. 1 Feld,
+    Optionen-Anzahl, Typ-Whitelist) macht danach validate_schema_fields im
+    Schreibweg. Returns (fields, error_msg)."""
+    import re
+    from core.integrations.anfrage_forms import ALLOWED_FIELD_TYPES, RESERVED_FIELD_NAMES
+    name_re = re.compile(r"^[a-z][a-z0-9_]*$")
+    out: list[dict] = []
+    seen: set[str] = set()
+    for f in raw_fields:
+        if not isinstance(f, dict):
+            return None, "Ungueltiger Feld-Eintrag."
+        label = (f.get("label") or "").strip()
+        ftype = (f.get("type") or "").strip()
+        if not label:
+            return None, "Jedes Feld braucht eine Bezeichnung."
+        if ftype not in ALLOWED_FIELD_TYPES:
+            return None, f"Unbekannter Feldtyp '{ftype}'."
+        name = (f.get("name") or "").strip().lower()
+        if (not name or len(name) > 30 or not name_re.match(name)
+                or name in seen or name in RESERVED_FIELD_NAMES):
+            name = _slug_field_name(label, ftype, seen, RESERVED_FIELD_NAMES)
+        seen.add(name)
+        field: dict = {
+            "name": name, "label": label[:200], "type": ftype,
+            "required": bool(f.get("required")),
+        }
+        ph = (f.get("placeholder") or "").strip()
+        if ph:
+            field["placeholder"] = ph[:200]
+        if ftype in _OPTION_FIELD_TYPES:
+            opts = f.get("options") or []
+            if isinstance(opts, str):
+                opts = opts.split(",")
+            opts = [str(o).strip()[:80] for o in opts if str(o).strip()][:12]
+            field["options"] = opts
+        out.append(field)
+    return out, ""
+
+
+@router.get("/formulare/{anfrage_typ}")
+async def api_formular_get(
+    anfrage_typ: str, request: Request, _e=Depends(require_app_inhaber),
+) -> JSONResponse:
+    """Aktuelles Formular-Schema (Tenant-Override oder Default) + Metadaten
+    fuer den Editor. Nur Inhaber, feature-gegated."""
+    from core.integrations.anfrage_forms import get_schema_for_tenant, RESERVED_FIELD_NAMES
+    from core.models.anfrage import ANFRAGE_TYP_TISCHLER, ANFRAGE_TYP_ALLGEMEIN
+    from core.features.check import is_feature_enabled
+    tid = current_tenant_id(request)
+    if anfrage_typ not in (ANFRAGE_TYP_TISCHLER, ANFRAGE_TYP_ALLGEMEIN):
+        return JSONResponse({"ok": False, "error": "Unbekannter Formular-Typ."}, status_code=400)
+    if not await is_feature_enabled(tid, _ANFRAGE_FORMULAR_FEATURE):
+        return JSONResponse({"ok": False, "error": "Die Anfrage-Formular-Funktion ist nicht aktiv."}, status_code=403)
+    schema = await get_schema_for_tenant(tid, anfrage_typ)
+    return JSONResponse({
+        "ok": True,
+        "anfrage_typ": anfrage_typ,
+        "title": schema.get("title") or "",
+        "subtitle": schema.get("subtitle") or "",
+        "fields": schema.get("fields") or [],
+        "field_types": _FIELD_TYPE_CHOICES,
+        "option_types": sorted(_OPTION_FIELD_TYPES),
+        "anfrage_typen": _ANFRAGE_TYP_CHOICES,
+        "reserved_names": sorted(RESERVED_FIELD_NAMES),
+    })
+
+
+@router.post("/formulare/{anfrage_typ}")
+async def api_formular_save(
+    anfrage_typ: str, request: Request,
+    _e=Depends(require_app_inhaber), _c=Depends(require_app_csrf),
+) -> JSONResponse:
+    """Speichert die Formular-Felder. Body: { fields: list, title?, subtitle? }."""
+    from core.integrations.anfrage_forms import upsert_tenant_schema
+    from core.models.anfrage import ANFRAGE_TYP_TISCHLER, ANFRAGE_TYP_ALLGEMEIN
+    from core.features.check import is_feature_enabled
+    tid = current_tenant_id(request)
+    if anfrage_typ not in (ANFRAGE_TYP_TISCHLER, ANFRAGE_TYP_ALLGEMEIN):
+        return JSONResponse({"ok": False, "error": "Unbekannter Formular-Typ."}, status_code=400)
+    if not await is_feature_enabled(tid, _ANFRAGE_FORMULAR_FEATURE):
+        return JSONResponse({"ok": False, "error": "Die Anfrage-Formular-Funktion ist nicht aktiv."}, status_code=403)
+    body = await request.json()
+    raw_fields = body.get("fields")
+    if not isinstance(raw_fields, list):
+        return JSONResponse({"ok": False, "error": "Es fehlen Felder."}, status_code=400)
+    fields, err = _normalize_formular_fields(raw_fields)
+    if err:
+        return JSONResponse({"ok": False, "error": err}, status_code=400)
+    title = (body.get("title") or "").strip() or None
+    subtitle = (body.get("subtitle") or "").strip() or None
+    ok, msg = await upsert_tenant_schema(
+        tenant_id=tid, anfrage_typ=anfrage_typ,
+        fields=fields, title=title, subtitle=subtitle,
+    )
+    if not ok:
+        return JSONResponse({"ok": False, "error": msg}, status_code=400)
+    logger.info("PWA-Formular gespeichert: typ=%s tenant=%s felder=%d", anfrage_typ, tid, len(fields))
+    return JSONResponse({"ok": True})
+
+
+@router.post("/formulare/{anfrage_typ}/reset")
+async def api_formular_reset(
+    anfrage_typ: str, request: Request,
+    _e=Depends(require_app_inhaber), _c=Depends(require_app_csrf),
+) -> JSONResponse:
+    """Setzt das Formular auf den Branchen-Default zurueck (loescht den Tenant-
+    Override) und liefert das Default-Schema zum Neu-Rendern zurueck."""
+    from core.integrations.anfrage_forms import delete_tenant_schema, get_default_schema
+    from core.models.anfrage import ANFRAGE_TYP_TISCHLER, ANFRAGE_TYP_ALLGEMEIN
+    from core.features.check import is_feature_enabled
+    tid = current_tenant_id(request)
+    if anfrage_typ not in (ANFRAGE_TYP_TISCHLER, ANFRAGE_TYP_ALLGEMEIN):
+        return JSONResponse({"ok": False, "error": "Unbekannter Formular-Typ."}, status_code=400)
+    if not await is_feature_enabled(tid, _ANFRAGE_FORMULAR_FEATURE):
+        return JSONResponse({"ok": False, "error": "Die Anfrage-Formular-Funktion ist nicht aktiv."}, status_code=403)
+    await delete_tenant_schema(tid, anfrage_typ)
+    schema = get_default_schema(anfrage_typ)
+    logger.info("PWA-Formular zurueckgesetzt: typ=%s tenant=%s", anfrage_typ, tid)
+    return JSONResponse({
+        "ok": True,
+        "title": schema.get("title") or "",
+        "subtitle": schema.get("subtitle") or "",
+        "fields": schema.get("fields") or [],
+    })
+
+
 @router.post("/team/anlegen")
 async def api_team_anlegen(
     request: Request,

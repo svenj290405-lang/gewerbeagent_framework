@@ -12,7 +12,9 @@
 // + App-verbunden-Anzeige korrekt, aufbauend auf v18.
 // v20: Verbindungen im Einstellungen-Screen (Google/Microsoft OAuth +
 // Lexware-API-Key direkt aus der App).
-const CACHE = "ga-app-v20";
+// v21: Anfrage-Formular-Editor (Felder hinzufügen/bearbeiten/sortieren,
+// Typ + Pflicht + Optionen, Reset auf Standard) im Mehr-Hub.
+const CACHE = "ga-app-v21";
 const SHELL = [
   "/app",
   "/app/static/app.css",

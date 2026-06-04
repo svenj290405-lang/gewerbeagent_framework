@@ -720,6 +720,183 @@ const SCREENS = {
     renderVerbindungen();
   },
 
+  async formulare() {
+    // Anfrage-Formular-Editor (Inhaber). Quelle der Wahrheit ist `state`;
+    // Text-Inputs schreiben live in state -> ein struktureller Re-Render
+    // (Feld hinzufügen/löschen/verschieben/Typwechsel) verliert nichts.
+    const state = {
+      typ: (App.formular && App.formular.typ) || "allgemein",
+      title: "", subtitle: "", fields: [],
+      fieldTypes: [], optionTypes: [], typen: [], dirty: false,
+    };
+    App.formular = state;
+
+    const isOptionType = (t) => state.optionTypes.indexOf(t) !== -1;
+    const normField = (f) => ({
+      name: f.name || "", label: f.label || "", type: f.type || "text",
+      required: !!f.required, placeholder: f.placeholder || "",
+      options: Array.isArray(f.options) ? f.options.slice() : [],
+    });
+    const setMsg = (t, ok) => {
+      const m = document.getElementById("f-msg");
+      if (m) { m.textContent = t; m.style.color = ok ? "var(--ok,#1a7f37)" : "var(--err,#b42318)"; }
+    };
+    const inputStyle = "width:100%;padding:10px;border:1px solid var(--line);border-radius:10px;margin:4px 0 8px;font-size:16px";
+
+    const renderFields = () => {
+      const wrap = document.getElementById("f-fields");
+      if (!wrap) return;
+      if (!state.fields.length) {
+        wrap.innerHTML = `<div class="card"><p class="muted">Noch keine Felder. Füge unten ein Feld hinzu.</p></div>`;
+        return;
+      }
+      wrap.innerHTML = state.fields.map((f, i) => {
+        const typeOpts = state.fieldTypes.map((t) =>
+          `<option value="${t.value}" ${t.value === f.type ? "selected" : ""}>${esc(t.label)}</option>`).join("");
+        const optBlock = isOptionType(f.type)
+          ? `<label class="sub">Optionen (eine pro Zeile)</label>
+             <textarea class="f-opts" data-i="${i}" rows="3" style="${inputStyle};font-size:15px">${esc((f.options || []).join("\n"))}</textarea>`
+          : "";
+        const phBlock = (f.type === "text" || f.type === "textarea" || f.type === "tel")
+          ? `<label class="sub">Platzhalter (optional)</label>
+             <input class="f-ph" data-i="${i}" value="${esc(f.placeholder || "")}" style="${inputStyle};font-size:15px">`
+          : "";
+        return `<div class="card">
+          <div class="row" style="margin-bottom:4px"><b>Feld ${i + 1}</b>
+            <span style="display:flex;gap:6px">
+              <button class="btn-sm btn-ghost f-up" data-i="${i}" ${i === 0 ? "disabled" : ""}>↑</button>
+              <button class="btn-sm btn-ghost f-down" data-i="${i}" ${i === state.fields.length - 1 ? "disabled" : ""}>↓</button>
+              <button class="btn-sm btn-ghost f-del" data-i="${i}">✕</button>
+            </span>
+          </div>
+          <label class="sub">Bezeichnung (für Kunden sichtbar)</label>
+          <input class="f-label" data-i="${i}" value="${esc(f.label || "")}" style="${inputStyle}">
+          <label class="sub">Typ</label>
+          <select class="f-type" data-i="${i}" style="${inputStyle}">${typeOpts}</select>
+          ${optBlock}${phBlock}
+          <label style="display:flex;align-items:center;gap:8px;margin-top:4px">
+            <input type="checkbox" class="f-req" data-i="${i}" ${f.required ? "checked" : ""}> <span>Pflichtfeld</span>
+          </label>
+        </div>`;
+      }).join("");
+
+      const idx = (e) => +e.currentTarget.dataset.i;
+      wrap.querySelectorAll(".f-label").forEach((el) => el.addEventListener("input", (e) => { state.fields[idx(e)].label = e.target.value; state.dirty = true; }));
+      wrap.querySelectorAll(".f-ph").forEach((el) => el.addEventListener("input", (e) => { state.fields[idx(e)].placeholder = e.target.value; state.dirty = true; }));
+      wrap.querySelectorAll(".f-opts").forEach((el) => el.addEventListener("input", (e) => { state.fields[idx(e)].options = e.target.value.split("\n").map((s) => s.trim()).filter(Boolean); state.dirty = true; }));
+      wrap.querySelectorAll(".f-req").forEach((el) => el.addEventListener("change", (e) => { state.fields[idx(e)].required = e.target.checked; state.dirty = true; }));
+      wrap.querySelectorAll(".f-type").forEach((el) => el.addEventListener("change", (e) => {
+        const i = idx(e); state.fields[i].type = e.target.value;
+        if (isOptionType(e.target.value) && !(state.fields[i].options || []).length) state.fields[i].options = [];
+        state.dirty = true; renderFields();
+      }));
+      wrap.querySelectorAll(".f-up").forEach((el) => el.addEventListener("click", (e) => { const i = idx(e); if (i > 0) { const a = state.fields; const t = a[i - 1]; a[i - 1] = a[i]; a[i] = t; state.dirty = true; renderFields(); } }));
+      wrap.querySelectorAll(".f-down").forEach((el) => el.addEventListener("click", (e) => { const i = idx(e); const a = state.fields; if (i < a.length - 1) { const t = a[i + 1]; a[i + 1] = a[i]; a[i] = t; state.dirty = true; renderFields(); } }));
+      wrap.querySelectorAll(".f-del").forEach((el) => el.addEventListener("click", (e) => {
+        const i = idx(e);
+        if (state.fields.length <= 1) { alert("Mindestens ein Feld muss bleiben."); return; }
+        if (confirm("Dieses Feld löschen?")) { state.fields.splice(i, 1); state.dirty = true; renderFields(); }
+      }));
+    };
+
+    const addField = () => {
+      state.fields.push({ name: "", label: "", type: "text", required: false, placeholder: "", options: [] });
+      state.dirty = true; renderFields();
+      const labels = document.querySelectorAll("#f-fields .f-label");
+      if (labels.length) labels[labels.length - 1].focus();
+    };
+
+    const save = async () => {
+      const btn = document.getElementById("f-save");
+      if (state.fields.some((f) => !(f.label || "").trim())) { setMsg("Jedes Feld braucht eine Bezeichnung.", false); return; }
+      btn.disabled = true; btn.textContent = "Speichere …"; setMsg("", true);
+      const body = {
+        title: (state.title || "").trim(), subtitle: (state.subtitle || "").trim(),
+        fields: state.fields.map((f) => ({
+          name: f.name || "", label: (f.label || "").trim(), type: f.type,
+          required: !!f.required, placeholder: f.placeholder || "", options: f.options || [],
+        })),
+      };
+      const r = await api(`/app/api/formulare/${encodeURIComponent(state.typ)}`,
+        { method: "POST", body: JSON.stringify(body) });
+      const j = r ? await r.json().catch(() => null) : null;
+      btn.disabled = false; btn.textContent = "Speichern";
+      if (j && j.ok) { state.dirty = false; await load(); setMsg("✓ Gespeichert.", true); }
+      else { setMsg((j && j.error) || "Konnte nicht speichern.", false); }
+    };
+
+    const reset = async () => {
+      if (!confirm("Formular wirklich auf den Standard zurücksetzen? Deine Anpassungen gehen verloren.")) return;
+      const r = await api(`/app/api/formulare/${encodeURIComponent(state.typ)}/reset`,
+        { method: "POST", body: JSON.stringify({}) });
+      const j = r ? await r.json().catch(() => null) : null;
+      if (j && j.ok) {
+        state.title = j.title || ""; state.subtitle = j.subtitle || "";
+        state.fields = (j.fields || []).map(normField); state.dirty = false;
+        shell(); setMsg("✓ Auf Standard zurückgesetzt.", true);
+      } else { setMsg((j && j.error) || "Konnte nicht zurücksetzen.", false); }
+    };
+
+    const switchTyp = async (typ) => {
+      if (typ === state.typ) return;
+      if (state.dirty && !confirm("Ungespeicherte Änderungen verwerfen und Typ wechseln?")) return;
+      state.typ = typ; App.formular.typ = typ;
+      await load();
+    };
+
+    const shell = () => {
+      const typPills = state.typen.map((t) =>
+        `<button class="btn-sm ${t.value === state.typ ? "" : "btn-ghost"}" data-typ="${t.value}">${esc(t.label)}</button>`).join(" ");
+      App.view.innerHTML =
+        `<button class="btn-sm btn-ghost" id="back-mehr" style="margin-bottom:10px">← Zurück</button>` +
+        `<h1 style="font-size:22px;margin:4px 4px 10px">Anfrage-Formular</h1>` +
+        `<p class="muted" style="font-size:12px;margin:0 4px 12px">So sieht das Formular aus, das deine Kunden über den Anfrage-Link ausfüllen. Änderungen gelten für neue Anfragen.</p>` +
+        (state.typen.length > 1 ? `<div class="card"><h2>Formular-Typ</h2><div style="display:flex;gap:8px;flex-wrap:wrap">${typPills}</div></div>` : "") +
+        `<div class="card"><h2>Überschrift</h2>
+          <label class="sub">Titel</label>
+          <input id="f-title" value="${esc(state.title)}" style="${inputStyle}">
+          <label class="sub">Untertitel</label>
+          <input id="f-subtitle" value="${esc(state.subtitle)}" style="${inputStyle};margin-bottom:2px">
+        </div>` +
+        `<div id="f-fields"></div>` +
+        `<button class="btn-sm btn-ghost" id="f-add" style="width:100%;margin:6px 0 14px">+ Feld hinzufügen</button>` +
+        `<button class="btn-sm" id="f-save" style="width:100%">Speichern</button>` +
+        `<button class="btn-sm btn-ghost" id="f-reset" style="width:100%;margin-top:8px">Auf Standard zurücksetzen</button>` +
+        `<p class="muted" id="f-msg" style="text-align:center;margin-top:10px;font-size:13px"></p>`;
+      document.getElementById("back-mehr").addEventListener("click", () => {
+        if (state.dirty && !confirm("Ungespeicherte Änderungen verwerfen?")) return;
+        navigate("mehr");
+      });
+      document.querySelectorAll("[data-typ]").forEach((b) => b.addEventListener("click", () => switchTyp(b.dataset.typ)));
+      document.getElementById("f-title").addEventListener("input", (e) => { state.title = e.target.value; state.dirty = true; });
+      document.getElementById("f-subtitle").addEventListener("input", (e) => { state.subtitle = e.target.value; state.dirty = true; });
+      document.getElementById("f-add").addEventListener("click", addField);
+      document.getElementById("f-save").addEventListener("click", save);
+      document.getElementById("f-reset").addEventListener("click", reset);
+      renderFields();
+    };
+
+    const load = async () => {
+      const r = await api(`/app/api/formulare/${encodeURIComponent(state.typ)}`);
+      const j = r ? await r.json().catch(() => null) : null;
+      if (!j || !j.ok) {
+        App.view.innerHTML =
+          `<button class="btn-sm btn-ghost" id="back-mehr" style="margin-bottom:10px">← Zurück</button>` +
+          `<div class="card"><p class="muted">${esc((j && j.error) || "Konnte Formular nicht laden.")}</p></div>`;
+        const bb = document.getElementById("back-mehr");
+        if (bb) bb.addEventListener("click", () => navigate("mehr"));
+        return;
+      }
+      state.title = j.title || ""; state.subtitle = j.subtitle || "";
+      state.fields = (j.fields || []).map(normField);
+      state.fieldTypes = j.field_types || []; state.optionTypes = j.option_types || [];
+      state.typen = j.anfrage_typen || []; state.typ = j.anfrage_typ || state.typ; state.dirty = false;
+      shell();
+    };
+
+    await load();
+  },
+
   async mehr() {
     const m = App.me;
     const feats = new Set(m.features || []);
@@ -729,6 +906,7 @@ const SCREENS = {
     menu.push(`<button class="row menu-item" data-go="material"><span>🧰 Material</span><span class="sub">›</span></button>`);
     if (feats.has("visualisierung")) menu.push(`<button class="row menu-item" data-go="visualisierung"><span>🎨 Visualisierung</span><span class="sub">›</span></button>`);
     if (feats.has("mitarbeiter")) menu.push(`<button class="row menu-item" data-go="team"><span>👥 Team</span><span class="sub">›</span></button>`);
+    if (feats.has("anfrage_formular") && m.employee.is_inhaber) menu.push(`<button class="row menu-item" data-go="formulare"><span>📝 Anfrage-Formular</span><span class="sub">›</span></button>`);
     menu.push(`<button class="row menu-item" data-go="einstellungen"><span>⚙️ Einstellungen</span><span class="sub">›</span></button>`);
     App.view.innerHTML =
       `<div class="card"><h2>${esc(m.tenant.company_name || "Mein Betrieb")}</h2>
@@ -741,7 +919,7 @@ const SCREENS = {
         ${notifSupported() ? `<button class="btn-sm btn-ghost" id="enable-notif-more" style="margin-top:8px">Push aktivieren</button>` : `<p class="muted" style="margin-top:6px">Auf dem iPhone: erst „Zum Home-Bildschirm" hinzufügen, dann sind Benachrichtigungen möglich.</p>`}
       </div>
       <div class="card"><form method="post" action="/app/logout"><button type="submit">Abmelden</button></form></div>
-      <p class="muted" style="text-align:center;margin-top:14px">Weitere Funktionen (Material, Formulare, Wissen …) folgen.</p>`;
+      <p class="muted" style="text-align:center;margin-top:14px">Weitere Funktionen folgen.</p>`;
     const b = document.getElementById("enable-notif-more");
     if (b) b.addEventListener("click", enablePush);
     document.querySelectorAll(".menu-item").forEach((mi) =>
