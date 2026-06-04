@@ -17,7 +17,8 @@
 // v22: echte PNG-Icons (192/512 + maskable + apple-touch) — saubere
 // Home-Screen-Installation auf iOS/Android.
 // v23: Kunden-Archiv-Upload (Foto/PDF/Notiz in Drive-Ordner) im Kunden-Profil.
-const CACHE = "ga-app-v23";
+// v24: „Zahlungen prüfen"-Button im Büro (Lexware-Bezahlstatus-Abgleich).
+const CACHE = "ga-app-v24";
 const SHELL = [
   "/app",
   "/app/static/app.css",

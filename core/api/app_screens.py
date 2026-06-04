@@ -1893,6 +1893,30 @@ async def api_beleg_upload(
     return JSONResponse({"ok": True, "id": str(beleg_id), "lexware_link": deeplink})
 
 
+@router.post("/rechnungen/pruefen")
+async def api_rechnungen_pruefen(
+    request: Request,
+    _e=Depends(require_app_inhaber),
+    _c=Depends(require_app_csrf),
+) -> JSONResponse:
+    """Gleicht den Bezahl-Status offener Rechnungen mit Lexware ab (spiegelt
+    /rechnung_pruefen bzw. das Assistent-Tool rechnungen_pruefen). Nur
+    Abgleich + Markierung, KEIN Versand. Inhaber, feature-gegated lexware."""
+    from core.features.check import is_feature_enabled
+    from core.integrations.rechnung_payment_monitor import check_pending_invoices_for_tenant
+    tid = current_tenant_id(request)
+    if not await is_feature_enabled(tid, "lexware"):
+        return JSONResponse({"ok": False, "error": "Die Buchhaltung (Lexware) ist nicht aktiv."}, status_code=403)
+    summary = await check_pending_invoices_for_tenant(tid)
+    return JSONResponse({
+        "ok": True,
+        "geprueft": summary.get("checked", 0),
+        "bezahlt": summary.get("paid", 0),
+        "unveraendert": summary.get("no_change", 0),
+        "fehler": summary.get("errors", 0),
+    })
+
+
 @router.get("/material")
 async def api_material_list(
     request: Request, _e=Depends(require_app_user),

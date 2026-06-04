@@ -161,6 +161,7 @@ const SCREENS = {
            <button class="btn-sm btn-ghost" id="auftraege-btn" style="padding:8px 12px">🛠 Aufträge</button>
            <button class="btn-sm" id="beleg-new-btn" style="padding:8px 12px">📄 Beleg</button>
            ${isInhaber ? `
+           <button class="btn-sm btn-ghost" id="rechnung-pruefen-btn" style="padding:8px 12px">🔄 Zahlungen</button>
            <button class="btn-sm btn-ghost" id="rechnung-new-btn" style="padding:8px 12px">+ Rechnung</button>
            <button class="btn-sm btn-ghost" id="angebot-new-btn" style="padding:8px 12px">+ Angebot</button>` : ""}
          </div>
@@ -185,6 +186,18 @@ const SCREENS = {
     document.getElementById("auftraege-btn").addEventListener("click", showAuftraege);
     if (aBtn) aBtn.addEventListener("click", () => showAngebotForm());
     if (rBtn) rBtn.addEventListener("click", () => showRechnungForm());
+    const pBtn = document.getElementById("rechnung-pruefen-btn");
+    if (pBtn) pBtn.addEventListener("click", async () => {
+      const orig = pBtn.textContent;
+      pBtn.disabled = true; pBtn.textContent = "Prüfe …";
+      const r = await api("/app/api/rechnungen/pruefen", { method: "POST", body: "{}" });
+      const j = r ? await r.json().catch(() => null) : null;
+      pBtn.disabled = false; pBtn.textContent = orig;
+      if (j && j.ok) {
+        if ((j.bezahlt || 0) > 0) { alert(`✓ ${j.bezahlt} Rechnung(en) als bezahlt markiert (${j.geprueft} geprüft).`); navigate("buchhaltung"); }
+        else { alert(`Geprüft: ${j.geprueft || 0} offene Rechnung(en) — keine neuen Zahlungen.`); }
+      } else { alert((j && j.error) || "Konnte nicht prüfen."); }
+    });
   },
 
   async team() {
