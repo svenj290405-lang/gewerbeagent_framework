@@ -14,12 +14,18 @@
 // Lexware-API-Key direkt aus der App).
 // v21: Anfrage-Formular-Editor (Felder hinzufügen/bearbeiten/sortieren,
 // Typ + Pflicht + Optionen, Reset auf Standard) im Mehr-Hub.
-const CACHE = "ga-app-v21";
+// v22: echte PNG-Icons (192/512 + maskable + apple-touch) — saubere
+// Home-Screen-Installation auf iOS/Android.
+const CACHE = "ga-app-v22";
 const SHELL = [
   "/app",
   "/app/static/app.css",
   "/app/static/app.js",
   "/app/static/icon.svg",
+  "/app/static/icon-192.png",
+  "/app/static/icon-512.png",
+  "/app/static/icon-maskable-512.png",
+  "/app/static/apple-touch-icon.png",
   "/app/manifest.webmanifest",
 ];
 
@@ -64,8 +70,8 @@ self.addEventListener("push", (event) => {
   event.waitUntil(
     self.registration.showNotification(data.title, {
       body: data.body,
-      icon: "/app/static/icon.svg",
-      badge: "/app/static/icon.svg",
+      icon: "/app/static/icon-192.png",
+      badge: "/app/static/icon-192.png",
       tag: data.tag || "ga",
       data: { url: data.url || "/app" },
       requireInteraction: false,
