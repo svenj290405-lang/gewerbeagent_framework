@@ -112,10 +112,22 @@ def test_feature_gate_filters_mail_and_lexware_tools():
     names = {s.name for s in cc._available_tools(ohne)}
     assert "offene_anfragen" not in names          # braucht mail_intake
     assert "auftrag_status" not in names            # braucht lexware (+Inhaber)
+    assert "archiv_suchen" not in names             # braucht drive_archiv
+    assert "rechnungen_pruefen" not in names        # braucht lexware
+    assert "formulare_status" not in names          # braucht anfrage_formular
     assert "team_status" in names
     assert "wissen_suchen" in names
     assert "wissen_merken" in names
+    assert "wissen_loeschen" in names               # ungegated
     assert "rueckruf_erledigt" in names
+
+
+def test_archiv_and_lexware_tools_appear_with_features():
+    mit = _ctx(features=("drive_archiv", "lexware", "anfrage_formular"))
+    names = {s.name for s in cc._available_tools(mit)}
+    assert "archiv_suchen" in names
+    assert "rechnungen_pruefen" in names
+    assert "formulare_status" in names
 
 
 def test_inhaber_gate_filters_new_write_tools():
@@ -129,7 +141,7 @@ def test_inhaber_gate_filters_new_write_tools():
 
 
 def test_registry_has_all_tools():
-    assert len(cc._REGISTRY) == 18
+    assert len(cc._REGISTRY) == 22
 
 
 # --------------------------------------------------------------------------

@@ -877,6 +877,77 @@ def _summary_material_anlegen(ctx: Ctx, args: dict) -> str:
     return f"Material „{(args.get('name') or '—').strip()}\" im Katalog anlegen?"
 
 
+# ---- READ (Telegram-Paritaet) ---------------------------------------------
+
+async def _run_archiv_suchen(ctx: Ctx, args: dict) -> dict:
+    """Findet die Drive-Archiv-Ordner eines Kunden (spiegelt /archiv ohne
+    Upload-Wizard: reine Suche + Link)."""
+    from core.integrations.google_drive import list_tenant_kunde_drives
+
+    name = (args.get("kunde_name") or "").strip()
+    folders = await list_tenant_kunde_drives(ctx.tid, limit=500)
+    if name:
+        folders = [f for f in folders if name.lower() in (f.kunde_name or "").lower()]
+    return {"anzahl": len(folders), "ordner": [
+        {"kunde": f.kunde_name, "link": f.drive_folder_url,
+         "dateien": f.upload_count,
+         "letzter_upload": f.last_upload_at.isoformat() if f.last_upload_at else None}
+        for f in folders[:15]]}
+
+
+async def _run_rechnungen_pruefen(ctx: Ctx, args: dict) -> dict:
+    """Synchronisiert den Bezahl-Status offener Rechnungen mit Lexware
+    (spiegelt /rechnung_pruefen). Kein Versand, nur Abgleich + Markierung."""
+    from core.integrations.rechnung_payment_monitor import (
+        check_pending_invoices_for_tenant)
+
+    summary = await check_pending_invoices_for_tenant(ctx.tid)
+    return {"geprueft": summary.get("checked", 0),
+            "neu_als_bezahlt_markiert": summary.get("paid", 0),
+            "unveraendert": summary.get("no_change", 0),
+            "fehler": summary.get("errors", 0)}
+
+
+async def _run_formulare_status(ctx: Ctx, args: dict) -> dict:
+    """Status der Kunden-Anfrage-Formulare der letzten 30 Tage
+    (spiegelt /formulare-Überschrift: offen/ausgefüllt/abgelaufen)."""
+    from core.integrations.anfrage_status import count_status_for_tenant
+
+    counts = await count_status_for_tenant(ctx.tid)
+    return {"letzte_30_tage": counts}
+
+
+# ---- WRITE (Telegram-Paritaet) --------------------------------------------
+
+async def _run_wissen_loeschen(ctx: Ctx, args: dict) -> dict:
+    from core.database.connection import get_session
+    from core.models.tenant_knowledge import TenantKnowledge
+    from sqlalchemy import select
+
+    such = (args.get("suchtext") or "").strip()
+    if len(such) < 3:
+        return {"ok": False, "error": "Bitte einen Suchtext (min. 3 Zeichen) nennen."}
+    async with get_session() as s:
+        rows = (await s.execute(
+            select(TenantKnowledge)
+            .where(TenantKnowledge.tenant_id == ctx.tid)
+            .where(TenantKnowledge.text.ilike(f"%{such}%")).limit(3)
+        )).scalars().all()
+        if not rows:
+            return {"ok": False, "error": f"Kein Wissens-Eintrag mit '{such}' gefunden."}
+        if len(rows) > 1:
+            return {"ok": False, "error": f"Mehrere Einträge passen auf '{such}' — bitte genauer."}
+        entry = rows[0]
+        geloescht = entry.text
+        await s.delete(entry)
+        await s.commit()
+    return {"ok": True, "geloescht": geloescht[:140]}
+
+
+def _summary_wissen_loeschen(ctx: Ctx, args: dict) -> str:
+    return f"Wissens-Eintrag mit „{(args.get('suchtext') or '—').strip()}\" löschen?"
+
+
 # ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
@@ -1050,4 +1121,35 @@ _REGISTRY: list[ToolSpec] = [
             "standard_menge": {"type": _I}, "notes": {"type": _S}},
             "required": ["name", "bestell_link"]},
         run=_run_material_anlegen, summarize=_summary_material_anlegen),
+
+    # ---- READ (Telegram-Paritaet) ----
+    ToolSpec(
+        name="archiv_suchen", kind="read", feature="drive_archiv",
+        description="Findet den Drive-Archiv-Ordner eines Kunden (mit Link und "
+                    "Anzahl Dateien). Ohne Namen: zuletzt genutzte Ordner.",
+        parameters={"type": "OBJECT", "properties": {
+            "kunde_name": {"type": _S, "description": "Kundenname (optional)."}}},
+        run=_run_archiv_suchen),
+    ToolSpec(
+        name="rechnungen_pruefen", kind="read", feature="lexware",
+        description="Gleicht den Bezahl-Status offener Rechnungen mit Lexware ab "
+                    "und markiert bezahlte. Verschickt nichts.",
+        parameters={"type": "OBJECT", "properties": {}},
+        run=_run_rechnungen_pruefen),
+    ToolSpec(
+        name="formulare_status", kind="read", feature="anfrage_formular",
+        description="Zeigt den Status der Kunden-Anfrage-Formulare der letzten "
+                    "30 Tage (offen / ausgefüllt / abgelaufen).",
+        parameters={"type": "OBJECT", "properties": {}},
+        run=_run_formulare_status),
+
+    # ---- WRITE (Telegram-Paritaet) ----
+    ToolSpec(
+        name="wissen_loeschen", kind="write",
+        description="Löscht einen Eintrag aus der Wissensdatenbank (per "
+                    "Suchtext, nur bei eindeutigem Treffer).",
+        parameters={"type": "OBJECT", "properties": {
+            "suchtext": {"type": _S, "description": "Teil des zu löschenden Eintrags."}},
+            "required": ["suchtext"]},
+        run=_run_wissen_loeschen, summarize=_summary_wissen_loeschen),
 ]

@@ -715,6 +715,7 @@ const SCREENS = {
       if (tool === "mitarbeiter_zurueck") return `${r.mitarbeiter} ist wieder verfügbar.`;
       if (tool === "auftrag_status") return `Auftrag von ${r.kunde}: ${r.status_label}.`;
       if (tool === "material_anlegen") return `Material „${r.name}" im Katalog angelegt.`;
+      if (tool === "wissen_loeschen") return `Wissens-Eintrag gelöscht.`;
       return "Erledigt.";
     }
 

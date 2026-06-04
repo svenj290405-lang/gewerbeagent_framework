@@ -8,10 +8,9 @@
  *  - Minimaler Offline-Shell-Cache (App-Rahmen laedt auch ohne Netz; die
  *    eigentlichen Daten kommen immer frisch vom Server).
  */
-// v15: Assistent-Tools erweitert (anstehende Termine, Team-Status, offene
-// Anfragen, Wissen suchen/merken, Rückruf abhaken, Mitarbeiter zurück,
-// Auftrag-Status, Material anlegen), aufbauend auf v14 (Assistent-Basis).
-const CACHE = "ga-app-v15";
+// v16: Assistent-Tools Telegram-Paritaet (Archiv-Suche, Rechnungen prüfen,
+// Formulare-Status, Wissen löschen), aufbauend auf v15.
+const CACHE = "ga-app-v16";
 const SHELL = [
   "/app",
   "/app/static/app.css",
