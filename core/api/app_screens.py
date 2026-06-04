@@ -1073,6 +1073,163 @@ async def api_kunde_profil(
 
 
 # =====================================================================
+# Kunden-Archiv: Dateien/Notizen in den Drive-Ordner des Kunden ablegen
+#
+# Telegram-Paritaet zum /archiv-Wizard. Wiederverwendung:
+# upload_file_to_kunde_folder (google_drive.py) legt den Kunden-Ordner
+# race-safe an bzw. findet ihn (TenantKundeDrive) und zaehlt upload_count
+# hoch — hier liegt nur der App-Upload-Endpoint im Belege-Muster (rohe
+# Bytes + Content-Type, KEIN multipart). require_app_user (Monteur im Feld,
+# kein Inhaber-Gate). Feature-gegated: drive_archiv.
+# =====================================================================
+
+_ARCHIV_ALLOWED_MIMES = {"image/jpeg", "image/png", "image/webp", "application/pdf"}
+_ARCHIV_MAX_SIZE_BYTES = 25_000_000  # 25 MB (wie Telegram-/archiv)
+_ARCHIV_EXT = {
+    "image/jpeg": ".jpg", "image/png": ".png",
+    "image/webp": ".webp", "application/pdf": ".pdf",
+}
+
+
+def _normalize_archiv_mime(raw: str | None) -> str | None:
+    mime = (raw or "").split(";")[0].strip().lower()
+    return mime if mime in _ARCHIV_ALLOWED_MIMES else None
+
+
+def _archiv_note_blob(kunde_name: str, text: str) -> bytes:
+    """Text-Notiz als .txt mit Kopfzeile (Kunde + Zeitstempel) — spiegelt den
+    Telegram-Notiz-Header."""
+    ts = dt.datetime.now(dt.timezone.utc).strftime("%d.%m.%Y %H:%M")
+    header = f"Notiz für {kunde_name}\nErfasst: {ts} UTC\n" + ("-" * 40) + "\n\n"
+    return (header + text).encode("utf-8")
+
+
+async def _archiv_feature_ok(tid) -> bool:
+    from core.features.check import is_feature_enabled
+    return await is_feature_enabled(tid, "drive_archiv")
+
+
+@router.post("/archiv/upload")
+async def api_archiv_upload(
+    request: Request,
+    emp: Employee = Depends(require_app_user),
+    _c=Depends(require_app_csrf),
+) -> JSONResponse:
+    """Foto/PDF aus der PWA in den Drive-Ordner eines Kunden ablegen.
+
+    Body = rohe Datei-Bytes; Content-Type bestimmt den MIME. Query:
+    ?kunde_name= (Pflicht), ?filename=, ?kunde_email= (verbessert das
+    Ordner-Matching), optional ?caption= legt zusaetzlich eine Text-Notiz
+    in denselben Ordner."""
+    from core.integrations.google_drive import upload_file_to_kunde_folder
+    tid = current_tenant_id(request)
+    if not await _archiv_feature_ok(tid):
+        return JSONResponse({"ok": False, "error": "Das Kunden-Archiv ist nicht aktiv."}, status_code=403)
+
+    file_bytes = await request.body()
+    if not file_bytes:
+        return JSONResponse({"ok": False, "error": "Keine Datei empfangen."}, status_code=400)
+    if len(file_bytes) > _ARCHIV_MAX_SIZE_BYTES:
+        mb = len(file_bytes) // 1024 // 1024
+        return JSONResponse({"ok": False, "error": f"Datei zu gross ({mb} MB, max 25 MB)."}, status_code=413)
+    mime = _normalize_archiv_mime(request.headers.get("content-type"))
+    if mime is None:
+        return JSONResponse({"ok": False, "error": "Nur JPEG, PNG, WebP oder PDF erlaubt."}, status_code=415)
+
+    kunde_name = (request.query_params.get("kunde_name") or "").strip()[:200]
+    if len(kunde_name) < 2:
+        return JSONResponse({"ok": False, "error": "Kunde fehlt."}, status_code=400)
+    kunde_email = (request.query_params.get("kunde_email") or "").strip()[:200] or None
+    caption = (request.query_params.get("caption") or "").strip()[:1000] or None
+    ts = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d_%H%M%S")
+    filename = (
+        (request.query_params.get("filename") or "").strip()[:255]
+        or f"foto_{ts}{_ARCHIV_EXT.get(mime, '.bin')}"
+    )
+
+    try:
+        result = await upload_file_to_kunde_folder(
+            tenant_id=tid, kunde_name=kunde_name, file_bytes=file_bytes,
+            filename=filename, mime_type=mime, employee_id=emp.id,
+            kunde_email=kunde_email,
+        )
+        if caption:
+            # Notiz best-effort in denselben Ordner — der Datei-Upload oben
+            # bleibt auch dann gueltig, wenn die Notiz scheitert.
+            try:
+                await upload_file_to_kunde_folder(
+                    tenant_id=tid, kunde_name=kunde_name,
+                    file_bytes=_archiv_note_blob(kunde_name, caption),
+                    filename=f"notiz_{ts}.txt", mime_type="text/plain",
+                    employee_id=emp.id, kunde_email=kunde_email,
+                )
+            except Exception:  # noqa: BLE001
+                logger.warning("Archiv-Notiz neben Datei fehlgeschlagen (tenant=%s)", tid)
+    except ValueError as e:
+        # get_drive_service wirft ValueError wenn kein Drive-Scope verbunden ist
+        logger.info("Archiv-Upload ohne Drive-Verbindung (tenant=%s): %s", tid, e)
+        return JSONResponse(
+            {"ok": False, "error": "Google Drive ist nicht verbunden. Bitte in den Einstellungen verbinden."},
+            status_code=409,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.exception("PWA-Archiv-Upload fehlgeschlagen: %s", e)
+        return JSONResponse({"ok": False, "error": "Drive-Upload fehlgeschlagen. Bitte erneut versuchen."}, status_code=502)
+
+    logger.info("PWA-Archiv-Upload: tenant=%s mitarbeiter=%s kunde=%s mime=%s", tid, emp.id, kunde_name, mime)
+    return JSONResponse({
+        "ok": True,
+        "folder_url": result.get("kunde_folder_url"),
+        "upload_count": result.get("upload_count"),
+    })
+
+
+@router.post("/archiv/notiz")
+async def api_archiv_notiz(
+    request: Request,
+    emp: Employee = Depends(require_app_user),
+    _c=Depends(require_app_csrf),
+) -> JSONResponse:
+    """Reine Text-Notiz in den Kunden-Drive-Ordner.
+    Body JSON: { kunde_name, text, kunde_email? }."""
+    from core.integrations.google_drive import upload_file_to_kunde_folder
+    tid = current_tenant_id(request)
+    if not await _archiv_feature_ok(tid):
+        return JSONResponse({"ok": False, "error": "Das Kunden-Archiv ist nicht aktiv."}, status_code=403)
+    body = await request.json()
+    kunde_name = (body.get("kunde_name") or "").strip()[:200]
+    text = (body.get("text") or "").strip()
+    if len(kunde_name) < 2:
+        return JSONResponse({"ok": False, "error": "Kunde fehlt."}, status_code=400)
+    if len(text) < 2:
+        return JSONResponse({"ok": False, "error": "Notiz ist leer."}, status_code=400)
+    kunde_email = (body.get("kunde_email") or "").strip()[:200] or None
+    ts = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d_%H%M%S")
+    try:
+        result = await upload_file_to_kunde_folder(
+            tenant_id=tid, kunde_name=kunde_name,
+            file_bytes=_archiv_note_blob(kunde_name, text),
+            filename=f"notiz_{ts}.txt", mime_type="text/plain",
+            employee_id=emp.id, kunde_email=kunde_email,
+        )
+    except ValueError as e:
+        logger.info("Archiv-Notiz ohne Drive-Verbindung (tenant=%s): %s", tid, e)
+        return JSONResponse(
+            {"ok": False, "error": "Google Drive ist nicht verbunden. Bitte in den Einstellungen verbinden."},
+            status_code=409,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.exception("PWA-Archiv-Notiz fehlgeschlagen: %s", e)
+        return JSONResponse({"ok": False, "error": "Notiz konnte nicht abgelegt werden."}, status_code=502)
+    logger.info("PWA-Archiv-Notiz: tenant=%s mitarbeiter=%s kunde=%s", tid, emp.id, kunde_name)
+    return JSONResponse({
+        "ok": True,
+        "folder_url": result.get("kunde_folder_url"),
+        "upload_count": result.get("upload_count"),
+    })
+
+
+# =====================================================================
 # Wissensdatenbank (lesen / anlegen / löschen)
 # =====================================================================
 

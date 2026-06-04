@@ -16,7 +16,8 @@
 // Typ + Pflicht + Optionen, Reset auf Standard) im Mehr-Hub.
 // v22: echte PNG-Icons (192/512 + maskable + apple-touch) — saubere
 // Home-Screen-Installation auf iOS/Android.
-const CACHE = "ga-app-v22";
+// v23: Kunden-Archiv-Upload (Foto/PDF/Notiz in Drive-Ordner) im Kunden-Profil.
+const CACHE = "ga-app-v23";
 const SHELL = [
   "/app",
   "/app/static/app.css",

@@ -1818,6 +1818,16 @@ async function showKundenProfil(name) {
       <a class="row" href="${esc(d.drive.url)}" target="_blank" rel="noopener" style="text-decoration:none;color:inherit"><div><div>Ordner öffnen</div><div class="sub">${esc(String(d.drive.anzahl || 0))} Datei(en)${d.drive.letzter ? " · zuletzt " + esc(d.drive.letzter) : ""}</div></div><span class="sub">›</span></a>
     </div>`);
   }
+  if ((App.me.features || []).includes("drive_archiv")) {
+    parts.push(`<div class="card"><h2>📎 Zum Archiv hinzufügen</h2>
+      <p class="muted" style="font-size:12px;margin-top:0">Foto, PDF oder Notiz landet im Google-Drive-Ordner von ${esc(d.name)}.</p>
+      <input type="file" id="arch-file" accept="image/jpeg,image/png,image/webp,application/pdf" capture="environment" style="display:none">
+      <button class="btn-sm" id="arch-file-btn" style="width:100%;margin-bottom:8px">📷 Foto / PDF hochladen</button>
+      <textarea id="arch-note" rows="2" placeholder="Notiz (optional, wird beim Hochladen mitgespeichert) …" style="width:100%;padding:10px;border:1px solid var(--line);border-radius:10px;font-size:15px;margin-bottom:8px"></textarea>
+      <button class="btn-sm btn-ghost" id="arch-note-btn" style="width:100%">📝 Nur Notiz speichern</button>
+      <p class="muted" id="arch-msg" style="font-size:13px;margin-top:8px;text-align:center"></p>
+    </div>`);
+  }
   parts.push(`<div class="card"><h2>Gespräche (${(d.gespraeche || []).length})</h2>${
     (d.gespraeche || []).length ? d.gespraeche.map((x) => rowTap(x.briefing || "Aufnahme", "", x.zeit, x.id)).join("") : emptyRow("Keine Gespräche")
   }</div>`);
@@ -1829,7 +1839,63 @@ async function showKundenProfil(name) {
   }</div>`);
   App.view.innerHTML = parts.join("");
   document.getElementById("back-kunden").addEventListener("click", () => navigate("kunden"));
+  if ((App.me.features || []).includes("drive_archiv")) bindArchivUpload(d);
   bindAufnahmen();
+}
+
+// Archiv-Upload im Kunden-Profil: Foto/PDF (roher fetch mit Datei-MIME, wie
+// Beleg-Upload) + optionale/eigenständige Notiz. Nach Erfolg lädt das Profil
+// neu (Datei-Zähler/Ordner-Link aktualisieren).
+function bindArchivUpload(d) {
+  const fileBtn = document.getElementById("arch-file-btn");
+  const fileEl = document.getElementById("arch-file");
+  const noteBtn = document.getElementById("arch-note-btn");
+  const noteEl = document.getElementById("arch-note");
+  const msg = document.getElementById("arch-msg");
+  if (!fileBtn || !fileEl || !noteBtn || !noteEl) return;
+  const setM = (t, ok) => { msg.textContent = t; msg.style.color = ok ? "var(--ok,#1a7f37)" : "var(--err,#b42318)"; };
+  const q = (k, v) => (v ? `&${k}=${encodeURIComponent(v)}` : "");
+  const reload = () => setTimeout(() => showKundenProfil(d.name), 700);
+
+  fileBtn.addEventListener("click", () => fileEl.click());
+  fileEl.addEventListener("change", async () => {
+    const f = fileEl.files && fileEl.files[0];
+    if (!f) return;
+    if (f.size > 25 * 1024 * 1024) { setM("Datei zu groß (max 25 MB).", false); fileEl.value = ""; return; }
+    const orig = fileBtn.textContent;
+    fileBtn.disabled = true; fileBtn.textContent = "Lädt hoch …"; setM("", true);
+    const caption = (noteEl.value || "").trim();
+    const url = "/app/api/archiv/upload?kunde_name=" + encodeURIComponent(d.name)
+      + q("kunde_email", d.email) + q("filename", f.name) + q("caption", caption);
+    let j = null;
+    try {
+      const r = await fetch(url, {
+        method: "POST",
+        headers: { "X-CSRF-Token": App.me.csrf, "Content-Type": f.type || "application/octet-stream" },
+        body: f,
+      });
+      if (r.status === 303 || r.status === 401) { location.href = "/app/login"; return; }
+      j = await r.json().catch(() => null);
+    } catch (e) { /* Netzfehler -> j bleibt null */ }
+    fileBtn.disabled = false; fileBtn.textContent = orig; fileEl.value = "";
+    if (j && j.ok) { noteEl.value = ""; setM("✓ Hochgeladen.", true); reload(); }
+    else { setM((j && j.error) || "Upload fehlgeschlagen.", false); }
+  });
+
+  noteBtn.addEventListener("click", async () => {
+    const text = (noteEl.value || "").trim();
+    if (text.length < 2) { setM("Notiz ist leer.", false); return; }
+    const orig = noteBtn.textContent;
+    noteBtn.disabled = true; noteBtn.textContent = "Speichert …"; setM("", true);
+    const r = await api("/app/api/archiv/notiz", {
+      method: "POST",
+      body: JSON.stringify({ kunde_name: d.name, text, kunde_email: d.email || "" }),
+    });
+    const j = r ? await r.json().catch(() => null) : null;
+    noteBtn.disabled = false; noteBtn.textContent = orig;
+    if (j && j.ok) { noteEl.value = ""; setM("✓ Notiz gespeichert.", true); reload(); }
+    else { setM((j && j.error) || "Konnte Notiz nicht speichern.", false); }
+  });
 }
 
 // ---------- Material-Bestellverlauf ----------
