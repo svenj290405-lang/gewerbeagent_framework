@@ -710,6 +710,11 @@ const SCREENS = {
       if (tool === "rueckruf_anlegen") return `Rückruf für ${r.kunde} angelegt.`;
       if (tool === "material_bestellen") return `${r.menge}× ${r.material} bestellt.`;
       if (tool === "abwesenheit_melden") return `${r.mitarbeiter} ist als ${r.typ} eingetragen.`;
+      if (tool === "wissen_merken") return `In der Wissensdatenbank gespeichert (${r.kategorie}).`;
+      if (tool === "rueckruf_erledigt") return `Rückruf von ${r.kunde} abgehakt.`;
+      if (tool === "mitarbeiter_zurueck") return `${r.mitarbeiter} ist wieder verfügbar.`;
+      if (tool === "auftrag_status") return `Auftrag von ${r.kunde}: ${r.status_label}.`;
+      if (tool === "material_anlegen") return `Material „${r.name}" im Katalog angelegt.`;
       return "Erledigt.";
     }
 

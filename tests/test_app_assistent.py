@@ -107,6 +107,31 @@ def test_feature_gate_filters_kalender_tools():
     assert "kunde_suchen" in names
 
 
+def test_feature_gate_filters_mail_and_lexware_tools():
+    ohne = _ctx(features=())
+    names = {s.name for s in cc._available_tools(ohne)}
+    assert "offene_anfragen" not in names          # braucht mail_intake
+    assert "auftrag_status" not in names            # braucht lexware (+Inhaber)
+    assert "team_status" in names
+    assert "wissen_suchen" in names
+    assert "wissen_merken" in names
+    assert "rueckruf_erledigt" in names
+
+
+def test_inhaber_gate_filters_new_write_tools():
+    monteur = _ctx(features=("kalender", "lexware", "mail_intake"), is_inhaber=False)
+    names = {s.name for s in cc._available_tools(monteur)}
+    assert "mitarbeiter_zurueck" not in names
+    assert "material_anlegen" not in names
+    assert "auftrag_status" not in names
+    assert "rueckruf_erledigt" in names
+    assert "anstehende_termine" in names
+
+
+def test_registry_has_all_tools():
+    assert len(cc._REGISTRY) == 18
+
+
 # --------------------------------------------------------------------------
 # Read-Schleife -> message
 # --------------------------------------------------------------------------

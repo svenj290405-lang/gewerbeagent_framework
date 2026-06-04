@@ -612,6 +612,271 @@ def _summary_abwesenheit(ctx: Ctx, args: dict) -> str:
     return f"{mit}{zeit} {label}?"
 
 
+# ---- READ (Erweiterung) ---------------------------------------------------
+
+async def _run_anstehende_termine(ctx: Ctx, args: dict) -> dict:
+    from core.database.connection import get_session
+    from core.models.kundengespraech import Kundengespraech
+    from sqlalchemy import select
+
+    try:
+        tage = int(args.get("tage") or 14)
+    except (TypeError, ValueError):
+        tage = 14
+    tage = max(1, min(tage, 60))
+    heute = dt.date.today()
+    bis = heute + dt.timedelta(days=tage)
+    async with get_session() as s:
+        rows = (await s.execute(
+            select(Kundengespraech)
+            .where(Kundengespraech.tenant_id == ctx.tid)
+            .where(Kundengespraech.termin_datum.is_not(None))
+            .where(Kundengespraech.termin_datum >= heute)
+            .where(Kundengespraech.termin_datum < bis)
+            .order_by(Kundengespraech.termin_datum.asc()).limit(30)
+        )).scalars().all()
+    return {"anzahl": len(rows), "termine": [
+        {"kunde": r.kunde_name,
+         "termin": r.termin_datum.isoformat() if r.termin_datum else None,
+         "info": (r.briefing_kurz or "")[:120]} for r in rows]}
+
+
+async def _run_team_status(ctx: Ctx, args: dict) -> dict:
+    from core.models.employee import get_employees_for_tenant
+    from core.models.employee_absence import get_active_absences, get_upcoming_absences
+
+    heute = dt.date.today()
+    employees = await get_employees_for_tenant(ctx.tid, active_only=False)
+    active = await get_active_absences(ctx.tid, heute)
+    upcoming = await get_upcoming_absences(ctx.tid, days_ahead=7)
+    absent_today = {emp.id: ab for emp, ab in active}
+    upc: dict = {}
+    for emp, ab in upcoming:
+        upc.setdefault(emp.id, []).append(ab)
+    out = []
+    for e in employees:
+        ab = absent_today.get(e.id)
+        out.append({
+            "name": e.name,
+            "inhaber": bool(getattr(e, "is_default", False)),
+            "aktiv": bool(getattr(e, "is_active", True)),
+            "abwesend_heute": (ab.absence_type if ab else None),
+            "kommende_abwesenheit": [a.start_date.isoformat() for a in upc.get(e.id, [])][:1],
+        })
+    return {"team": out}
+
+
+async def _run_offene_anfragen(ctx: Ctx, args: dict) -> dict:
+    from core.database.connection import get_session
+    from core.models.email_conversation import EmailConversation, STATE_CLOSED
+    from sqlalchemy import select
+
+    async with get_session() as s:
+        rows = (await s.execute(
+            select(EmailConversation)
+            .where(EmailConversation.tenant_id == ctx.tid)
+            .where(EmailConversation.state != STATE_CLOSED)
+            .order_by(EmailConversation.updated_at.desc()).limit(12)
+        )).scalars().all()
+    return {"anzahl": len(rows), "anfragen": [
+        {"kunde": r.kunde_name or "—", "betreff": (r.last_subject or "")[:120]} for r in rows]}
+
+
+async def _run_wissen_suchen(ctx: Ctx, args: dict) -> dict:
+    from core.database.connection import get_session
+    from core.models.tenant_knowledge import TenantKnowledge, KATEGORIE_LABELS
+    from sqlalchemy import select
+
+    frage = (args.get("frage") or "").strip()
+
+    async def _fetch(filtered: bool):
+        async with get_session() as s:
+            q = select(TenantKnowledge).where(TenantKnowledge.tenant_id == ctx.tid)
+            if filtered and len(frage) >= 2:
+                q = q.where(TenantKnowledge.text.ilike(f"%{frage}%"))
+            return (await s.execute(
+                q.order_by(TenantKnowledge.kategorie).limit(30))).scalars().all()
+
+    rows = await _fetch(filtered=True)
+    if frage and not rows:  # Filter ohne Treffer → alles liefern (Tabelle ist klein)
+        rows = await _fetch(filtered=False)
+    return {"eintraege": [
+        {"kategorie": KATEGORIE_LABELS.get(r.kategorie, r.kategorie), "text": r.text}
+        for r in rows]}
+
+
+# ---- WRITE (Erweiterung) --------------------------------------------------
+
+async def _run_wissen_merken(ctx: Ctx, args: dict) -> dict:
+    from core.database.connection import get_session
+    from core.models.tenant_knowledge import TenantKnowledge, KATEGORIE_LABELS
+
+    kategorie = (args.get("kategorie") or "").strip()
+    text = (args.get("text") or "").strip()
+    if kategorie not in KATEGORIE_LABELS:
+        kategorie = "faq"
+    if not (3 <= len(text) <= 2000):
+        return {"ok": False, "error": "Text muss 3–2000 Zeichen haben."}
+    async with get_session() as s:
+        s.add(TenantKnowledge(tenant_id=ctx.tid, kategorie=kategorie, text=text))
+        await s.commit()
+    return {"ok": True, "kategorie": KATEGORIE_LABELS.get(kategorie, kategorie), "text": text}
+
+
+def _summary_wissen(ctx: Ctx, args: dict) -> str:
+    t = (args.get("text") or "").strip()
+    return f"Zur Wissensdatenbank merken: „{t[:90]}{'…' if len(t) > 90 else ''}\"?"
+
+
+async def _run_rueckruf_erledigt(ctx: Ctx, args: dict) -> dict:
+    from core.database.connection import get_session
+    from core.models.rueckruf import (
+        Rueckruf, RUECKRUF_STATUS_OFFEN, RUECKRUF_STATUS_ERLEDIGT)
+    from sqlalchemy import select
+
+    name = (args.get("kunde_name") or "").strip()
+    if len(name) < 2:
+        return {"ok": False, "error": "Bitte den Kundennamen nennen."}
+    async with get_session() as s:
+        rows = (await s.execute(
+            select(Rueckruf)
+            .where(Rueckruf.tenant_id == ctx.tid)
+            .where(Rueckruf.status == RUECKRUF_STATUS_OFFEN)
+            .where(Rueckruf.kunde_name.ilike(f"%{name}%")).limit(2)
+        )).scalars().all()
+        if not rows:
+            return {"ok": False, "error": f"Kein offener Rückruf für '{name}'."}
+        if len(rows) > 1:
+            return {"ok": False, "error": f"Mehrere offene Rückrufe für '{name}' — bitte genauer."}
+        r = rows[0]
+        r.status = RUECKRUF_STATUS_ERLEDIGT
+        r.erledigt_at = dt.datetime.now(dt.timezone.utc)
+        r.erledigt_by_employee_id = getattr(ctx.employee, "id", None)
+        await s.commit()
+        kunde = r.kunde_name
+    return {"ok": True, "kunde": kunde}
+
+
+def _summary_rueckruf_erledigt(ctx: Ctx, args: dict) -> str:
+    return f"Rückruf von {(args.get('kunde_name') or '—').strip()} als erledigt abhaken?"
+
+
+async def _run_mitarbeiter_zurueck(ctx: Ctx, args: dict) -> dict:
+    from core.database.connection import get_session
+    from core.models.employee import Employee
+    from core.models.employee_absence import close_absence
+    from sqlalchemy import select, or_
+
+    mitarbeiter = (args.get("mitarbeiter") or "").strip()
+    if not mitarbeiter:
+        return {"ok": False, "error": "Bitte den Mitarbeiter nennen."}
+    async with get_session() as s:
+        emp = (await s.execute(
+            select(Employee)
+            .where(Employee.tenant_id == ctx.tid)
+            .where(or_(Employee.slug == mitarbeiter,
+                       Employee.name.ilike(f"%{mitarbeiter}%"))).limit(2)
+        )).scalars().all()
+    if not emp:
+        return {"ok": False, "error": f"Mitarbeiter '{mitarbeiter}' nicht gefunden."}
+    if len(emp) > 1:
+        return {"ok": False, "error": f"'{mitarbeiter}' ist nicht eindeutig — bitte Vor- und Nachname."}
+    closed = await close_absence(emp[0].id, dt.date.today())
+    return {"ok": True, "mitarbeiter": emp[0].name, "war_abwesend": closed is not None}
+
+
+def _summary_mitarbeiter_zurueck(ctx: Ctx, args: dict) -> str:
+    return f"{(args.get('mitarbeiter') or '—').strip()} als wieder verfügbar melden?"
+
+
+async def _run_auftrag_status(ctx: Ctx, args: dict) -> dict:
+    from core.database.connection import get_session
+    from core.models.angebot import (
+        Angebot, AUFTRAG_LIFECYCLE, AUFTRAG_LIFECYCLE_LABELS,
+        ANGEBOT_STATUS_ACCEPTED, ANGEBOT_STATUS_WORK_IN_PROGRESS,
+        ANGEBOT_STATUS_WORK_DONE, ANGEBOT_STATUS_ABGEBROCHEN)
+    from sqlalchemy import select
+
+    settable = {ANGEBOT_STATUS_ACCEPTED, ANGEBOT_STATUS_WORK_IN_PROGRESS,
+                ANGEBOT_STATUS_WORK_DONE, ANGEBOT_STATUS_ABGEBROCHEN}
+    name = (args.get("kunde_name") or "").strip()
+    status = (args.get("status") or "").strip()
+    if status not in settable:
+        return {"ok": False, "error": (
+            "Status muss accepted, arbeit_laeuft, arbeit_fertig oder "
+            "abgebrochen sein. (Rechnung-raus läuft separat.)")}
+    if len(name) < 2:
+        return {"ok": False, "error": "Bitte den Kundennamen nennen."}
+    relevante = set(AUFTRAG_LIFECYCLE) | {ANGEBOT_STATUS_ABGEBROCHEN}
+    async with get_session() as s:
+        rows = (await s.execute(
+            select(Angebot)
+            .where(Angebot.tenant_id == ctx.tid)
+            .where(Angebot.kunde_name.ilike(f"%{name}%"))
+            .where(Angebot.status.in_(relevante)).limit(2)
+        )).scalars().all()
+        if not rows:
+            return {"ok": False, "error": f"Kein laufender Auftrag für '{name}' gefunden."}
+        if len(rows) > 1:
+            return {"ok": False, "error": f"Mehrere Aufträge für '{name}' — bitte genauer."}
+        a = rows[0]
+        a.status = status
+        if status == ANGEBOT_STATUS_ACCEPTED and not a.accepted_at:
+            a.accepted_at = dt.datetime.now(dt.timezone.utc)
+        await s.commit()
+        kunde = a.kunde_name
+    return {"ok": True, "kunde": kunde, "status": status,
+            "status_label": AUFTRAG_LIFECYCLE_LABELS.get(status, status)}
+
+
+def _summary_auftrag_status(ctx: Ctx, args: dict) -> str:
+    label = {"accepted": "angenommen", "arbeit_laeuft": "Arbeit läuft",
+             "arbeit_fertig": "fertig", "abgebrochen": "abgebrochen"}.get(
+        (args.get("status") or "").strip(), args.get("status") or "?")
+    return f"Auftrag von {(args.get('kunde_name') or '—').strip()} auf „{label}\" setzen?"
+
+
+async def _run_material_anlegen(ctx: Ctx, args: dict) -> dict:
+    import re
+    from core.database.connection import get_session
+    from core.models.tenant_material import TenantMaterial
+    from sqlalchemy import select
+
+    name = (args.get("name") or "").strip()
+    link = (args.get("bestell_link") or "").strip()
+    if not name or not link:
+        return {"ok": False, "error": "Name und Bestell-Link sind Pflicht."}
+    try:
+        std = int(args.get("standard_menge") or 1)
+    except (TypeError, ValueError):
+        std = 1
+    base = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or "material"
+    async with get_session() as s:
+        slug = base
+        i = 2
+        while (await s.execute(
+            select(TenantMaterial.id)
+            .where(TenantMaterial.tenant_id == ctx.tid)
+            .where(TenantMaterial.slug == slug))).scalar_one_or_none() is not None:
+            slug = f"{base}-{i}"
+            i += 1
+            if i > 30:
+                return {"ok": False, "error": "Konnte keinen eindeutigen Slug bilden."}
+        m = TenantMaterial(
+            tenant_id=ctx.tid, slug=slug, name=name, bestell_link=link,
+            lieferant_name=(args.get("lieferant") or "").strip() or None,
+            einheit=(args.get("einheit") or "Stück").strip() or "Stück",
+            standard_menge=max(1, std),
+            notes=(args.get("notes") or "").strip() or None, aktiv=True)
+        s.add(m)
+        await s.commit()
+    return {"ok": True, "name": name, "slug": slug}
+
+
+def _summary_material_anlegen(ctx: Ctx, args: dict) -> str:
+    return f"Material „{(args.get('name') or '—').strip()}\" im Katalog anlegen?"
+
+
 # ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
@@ -703,4 +968,86 @@ _REGISTRY: list[ToolSpec] = [
             "notes": {"type": _S}},
             "required": ["mitarbeiter", "typ"]},
         run=_run_abwesenheit, summarize=_summary_abwesenheit),
+
+    # ---- READ (Erweiterung) ----
+    ToolSpec(
+        name="anstehende_termine", kind="read",
+        description="Zeigt die anstehenden Termine der nächsten Tage "
+                    "(aus den erfassten Kundengesprächen).",
+        parameters={"type": "OBJECT", "properties": {
+            "tage": {"type": _I, "description": "Vorausschau in Tagen (Standard 14, max 60)."}}},
+        run=_run_anstehende_termine),
+    ToolSpec(
+        name="team_status", kind="read",
+        description="Zeigt das Team: wer heute abwesend (krank/Urlaub) ist und "
+                    "welche Abwesenheiten anstehen.",
+        parameters={"type": "OBJECT", "properties": {}},
+        run=_run_team_status),
+    ToolSpec(
+        name="offene_anfragen", kind="read", feature="mail_intake",
+        description="Zeigt die offenen Kundenanfragen (E-Mail-Eingang), die noch "
+                    "nicht abgeschlossen sind.",
+        parameters={"type": "OBJECT", "properties": {}},
+        run=_run_offene_anfragen),
+    ToolSpec(
+        name="wissen_suchen", kind="read",
+        description="Durchsucht die Wissensdatenbank des Betriebs (Preise, "
+                    "Leistungen, Anfahrt, Öffnungszeiten, Besonderheiten …) und "
+                    "liefert passende Einträge, um eine Frage zu beantworten.",
+        parameters={"type": "OBJECT", "properties": {
+            "frage": {"type": _S, "description": "Suchbegriff/Stichwort (optional — leer = alles)."}}},
+        run=_run_wissen_suchen),
+
+    # ---- WRITE (Erweiterung) ----
+    ToolSpec(
+        name="wissen_merken", kind="write",
+        description="Speichert eine Information dauerhaft in der "
+                    "Wissensdatenbank (z.B. Preis, Regel, Besonderheit).",
+        parameters={"type": "OBJECT", "properties": {
+            "text": {"type": _S, "description": "Der zu merkende Text."},
+            "kategorie": {"type": _S,
+                          "description": "leistungen | materialien | preise | anfahrt | "
+                                         "oeffnungszeiten | notfall | besonderheiten | faq.",
+                          "enum": ["leistungen", "materialien", "preise", "anfahrt",
+                                   "oeffnungszeiten", "notfall", "besonderheiten", "faq"]}},
+            "required": ["text"]},
+        run=_run_wissen_merken, summarize=_summary_wissen),
+    ToolSpec(
+        name="rueckruf_erledigt", kind="write",
+        description="Hakt den offenen Rückruf eines Kunden als erledigt ab "
+                    "(nur bei genau einem eindeutigen offenen Rückruf).",
+        parameters={"type": "OBJECT", "properties": {
+            "kunde_name": {"type": _S, "description": "Name des Kunden."}},
+            "required": ["kunde_name"]},
+        run=_run_rueckruf_erledigt, summarize=_summary_rueckruf_erledigt),
+    ToolSpec(
+        name="mitarbeiter_zurueck", kind="write", requires_inhaber=True,
+        description="Meldet einen Mitarbeiter wieder verfügbar (beendet seine "
+                    "laufende Abwesenheit). Nur für den Inhaber.",
+        parameters={"type": "OBJECT", "properties": {
+            "mitarbeiter": {"type": _S, "description": "Name oder Kürzel des Mitarbeiters."}},
+            "required": ["mitarbeiter"]},
+        run=_run_mitarbeiter_zurueck, summarize=_summary_mitarbeiter_zurueck),
+    ToolSpec(
+        name="auftrag_status", kind="write", requires_inhaber=True, feature="lexware",
+        description="Setzt den Status eines laufenden Auftrags (per Kundenname). "
+                    "Mögliche Stufen: accepted (angenommen), arbeit_laeuft, "
+                    "arbeit_fertig, abgebrochen. Der Rechnungsversand läuft separat.",
+        parameters={"type": "OBJECT", "properties": {
+            "kunde_name": {"type": _S, "description": "Name des Kunden."},
+            "status": {"type": _S, "description": "Neuer Status.",
+                       "enum": ["accepted", "arbeit_laeuft", "arbeit_fertig", "abgebrochen"]}},
+            "required": ["kunde_name", "status"]},
+        run=_run_auftrag_status, summarize=_summary_auftrag_status),
+    ToolSpec(
+        name="material_anlegen", kind="write", requires_inhaber=True,
+        description="Legt einen neuen Material-Eintrag im Bestell-Katalog an "
+                    "(braucht Name und Bestell-Link). Nur für den Inhaber.",
+        parameters={"type": "OBJECT", "properties": {
+            "name": {"type": _S, "description": "Material-Name."},
+            "bestell_link": {"type": _S, "description": "URL zum Bestellen."},
+            "lieferant": {"type": _S}, "einheit": {"type": _S, "description": "z.B. Stück, Meter, kg."},
+            "standard_menge": {"type": _I}, "notes": {"type": _S}},
+            "required": ["name", "bestell_link"]},
+        run=_run_material_anlegen, summarize=_summary_material_anlegen),
 ]

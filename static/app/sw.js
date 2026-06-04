@@ -8,10 +8,10 @@
  *  - Minimaler Offline-Shell-Cache (App-Rahmen laedt auch ohne Netz; die
  *    eigentlichen Daten kommen immer frisch vom Server).
  */
-// v14: Assistent (Gemini-Kommando-Zentrale, Function-Calling + Sprachbefehl),
-// zusaetzlich zu Kunden-Profil (v13) + Visualisierung (v12) +
-// Material-Bestellungen (v11) + Aufträge (v10) + Belege (v9) + Diktat (v8).
-const CACHE = "ga-app-v14";
+// v15: Assistent-Tools erweitert (anstehende Termine, Team-Status, offene
+// Anfragen, Wissen suchen/merken, Rückruf abhaken, Mitarbeiter zurück,
+// Auftrag-Status, Material anlegen), aufbauend auf v14 (Assistent-Basis).
+const CACHE = "ga-app-v15";
 const SHELL = [
   "/app",
   "/app/static/app.css",
