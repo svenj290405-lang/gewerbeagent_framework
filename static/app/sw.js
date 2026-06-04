@@ -10,7 +10,9 @@
  */
 // v19: Mitarbeiter-Aktivierung (Einladungs-Link) + Team-Aktivität (30 Tage)
 // + App-verbunden-Anzeige korrekt, aufbauend auf v18.
-const CACHE = "ga-app-v19";
+// v20: Verbindungen im Einstellungen-Screen (Google/Microsoft OAuth +
+// Lexware-API-Key direkt aus der App).
+const CACHE = "ga-app-v20";
 const SHELL = [
   "/app",
   "/app/static/app.css",

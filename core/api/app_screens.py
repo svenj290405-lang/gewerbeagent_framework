@@ -2085,6 +2085,219 @@ async def api_einstellungen_set(
     return JSONResponse({"ok": True})
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Verbindungen (OAuth + API-Keys) im Einstellungen-Screen
+#
+# Telegram-Paritaet: der Inhaber verknuepft Google (Kalender + Drive),
+# Microsoft/Outlook und Lexware Office direkt aus der App. Der OAuth-Kern
+# (generate_auth_url / handle_callback / OAuthState / OAuthToken) wird
+# UNVERAENDERT wiederverwendet — hier liegt nur die App-Bedienoberflaeche
+# darauf. Wichtig: Google-Kalender und Drive teilen sich EINEN Google-Token
+# (ein Consent deckt beide Scopes ab); Lexware ist KEIN OAuth, sondern ein
+# manueller API-Key, der verschluesselt in der ToolConfig landet.
+# ─────────────────────────────────────────────────────────────────────
+
+_OAUTH_APP_PROVIDERS = ("google", "microsoft")
+
+
+async def _microsoft_oauth_available() -> bool:
+    """True wenn die Microsoft-OAuth-Client-Credentials hinterlegt sind
+    (ToolConfig 'microsoft_oauth'). Ohne sie kann kein Tenant Outlook
+    verbinden — dann blendet die App den Button aus statt einen Fehler-
+    Klick anzubieten."""
+    from core.models.tool_config import ToolConfig
+    async with get_session() as s:
+        row = (await s.execute(
+            select(ToolConfig).where(ToolConfig.tool_name == "microsoft_oauth")
+        )).first()
+    return row is not None
+
+
+async def _verbindungen_status(tid: uuid.UUID, employee_id: uuid.UUID) -> dict:
+    """Liefert pro Anbieter den Verbindungs-Status fuer den Einstellungen-
+    Screen. Nutzt denselben Token-Lookup (employee-aware Fallback) wie der
+    Rest des Systems, damit „verbunden?" exakt das widerspiegelt, was die
+    Integrationen zur Laufzeit sehen."""
+    from core.security.oauth_token_lookup import find_oauth_token
+    from core.integrations.google_drive import is_drive_configured
+    from core.models.tool_config import ToolConfig
+
+    # Google — ein Token deckt Kalender UND Drive (Scope-abhaengig)
+    g = await find_oauth_token(tid, "google", employee_id)
+    g_scopes = (getattr(g, "scopes", "") or "").split(",") if g else []
+    google = {
+        "connected": g is not None,
+        "account": getattr(g, "account_email", None) if g else None,
+        "kalender": bool(g) and any("calendar" in s for s in g_scopes),
+        "drive": is_drive_configured(g),
+    }
+
+    # Microsoft / Outlook — eigener Token
+    m = await find_oauth_token(tid, "microsoft", employee_id)
+    microsoft = {
+        "connected": m is not None,
+        "account": getattr(m, "account_email", None) if m else None,
+        "available": await _microsoft_oauth_available(),
+    }
+
+    # Lexware — API-Key in ToolConfig (kein OAuth)
+    async with get_session() as s:
+        tc = (await s.execute(
+            select(ToolConfig).where(
+                ToolConfig.tenant_id == tid,
+                ToolConfig.tool_name == "lexware",
+            )
+        )).scalar_one_or_none()
+    lex_cfg = (tc.config or {}) if tc else {}
+    lexware = {
+        "connected": bool(tc and tc.enabled and lex_cfg.get("encrypted_api_key")),
+        "account": lex_cfg.get("organization_id"),
+    }
+
+    return {"google": google, "microsoft": microsoft, "lexware": lexware}
+
+
+@router.get("/verbindungen")
+async def api_verbindungen_get(
+    request: Request, _e=Depends(require_app_inhaber),
+) -> JSONResponse:
+    """Verbindungs-Status (Google/Microsoft/Lexware) — nur Inhaber."""
+    tid = current_tenant_id(request)
+    emp = request.state.app_employee
+    return JSONResponse(await _verbindungen_status(tid, emp.id))
+
+
+@router.post("/oauth/start")
+async def api_oauth_start(
+    request: Request,
+    _e=Depends(require_app_inhaber),
+    _c=Depends(require_app_csrf),
+) -> JSONResponse:
+    """Startet einen OAuth-Flow aus der App heraus. Liefert die Authorize-
+    URL zurueck; das Frontend oeffnet sie in einem Popup (so umgeht es den
+    Service-Worker und die Redirect-Kette landet sauber bei Google/MS).
+    tenant_slug + employee_slug kommen aus der SESSION, nie vom Client —
+    so bleibt die Tenant-Isolation hart serverseitig. Body: { provider }."""
+    from core.security.oauth_flow import generate_auth_url
+    body = await request.json()
+    provider = (body.get("provider") or "").strip()
+    if provider not in _OAUTH_APP_PROVIDERS:
+        return JSONResponse({"ok": False, "error": "Unbekannter Anbieter."}, status_code=400)
+    tenant = request.state.app_tenant
+    emp = request.state.app_employee
+    try:
+        auth_url = await generate_auth_url(
+            tenant_slug=tenant.slug, provider=provider, employee_slug=emp.slug,
+        )
+    except Exception:
+        # Kein str(e) ans Frontend — interne Details nicht leaken.
+        logger.exception("App-OAuth-Start fehlgeschlagen (provider=%s)", provider)
+        return JSONResponse(
+            {"ok": False,
+             "error": "Verbindung konnte nicht gestartet werden. "
+                      "Ist der Anbieter eingerichtet?"},
+            status_code=500,
+        )
+    return JSONResponse({"ok": True, "auth_url": auth_url})
+
+
+@router.post("/lexware/verbinden")
+async def api_lexware_verbinden(
+    request: Request,
+    _e=Depends(require_app_inhaber),
+    _c=Depends(require_app_csrf),
+) -> JSONResponse:
+    """Lexware-API-Key entgegennehmen, gegen Lexware live pruefen
+    (health_check) und verschluesselt in der ToolConfig ablegen. Spiegelt
+    den Telegram-/lexware_setup-Flow, ohne den Telegram-Handler zu
+    importieren. Body: { api_key }."""
+    from core.integrations.lexware import LexwareProvider
+    from core.security.encryption import encrypt
+    from core.models.tool_config import ToolConfig
+    tid = current_tenant_id(request)
+    body = await request.json()
+    api_key = (body.get("api_key") or "").strip()
+    if len(api_key) < 20 or " " in api_key:
+        return JSONResponse(
+            {"ok": False, "error": "Bitte einen gueltigen Lexware-API-Schluessel eingeben."},
+            status_code=400,
+        )
+    # Live-Check, BEVOR wir speichern — kein toter Key in der DB.
+    try:
+        info = await LexwareProvider(api_key=api_key).health_check()
+    except Exception:
+        logger.warning("Lexware-Health-Check fehlgeschlagen (App-Verbindung, tenant=%s)", tid)
+        return JSONResponse(
+            {"ok": False, "error": "Schluessel ungueltig oder Lexware nicht erreichbar."},
+            status_code=400,
+        )
+    org_id = (info or {}).get("organizationId")
+    encrypted = encrypt(api_key)
+    async with get_session() as s:
+        tc = (await s.execute(
+            select(ToolConfig).where(
+                ToolConfig.tenant_id == tid,
+                ToolConfig.tool_name == "lexware",
+            )
+        )).scalar_one_or_none()
+        if tc is None:
+            tc = ToolConfig(tenant_id=tid, tool_name="lexware", enabled=True, config={})
+            s.add(tc)
+        cfg = dict(tc.config or {})
+        cfg["encrypted_api_key"] = encrypted
+        if org_id:
+            cfg["organization_id"] = org_id
+        tc.config = cfg
+        tc.enabled = True
+        await s.commit()
+    return JSONResponse({"ok": True, "account": org_id})
+
+
+@router.post("/verbindungen/trennen")
+async def api_verbindungen_trennen(
+    request: Request,
+    _e=Depends(require_app_inhaber),
+    _c=Depends(require_app_csrf),
+) -> JSONResponse:
+    """Trennt eine Verbindung. Google/Microsoft: Token loeschen (der Lookup
+    liefert den Tenant-Token = Default-/Inhaber-Employee). Lexware: ToolConfig
+    deaktivieren + Key entfernen. Body: { provider }."""
+    from core.models.tool_config import ToolConfig
+    from sqlalchemy import delete as sa_delete
+    tid = current_tenant_id(request)
+    emp = request.state.app_employee
+    body = await request.json()
+    provider = (body.get("provider") or "").strip()
+
+    if provider == "lexware":
+        async with get_session() as s:
+            tc = (await s.execute(
+                select(ToolConfig).where(
+                    ToolConfig.tenant_id == tid,
+                    ToolConfig.tool_name == "lexware",
+                )
+            )).scalar_one_or_none()
+            if tc is not None:
+                cfg = dict(tc.config or {})
+                cfg.pop("encrypted_api_key", None)
+                tc.config = cfg
+                tc.enabled = False
+                await s.commit()
+        return JSONResponse({"ok": True})
+
+    if provider in _OAUTH_APP_PROVIDERS:
+        from core.security.oauth_token_lookup import find_oauth_token
+        from core.models import OAuthToken
+        tok = await find_oauth_token(tid, provider, emp.id)
+        if tok is not None:
+            async with get_session() as s:
+                await s.execute(sa_delete(OAuthToken).where(OAuthToken.id == tok.id))
+                await s.commit()
+        return JSONResponse({"ok": True})
+
+    return JSONResponse({"ok": False, "error": "Unbekannter Anbieter."}, status_code=400)
+
+
 @router.post("/team/anlegen")
 async def api_team_anlegen(
     request: Request,

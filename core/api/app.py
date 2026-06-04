@@ -385,6 +385,13 @@ async def oauth_callback(
                 <p>Account <b>{safe_email}</b> wurde mit
                 dem Gewerbeagent-Framework verknuepft.</p>
                 <p>Du kannst dieses Fenster jetzt schliessen.</p>
+                <script>
+                  // Aus der PWA per window.open geoeffnet? Dann automatisch
+                  // schliessen — die App laedt den Status beim Schliessen neu.
+                  // Im normalen Browser-Tab (z.B. via Telegram-Link) ist
+                  // window.close() ein No-Op, schadet also nicht.
+                  setTimeout(function() {{ try {{ window.close(); }} catch (e) {{}} }}, 1500);
+                </script>
             </body>
             </html>
             """,

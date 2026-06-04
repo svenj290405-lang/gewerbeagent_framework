@@ -563,6 +563,7 @@ const SCREENS = {
         fld("PLZ", "heimat_plz") +
         fld("Ort", "heimat_ort") +
       `</div>` +
+      (isInhaber ? `<div id="verbindungen-mount"></div>` : "") +
       readOnlyBlock +
       (isInhaber ? `<button class="btn-sm" id="set-save" style="width:100%;margin-top:8px">Speichern</button>` : "");
 
@@ -591,6 +592,132 @@ const SCREENS = {
         saveBtn.disabled = false; saveBtn.textContent = "Speichern";
       });
     }
+
+    // ── Verbindungen (OAuth + Lexware) — nur Inhaber ───────────────────
+    if (!isInhaber) return;
+
+    const row = (title, sub, btns) =>
+      `<div class="row" style="align-items:flex-start;gap:8px">
+         <div style="min-width:0"><div>${title}</div><div class="sub" style="word-break:break-word">${sub}</div></div>
+         <div style="display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end;flex-shrink:0">${btns}</div>
+       </div>`;
+
+    const startOAuth = (provider) => {
+      // Popup SYNCHRON im Klick-Gesture oeffnen (sonst Popup-Blocker),
+      // dann Ziel-URL setzen sobald die Authorize-URL da ist.
+      const w = window.open("", "ga_oauth", "width=520,height=720");
+      api("/app/api/oauth/start", { method: "POST", body: JSON.stringify({ provider }) })
+        .then((r) => (r && r.ok ? r.json() : null))
+        .then((j) => {
+          if (j && j.ok && j.auth_url) {
+            if (w) { w.location = j.auth_url; watchPopup(w); }
+            else { window.location = j.auth_url; }
+          } else {
+            if (w) w.close();
+            alert((j && j.error) || "Verbindung konnte nicht gestartet werden.");
+          }
+        })
+        .catch(() => { if (w) w.close(); alert("Verbindung konnte nicht gestartet werden."); });
+    };
+
+    const watchPopup = (w) => {
+      if (!w) return;
+      const iv = setInterval(() => {
+        if (w.closed) { clearInterval(iv); renderVerbindungen(); }
+      }, 1000);
+      setTimeout(() => clearInterval(iv), 300000); // Sicherheitsnetz: 5 min
+    };
+
+    const trennen = async (provider) => {
+      const names = { google: "Google", microsoft: "Microsoft/Outlook", lexware: "Lexware" };
+      if (!confirm(`${names[provider] || provider}-Verbindung wirklich trennen?`)) return;
+      const r = await api("/app/api/verbindungen/trennen",
+        { method: "POST", body: JSON.stringify({ provider }) });
+      if (r && r.ok) renderVerbindungen(); else alert("Konnte nicht trennen.");
+    };
+
+    const saveLexware = async () => {
+      const inp = document.getElementById("lexware-key");
+      const msg = document.getElementById("lexware-msg");
+      const btn = document.getElementById("lexware-save");
+      const key = (inp.value || "").trim();
+      if (key.length < 20) { msg.textContent = "Bitte einen gültigen Schlüssel eingeben."; return; }
+      btn.disabled = true; btn.textContent = "Prüfe …"; msg.textContent = "";
+      const r = await api("/app/api/lexware/verbinden",
+        { method: "POST", body: JSON.stringify({ api_key: key }) });
+      const j = r ? await r.json().catch(() => null) : null;
+      btn.disabled = false; btn.textContent = "Schlüssel speichern";
+      if (j && j.ok) { inp.value = ""; renderVerbindungen(); }
+      else { msg.textContent = (j && j.error) || "Konnte nicht speichern."; }
+    };
+
+    const renderVerbindungen = async () => {
+      const mount = document.getElementById("verbindungen-mount");
+      if (!mount) return;
+      mount.innerHTML = `<div class="card"><h2>Verbindungen</h2><p class="muted">Lädt …</p></div>`;
+      const r = await api("/app/api/verbindungen");
+      if (!r || !r.ok) {
+        mount.innerHTML = `<div class="card"><h2>Verbindungen</h2><p class="muted">Konnte Verbindungen nicht laden.</p></div>`;
+        return;
+      }
+      const v = await r.json();
+
+      const g = v.google || {};
+      const gScopes = [g.kalender ? "Kalender" : null, g.drive ? "Drive" : null].filter(Boolean).join(" + ");
+      const gSub = g.connected
+        ? `✓ ${esc(g.account || "verbunden")}${gScopes ? ` · ${gScopes}` : ""}`
+        : "Kalender & Drive verbinden";
+      const gBtns = g.connected
+        ? `<button class="btn-sm btn-ghost" data-oauth="google">Neu verbinden</button><button class="btn-sm btn-ghost" data-trennen="google">Trennen</button>`
+        : `<button class="btn-sm" data-oauth="google">Verbinden</button>`;
+
+      const m = v.microsoft || {};
+      let mSub, mBtns;
+      if (!m.available) { mSub = "Nicht verfügbar — bitte Support kontaktieren"; mBtns = ""; }
+      else if (m.connected) {
+        mSub = `✓ ${esc(m.account || "verbunden")}`;
+        mBtns = `<button class="btn-sm btn-ghost" data-oauth="microsoft">Neu verbinden</button><button class="btn-sm btn-ghost" data-trennen="microsoft">Trennen</button>`;
+      } else {
+        mSub = "Outlook-Postfach & Kalender verbinden";
+        mBtns = `<button class="btn-sm" data-oauth="microsoft">Verbinden</button>`;
+      }
+
+      const lx = v.lexware || {};
+      const lxSub = lx.connected
+        ? `✓ verbunden${lx.account ? ` · Org ${esc(lx.account)}` : ""}`
+        : "Buchhaltung verbinden (API-Schlüssel)";
+      const lxBtns = lx.connected
+        ? `<button class="btn-sm btn-ghost" data-lexware="1">Schlüssel ändern</button><button class="btn-sm btn-ghost" data-trennen="lexware">Trennen</button>`
+        : `<button class="btn-sm" data-lexware="1">Verbinden</button>`;
+
+      mount.innerHTML = `<div class="card"><h2>Verbindungen</h2>
+        <p class="muted" style="font-size:12px;margin-top:0">Verknüpfe deine Konten direkt hier — kein Umweg mehr über Telegram oder den Setup-Bereich.</p>
+        ${row("📅 Google (Kalender + Drive)", gSub, gBtns)}
+        ${row("✉️ Microsoft / Outlook", mSub, mBtns)}
+        ${row("🧾 Lexware Office", lxSub, lxBtns)}
+        <div id="lexware-form" style="display:none;margin-top:10px">
+          <label class="sub">Lexware API-Schlüssel</label>
+          <input type="text" id="lexware-key" placeholder="aus app.lexware.de → Profil → API-Keys" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" style="width:100%;padding:12px;border:1px solid var(--line);border-radius:10px;margin:4px 0 8px;font-size:16px" />
+          <button class="btn-sm" id="lexware-save" style="width:100%">Schlüssel speichern</button>
+          <p class="muted" id="lexware-msg" style="font-size:12px;margin-top:6px"></p>
+        </div>
+      </div>`;
+
+      mount.querySelectorAll("[data-oauth]").forEach((b) =>
+        b.addEventListener("click", () => startOAuth(b.getAttribute("data-oauth"))));
+      mount.querySelectorAll("[data-trennen]").forEach((b) =>
+        b.addEventListener("click", () => trennen(b.getAttribute("data-trennen"))));
+      mount.querySelectorAll("[data-lexware]").forEach((b) =>
+        b.addEventListener("click", () => {
+          const f = document.getElementById("lexware-form");
+          f.style.display = f.style.display === "none" ? "block" : "none";
+          if (f.style.display === "block") document.getElementById("lexware-key").focus();
+        }));
+      const lxSave = document.getElementById("lexware-save");
+      if (lxSave) lxSave.addEventListener("click", saveLexware);
+    };
+
+    renderVerbindungen();
   },
 
   async mehr() {
