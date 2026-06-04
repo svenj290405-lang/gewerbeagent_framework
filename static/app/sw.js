@@ -8,9 +8,9 @@
  *  - Minimaler Offline-Shell-Cache (App-Rahmen laedt auch ohne Netz; die
  *    eigentlichen Daten kommen immer frisch vom Server).
  */
-// v18: Assistent als echter Chat mit „Q" (Nachrichten-Blasen, Tipp-Animation,
-// feste Eingabeleiste mit Upload/Mikro/Senden), aufbauend auf v17.
-const CACHE = "ga-app-v18";
+// v19: Mitarbeiter-Aktivierung (Einladungs-Link) + Team-Aktivität (30 Tage)
+// + App-verbunden-Anzeige korrekt, aufbauend auf v18.
+const CACHE = "ga-app-v19";
 const SHELL = [
   "/app",
   "/app/static/app.css",

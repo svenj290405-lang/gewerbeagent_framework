@@ -187,6 +187,9 @@ async def create_app_session(
     )
     session.add(sess)
     await session.flush()
+    # Aktivitaets-Tracking (failsafe, eigene Session) — jeder Login zaehlt.
+    from core.models.app_usage_event import record_app_usage, USAGE_LOGIN
+    await record_app_usage(employee.tenant_id, employee.id, USAGE_LOGIN)
     return sess
 
 

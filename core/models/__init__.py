@@ -318,6 +318,13 @@ __all__ = [
     "RUECKRUF_STATUS_LABEL",
     "AppSession",
     "AppLoginToken",
+    "AppUsageEvent",
+    "record_app_usage",
+    "usage_counts_by_employee",
+    "USAGE_LOGIN",
+    "USAGE_ASSISTENT_BEFEHL",
+    "USAGE_ASSISTENT_AKTION",
+    "USAGE_DIKTAT",
     "PushSubscription",
     "APP_SESSION_LIFETIME",
     "APP_LOGIN_TOKEN_LIFETIME",
@@ -394,6 +401,15 @@ from core.models.app_account import (
     PushSubscription,
     APP_SESSION_LIFETIME,
     APP_LOGIN_TOKEN_LIFETIME,
+)
+from core.models.app_usage_event import (
+    AppUsageEvent,
+    record_app_usage,
+    usage_counts_by_employee,
+    USAGE_LOGIN,
+    USAGE_ASSISTENT_BEFEHL,
+    USAGE_ASSISTENT_AKTION,
+    USAGE_DIKTAT,
 )
 from core.models.failed_mail_queue import (
     FailedMailQueue,

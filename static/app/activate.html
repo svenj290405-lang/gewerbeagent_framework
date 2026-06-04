@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#0066cc" />
+  <title>Gewerbeagent — Zugang einrichten</title>
+  <link rel="icon" href="/app/static/icon.svg" />
+  <link rel="manifest" href="/app/manifest.webmanifest" />
+  <link rel="stylesheet" href="/app/static/app.css" />
+</head>
+<body class="login-body">
+  <main class="login-card">
+    <img src="/app/static/icon.svg" alt="" width="64" height="64" />
+    <h1 id="title">Zugang einrichten</h1>
+    <p class="muted" id="sub">Einen Moment …</p>
+
+    <p id="msg" class="msg" role="status" aria-live="polite"></p>
+
+    <form id="act-form" method="post" action="/app/activate/setzen" hidden>
+      <input type="hidden" id="token" name="token" />
+      <label for="email">Deine E-Mail</label>
+      <input id="email" name="email" type="email" autocomplete="username"
+             required placeholder="du@betrieb.de" />
+      <label for="password">Passwort wählen (mind. 6 Zeichen)</label>
+      <input id="password" name="password" type="password"
+             autocomplete="new-password" required minlength="6" placeholder="••••••••" />
+      <label for="password2">Passwort wiederholen</label>
+      <input id="password2" type="password" autocomplete="new-password"
+             required minlength="6" placeholder="••••••••" />
+      <button type="submit" id="submit-btn">Loslegen</button>
+    </form>
+
+    <p class="muted" id="back" hidden style="margin-top:18px">
+      <a href="/app/login">Zur Anmeldung</a>
+    </p>
+  </main>
+
+  <script>
+    const params = new URLSearchParams(location.search);
+    const token = params.get("token") || "";
+    const msg = document.getElementById("msg");
+    const form = document.getElementById("act-form");
+    const back = document.getElementById("back");
+    const fehler = params.get("fehler");
+    if (fehler === "eingabe") msg.textContent = "Bitte gültige E-Mail und Passwort (mind. 6 Zeichen) eingeben.";
+    else if (fehler === "link") msg.textContent = "Der Einladungs-Link ist abgelaufen oder schon benutzt.";
+
+    async function init() {
+      if (!token) { showInvalid(); return; }
+      try {
+        const res = await fetch("/app/activate/info?token=" + encodeURIComponent(token));
+        const d = await res.json();
+        if (!d.ok) { showInvalid(); return; }
+        document.getElementById("title").textContent = "Hallo " + (d.name ? d.name.split(" ")[0] : "") + " 👋";
+        document.getElementById("sub").textContent =
+          (d.company ? d.company + " — r" : "R") + "ichte deinen App-Zugang ein.";
+        document.getElementById("token").value = token;
+        if (d.email) document.getElementById("email").value = d.email;
+        form.hidden = false;
+      } catch (e) { showInvalid(); }
+    }
+
+    function showInvalid() {
+      document.getElementById("title").textContent = "Link ungültig";
+      document.getElementById("sub").textContent =
+        "Dieser Einladungs-Link ist abgelaufen oder wurde schon benutzt. Bitte deinen Chef um einen neuen.";
+      back.hidden = false;
+    }
+
+    form.addEventListener("submit", (e) => {
+      const p1 = document.getElementById("password").value;
+      const p2 = document.getElementById("password2").value;
+      if (p1 !== p2) {
+        e.preventDefault();
+        msg.textContent = "Die Passwörter stimmen nicht überein.";
+      } else {
+        document.getElementById("submit-btn").disabled = true;
+      }
+    });
+
+    init();
+  </script>
+</body>
+</html>

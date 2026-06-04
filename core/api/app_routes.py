@@ -41,6 +41,7 @@ from core.security.app_auth import (
     require_app_csrf,
     require_app_user,
     revoke_app_session,
+    set_app_password_hash,
     set_app_session_cookie,
     verify_app_login,
     APP_SESSION_COOKIE_NAME,
@@ -211,6 +212,90 @@ async def app_logout(request: Request, _emp=Depends(require_app_user)):
             await revoke_app_session(token, session=s)
     resp = RedirectResponse("/app/login", status_code=303)
     clear_app_session_cookie(resp)
+    return resp
+
+
+# =====================================================================
+# Mitarbeiter-Aktivierung (Einladungs-Link -> Passwort setzen -> eingeloggt)
+# =====================================================================
+#
+# Der Inhaber legt einen Mitarbeiter an (POST /app/api/team/anlegen) und
+# bekommt einen Link /app/activate?token=...  Den schickt er per WhatsApp/SMS.
+# Der Mitarbeiter oeffnet ihn, setzt sein Passwort und ist sofort eingeloggt.
+
+@router.get("/activate")
+async def app_activate_page() -> FileResponse:
+    return FileResponse(str(STATIC_DIR / "activate.html"))
+
+
+@router.get("/activate/info")
+async def app_activate_info(token: str = "") -> JSONResponse:
+    """Liest die Einladung (OHNE sie zu verbrauchen), damit die Seite Name +
+    Betrieb anzeigen kann. Verbraucht wird erst beim Passwort-Setzen."""
+    from core.models.employee_activation_token import EmployeeActivationToken
+    from core.models.employee import Employee
+
+    token = (token or "").strip()
+    if not token:
+        return JSONResponse({"ok": False})
+    async with get_session() as s:
+        row = (await s.execute(
+            select(EmployeeActivationToken)
+            .where(EmployeeActivationToken.token == token)
+        )).scalar_one_or_none()
+        if row is None or not row.is_valid():
+            return JSONResponse({"ok": False})
+        emp = (await s.execute(
+            select(Employee).where(Employee.id == row.employee_id)
+        )).scalar_one_or_none()
+        tenant = (await s.execute(
+            select(Tenant).where(Tenant.id == row.tenant_id)
+        )).scalar_one_or_none()
+    if emp is None or not emp.is_active:
+        return JSONResponse({"ok": False})
+    return JSONResponse({
+        "ok": True,
+        "name": emp.name or "",
+        "email": emp.contact_email or "",
+        "company": (tenant.company_name if tenant else "") or "",
+    })
+
+
+@router.post("/activate/setzen")
+async def app_activate_set(
+    request: Request,
+    token: str = Form(...),
+    email: str = Form(...),
+    password: str = Form(...),
+):
+    """Einladung einloesen: Token (atomar) verbrauchen, contact_email +
+    Passwort setzen, Session anlegen, eingeloggt zur App."""
+    from core.models.employee_activation_token import consume_activation_token
+    from core.models.employee import Employee
+
+    token = (token or "").strip()
+    email = (email or "").strip().lower()
+    if "@" not in email or len(password) < 6:
+        return RedirectResponse(f"/app/activate?token={token}&fehler=eingabe", status_code=303)
+
+    consumed = await consume_activation_token(token)
+    if consumed is None:
+        return RedirectResponse("/app/activate?fehler=link", status_code=303)
+
+    async with get_session() as s:
+        emp = (await s.execute(
+            select(Employee).where(Employee.id == consumed.employee_id)
+        )).scalar_one_or_none()
+        if emp is None or not emp.is_active:
+            return RedirectResponse("/app/activate?fehler=link", status_code=303)
+        emp.contact_email = email
+        set_app_password_hash(emp, password)
+        await s.flush()
+        sess = await create_app_session(employee=emp, request=request, session=s)
+        token_val = sess.token
+        await s.commit()
+    resp = RedirectResponse("/app", status_code=303)
+    set_app_session_cookie(resp, token_val)
     return resp
 
 

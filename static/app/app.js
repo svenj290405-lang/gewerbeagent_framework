@@ -196,10 +196,15 @@ const SCREENS = {
       if (e.abwesend_heute) tags.push(`<span class="pill danger">${e.abwesend_heute === "krank" ? "krank" : "abwesend"}</span>`);
       if (!e.is_active) tags.push(`<span class="pill">inaktiv</span>`);
       if (e.kalender_verbunden) tags.push(`<span class="pill ok">Kalender</span>`);
-      if (e.app_verbunden) tags.push(`<span class="pill ok">App</span>`);
+      if (e.app_verbunden) tags.push(`<span class="pill ok">App-Zugang</span>`);
+      else if (!e.is_inhaber) tags.push(`<span class="pill warn">kein Zugang</span>`);
       const up = (e.kommende_abwesenheiten || []).map((a) =>
         `<div class="sub">${a.typ === "urlaub" ? "Urlaub" : a.typ}: ${esc(a.von)}–${esc(a.bis)}</div>`).join("");
       const skills = (e.skills || []).length ? `<div class="sub">${(e.skills || []).map(esc).join(", ")}</div>` : "";
+      const akt = e.aktivitaet_30t || {};
+      const aktTotal = (akt.logins || 0) + (akt.diktate || 0) + (akt.assistent || 0);
+      const aktLine = (isInhaber && aktTotal)
+        ? `<div class="sub" style="margin-top:2px">📊 30 Tage: ${akt.logins || 0}× aktiv · ${akt.diktate || 0} Diktate · ${akt.assistent || 0} Q-Befehle</div>` : "";
       let actions = "";
       if (isInhaber && !e.is_inhaber) {
         actions = `<button class="btn-sm btn-ghost" data-act="toggle" data-slug="${esc(e.slug)}" data-active="${e.is_active ? "1" : "0"}">${e.is_active ? "Deaktivieren" : "Aktivieren"}</button>`;
@@ -217,7 +222,7 @@ const SCREENS = {
         }
       }
       return `<div class="card">
-        <div class="row"><div><div><b>${esc(e.name)}</b>${e.is_inhaber ? " · Inhaber" : (e.job_title ? " · " + esc(e.job_title) : "")}</div>${skills}${up}</div><div>${actions}</div></div>
+        <div class="row"><div><div><b>${esc(e.name)}</b>${e.is_inhaber ? " · Inhaber" : (e.job_title ? " · " + esc(e.job_title) : "")}</div>${skills}${up}${aktLine}</div><div>${actions}</div></div>
         <div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap">${tags.join("")}</div>
         ${absenceActions ? `<div style="margin-top:8px;display:flex;gap:6px;flex-wrap:wrap">${absenceActions}</div>` : ""}
       </div>`;

@@ -65,6 +65,9 @@ from core.models.admin import (
 from core.models.anfrage import AnfrageToken, AnfrageResponse
 from core.models.tenant import Tenant, TenantStatus
 from core.models import Angebot, Beleg, EmailConversation, Kundengespraech, Rechnung
+from core.models.app_usage_event import (
+    AppUsageEvent, USAGE_LOGIN, USAGE_ASSISTENT_BEFEHL, USAGE_ASSISTENT_AKTION,
+)
 from core.models.email_conversation import (
     STATE_BOOKED,
     STATE_CLOSED,
@@ -1378,6 +1381,8 @@ _METRIC_COLUMNS = [
     ("rechnungen", "Rechnungen", "int"),
     ("rechnungen_bezahlt", "Rechn. bez.", "int"),
     ("belege", "Belege", "int"),
+    ("app_logins", "App-Logins", "int"),
+    ("assistent_befehle", "Q-Befehle", "int"),
     ("kosten", "API-Kosten", "cost"),
 ]
 
@@ -1396,6 +1401,8 @@ _METRIC_GROUPS = [
      ["kunden_neu", "angebote", "angebote_angen"]),
     ("Rechnungen & Belege",
      ["rechnungen", "rechnungen_bezahlt", "belege"]),
+    ("App & Assistent",
+     ["app_logins", "assistent_befehle"]),
     ("System", ["kosten"]),
 ]
 
@@ -1534,6 +1541,16 @@ async def _collect_metrics(
         Rechnung.status == RECHNUNG_STATUS_BEZAHLT)
     belege = await grouped(
         func.count(Beleg.id), Beleg.tenant_id, Beleg.created_at)
+
+    # --- App- / Assistent-Nutzung ---
+    app_logins = await grouped(
+        func.count(AppUsageEvent.id), AppUsageEvent.tenant_id,
+        AppUsageEvent.created_at, AppUsageEvent.kind == USAGE_LOGIN)
+    assistent_befehle = await grouped(
+        func.count(AppUsageEvent.id), AppUsageEvent.tenant_id,
+        AppUsageEvent.created_at,
+        AppUsageEvent.kind.in_([USAGE_ASSISTENT_BEFEHL, USAGE_ASSISTENT_AKTION]))
+
     kosten = await grouped(
         func.coalesce(func.sum(ApiUsageLog.cost_eur), 0),
         ApiUsageLog.tenant_id, ApiUsageLog.created_at)
@@ -1596,6 +1613,8 @@ async def _collect_metrics(
             "rechnungen": rech,
             "rechnungen_bezahlt": geti(rechnungen_bezahlt, tid),
             "belege": bel,
+            "app_logins": geti(app_logins, tid),
+            "assistent_befehle": geti(assistent_befehle, tid),
             "kosten": getf(kosten, tid),
         }
         for k, _h, _fmt in _METRIC_COLUMNS:

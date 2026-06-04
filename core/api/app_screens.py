@@ -363,9 +363,19 @@ async def api_team(request: Request, _e=Depends(require_app_user)) -> JSONRespon
             "bis": ab.end_date.strftime("%d.%m.") if ab.end_date else "offen",
         })
 
+    # Pro-Mitarbeiter-Aktivitaet der letzten 30 Tage (Logins, Diktate,
+    # Assistent-Befehle) — fuer den Inhaber sichtbar, wer die App nutzt.
+    from core.models.app_usage_event import (
+        usage_counts_by_employee, USAGE_LOGIN, USAGE_DIKTAT,
+        USAGE_ASSISTENT_BEFEHL, USAGE_ASSISTENT_AKTION,
+    )
+    since = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=30)
+    aktivitaet = await usage_counts_by_employee(tid, since=since)
+
     out = []
     for e in employees:
         ab = absent_map.get(e.id)
+        akt = aktivitaet.get(str(e.id), {})
         out.append({
             "slug": e.slug,
             "name": e.name,
@@ -374,9 +384,15 @@ async def api_team(request: Request, _e=Depends(require_app_user)) -> JSONRespon
             "job_title": e.job_title or "",
             "skills": list(e.skills or []),
             "kalender_verbunden": bool(e.calendar_provider),
-            "app_verbunden": bool(e.telegram_chat_id),  # Geraet/Account gebunden
+            # "App-Zugang eingerichtet" = kann sich wirklich anmelden.
+            "app_verbunden": bool(e.contact_email or e.app_password_hash),
             "abwesend_heute": ab.absence_type if ab else None,
             "kommende_abwesenheiten": upcoming_by_emp.get(e.id, []),
+            "aktivitaet_30t": {
+                "logins": akt.get(USAGE_LOGIN, 0),
+                "diktate": akt.get(USAGE_DIKTAT, 0),
+                "assistent": akt.get(USAGE_ASSISTENT_BEFEHL, 0) + akt.get(USAGE_ASSISTENT_AKTION, 0),
+            },
         })
     return JSONResponse({"team": out})
 
@@ -778,6 +794,8 @@ async def api_aufnahme_diktat(
         )
 
     g_id = await _save_diktat_gespraech(tid, emp.id, kunde_name, dauer, extracted)
+    from core.models.app_usage_event import record_app_usage, USAGE_DIKTAT
+    await record_app_usage(tid, emp.id, USAGE_DIKTAT)
     logger.info(
         "PWA-Diktat gespeichert: id=%s tenant=%s mitarbeiter=%s kunde=%r todos=%d",
         g_id, tid, emp.id, kunde_name, len(extracted.get("todos") or []),
@@ -2358,6 +2376,8 @@ async def api_assistent(
 
     ctx = await _build_command_ctx(request)
     result = await run_command(text, ctx)
+    from core.models.app_usage_event import record_app_usage, USAGE_ASSISTENT_BEFEHL
+    await record_app_usage(ctx.tid, getattr(ctx.employee, "id", None), USAGE_ASSISTENT_BEFEHL)
     return JSONResponse(result)
 
 
@@ -2384,6 +2404,9 @@ async def api_assistent_ausfuehren(
 
     ctx = await _build_command_ctx(request)
     result = await execute_confirmed(tool, args, ctx)
+    if result.get("type") == "done":
+        from core.models.app_usage_event import record_app_usage, USAGE_ASSISTENT_AKTION
+        await record_app_usage(ctx.tid, getattr(ctx.employee, "id", None), USAGE_ASSISTENT_AKTION)
     status = 200 if result.get("type") == "done" else 400
     return JSONResponse(result, status_code=status)
 
