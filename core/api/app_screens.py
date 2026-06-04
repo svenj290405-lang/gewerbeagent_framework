@@ -1355,130 +1355,22 @@ async def api_angebot_anlegen(
     _c=Depends(require_app_csrf),
 ) -> JSONResponse:
     """Legt Angebot + Positionen in DB an UND erstellt ein Lexware-Draft.
-    Body: {
-        kunde_name, kunde_strasse?, kunde_plz?, kunde_ort?, kunde_email?,
-        intro_text?, remark_text?,
-        positionen: [
-          {name, beschreibung?, menge, einheit, preis_brutto_eur, mwst_prozent?}
-        ]
-    }
-    """
-    from decimal import Decimal
-    from core.models.angebot import (
-        Angebot, ANGEBOT_STATUS_ERSTELLT, ANGEBOT_STATUS_IN_LEXWARE,
-    )
-    from core.models.angebot_position import AngebotPosition
-    from core.integrations.accounting_base import InvoiceLineItem
+    Delegiert an core.services.document_flow.create_angebot.
 
+    Body: { kunde_name, kunde_strasse?, kunde_plz?, kunde_ort?, kunde_email?,
+            intro_text?, remark_text?, positionen: [...] }
+    """
+    from core.services.document_flow import create_angebot
     tid = current_tenant_id(request)
     body = await request.json()
-    kunde_name = (body.get("kunde_name") or "").strip()
-    positionen = body.get("positionen") or []
-    if not kunde_name:
-        return JSONResponse({"ok": False, "error": "Kundenname ist Pflicht."}, status_code=400)
-    if not positionen:
-        return JSONResponse({"ok": False, "error": "Mindestens 1 Position."}, status_code=400)
-
-    # 1) Angebot + Positionen in DB
-    async with get_session() as s:
-        ang = Angebot(
-            tenant_id=tid,
-            quelle="web",
-            raw_input=None,
-            kunde_name=kunde_name,
-            kunde_strasse=(body.get("kunde_strasse") or "").strip() or None,
-            kunde_plz=(body.get("kunde_plz") or "").strip() or None,
-            kunde_ort=(body.get("kunde_ort") or "").strip() or None,
-            kunde_email=(body.get("kunde_email") or "").strip() or None,
-            introduction_text=(body.get("intro_text") or "").strip() or None,
-            remark_text=(body.get("remark_text") or "").strip() or None,
-            status=ANGEBOT_STATUS_ERSTELLT,
-        )
-        s.add(ang)
-        await s.flush()  # ang.id verfuegbar
-
-        line_items: list[InvoiceLineItem] = []
-        gesamt_brutto = Decimal("0")
-        for i, p in enumerate(positionen, start=1):
-            name = (p.get("name") or "").strip()
-            if not name:
-                continue
-            try:
-                menge = Decimal(str(p.get("menge") or 1))
-                preis = Decimal(str(p.get("preis_brutto_eur") or 0))
-            except Exception:
-                return JSONResponse(
-                    {"ok": False, "error": f"Position {i}: ungueltige Zahl."}, status_code=400,
-                )
-            einheit = (p.get("einheit") or "Stueck").strip() or "Stueck"
-            mwst = int(p.get("mwst_prozent") or 19)
-            besch = (p.get("beschreibung") or "").strip() or None
-            pos = AngebotPosition(
-                angebot_id=ang.id, position_nr=i,
-                name=name, beschreibung=besch,
-                menge=menge, einheit=einheit,
-                preis_brutto_eur=preis, mwst_prozent=mwst,
-            )
-            s.add(pos)
-            line_items.append(InvoiceLineItem(
-                name=name, quantity=float(menge), unit_name=einheit,
-                unit_price_gross=float(preis), description=besch,
-                tax_rate_percent=mwst,
-            ))
-            gesamt_brutto += menge * preis
-        ang.gesamtbetrag_brutto_eur = gesamt_brutto
-        await s.commit()
-        await s.refresh(ang)
-        ang_id = ang.id
-
-    # 2) Lexware-Draft
-    provider = await _build_lexware_provider(tid)
-    if provider is None:
-        return JSONResponse({
-            "ok": True, "id": str(ang_id), "lexware_voucher_number": None,
-            "lexware_deeplink": None,
-            "warning": "Lexware nicht verbunden — Angebot nur lokal gespeichert.",
-        })
-
-    one_time_address = {
-        "name": kunde_name,
-        "street": body.get("kunde_strasse") or "",
-        "zip": body.get("kunde_plz") or "",
-        "city": body.get("kunde_ort") or "",
-        "countryCode": "DE",
-    }
-    try:
-        quotation = await provider.create_quotation_draft(
-            line_items=line_items,
-            one_time_address=one_time_address,
-            title=f"Angebot {kunde_name}",
-            introduction=(body.get("intro_text") or "").strip() or
-                f"Sehr geehrte/r {kunde_name},\n\nvielen Dank fuer Ihre Anfrage. "
-                "Wir freuen uns, Ihnen folgendes Angebot zu unterbreiten.",
-            remark=(body.get("remark_text") or "").strip() or
-                "Die Preise verstehen sich inkl. gesetzlicher MwSt.",
-            tax_type="gross",
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("Lexware-quotation crash: %s", exc)
-        return JSONResponse({
-            "ok": True, "id": str(ang_id), "lexware_voucher_number": None,
-            "lexware_deeplink": None,
-            "warning": f"Lexware-Fehler: {str(exc)[:200]}",
-        })
-
-    async with get_session() as s:
-        a = (await s.execute(select(Angebot).where(Angebot.id == ang_id))).scalar_one()
-        a.lexware_quotation_id = quotation.quotation_id
-        a.lexware_voucher_number = quotation.voucher_number
-        a.status = ANGEBOT_STATUS_IN_LEXWARE
-        await s.commit()
-
-    return JSONResponse({
-        "ok": True, "id": str(ang_id),
-        "lexware_voucher_number": quotation.voucher_number,
-        "lexware_deeplink": quotation.deeplink_view,
-    })
+    result = await create_angebot(
+        tid, kunde_name=(body.get("kunde_name") or ""),
+        positionen=body.get("positionen") or [],
+        kunde_strasse=body.get("kunde_strasse"), kunde_plz=body.get("kunde_plz"),
+        kunde_ort=body.get("kunde_ort"), kunde_email=body.get("kunde_email"),
+        intro_text=body.get("intro_text"), remark_text=body.get("remark_text"),
+        quelle="web")
+    return JSONResponse(result, status_code=200 if result.get("ok") else 400)
 
 
 @router.post("/angebote/{angebot_id}/senden")
@@ -1487,43 +1379,24 @@ async def api_angebot_senden(
     _e=Depends(require_app_inhaber),
     _c=Depends(require_app_csrf),
 ) -> JSONResponse:
-    """Verschickt Angebot per Mail an den Kunden (Microsoft Graph + PDF).
+    """Verschickt Angebot per Mail an den Kunden. Delegiert an
+    core.services.document_flow.send_angebot.
     Body: { to_email?: str (Default = Angebot.kunde_email), cc?: list[str] }
     """
+    from core.services.document_flow import send_angebot
     tid = current_tenant_id(request)
     try:
         aid = uuid.UUID(angebot_id)
     except (ValueError, TypeError):
         return JSONResponse({"ok": False, "error": "ungueltige id"}, status_code=400)
     body = await request.json() if (await request.body()) else {}
-    to_email_override = (body.get("to_email") or "").strip() or None
-    cc = body.get("cc") or None
-
-    async with get_session() as s:
-        ang = (await s.execute(
-            select(Angebot).where(Angebot.id == aid).where(Angebot.tenant_id == tid)
-        )).scalar_one_or_none()
-    if ang is None:
-        return JSONResponse({"ok": False, "error": "Angebot nicht gefunden"}, status_code=404)
-
-    to_email = to_email_override or ang.kunde_email
-    if not to_email:
-        return JSONResponse({"ok": False, "error": "Keine Empfaenger-Mail vorhanden."}, status_code=400)
-
-    from core.integrations.angebot_mail import send_angebot_to_customer
-    try:
-        result = await send_angebot_to_customer(
-            angebot_id=aid, to_email=to_email, cc=cc,
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("send_angebot crash: %s", exc)
-        return JSONResponse({"ok": False, "error": "Mail-Versand fehlgeschlagen."}, status_code=500)
-
-    if not result.get("success"):
-        return JSONResponse({
-            "ok": False,
-            "error": result.get("error") or "Mail-Versand fehlgeschlagen.",
-        }, status_code=502)
+    result = await send_angebot(
+        tid, angebot_id=aid,
+        to_email=(body.get("to_email") or "").strip() or None,
+        cc=body.get("cc") or None)
+    if not result.get("ok"):
+        code = 404 if "nicht gefunden" in (result.get("error") or "") else 400
+        return JSONResponse(result, status_code=code)
     return JSONResponse({"ok": True, "message_id": result.get("message_id")})
 
 
@@ -1561,139 +1434,24 @@ async def api_rechnung_anlegen(
     _c=Depends(require_app_csrf),
 ) -> JSONResponse:
     """Legt eine Rechnung in der DB an UND erstellt ein Lexware-Draft.
+    Delegiert an core.services.document_flow.create_rechnung.
 
-    PWA bietet zwei Modi an:
-      - Pauschal: ein Leistungs-Titel + Brutto-Betrag (haeufiger Fall im
-        Handwerk: "Heizungsreparatur 350 EUR")
-      - Positionen: wie bei Angebot (Liste mit name+menge+preis+mwst)
-
-    Body: {
-      kunde_name, kunde_strasse?, kunde_plz?, kunde_ort?, kunde_email?,
-      leistung_titel?, leistung_beschreibung?, betrag_brutto_eur?,  // Pauschal
-      positionen?: [...]                                               // alternativ
-    }
+    Body: { kunde_name, ...adresse, leistung_titel?, leistung_beschreibung?,
+            betrag_brutto_eur?,  // Pauschal   ODER   positionen?: [...] }
     """
-    from decimal import Decimal
-    from core.models.rechnung import (
-        Rechnung,
-        RECHNUNG_STATUS_DRAFTED, RECHNUNG_STATUS_EXTRACTING,
-    )
-    from core.integrations.accounting_base import InvoiceLineItem
-
+    from core.services.document_flow import create_rechnung
     tid = current_tenant_id(request)
     body = await request.json()
-    kunde_name = (body.get("kunde_name") or "").strip()
-    if not kunde_name:
-        return JSONResponse({"ok": False, "error": "Kundenname ist Pflicht."}, status_code=400)
-
-    # Pauschal-Modus prio: wenn betrag_brutto_eur gesetzt → ein einzelnes
-    # LineItem aus leistung_titel + betrag bauen. Sonst Positionen-Modus.
-    positionen = body.get("positionen") or []
-    pauschal_betrag = body.get("betrag_brutto_eur")
-    leistung_titel = (body.get("leistung_titel") or "").strip()
-    leistung_beschr = (body.get("leistung_beschreibung") or "").strip() or None
-
-    line_items: list[InvoiceLineItem] = []
-    if pauschal_betrag and leistung_titel:
-        try:
-            betrag = Decimal(str(pauschal_betrag))
-        except Exception:
-            return JSONResponse({"ok": False, "error": "Betrag ungueltig."}, status_code=400)
-        line_items.append(InvoiceLineItem(
-            name=leistung_titel, quantity=1.0, unit_name="Stueck",
-            unit_price_gross=float(betrag), description=leistung_beschr,
-            tax_rate_percent=19,
-        ))
-    elif positionen:
-        for i, p in enumerate(positionen, start=1):
-            name = (p.get("name") or "").strip()
-            if not name:
-                continue
-            try:
-                menge = Decimal(str(p.get("menge") or 1))
-                preis = Decimal(str(p.get("preis_brutto_eur") or 0))
-            except Exception:
-                return JSONResponse({"ok": False, "error": f"Position {i}: ungueltige Zahl."}, status_code=400)
-            line_items.append(InvoiceLineItem(
-                name=name, quantity=float(menge),
-                unit_name=(p.get("einheit") or "Stueck"),
-                unit_price_gross=float(preis),
-                description=(p.get("beschreibung") or "").strip() or None,
-                tax_rate_percent=int(p.get("mwst_prozent") or 19),
-            ))
-    else:
-        return JSONResponse({
-            "ok": False,
-            "error": "Entweder Pauschal-Betrag oder Positionen angeben.",
-        }, status_code=400)
-    if not line_items:
-        return JSONResponse({"ok": False, "error": "Mindestens 1 Position."}, status_code=400)
-
-    betrag_gesamt = sum(Decimal(str(li.quantity)) * Decimal(str(li.unit_price_gross))
-                        for li in line_items)
-
-    async with get_session() as s:
-        r = Rechnung(
-            tenant_id=tid,
-            input_type="web",
-            raw_input_text=None,
-            kunde_name=kunde_name,
-            kunde_strasse=(body.get("kunde_strasse") or "").strip() or None,
-            kunde_plz=(body.get("kunde_plz") or "").strip() or None,
-            kunde_ort=(body.get("kunde_ort") or "").strip() or None,
-            kunde_email=(body.get("kunde_email") or "").strip() or None,
-            leistung_titel=leistung_titel or line_items[0].name,
-            leistung_beschreibung=leistung_beschr,
-            betrag_brutto_eur=betrag_gesamt,
-            status=RECHNUNG_STATUS_EXTRACTING,
-        )
-        s.add(r)
-        await s.commit()
-        await s.refresh(r)
-        rid = r.id
-
-    provider = await _build_lexware_provider(tid)
-    if provider is None:
-        return JSONResponse({
-            "ok": True, "id": str(rid),
-            "warning": "Lexware nicht verbunden — Rechnung nur lokal gespeichert.",
-        })
-
-    one_time_address = {
-        "name": kunde_name,
-        "street": body.get("kunde_strasse") or "",
-        "zip": body.get("kunde_plz") or "",
-        "city": body.get("kunde_ort") or "",
-        "countryCode": "DE",
-    }
-    try:
-        invoice = await provider.create_invoice_draft(
-            line_items=line_items,
-            one_time_address=one_time_address,
-            title=f"Rechnung {kunde_name}",
-            introduction=f"Sehr geehrte/r {kunde_name},\n\nvielen Dank fuer Ihren Auftrag.",
-            remark="Vielen Dank fuer Ihren Auftrag!",
-            tax_type="gross",
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("Lexware-invoice crash: %s", exc)
-        return JSONResponse({
-            "ok": True, "id": str(rid),
-            "warning": f"Lexware-Fehler: {str(exc)[:200]}",
-        })
-
-    async with get_session() as s:
-        rr = (await s.execute(select(Rechnung).where(Rechnung.id == rid))).scalar_one()
-        rr.lexware_invoice_id = invoice.invoice_id
-        rr.lexware_voucher_number = invoice.voucher_number
-        rr.status = RECHNUNG_STATUS_DRAFTED
-        await s.commit()
-
-    return JSONResponse({
-        "ok": True, "id": str(rid),
-        "lexware_voucher_number": invoice.voucher_number,
-        "lexware_deeplink": invoice.deeplink_view,
-    })
+    result = await create_rechnung(
+        tid, kunde_name=(body.get("kunde_name") or ""),
+        positionen=body.get("positionen") or None,
+        leistung_titel=body.get("leistung_titel"),
+        leistung_beschreibung=body.get("leistung_beschreibung"),
+        betrag_brutto_eur=body.get("betrag_brutto_eur"),
+        kunde_strasse=body.get("kunde_strasse"), kunde_plz=body.get("kunde_plz"),
+        kunde_ort=body.get("kunde_ort"), kunde_email=body.get("kunde_email"),
+        input_type="web")
+    return JSONResponse(result, status_code=200 if result.get("ok") else 400)
 
 
 @router.post("/rechnungen/{rechnung_id}/senden")
@@ -2523,101 +2281,33 @@ async def api_anfrage_reply(
     _e=Depends(require_app_user),
     _c=Depends(require_app_csrf),
 ) -> JSONResponse:
-    """Sendet eine Antwort auf eine Anfrage via Microsoft Graph (send_tracked_mail)
-    und aktualisiert die EmailConversation (last_message_id, last_q_reply,
-    state). Threading-konform: die naechste Kundenantwort wird ueber
-    In-Reply-To wieder auf diese Conversation gemappt.
-
+    """Beantwortet eine Anfrage per Mail (RFC-gethreaded). Delegiert an
+    core.services.document_flow.send_anfrage_reply.
     Body: { "body": "Antwort-Text", "close": true|false }
-    - close=true setzt state=closed (Inhaber sagt "Thema erledigt").
     """
+    from core.services.document_flow import send_anfrage_reply
     tid = current_tenant_id(request)
-    employee = request.state.app_employee  # vom require_app_user gesetzt
-
+    employee = request.state.app_employee
     try:
         cid = uuid.UUID(anfrage_id)
     except (ValueError, TypeError):
         return JSONResponse({"ok": False, "error": "ungueltige id"}, status_code=400)
-
     body_data = await request.json()
     reply_text = ((body_data or {}).get("body") or "").strip()
     if not reply_text:
         return JSONResponse({"ok": False, "error": "Leere Antwort."}, status_code=400)
     close_after = bool((body_data or {}).get("close", False))
-
-    async with get_session() as s:
-        conv = (await s.execute(
-            select(EmailConversation)
-            .where(EmailConversation.id == cid)
-            .where(EmailConversation.tenant_id == tid)
-        )).scalar_one_or_none()
-    if conv is None:
-        return JSONResponse({"ok": False, "error": "Anfrage nicht gefunden"}, status_code=404)
-
-    # Subject mit Re:-Prefix (RFC 5322 — nur 1x „Re:" zu Beginn).
-    base_subject = (conv.last_subject or "Ihre Anfrage").strip()
-    if not base_subject.lower().startswith("re:"):
-        reply_subject = f"Re: {base_subject}"
-    else:
-        reply_subject = base_subject
-
-    # Plain → einfacher HTML-Body (Zeilenumbruch zu <br>, leere Zeilen zu <p>).
-    paragraphs = [p.strip() for p in reply_text.split("\n\n") if p.strip()]
-    body_html = "".join(
-        "<p>" + p.replace("\n", "<br>") + "</p>" for p in paragraphs
-    )
-
-    # Send via send_tracked_mail (Draft-Create + Send, damit wir die
-    # internetMessageId fuer das Threading bekommen). employee_id liefert
-    # den richtigen Postfach-Owner falls Multi-OAuth aktiv ist.
-    from core.integrations.microsoft import send_tracked_mail
-    from core.integrations.mail_pipeline import (
-        record_outbound_q_reply,
-        set_conversation_state,
-    )
-
-    try:
-        send_result = await send_tracked_mail(
-            tenant_id=tid,
-            to_email=conv.kunde_email,
-            subject=reply_subject,
-            body_html=body_html,
-            body_text=reply_text,
-            employee_id=getattr(employee, "id", None),
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("anfrage-reply send_tracked_mail crash: %s", exc)
-        return JSONResponse(
-            {"ok": False, "error": "Mail-Versand fehlgeschlagen."},
-            status_code=500,
-        )
-
-    if not send_result.get("success"):
-        return JSONResponse({
-            "ok": False,
-            "error": send_result.get("error") or "Mail-Versand fehlgeschlagen.",
-        }, status_code=502)
-
-    # Conversation-Threading aktualisieren — last_message_id auf die
-    # neue internetMessageId, damit der Kunden-Reply darauf zurueck-
-    # gemappt wird.
-    await record_outbound_q_reply(
-        conv_id=cid,
-        internet_message_id=send_result.get("internet_message_id"),
-        microsoft_conversation_id=send_result.get("conversation_id"),
-        q_reply_text=reply_text,
-        subject=reply_subject,
-    )
-    if close_after:
-        await set_conversation_state(cid, STATE_CLOSED)
-
+    result = await send_anfrage_reply(
+        tid, conv_id=cid, reply_text=reply_text,
+        employee_id=getattr(employee, "id", None), close=close_after)
+    if not result.get("ok"):
+        err = result.get("error") or ""
+        code = 404 if "nicht gefunden" in err else (502 if "Versand" in err else 400)
+        return JSONResponse(result, status_code=code)
     return JSONResponse({
         "ok": True,
-        "internet_message_id": send_result.get("internet_message_id"),
-        "closed": close_after,
-    })
-
-
+        "internet_message_id": result.get("internet_message_id"),
+        "closed": result.get("closed")})
 # =====================================================================
 # Assistent — Gemini-Kommando-Zentrale
 # =====================================================================

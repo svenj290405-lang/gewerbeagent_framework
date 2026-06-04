@@ -8,9 +8,9 @@
  *  - Minimaler Offline-Shell-Cache (App-Rahmen laedt auch ohne Netz; die
  *    eigentlichen Daten kommen immer frisch vom Server).
  */
-// v16: Assistent-Tools Telegram-Paritaet (Archiv-Suche, Rechnungen prüfen,
-// Formulare-Status, Wissen löschen), aufbauend auf v15.
-const CACHE = "ga-app-v16";
+// v17: Assistent — Beleg-Fluss/Kundenzyklus (Angebot erstellen+senden,
+// Rechnung erstellen, Auftrag abrechnen, Anfrage beantworten), aufbauend auf v16.
+const CACHE = "ga-app-v17";
 const SHELL = [
   "/app",
   "/app/static/app.css",

@@ -7012,16 +7012,12 @@ async def _handle_auftrag_callback(chat_id, callback_data, callback_query_id, bo
 
 
 async def _run_rechnung_versand_pipeline(angebot_id) -> str:
-    """Bei 🏁 Fertig: Rechnung in Lexware finalisieren + Mail mit PDF an
-    den Kunden. Setzt Status auf rechnung_gesendet wenn alles klappt.
-
-    Strategie: wir legen die Invoice NEU als finalized an (Lexware bietet
-    keine 'draft -> open'-Konvertierung an). Der alte Draft kann manuell
-    in Lexware geloescht werden — er stoert nicht.
+    """Bei 🏁 Fertig: Rechnung in Lexware finalisieren + Mail mit PDF an den
+    Kunden. Die geldkritische Logik liegt in
+    core.services.document_flow.finalize_and_send_invoice (geteilt mit dem
+    App-Assistenten) — hier wird nur der Telegram-Report gebaut.
     """
-    from core.integrations.angebot_mail import (
-        send_rechnung_to_customer,
-    )
+    from core.services.document_flow import finalize_and_send_invoice
 
     async with AsyncSessionLocal() as s:
         ang = (await s.execute(
@@ -7029,158 +7025,48 @@ async def _run_rechnung_versand_pipeline(angebot_id) -> str:
         )).scalar_one_or_none()
         if ang is None:
             return "❌ Auftrag nicht gefunden."
-        positions = (await s.execute(
-            select(AngebotPosition).where(AngebotPosition.angebot_id == angebot_id)
-            .order_by(AngebotPosition.position_nr)
-        )).scalars().all()
-        tenant = (await s.execute(
-            select(Tenant).where(Tenant.id == ang.tenant_id)
-        )).scalar_one()
+        tid = ang.tenant_id
         kunde_name = ang.kunde_name
-        kunde_email = ang.kunde_email
-        kunde_strasse = ang.kunde_strasse
-        kunde_plz = ang.kunde_plz
-        kunde_ort = ang.kunde_ort
 
-    provider = await _get_lexware_provider_for_tenant(tenant)
-    if provider is None:
-        return "❌ Lexware ist nicht eingerichtet."
+    res = await finalize_and_send_invoice(tid, angebot_id=angebot_id)
 
-    line_items = [
-        InvoiceLineItem(
-            name=p.name,
-            quantity=float(p.menge),
-            unit_name=p.einheit or "Stueck",
-            unit_price_gross=float(p.preis_brutto_eur),
-            description=p.beschreibung,
-            tax_rate_percent=int(p.mwst_prozent or 19),
-        )
-        for p in positions
-    ]
-    one_time_address = {"name": kunde_name, "countryCode": "DE"}
-    if kunde_strasse:
-        one_time_address["street"] = kunde_strasse
-    if kunde_plz:
-        one_time_address["zip"] = kunde_plz
-    if kunde_ort:
-        one_time_address["city"] = kunde_ort
-
-    report = [f"🧾 <b>Rechnung: {_h_safe(kunde_name)}</b>", ""]
-
-    # Stufe 1: Finalisierte Rechnung in Lexware anlegen.
-    # WICHTIG: Hier bewusst NICHT das personalisierte Angebots-Anschreiben
-    # (ang.introduction_text) uebernehmen. Das ist auf die Anfrage/das Angebot
-    # gemuenzt ("danke fuer Ihre Anfrage, anbei unser Angebot") und passt nicht
-    # auf eine Rechnung. Stattdessen ein eigener, neutraler Rechnungstext.
-    intro_text = (
-        "Sehr geehrte Damen und Herren,\n\nvielen Dank fuer Ihren Auftrag "
-        "und das entgegengebrachte Vertrauen. Wie vereinbart stellen wir "
-        "Ihnen die erbrachten Leistungen nachstehend in Rechnung."
-    )
-    try:
-        invoice = await provider.create_invoice_draft(
-            line_items=line_items,
-            one_time_address=one_time_address,
-            title=f"Rechnung {kunde_name}",
-            introduction=intro_text,
-            remark="Bitte begleichen Sie den Rechnungsbetrag innerhalb von 14 Tagen.",
-            tax_type="gross",
-            finalize=True,
-        )
-    except Exception as exc:
-        logger.exception(f"Rechnungs-Finalisierung gescheitert: {exc}")
-        async with AsyncSessionLocal() as s:
-            ang = (await s.execute(
-                select(Angebot).where(Angebot.id == angebot_id)
-            )).scalar_one()
-            ang.status = ANGEBOT_STATUS_WORK_DONE  # bleibt im "Fertig"-Status
-            await s.commit()
+    if not res.get("ok"):
+        err = res.get("error") or "unbekannt"
+        if "nicht eingerichtet" in err:
+            return "❌ Lexware ist nicht eingerichtet."
         return (
             f"❌ Rechnung konnte nicht angelegt werden: "
-            f"<code>{_h_safe(str(exc)[:200])}</code>\n\n"
+            f"<code>{_h_safe(str(err)[:200])}</code>\n\n"
             "Status bleibt 'Fertig' — du kannst es nochmal versuchen."
         )
 
-    # IDs persistieren — alte lexware_invoice_id (Draft) wird ueberschrieben.
-    async with AsyncSessionLocal() as s:
-        ang = (await s.execute(
-            select(Angebot).where(Angebot.id == angebot_id)
-        )).scalar_one()
-        ang.lexware_invoice_id = invoice.invoice_id
-        ang.status = ANGEBOT_STATUS_WORK_DONE
-        await s.commit()
-
+    report = [f"🧾 <b>Rechnung: {_h_safe(kunde_name)}</b>", ""]
     report.append(
         f"✅ Rechnung in Lexware angelegt — "
-        f"<a href=\"{invoice.deeplink_view}\">oeffnen</a>"
+        f"<a href=\"{res.get('invoice_deeplink')}\">oeffnen</a>"
     )
-
-    # Stufe 2: Email-Fallback aus Lexware-Kontakten
-    if not kunde_email and kunde_name and len(kunde_name.strip()) >= 3:
-        try:
-            contacts = await provider.search_contacts(
-                kunde_name, customer_only=True, limit=5,
-            )
-        except Exception:
-            contacts = []
-        chosen = None
-        kn_low = kunde_name.lower()
-        for c in contacts:
-            if c.email and any(tok in (c.name or "").lower() for tok in kn_low.split()):
-                chosen = c.email
-                break
-        if not chosen:
-            for c in contacts:
-                if c.email:
-                    chosen = c.email
-                    break
-        if chosen:
-            kunde_email = chosen
-            report.append(
-                f"🔎 Mail-Adresse aus Lexware-Kontakten: <code>{_h_safe(chosen)}</code>"
-            )
-            async with AsyncSessionLocal() as s:
-                ang2 = (await s.execute(
-                    select(Angebot).where(Angebot.id == angebot_id)
-                )).scalar_one()
-                ang2.kunde_email = chosen
-                await s.commit()
-
-    # Stufe 3: Mail an Kunden mit Rechnungs-PDF
-    if not kunde_email:
+    if res.get("email_from_lexware") and res.get("email_used"):
         report.append(
-            "⚠️ Keine Kunden-Mail vorhanden — Rechnung manuell aus "
-            "Lexware versenden. Status bleibt auf 'Fertig'."
+            f"🔎 Mail-Adresse aus Lexware-Kontakten: <code>{_h_safe(res['email_used'])}</code>"
         )
-        return "\n".join(report)
-
-    try:
-        mail_result = await send_rechnung_to_customer(
-            angebot_id=angebot_id, to_email=kunde_email,
-        )
-    except Exception as exc:
-        logger.exception(f"Rechnungs-Mail-Versand crashed: {exc}")
-        mail_result = {"success": False, "error": str(exc)}
-
-    if mail_result.get("success"):
-        async with AsyncSessionLocal() as s:
-            ang = (await s.execute(
-                select(Angebot).where(Angebot.id == angebot_id)
-            )).scalar_one()
-            ang.status = ANGEBOT_STATUS_RECHNUNG_GESENDET
-            await s.commit()
+    if res.get("mail_sent"):
         report.append(
-            f"✅ Rechnung per Mail an <b>{_h_safe(kunde_email)}</b> versendet"
+            f"✅ Rechnung per Mail an <b>{_h_safe(res.get('email_used'))}</b> versendet"
         )
         report.append("")
         report.append("🎉 <b>Auftrag abgeschlossen.</b>")
     else:
-        err = mail_result.get("error", "unbekannt")
-        report.append(
-            f"⚠️ Mail-Versand fehlgeschlagen — <i>{_h_safe(err[:160])}</i>\n"
-            "Status bleibt auf 'Fertig'. Im /auftraege erneut anstossen."
-        )
-
+        merr = res.get("mail_error") or "unbekannt"
+        if "Keine Kunden-Mail" in merr:
+            report.append(
+                "⚠️ Keine Kunden-Mail vorhanden — Rechnung manuell aus "
+                "Lexware versenden. Status bleibt auf 'Fertig'."
+            )
+        else:
+            report.append(
+                f"⚠️ Mail-Versand fehlgeschlagen — <i>{_h_safe(merr[:160])}</i>\n"
+                "Status bleibt auf 'Fertig'. Im /auftraege erneut anstossen."
+            )
     return "\n".join(report)
 
 

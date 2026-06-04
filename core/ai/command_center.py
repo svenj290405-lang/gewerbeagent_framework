@@ -948,6 +948,132 @@ def _summary_wissen_loeschen(ctx: Ctx, args: dict) -> str:
     return f"Wissens-Eintrag mit „{(args.get('suchtext') or '—').strip()}\" löschen?"
 
 
+# ---- WRITE (Kundenzyklus / Beleg-Fluss) -----------------------------------
+#
+# Diese Tools rufen den geteilten Service core.services.document_flow, den
+# auch die App-Routen und der Telegram-Bot nutzen. Senden geht an echte
+# Kunden — daher (wie alle Write-Tools) erst nach Bestaetigung.
+
+async def _run_angebot_erstellen(ctx: Ctx, args: dict) -> dict:
+    from core.ai.gemini import extract_angebot_from_text
+    from core.services.document_flow import create_angebot
+
+    kunde = (args.get("kunde_name") or "").strip()
+    besch = (args.get("beschreibung") or "").strip()
+    if not kunde or len(besch) < 5:
+        return {"ok": False, "error": "Bitte Kundenname und eine Beschreibung der Leistung nennen."}
+    try:
+        ex = await extract_angebot_from_text(besch, tenant_id=ctx.tid)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("angebot_erstellen extract crash: %s", exc)
+        return {"ok": False, "error": "Konnte die Leistung nicht in Positionen umwandeln."}
+    positionen = ex.get("positionen") or []
+    if not positionen:
+        return {"ok": False, "error": "Keine Positionen erkannt — bitte konkreter (Leistung + Preis)."}
+    return await create_angebot(
+        ctx.tid, kunde_name=kunde, positionen=positionen,
+        kunde_email=(args.get("kunde_email") or "").strip() or ex.get("kunde_email"),
+        kunde_strasse=ex.get("kunde_strasse"), kunde_plz=ex.get("kunde_plz"),
+        kunde_ort=ex.get("kunde_ort"), quelle="assistent")
+
+
+def _summary_angebot_erstellen(ctx: Ctx, args: dict) -> str:
+    return f"Angebot für {(args.get('kunde_name') or '—').strip()} aus deiner Beschreibung erstellen (Lexware-Entwurf)?"
+
+
+async def _run_angebot_senden(ctx: Ctx, args: dict) -> dict:
+    from core.services.document_flow import find_angebot_for_send, send_angebot
+
+    name = (args.get("kunde_name") or "").strip()
+    if len(name) < 2:
+        return {"ok": False, "error": "Bitte den Kundennamen nennen."}
+    ang = await find_angebot_for_send(ctx.tid, name)
+    if ang is None:
+        return {"ok": False, "error": f"Kein versendbares Angebot für '{name}' gefunden."}
+    if ang == "AMBIG":
+        return {"ok": False, "error": f"Mehrere Angebote für '{name}' — bitte in der App senden."}
+    return await send_angebot(
+        ctx.tid, angebot_id=ang.id,
+        to_email=(args.get("to_email") or "").strip() or None)
+
+
+def _summary_angebot_senden(ctx: Ctx, args: dict) -> str:
+    return f"Angebot von {(args.get('kunde_name') or '—').strip()} per Mail an den Kunden senden?"
+
+
+async def _run_rechnung_erstellen(ctx: Ctx, args: dict) -> dict:
+    from core.ai.gemini import extract_rechnung_from_text
+    from core.services.document_flow import create_rechnung
+
+    kunde = (args.get("kunde_name") or "").strip()
+    besch = (args.get("beschreibung") or "").strip()
+    if not kunde or len(besch) < 5:
+        return {"ok": False, "error": "Bitte Kundenname und eine Beschreibung der Leistung nennen."}
+    try:
+        ex = await extract_rechnung_from_text(besch)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("rechnung_erstellen extract crash: %s", exc)
+        return {"ok": False, "error": "Konnte die Leistung nicht in Positionen umwandeln."}
+    positionen = ex.get("positionen") or []
+    if not positionen:
+        return {"ok": False, "error": "Keine Positionen erkannt — bitte konkreter (Leistung + Preis)."}
+    return await create_rechnung(
+        ctx.tid, kunde_name=kunde, positionen=positionen,
+        kunde_email=(args.get("kunde_email") or "").strip() or ex.get("kunde_email"),
+        kunde_strasse=ex.get("kunde_strasse"), kunde_plz=ex.get("kunde_plz"),
+        kunde_ort=ex.get("kunde_ort"), input_type="assistent")
+
+
+def _summary_rechnung_erstellen(ctx: Ctx, args: dict) -> str:
+    return f"Rechnung für {(args.get('kunde_name') or '—').strip()} erstellen (Lexware-Entwurf)?"
+
+
+async def _run_rechnung_abrechnen(ctx: Ctx, args: dict) -> dict:
+    from core.services.document_flow import (
+        find_auftrag_for_invoice, finalize_and_send_invoice)
+
+    name = (args.get("kunde_name") or "").strip()
+    if len(name) < 2:
+        return {"ok": False, "error": "Bitte den Kundennamen nennen."}
+    ang = await find_auftrag_for_invoice(ctx.tid, name)
+    if ang is None:
+        return {"ok": False, "error": (
+            f"Kein fertiger Auftrag für '{name}' gefunden "
+            "(der Auftrag muss auf 'fertig' stehen).")}
+    if ang == "AMBIG":
+        return {"ok": False, "error": f"Mehrere fertige Aufträge für '{name}' — bitte in der App abrechnen."}
+    return await finalize_and_send_invoice(ctx.tid, angebot_id=ang.id)
+
+
+def _summary_rechnung_abrechnen(ctx: Ctx, args: dict) -> str:
+    return (f"Rechnung für den fertigen Auftrag von {(args.get('kunde_name') or '—').strip()} "
+            "in Lexware finalisieren und per Mail an den Kunden senden?")
+
+
+async def _run_anfrage_beantworten(ctx: Ctx, args: dict) -> dict:
+    from core.services.document_flow import find_open_conversation, send_anfrage_reply
+
+    name = (args.get("kunde_name") or "").strip()
+    antwort = (args.get("antwort_text") or "").strip()
+    if len(name) < 2 or len(antwort) < 2:
+        return {"ok": False, "error": "Bitte Kunde und Antworttext nennen."}
+    conv = await find_open_conversation(ctx.tid, name)
+    if conv is None:
+        return {"ok": False, "error": f"Keine offene Anfrage von '{name}' gefunden."}
+    if conv == "AMBIG":
+        return {"ok": False, "error": f"Mehrere offene Anfragen von '{name}' — bitte in der App antworten."}
+    return await send_anfrage_reply(
+        ctx.tid, conv_id=conv.id, reply_text=antwort,
+        employee_id=getattr(ctx.employee, "id", None),
+        close=bool(args.get("abschliessen")))
+
+
+def _summary_anfrage_beantworten(ctx: Ctx, args: dict) -> str:
+    a = (args.get("antwort_text") or "").strip()
+    return (f"Antwort an {(args.get('kunde_name') or '—').strip()} senden: "
+            f"„{a[:90]}{'…' if len(a) > 90 else ''}\"?")
+
+
 # ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
@@ -1152,4 +1278,55 @@ _REGISTRY: list[ToolSpec] = [
             "suchtext": {"type": _S, "description": "Teil des zu löschenden Eintrags."}},
             "required": ["suchtext"]},
         run=_run_wissen_loeschen, summarize=_summary_wissen_loeschen),
+
+    # ---- WRITE (Kundenzyklus / Beleg-Fluss) ----
+    ToolSpec(
+        name="angebot_erstellen", kind="write", requires_inhaber=True, feature="lexware",
+        description="Erstellt ein Angebot für einen Kunden aus einer freien "
+                    "Beschreibung der Leistung (KI wandelt sie in Positionen um) "
+                    "und legt einen Lexware-Entwurf an. Versendet noch nichts.",
+        parameters={"type": "OBJECT", "properties": {
+            "kunde_name": {"type": _S, "description": "Name des Kunden."},
+            "beschreibung": {"type": _S, "description": "Was angeboten wird, inkl. Mengen/Preise."},
+            "kunde_email": {"type": _S, "description": "E-Mail des Kunden (optional)."}},
+            "required": ["kunde_name", "beschreibung"]},
+        run=_run_angebot_erstellen, summarize=_summary_angebot_erstellen),
+    ToolSpec(
+        name="angebot_senden", kind="write", requires_inhaber=True, feature="lexware",
+        description="Verschickt ein bereits erstelltes Angebot per Mail an den "
+                    "Kunden (findet das jüngste offene Angebot des Kunden).",
+        parameters={"type": "OBJECT", "properties": {
+            "kunde_name": {"type": _S, "description": "Name des Kunden."},
+            "to_email": {"type": _S, "description": "Abweichende Empfänger-Mail (optional)."}},
+            "required": ["kunde_name"]},
+        run=_run_angebot_senden, summarize=_summary_angebot_senden),
+    ToolSpec(
+        name="rechnung_erstellen", kind="write", requires_inhaber=True, feature="lexware",
+        description="Erstellt eine Rechnung für einen Kunden aus einer freien "
+                    "Beschreibung der Leistung (Lexware-Entwurf). Versendet noch nichts.",
+        parameters={"type": "OBJECT", "properties": {
+            "kunde_name": {"type": _S, "description": "Name des Kunden."},
+            "beschreibung": {"type": _S, "description": "Erbrachte Leistung inkl. Beträgen."},
+            "kunde_email": {"type": _S, "description": "E-Mail des Kunden (optional)."}},
+            "required": ["kunde_name", "beschreibung"]},
+        run=_run_rechnung_erstellen, summarize=_summary_rechnung_erstellen),
+    ToolSpec(
+        name="rechnung_abrechnen", kind="write", requires_inhaber=True, feature="lexware",
+        description="Schliesst einen fertigen Auftrag ab: finalisiert die Rechnung "
+                    "in Lexware und schickt sie als PDF per Mail an den Kunden. "
+                    "Nur wenn der Auftrag auf 'fertig' steht.",
+        parameters={"type": "OBJECT", "properties": {
+            "kunde_name": {"type": _S, "description": "Name des Kunden des fertigen Auftrags."}},
+            "required": ["kunde_name"]},
+        run=_run_rechnung_abrechnen, summarize=_summary_rechnung_abrechnen),
+    ToolSpec(
+        name="anfrage_beantworten", kind="write", feature="mail_intake",
+        description="Beantwortet eine offene Kundenanfrage per Mail mit dem "
+                    "angegebenen Text (RFC-gethreaded).",
+        parameters={"type": "OBJECT", "properties": {
+            "kunde_name": {"type": _S, "description": "Name oder Mail des anfragenden Kunden."},
+            "antwort_text": {"type": _S, "description": "Der zu sendende Antworttext."},
+            "abschliessen": {"type": "BOOLEAN", "description": "Anfrage danach als erledigt schliessen?"}},
+            "required": ["kunde_name", "antwort_text"]},
+        run=_run_anfrage_beantworten, summarize=_summary_anfrage_beantworten),
 ]

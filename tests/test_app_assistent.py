@@ -140,8 +140,29 @@ def test_inhaber_gate_filters_new_write_tools():
     assert "anstehende_termine" in names
 
 
+def test_beleg_fluss_tools_gating():
+    # Inhaber mit lexware+mail sieht den ganzen Beleg-Fluss
+    full = _ctx(features=("lexware", "mail_intake"), is_inhaber=True)
+    names = {s.name for s in cc._available_tools(full)}
+    for t in ("angebot_erstellen", "angebot_senden", "rechnung_erstellen",
+              "rechnung_abrechnen", "anfrage_beantworten"):
+        assert t in names
+    # Ohne lexware: keine Angebot/Rechnung-Tools, aber anfrage_beantworten (mail_intake)
+    ohne_lex = _ctx(features=("mail_intake",), is_inhaber=True)
+    names2 = {s.name for s in cc._available_tools(ohne_lex)}
+    assert "angebot_erstellen" not in names2
+    assert "rechnung_abrechnen" not in names2
+    assert "anfrage_beantworten" in names2
+    # Monteur (kein Inhaber): keine Angebot/Rechnung-Tools, aber Anfrage-Antwort erlaubt
+    monteur = _ctx(features=("lexware", "mail_intake"), is_inhaber=False)
+    names3 = {s.name for s in cc._available_tools(monteur)}
+    assert "angebot_erstellen" not in names3
+    assert "rechnung_abrechnen" not in names3
+    assert "anfrage_beantworten" in names3
+
+
 def test_registry_has_all_tools():
-    assert len(cc._REGISTRY) == 22
+    assert len(cc._REGISTRY) == 27
 
 
 # --------------------------------------------------------------------------

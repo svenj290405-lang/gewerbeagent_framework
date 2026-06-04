@@ -716,6 +716,11 @@ const SCREENS = {
       if (tool === "auftrag_status") return `Auftrag von ${r.kunde}: ${r.status_label}.`;
       if (tool === "material_anlegen") return `Material „${r.name}" im Katalog angelegt.`;
       if (tool === "wissen_loeschen") return `Wissens-Eintrag gelöscht.`;
+      if (tool === "angebot_erstellen") return `Angebot für ${r.kunde} erstellt${r.lexware_voucher_number ? " (" + r.lexware_voucher_number + ")" : ""}.${r.warning ? " " + r.warning : ""}`;
+      if (tool === "angebot_senden") return `Angebot an ${r.to_email} gesendet.`;
+      if (tool === "rechnung_erstellen") return `Rechnung für ${r.kunde} erstellt${r.lexware_voucher_number ? " (" + r.lexware_voucher_number + ")" : ""}.${r.warning ? " " + r.warning : ""}`;
+      if (tool === "rechnung_abrechnen") return r.mail_sent ? `Rechnung an ${r.email_used} gesendet — Auftrag abgeschlossen.` : `Rechnung in Lexware angelegt${r.mail_error ? " (Mail offen: " + r.mail_error + ")" : ""}.`;
+      if (tool === "anfrage_beantworten") return `Antwort an ${r.kunde} gesendet${r.closed ? " (Anfrage geschlossen)" : ""}.`;
       return "Erledigt.";
     }
 
