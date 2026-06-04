@@ -94,3 +94,48 @@ button:disabled { opacity: .6; }
   border-bottom: 1px solid var(--line); border-radius: 0; padding: 12px 0;
   font-size: 15px; font-weight: 500; cursor: pointer; text-align: left; }
 .menu-item:last-child { border-bottom: 0; }
+
+/* ---------- Assistent-Chat (Q) ---------- */
+.chat { display: flex; flex-direction: column; gap: 10px; padding-bottom: 44px; min-height: 50vh; }
+.chat-intro { text-align: center; color: var(--muted); font-size: 14px;
+  padding: 32px 18px; display: flex; flex-direction: column; align-items: center; gap: 14px; }
+.chat-intro p { margin: 0; line-height: 1.5; max-width: 340px; }
+.q-avatar { width: 52px; height: 52px; border-radius: 50%; background: var(--primary);
+  color: #fff; font-weight: 700; font-size: 22px; display: flex; align-items: center;
+  justify-content: center; box-shadow: 0 4px 12px rgba(0,102,204,.3); }
+
+.bubble { max-width: 84%; padding: 10px 14px; border-radius: 18px; font-size: 15px;
+  line-height: 1.42; white-space: pre-wrap; overflow-wrap: anywhere;
+  box-shadow: 0 1px 2px rgba(0,0,0,.06); animation: bubblein .14s ease-out; }
+@keyframes bubblein { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+.bubble.q { align-self: flex-start; background: var(--card); color: var(--text); border-bottom-left-radius: 5px; }
+.bubble.me { align-self: flex-end; background: var(--primary); color: #fff; border-bottom-right-radius: 5px; }
+.bubble.err { background: #fce6e5; color: var(--danger); }
+.bubble.confirm { max-width: 90%; border: 1px solid var(--line); white-space: normal; }
+.bubble.confirm .q-summary { font-weight: 600; margin: 0 0 12px; }
+.confirm-actions { display: flex; gap: 8px; }
+.confirm-actions .btn-sm { flex: 1; text-align: center; }
+.confirm-done { font-size: 13px; color: var(--muted); margin-top: 2px; }
+
+/* Tipp-Animation (drei Punkte) */
+.bubble.typing { display: flex; gap: 4px; align-items: center; padding: 14px; }
+.bubble.typing span { width: 7px; height: 7px; border-radius: 50%; background: var(--muted);
+  opacity: .4; animation: typingdot 1s infinite; }
+.bubble.typing span:nth-child(2) { animation-delay: .2s; }
+.bubble.typing span:nth-child(3) { animation-delay: .4s; }
+@keyframes typingdot { 0%,60%,100% { opacity: .3; transform: translateY(0); } 30% { opacity: 1; transform: translateY(-3px); } }
+
+/* Eingabeleiste */
+.composer { position: fixed; left: 0; right: 0; z-index: 9;
+  bottom: calc(56px + env(safe-area-inset-bottom));
+  background: var(--card); border-top: 1px solid var(--line); padding: 8px 10px; }
+.composer-inner { max-width: 720px; margin: 0 auto; display: flex; align-items: flex-end; gap: 6px; }
+.composer textarea { flex: 1; resize: none; max-height: 120px; min-height: 42px;
+  padding: 10px 14px; border: 1px solid var(--line); border-radius: 21px;
+  font-size: 16px; font-family: inherit; line-height: 1.3; background: var(--bg); }
+.composer textarea:focus { outline: none; border-color: var(--primary); background: var(--card); }
+.composer .cbtn { flex: 0 0 auto; width: 42px; height: 42px; border-radius: 50%; padding: 0;
+  font-size: 18px; display: flex; align-items: center; justify-content: center; }
+.composer .cbtn.ghost { background: #eef2f7; color: var(--primary); }
+.composer .cbtn.rec { background: var(--danger); color: #fff; animation: recpulse 1s infinite; }
+@keyframes recpulse { 0%,100% { box-shadow: 0 0 0 0 rgba(217,69,63,.4); } 50% { box-shadow: 0 0 0 7px rgba(217,69,63,0); } }

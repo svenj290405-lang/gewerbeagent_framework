@@ -617,92 +617,26 @@ const SCREENS = {
   },
 
   async assistent() {
+    App.qchat = App.qchat || [];
     App.view.innerHTML =
-      `<h1 style="font-size:22px;margin:4px 4px 6px">Assistent 🤖</h1>` +
-      `<p class="muted" style="margin:0 4px 14px">Sag oder tipp, was zu tun ist — z.B. „Trag Frau Meier morgen 14 Uhr für eine Heizungswartung ein", „Bestell 20 Meter Kupferrohr" oder „Tobias ist die ganze Woche krank".</p>` +
-      `<div class="card" style="padding:14px">
-         <textarea id="as-input" rows="2" placeholder="Befehl eingeben …"
-           style="width:100%;padding:10px;border:1px solid var(--line);border-radius:10px;font-size:16px;resize:vertical;box-sizing:border-box"></textarea>
-         <div style="display:flex;gap:8px;margin-top:10px">
-           <button class="btn-sm" id="as-send" style="flex:1;padding:12px">Senden</button>
-           <button class="btn-sm btn-ghost" id="as-mic" style="padding:12px 16px" title="Sprechen">🎤</button>
-         </div>
-         <p class="muted" id="as-status" style="margin:10px 0 0;min-height:18px"></p>
-       </div>
-       <div id="as-result" style="margin-top:14px"></div>`;
+      `<div class="chat" id="q-chat"></div>
+       <div class="composer"><div class="composer-inner">
+         <button class="cbtn ghost" id="q-attach" title="Beleg/Foto hochladen">📎</button>
+         <textarea id="q-input" rows="1" placeholder="Schreib Q …"></textarea>
+         <button class="cbtn ghost" id="q-mic" title="Sprechen">🎤</button>
+         <button class="cbtn" id="q-send" title="Senden">➤</button>
+       </div></div>
+       <input type="file" id="q-file" accept="image/jpeg,image/png,application/pdf" style="display:none">`;
 
-    const input = document.getElementById("as-input");
-    const sendBtn = document.getElementById("as-send");
-    const micBtn = document.getElementById("as-mic");
-    const statusEl = document.getElementById("as-status");
-    const resultEl = document.getElementById("as-result");
+    const chatEl = document.getElementById("q-chat");
+    const input = document.getElementById("q-input");
+    const sendBtn = document.getElementById("q-send");
+    const micBtn = document.getElementById("q-mic");
+    const attachBtn = document.getElementById("q-attach");
+    const fileEl = document.getElementById("q-file");
 
-    function setBusy(on, msg) {
-      sendBtn.disabled = on; micBtn.disabled = on;
-      statusEl.textContent = msg || "";
-    }
-
-    async function send() {
-      const text = (input.value || "").trim();
-      if (!text) { input.focus(); return; }
-      resultEl.innerHTML = "";
-      setBusy(true, "Denkt nach …");
-      let res, j = null;
-      try {
-        res = await fetch("/app/api/assistent", {
-          method: "POST",
-          headers: { "X-CSRF-Token": App.me.csrf, "Content-Type": "application/json" },
-          body: JSON.stringify({ text }),
-        });
-      } catch (e) { setBusy(false, "Netzwerkfehler. Bitte erneut."); return; }
-      if (res.status === 303 || res.status === 401 || res.redirected) { location.href = "/app/login"; return; }
-      try { j = await res.json(); } catch (e) {}
-      setBusy(false, "");
-      renderResult(j);
-    }
-
-    function renderResult(j) {
-      if (!j || !j.type) { resultEl.innerHTML = card("Konnte den Befehl nicht verarbeiten."); return; }
-      if (j.type === "message") { resultEl.innerHTML = card(esc(j.text)); return; }
-      if (j.type === "error") { resultEl.innerHTML = card(`<span style="color:var(--danger,#c0392b)">${esc(j.text)}</span>`); return; }
-      if (j.type === "confirm") {
-        resultEl.innerHTML =
-          `<div class="card">
-             ${j.frage ? `<p style="margin:0 0 10px">${esc(j.frage)}</p>` : ""}
-             <p style="margin:0 0 14px;font-weight:600">${esc(j.summary)}</p>
-             <div style="display:flex;gap:8px">
-               <button class="btn-sm" id="as-confirm" style="flex:1;padding:12px">Ausführen</button>
-               <button class="btn-sm btn-ghost" id="as-cancel" style="flex:1;padding:12px">Abbrechen</button>
-             </div>
-           </div>`;
-        document.getElementById("as-cancel").addEventListener("click", () => { resultEl.innerHTML = ""; });
-        document.getElementById("as-confirm").addEventListener("click", () => confirmAction(j.tool, j.args));
-      }
-    }
-
-    async function confirmAction(tool, args) {
-      const cBtn = document.getElementById("as-confirm");
-      const xBtn = document.getElementById("as-cancel");
-      if (cBtn) { cBtn.disabled = true; cBtn.textContent = "Führt aus …"; }
-      if (xBtn) xBtn.disabled = true;
-      let res, j = null;
-      try {
-        res = await fetch("/app/api/assistent/ausfuehren", {
-          method: "POST",
-          headers: { "X-CSRF-Token": App.me.csrf, "Content-Type": "application/json" },
-          body: JSON.stringify({ tool, args }),
-        });
-      } catch (e) { resultEl.innerHTML = card("Netzwerkfehler. Bitte erneut."); return; }
-      if (res.status === 303 || res.status === 401 || res.redirected) { location.href = "/app/login"; return; }
-      try { j = await res.json(); } catch (e) {}
-      if (j && j.type === "done" && j.result && j.result.ok) {
-        resultEl.innerHTML = card(`✓ ${esc(resultText(tool, j.result))}`);
-        input.value = "";
-      } else {
-        const msg = (j && (j.text || (j.result && j.result.error))) || "Aktion fehlgeschlagen.";
-        resultEl.innerHTML = card(`<span style="color:var(--danger,#c0392b)">${esc(msg)}</span>`);
-      }
-    }
+    function scrollDown() { requestAnimationFrame(() => window.scrollTo(0, document.body.scrollHeight)); }
+    function auto() { input.style.height = "auto"; input.style.height = Math.min(input.scrollHeight, 120) + "px"; }
 
     function resultText(tool, r) {
       if (tool === "termin_anlegen") return `Termin für ${r.kunde} am ${r.datum} um ${r.uhrzeit} angelegt.`;
@@ -724,52 +658,128 @@ const SCREENS = {
       return "Erledigt.";
     }
 
-    function card(html) { return `<div class="card">${html}</div>`; }
-
-    sendBtn.addEventListener("click", send);
-    input.addEventListener("keydown", (e) => {
-      if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
-    });
-
-    // ---- Sprach-Befehl: aufnehmen → transkribieren → ins Feld → senden ----
-    micBtn.addEventListener("click", async () => {
-      if (Diktat.recording) {
-        const { blob, durationSec } = _diktatFinish();
-        micBtn.textContent = "🎤";
-        if (durationSec < 1 || blob.size < 2000) { setBusy(false, "Zu kurz. Bitte erneut."); return; }
-        setBusy(true, "Höre zu …");
-        let res, j = null;
-        try {
-          res = await fetch("/app/api/assistent/transkript", {
-            method: "POST",
-            headers: { "X-CSRF-Token": App.me.csrf, "Content-Type": "audio/wav" },
-            body: blob,
-          });
-        } catch (e) { setBusy(false, "Netzwerkfehler. Bitte erneut."); return; }
-        if (res.status === 303 || res.status === 401 || res.redirected) { location.href = "/app/login"; return; }
-        try { j = await res.json(); } catch (e) {}
-        if (res.ok && j && j.ok && j.text) {
-          input.value = j.text;
-          setBusy(false, "");
-          send();
-        } else {
-          setBusy(false, (j && j.error) || "Nichts verstanden. Bitte erneut.");
-        }
+    function render() {
+      if (!App.qchat.length) {
+        chatEl.innerHTML = `<div class="chat-intro"><div class="q-avatar">Q</div><p>Ich bin <b>Q</b>, dein Assistent.<br>Sag oder tipp, was zu tun ist — z.&nbsp;B. „Trag Frau Meier morgen 14 Uhr ein", „Bestell 20&nbsp;m Kupferrohr" oder „Mach Schmidt ein Angebot". Mit 📎 lädst du Belege hoch.</p></div>`;
         return;
       }
-      // Aufnahme starten
+      chatEl.innerHTML = App.qchat.map((m, i) => {
+        if (m.role === "me") return `<div class="bubble me">${esc(m.text)}</div>`;
+        if (m.role === "typing") return `<div class="bubble q typing"><span></span><span></span><span></span></div>`;
+        if (m.role === "err") return `<div class="bubble q err">${esc(m.text)}</div>`;
+        if (m.role === "confirm") {
+          const btns = m.resolved
+            ? `<div class="confirm-done">${m.cancelled ? "✕ Abgebrochen" : "✓ Bestätigt"}</div>`
+            : `<div class="confirm-actions"><button class="btn-sm" data-cyes="${i}">Ausführen</button><button class="btn-sm btn-ghost" data-cno="${i}">Abbrechen</button></div>`;
+          return `<div class="bubble q confirm">${m.frage ? `<p style="margin:0 0 8px">${esc(m.frage)}</p>` : ""}<p class="q-summary">${esc(m.summary)}</p>${btns}</div>`;
+        }
+        return `<div class="bubble q">${esc(m.text)}</div>`;
+      }).join("");
+      chatEl.querySelectorAll("[data-cyes]").forEach((b) =>
+        b.addEventListener("click", () => doConfirm(parseInt(b.dataset.cyes, 10))));
+      chatEl.querySelectorAll("[data-cno]").forEach((b) =>
+        b.addEventListener("click", () => {
+          const m = App.qchat[parseInt(b.dataset.cno, 10)];
+          m.resolved = true; m.cancelled = true;
+          App.qchat.push({ role: "q", text: "Okay, lasse ich." });
+          render(); scrollDown();
+        }));
+      scrollDown();
+    }
+
+    function push(m) { App.qchat.push(m); render(); }
+    function popTyping() { const i = App.qchat.findIndex((x) => x.role === "typing"); if (i >= 0) App.qchat.splice(i, 1); }
+
+    async function send() {
+      const text = (input.value || "").trim();
+      if (!text) return;
+      input.value = ""; auto();
+      push({ role: "me", text });
+      push({ role: "typing" });
+      let res, j = null;
+      try {
+        res = await fetch("/app/api/assistent", { method: "POST",
+          headers: { "X-CSRF-Token": App.me.csrf, "Content-Type": "application/json" },
+          body: JSON.stringify({ text }) });
+      } catch (e) { popTyping(); push({ role: "err", text: "Netzwerkfehler. Bitte erneut." }); return; }
+      if (res.status === 303 || res.status === 401 || res.redirected) { location.href = "/app/login"; return; }
+      try { j = await res.json(); } catch (e) {}
+      popTyping();
+      if (!j || !j.type) { push({ role: "err", text: "Konnte den Befehl nicht verarbeiten." }); return; }
+      if (j.type === "message") push({ role: "q", text: j.text });
+      else if (j.type === "error") push({ role: "err", text: j.text });
+      else if (j.type === "confirm") push({ role: "confirm", tool: j.tool, args: j.args, summary: j.summary, frage: j.frage, resolved: false });
+    }
+
+    async function doConfirm(idx) {
+      const m = App.qchat[idx];
+      if (!m || m.resolved) return;
+      m.resolved = true; render();
+      push({ role: "typing" });
+      let res, j = null;
+      try {
+        res = await fetch("/app/api/assistent/ausfuehren", { method: "POST",
+          headers: { "X-CSRF-Token": App.me.csrf, "Content-Type": "application/json" },
+          body: JSON.stringify({ tool: m.tool, args: m.args }) });
+      } catch (e) { popTyping(); push({ role: "err", text: "Netzwerkfehler. Bitte erneut." }); return; }
+      if (res.status === 303 || res.status === 401 || res.redirected) { location.href = "/app/login"; return; }
+      try { j = await res.json(); } catch (e) {}
+      popTyping();
+      if (j && j.type === "done" && j.result && j.result.ok) push({ role: "q", text: "✓ " + resultText(m.tool, j.result) });
+      else push({ role: "err", text: (j && (j.text || (j.result && j.result.error))) || "Aktion fehlgeschlagen." });
+    }
+
+    async function doUpload(file) {
+      if (!file) return;
+      push({ role: "me", text: "📄 " + file.name });
+      push({ role: "typing" });
+      let res, j = null;
+      try {
+        res = await fetch("/app/api/belege/upload?caption=" + encodeURIComponent("Hochgeladen über Q"),
+          { method: "POST", headers: { "X-CSRF-Token": App.me.csrf, "Content-Type": file.type }, body: file });
+      } catch (e) { popTyping(); push({ role: "err", text: "Upload fehlgeschlagen." }); return; }
+      if (res.status === 303 || res.status === 401 || res.redirected) { location.href = "/app/login"; return; }
+      try { j = await res.json(); } catch (e) {}
+      popTyping();
+      if (res.ok && j && j.ok) push({ role: "q", text: j.duplikat ? "Den Beleg hatte ich schon — kein Doppel-Upload." : "📄 Beleg gespeichert." });
+      else push({ role: "err", text: (j && j.error) || "Beleg konnte nicht gespeichert werden." });
+    }
+
+    sendBtn.addEventListener("click", send);
+    input.addEventListener("input", auto);
+    input.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } });
+    attachBtn.addEventListener("click", () => fileEl.click());
+    fileEl.addEventListener("change", () => { if (fileEl.files && fileEl.files[0]) doUpload(fileEl.files[0]); fileEl.value = ""; });
+
+    micBtn.addEventListener("click", async () => {
+      if (Diktat.recording) {
+        const out = _diktatFinish();
+        micBtn.classList.remove("rec"); micBtn.textContent = "🎤";
+        if (out.durationSec < 1 || out.blob.size < 2000) { push({ role: "err", text: "Aufnahme war zu kurz." }); return; }
+        push({ role: "typing" });
+        let res, j = null;
+        try {
+          res = await fetch("/app/api/assistent/transkript", { method: "POST",
+            headers: { "X-CSRF-Token": App.me.csrf, "Content-Type": "audio/wav" }, body: out.blob });
+        } catch (e) { popTyping(); push({ role: "err", text: "Netzwerkfehler." }); return; }
+        if (res.status === 303 || res.status === 401 || res.redirected) { location.href = "/app/login"; return; }
+        try { j = await res.json(); } catch (e) {}
+        popTyping();
+        if (res.ok && j && j.ok && j.text) { input.value = j.text; send(); }
+        else push({ role: "err", text: (j && j.error) || "Nichts verstanden. Bitte erneut." });
+        return;
+      }
       try { await _diktatStartRecording(); }
       catch (e) {
-        statusEl.textContent = (e && e.name === "NotAllowedError")
-          ? "Mikrofon-Zugriff abgelehnt. Bitte im Browser erlauben."
-          : "Mikrofon nicht verfügbar.";
+        push({ role: "err", text: (e && e.name === "NotAllowedError") ? "Mikrofon-Zugriff abgelehnt. Bitte im Browser erlauben." : "Mikrofon nicht verfügbar." });
         _diktatTeardown(); return;
       }
-      micBtn.textContent = "⏹";
-      statusEl.textContent = "Sprich jetzt …";
+      micBtn.classList.add("rec"); micBtn.textContent = "⏹";
       Diktat.autostop = setTimeout(() => { if (Diktat.recording) micBtn.click(); }, 60 * 1000);
     });
 
+    render();
+    auto();
     input.focus();
   },
 };

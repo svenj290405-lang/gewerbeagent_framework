@@ -8,9 +8,9 @@
  *  - Minimaler Offline-Shell-Cache (App-Rahmen laedt auch ohne Netz; die
  *    eigentlichen Daten kommen immer frisch vom Server).
  */
-// v17: Assistent — Beleg-Fluss/Kundenzyklus (Angebot erstellen+senden,
-// Rechnung erstellen, Auftrag abrechnen, Anfrage beantworten), aufbauend auf v16.
-const CACHE = "ga-app-v17";
+// v18: Assistent als echter Chat mit „Q" (Nachrichten-Blasen, Tipp-Animation,
+// feste Eingabeleiste mit Upload/Mikro/Senden), aufbauend auf v17.
+const CACHE = "ga-app-v18";
 const SHELL = [
   "/app",
   "/app/static/app.css",
