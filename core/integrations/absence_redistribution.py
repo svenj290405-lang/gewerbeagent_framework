@@ -116,6 +116,28 @@ class RedistributionReport:
             lines.append("(keine Termine im Krankheits-Zeitraum)")
         return "\n".join(lines)
 
+    def telegram_summary(self) -> str:
+        """Datensparsame Variante fuer den Telegram-Push (Welle 0).
+
+        Telegram ist ein Drittland-Transfer (FZ-LLC) — die ausfuehrliche
+        summary() enthaelt Termin-Betreffe (oft Kundennamen) und den Namen
+        des kranken Mitarbeiters. Hier gehen NUR Zaehler raus; die Details
+        holt der Inhaber in der DSGVO-sauberen App (Team-Screen)."""
+        n_ok = len(self.reassigned)
+        n_none = len(self.no_coverage)
+        n_err = len(self.errors)
+        if not (n_ok or n_none or n_err):
+            return "🔄 <b>Umverteilung</b>\n(keine Termine im Zeitraum)"
+        lines = ["🔄 <b>Umverteilung verarbeitet</b>"]
+        if n_ok:
+            lines.append(f"✅ {n_ok} Termin(e) umverteilt")
+        if n_none:
+            lines.append(f"⚠️ {n_none} Termin(e) ohne Kollegen")
+        if n_err:
+            lines.append(f"❌ {n_err} Termin(e) mit Fehler")
+        lines.append("Details in der App.")
+        return "\n".join(lines)
+
 
 # ---------------------------------------------------------------------
 # Provider-agnostische Calendar-Operationen
@@ -444,7 +466,7 @@ async def _send_report_to_inhaber(tenant: Tenant, report: RedistributionReport):
             )
             return
         await TelegramNotifier.send_for_tenant(
-            tenant.id, report.summary(), employee_id=default.id,
+            tenant.id, report.telegram_summary(), employee_id=default.id,
         )
     except Exception as e:  # noqa: BLE001
         logger.warning(

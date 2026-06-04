@@ -542,24 +542,15 @@ async def push_tenant_followup_mail(
     Returns: True wenn Push abgeschickt (nicht garantiert dass Telegram
     es ausgeliefert hat), False bei Fehler.
     """
-    from html import escape as _h
-
     target_employee_id = employee_id or conv.assigned_employee_id
 
-    # State-Label damit der Inhaber sieht in welcher Phase die Konv. war
-    state_label = {
-        STATE_AWAITING_CONFIRMATION: "Anfrage offen",
-        "booked": "Termin gebucht",
-        "proposing_slots": "Slots vorgeschlagen",
-        "storniert": "storniert",
-    }.get(conv.state, conv.state)
-
+    # Datensparsam (Welle 0): Telegram ist ein Drittland-Transfer (FZ-LLC) →
+    # KEINE Kunden-PII (Name/Mail/Betreff/Inhalt) in den Push. Der Inhaber
+    # holt die Details in der DSGVO-sauberen App bzw. im Outlook.
     text = (
-        f"📬 <b>Folge-Mail vom Kunden</b> ({_h(state_label)})\n"
-        f"<b>Von:</b> {_h(sender_name)} ({_h(sender_email)})\n"
-        f"<b>Betreff:</b> {_h(subject[:80])}\n"
-        f"<b>Preview:</b> {_h(body_preview[:300])}\n"
-        f"<i>(keine Auto-Reply versendet — Mail steht im Outlook)</i>"
+        "📬 <b>Neue Nachricht zu einem laufenden Vorgang</b>\n"
+        "Öffne die App oder tippe /anfragen, um sie zu lesen.\n"
+        "<i>(Aus Datenschutzgründen ohne Inhalt.)</i>"
     )
 
     try:
@@ -1203,22 +1194,15 @@ async def push_tenant_bounce_notification(
 
     Returns: True wenn Push abgeschickt, False bei Fehler.
     """
-    from html import escape as _h
-
     target_employee_id = employee_id or conv.assigned_employee_id
 
-    # Bounce-Reason auf 200 Zeichen begrenzen — DSN-Reports koennen
-    # mehrere Seiten Text enthalten.
-    reason_short = (bounce_reason or "")[:200]
-
+    # Datensparsam (Welle 0): keine Kunden-Mail/Betreff/Bounce-Details in den
+    # Telegram-Push (Drittland-Transfer). Der Inhaber sieht den Vorgang in der
+    # App und kann dort manuell nachfassen.
     text = (
-        f"⚠️ <b>Mail-Zustellung fehlgeschlagen</b>\n"
-        f"<b>An:</b> {_h(conv.kunde_email)}\n"
-        f"<b>Subject war:</b> {_h((conv.last_subject or '')[:80])}\n"
-        f"<b>Bounce von:</b> {_h(bounce_sender)}\n"
-        f"<b>Grund:</b> {_h(reason_short)}\n"
-        f"<i>Bitte manuell pruefen — die Antwort an den Kunden kam "
-        f"nicht an.</i>"
+        "⚠️ <b>Eine automatische Antwort konnte nicht zugestellt werden</b>\n"
+        "Bitte in der App prüfen und ggf. manuell antworten.\n"
+        "<i>(Aus Datenschutzgründen ohne Inhalt.)</i>"
     )
 
     try:
@@ -1266,25 +1250,13 @@ async def push_tenant_new_anfrage_notification(
 
     Returns: True wenn Push abgeschickt, False bei Fehler.
     """
-    from html import escape as _h
-
-    preview_short = (body_preview or "").strip()[:200]
-    outlook_line = (
-        f'<a href="{_h(web_link)}">🔗 Im Outlook oeffnen</a>\n'
-        if web_link else ""
-    )
-    formular_line = (
-        f'<a href="{_h(anfrage_url)}">📝 Formular-Link (an Kunde versendet)</a>\n'
-        if anfrage_url else ""
-    )
-
+    # Datensparsam (Welle 0): keine Kunden-PII/Links in den Telegram-Push
+    # (Drittland-Transfer). Der Inhaber beantwortet die Anfrage in der App;
+    # der Formular-Link ist dort (und in Q's bereits versendeter Antwort).
     text = (
-        f"📧 <b>Neue Kundenanfrage</b>\n"
-        f"<b>Von:</b> {_h(sender_name)} ({_h(sender_email)})\n"
-        f"<b>Betreff:</b> {_h(subject[:80])}\n"
-        f"<b>Preview:</b> {_h(preview_short)}\n"
-        f"{outlook_line}"
-        f"{formular_line}"
+        "📧 <b>Neue Kundenanfrage</b>\n"
+        "Öffne die App oder tippe /anfragen, um sie zu beantworten.\n"
+        "<i>(Aus Datenschutzgründen ohne Inhalt.)</i>"
     )
 
     try:
@@ -1321,13 +1293,15 @@ async def push_tenant_intent_event(
     """
     from html import escape as _h
 
-    extra_line = f"<b>Details:</b> {_h(detail)}\n" if detail else ""
+    # Datensparsam (Welle 0): label + detail sind systemgeneriert (Aktion +
+    # Zähler, KEINE Kunden-Identität) und bleiben drin; Absender/Betreff/
+    # Inhalt der Kundenmail fliegen raus (Drittland-Transfer).
+    extra_line = f"{_h(detail)}\n" if detail else ""
     text = (
         f"📧 <b>{_h(label)}</b>\n"
-        f"<b>Von:</b> {_h(sender_name)} ({_h(sender_email)})\n"
-        f"<b>Betreff:</b> {_h(subject[:80])}\n"
-        f"<b>Preview:</b> {_h(body_preview[:300])}\n"
         f"{extra_line}"
+        "Details in der App.\n"
+        "<i>(Aus Datenschutzgründen ohne Mailinhalt.)</i>"
     )
 
     try:

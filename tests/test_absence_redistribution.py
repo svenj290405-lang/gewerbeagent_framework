@@ -318,6 +318,30 @@ def test_report_summary_empty():
     assert "keine Termine" in rep.summary()
 
 
+def test_telegram_summary_is_contentless():
+    """Welle 0: die Telegram-Variante zeigt nur Zaehler, KEINE Termin-
+    Betreffe (Kundennamen) oder den Namen des kranken Mitarbeiters."""
+    rep = ar.RedistributionReport(
+        sick_emp_slug="max", sick_emp_name="Max Mueller",
+        date_range=(dt.date(2026, 5, 20), dt.date(2026, 5, 20)),
+        reassigned=[_result("moved", subject="Heizung Mueller", new_slug="anna")],
+        no_coverage=[_result("no-coverage", subject="Bad Schmidt")],
+    )
+    out = rep.telegram_summary()
+    assert "1 Termin(e) umverteilt" in out
+    assert "1 Termin(e) ohne Kollegen" in out
+    for pii in ("Max Mueller", "Heizung Mueller", "Bad Schmidt", "anna"):
+        assert pii not in out
+
+
+def test_telegram_summary_empty():
+    rep = ar.RedistributionReport(
+        sick_emp_slug="max", sick_emp_name="Max",
+        date_range=(dt.date(2026, 5, 20), dt.date(2026, 5, 20)),
+    )
+    assert "keine Termine" in rep.telegram_summary()
+
+
 # =====================================================================
 # _run_cron_for_today — KERNREGEL: nur 'krank' wird umverteilt
 # =====================================================================

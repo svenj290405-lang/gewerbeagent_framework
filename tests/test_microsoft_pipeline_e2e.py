@@ -390,7 +390,9 @@ def test_intent_keyword_no_match():
 # =====================================================================
 
 @pytest.mark.asyncio
-async def test_push_new_anfrage_renders_outlook_link(push_capture):
+async def test_push_new_anfrage_is_contentless(push_capture):
+    """Welle 0 (Datensparsamkeit): der Push enthaelt nur den generischen Typ,
+    KEINE Kunden-PII (Name/Mail/Betreff/Inhalt) und keine Links mehr."""
     tenant = _make_tenant()
     ok = await mail_pipeline.push_tenant_new_anfrage_notification(
         tenant, sender_email="x@y.de", sender_name="Max",
@@ -400,11 +402,9 @@ async def test_push_new_anfrage_renders_outlook_link(push_capture):
     )
     assert ok is True
     text = push_capture[0]["text"]
-    assert "Neue Kundenanfrage" in text
-    assert "Max" in text
-    assert "Im Outlook oeffnen" in text
-    assert "https://outlook.office.com/abc" in text
-    assert "Formular-Link" in text
+    assert "Neue Kundenanfrage" in text  # generischer Typ bleibt
+    for pii in ("Max", "x@y.de", "Test-Anliegen", "outlook.office.com", "Formular-Link"):
+        assert pii not in text
 
 
 @pytest.mark.asyncio
@@ -417,6 +417,10 @@ async def test_push_followup_uses_assigned_employee(push_capture):
         subject="Re: Termin", body_preview="passt nicht", conv=conv,
     )
     assert push_capture[0]["employee_id"] == emp_id
+    # Welle 0: kein Kunden-PII im Push-Text
+    text = push_capture[0]["text"]
+    for pii in ("Max", "x@y.de", "Re: Termin", "passt nicht"):
+        assert pii not in text
 
 
 @pytest.mark.asyncio
@@ -428,8 +432,11 @@ async def test_push_intent_event_with_detail(push_capture):
         label="Storno verarbeitet", detail="1 Termin storniert",
     )
     text = push_capture[0]["text"]
-    assert "Storno verarbeitet" in text
-    assert "1 Termin storniert" in text
+    assert "Storno verarbeitet" in text       # systemgenerierter Typ bleibt
+    assert "1 Termin storniert" in text       # Zaehler (keine Kunden-Identitaet)
+    # Welle 0: Absender/Inhalt der Kundenmail fliegen raus
+    for pii in ("Max", "x@y.de", "muss absagen"):
+        assert pii not in text
 
 
 @pytest.mark.asyncio
@@ -445,9 +452,10 @@ async def test_push_bounce_notification_alarm_format(push_capture):
         bounce_reason="User unknown (550 5.1.1)",
     )
     text = push_capture[0]["text"]
-    assert "fehlgeschlagen" in text
-    assert "falsche@gmx.de" in text
-    assert "User unknown" in text
+    assert "zugestellt" in text  # generischer Alarm bleibt
+    # Welle 0: keine Kunden-Mail/Betreff/Bounce-Details mehr
+    for pii in ("falsche@gmx.de", "User unknown", "Kuechenmontage", "mailer-daemon"):
+        assert pii not in text
 
 
 # =====================================================================
