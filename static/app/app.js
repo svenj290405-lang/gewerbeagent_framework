@@ -42,9 +42,7 @@ function notifGranted() { return notifSupported() && Notification.permission ===
 const TABS = [
   { key: "aktuelles",   label: "Aktuelles", ico: "📋" },
   { key: "assistent",   label: "Assistent", ico: "🤖" },
-  { key: "anfragen",    label: "Anfragen", ico: "✉️", feature: "mail_intake" },
   { key: "termine",     label: "Termine",  ico: "📅", feature: "kalender" },
-  { key: "anrufe",      label: "Anrufe",   ico: "📞", feature: "voice_init" },
   { key: "buchhaltung", label: "Büro",     ico: "🧾", feature: "lexware" },
   { key: "mehr",        label: "Mehr",     ico: "⋯" },
 ];
@@ -76,16 +74,48 @@ function navigate(key) {
 // ---------- Screens ----------
 const SCREENS = {
   async aktuelles() {
-    const res = await api("/app/api/aktuelles");
+    const feats = new Set(App.me.features || []);
+    const hasMail = feats.has("mail_intake");
+    const [res, ares] = await Promise.all([
+      api("/app/api/aktuelles"),
+      hasMail ? api("/app/api/anfragen") : Promise.resolve(null),
+    ]);
     const d = res && res.ok ? await res.json() : {};
+    const ad = ares && ares.ok ? await ares.json() : { items: [] };
     const beratung = d.beratung || [];
     const auftraege = d.auftraege || [];
     const rueckrufe = d.rueckrufe || [];
+    const anfragenOffen = (ad.items || []).filter((x) => !x.closed);
     const parts = [];
-    parts.push(`<h1 style="font-size:22px;margin:4px 4px 14px">Aktuelles</h1>`);
+    parts.push(
+      `<div style="display:flex;align-items:center;justify-content:space-between;margin:4px 4px 14px">
+         <h1 style="font-size:22px;margin:0">Aktuelles</h1>
+         <div style="display:flex;gap:6px">
+           <button class="btn-sm" id="ak-diktat" style="padding:8px 12px">🎤 Diktat</button>
+           <button class="btn-sm btn-ghost" id="ak-rueckruf" style="padding:8px 12px">+ Rückruf</button>
+         </div>
+       </div>`);
 
     if (notifSupported() && !notifGranted()) {
       parts.push(`<div class="banner">Aktiviere Benachrichtigungen, damit du neue Buchungen und Rückrufe sofort siehst. <button class="btn-sm btn-ghost" id="enable-notif-inline">Aktivieren</button></div>`);
+    }
+
+    // --- Offene Anfragen (E-Mail-Eingang) ---
+    if (hasMail) {
+      parts.push(`<div class="section-title">Offene Anfragen (${anfragenOffen.length})</div>`);
+      if (!anfragenOffen.length) {
+        parts.push(`<div class="card">${emptyRow("Keine offenen Anfragen")}</div>`);
+      } else {
+        anfragenOffen.forEach((x) => {
+          parts.push(
+            `<button class="row menu-item" data-anfrage="${esc(x.id)}" style="display:block;text-align:left;padding:14px">
+               <div class="row" style="align-items:flex-start;border:0;padding:0">
+                 <div style="flex:1;min-width:0"><div><b>${esc(x.kunde_name || x.kunde_email)}</b></div><div class="sub" style="margin-top:2px">${esc(x.subject)}</div>${x.preview ? `<div class="sub" style="margin-top:4px;opacity:.8">${esc(x.preview)}</div>` : ""}</div>
+                 ${x.classification_label ? `<span class="pill ${x.classification_style || ""}" style="margin-left:8px">${esc(x.classification_label)}</span>` : ""}
+               </div>
+             </button>`);
+        });
+      }
     }
 
     // --- Beratungsgespräche (Leads: annehmen / ablehnen) ---
@@ -131,15 +161,22 @@ const SCREENS = {
       });
     }
 
-    // --- Offene Rückrufe ---
+    // --- Offene Rückrufe (mit Erledigt-Aktion) ---
     parts.push(`<div class="section-title">Offene Rückrufe (${rueckrufe.length})</div>`);
     parts.push(`<div class="card">${
-      rueckrufe.length ? rueckrufe.map((r) => row(r.kunde, r.telefon, r.anliegen)).join("") : emptyRow("Keine offenen Rückrufe")
+      rueckrufe.length ? rueckrufe.map((r) =>
+        rowAction(r.kunde, r.telefon + (r.anliegen ? " · " + esc(r.anliegen) : ""), "", r.id, "rueckruf-done", "Erledigt")).join("")
+      : emptyRow("Keine offenen Rückrufe")
     }</div>`);
 
     App.view.innerHTML = parts.join("");
     const inline = document.getElementById("enable-notif-inline");
     if (inline) inline.addEventListener("click", enablePush);
+    document.getElementById("ak-diktat").addEventListener("click", showDiktatForm);
+    document.getElementById("ak-rueckruf").addEventListener("click", showNewRueckrufForm);
+    document.querySelectorAll("[data-anfrage]").forEach((b) =>
+      b.addEventListener("click", () => showAnfrage(b.dataset.anfrage)));
+    bindRueckrufDone();
     bindAktuelles();
   },
 
@@ -1889,7 +1926,7 @@ async function showDiktatForm() {
      <div id="dk-result"></div>`;
   document.getElementById("back-anrufe").addEventListener("click", () => {
     if (Diktat.recording) _diktatTeardown();
-    navigate("anrufe");
+    navigate("aktuelles");
   });
 
   const toggle = document.getElementById("dk-toggle");
@@ -2267,7 +2304,7 @@ async function showNewRueckrufForm() {
        <textarea id="rr-anliegen" rows="4" placeholder="Worum geht's? z.B. Termin verschieben, Angebot besprechen …" style="width:100%;padding:12px;border:1px solid var(--line);border-radius:10px;font-family:inherit;font-size:16px"></textarea>
        <button class="btn-sm" id="rr-save" style="margin-top:12px;width:100%">Rückruf anlegen</button>
     </div>`;
-  document.getElementById("back-anrufe").addEventListener("click", () => navigate("anrufe"));
+  document.getElementById("back-anrufe").addEventListener("click", () => navigate("aktuelles"));
   document.getElementById("rr-save").addEventListener("click", async () => {
     const name = document.getElementById("rr-name").value.trim();
     const tel = document.getElementById("rr-tel").value.trim();
@@ -2283,7 +2320,7 @@ async function showNewRueckrufForm() {
       { method: "POST", body: JSON.stringify(body) });
     if (res && res.ok) {
       const j = await res.json();
-      if (j.ok) { navigate("anrufe"); return; }
+      if (j.ok) { navigate("aktuelles"); return; }
       alert("Konnte nicht anlegen: " + (j.error || "unbekannt"));
     } else {
       alert("Konnte nicht anlegen.");
@@ -2464,7 +2501,7 @@ async function showAnfrage(id) {
          <p class="muted" style="margin-top:8px;font-size:12px">Die Mail wird im Namen deines Mailpostfachs versendet — der Kunde sieht deinen Absender.</p>
        </div>`);
 
-  document.getElementById("back-anfragen").addEventListener("click", () => navigate("anfragen"));
+  document.getElementById("back-anfragen").addEventListener("click", () => navigate("aktuelles"));
   const sendBtn = document.getElementById("reply-send");
   if (sendBtn) {
     sendBtn.addEventListener("click", async () => {
@@ -2479,7 +2516,7 @@ async function showAnfrage(id) {
         const okJson = await res.json();
         if (okJson.ok) {
           alert(close ? "Antwort gesendet. Anfrage als erledigt markiert." : "Antwort gesendet.");
-          navigate("anfragen");
+          navigate("aktuelles");
           return;
         }
         alert("Mail-Versand fehlgeschlagen: " + (okJson.error || "unbekannter Fehler"));
@@ -2596,7 +2633,7 @@ function bindRueckrufDone() {
     b.addEventListener("click", async () => {
       b.disabled = true;
       const res = await api("/app/api/rueckrufe/erledigt", { method: "POST", body: JSON.stringify({ id: b.dataset.id }) });
-      if (res && res.ok) navigate("anrufe"); else { b.disabled = false; alert("Konnte nicht abhaken."); }
+      if (res && res.ok) navigate("aktuelles"); else { b.disabled = false; alert("Konnte nicht abhaken."); }
     }));
 }
 

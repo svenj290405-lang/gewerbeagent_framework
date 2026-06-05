@@ -26,7 +26,9 @@
 // v27: "Start" -> "Aktuelles" (Rückrufe + Beratungs-Leads annehmen/ablehnen +
 // Auftrags-Pipeline mit 0-100%-Regler); Briefings nach "Termine"; 100% ->
 // Rechnung in Q vorbereiten (editierbares Anschreiben) + senden.
-const CACHE = "ga-app-v27";
+// v28: Tabs "Anrufe" + "Anfragen" entfernt — in "Aktuelles" zusammengeführt
+// (Offene Anfragen tappbar, Rückrufe mit Erledigt, Diktat + Rückruf-Buttons).
+const CACHE = "ga-app-v28";
 const SHELL = [
   "/app",
   "/app/static/app.css",
