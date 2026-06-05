@@ -104,6 +104,24 @@ button:disabled { opacity: .6; }
   color: #fff; font-weight: 700; font-size: 22px; display: flex; align-items: center;
   justify-content: center; box-shadow: 0 4px 12px rgba(0,102,204,.3); }
 
+/* Empty-State: Netzwerk-Globus (Q-Sphere) mittig wie auf der Website */
+.q-hero { position: relative; display: flex; align-items: center; justify-content: center;
+  min-height: calc(100vh - 230px); isolation: isolate; }
+.q-hero::before { content: ""; position: absolute; top: 50%; left: 50%;
+  width: 520px; height: 520px; transform: translate(-50%, -50%); pointer-events: none; z-index: -1;
+  background: radial-gradient(circle, rgba(0,102,204,.18) 0%, rgba(158,197,255,.18) 28%, transparent 62%); }
+.q-sphere-wrap { position: relative; width: min(72vw, 300px); aspect-ratio: 1;
+  cursor: grab; touch-action: pan-y; }
+.q-sphere-wrap:active { cursor: grabbing; }
+.q-sphere-wrap canvas { width: 100% !important; height: 100% !important; display: block; }
+.q-sphere-fallback { display: none; width: 100%; aspect-ratio: 1; opacity: .85; }
+.q-sphere-fallback circle { fill: none; stroke: #9ec5ff; stroke-width: .4; opacity: .7; }
+.q-sphere-fallback .ring-1 { animation: qring 4s ease-in-out infinite; }
+.q-sphere-fallback .ring-2 { animation: qring 4s ease-in-out infinite .5s; }
+.q-sphere-fallback .ring-3 { animation: qring 4s ease-in-out infinite 1s; }
+@keyframes qring { 0%,100% { opacity: .3; transform: scale(.95); transform-origin: center; }
+  50% { opacity: .8; transform: scale(1.02); transform-origin: center; } }
+
 .bubble { max-width: 84%; padding: 10px 14px; border-radius: 18px; font-size: 15px;
   line-height: 1.42; white-space: pre-wrap; overflow-wrap: anywhere;
   box-shadow: 0 1px 2px rgba(0,0,0,.06); animation: bubblein .14s ease-out; }
@@ -117,6 +135,21 @@ button:disabled { opacity: .6; }
 .confirm-actions .btn-sm { flex: 1; text-align: center; }
 .confirm-done { font-size: 13px; color: var(--muted); margin-top: 2px; }
 
+/* Aktuelles: Fortschritts-Regler */
+.slider-wrap { display: flex; align-items: center; gap: 10px; margin-top: 12px; }
+.slider-wrap input[type=range] { flex: 1; accent-color: var(--primary); height: 26px; }
+.slider-wrap .slider-val { font-size: 13px; font-weight: 600; color: var(--primary);
+  min-width: 40px; text-align: right; font-variant-numeric: tabular-nums; }
+.card.lead { border-left: 3px solid var(--primary); }
+
+/* Rechnungs-Karte im Q-Chat */
+.bubble.rechnung { max-width: 94%; }
+.bubble.rechnung .rech-pos { background: var(--bg); border-radius: 10px; padding: 4px 12px; margin: 0 0 12px; }
+.bubble.rechnung label { display: block; margin-bottom: 2px; }
+.bubble.rechnung .rech-input { width: 100%; margin: 0 0 12px; padding: 10px 12px;
+  border: 1px solid var(--line); border-radius: 10px; font-size: 15px; font-family: inherit; }
+.bubble.rechnung textarea.rech-input { resize: vertical; min-height: 90px; line-height: 1.4; }
+
 /* Tipp-Animation (drei Punkte) */
 .bubble.typing { display: flex; gap: 4px; align-items: center; padding: 14px; }
 .bubble.typing span { width: 7px; height: 7px; border-radius: 50%; background: var(--muted);
@@ -128,8 +161,21 @@ button:disabled { opacity: .6; }
 /* Eingabeleiste */
 .composer { position: fixed; left: 0; right: 0; z-index: 9;
   bottom: calc(56px + env(safe-area-inset-bottom));
-  background: var(--card); border-top: 1px solid var(--line); padding: 8px 10px; }
-.composer-inner { max-width: 720px; margin: 0 auto; display: flex; align-items: flex-end; gap: 6px; }
+  background: var(--card); border-top: 1px solid var(--line); padding: 8px 10px;
+  display: flex; flex-direction: column; gap: 8px; }
+.composer-inner { max-width: 720px; margin: 0 auto; width: 100%; display: flex; align-items: flex-end; gap: 6px; }
+.composer .cbtn.active { background: var(--primary); color: #fff; }
+
+/* Funktions-Dropdown über der Eingabeleiste */
+.q-menu { max-width: 720px; width: 100%; margin: 0 auto; max-height: 46vh; overflow-y: auto;
+  background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 6px;
+  box-shadow: 0 6px 20px rgba(0,0,0,.12); }
+.q-menu[hidden] { display: none; }
+.q-menu button { width: 100%; background: none; color: var(--text); border: 0; border-radius: 9px;
+  padding: 11px 12px; font-size: 15px; font-weight: 500; text-align: left; cursor: pointer;
+  display: flex; align-items: center; gap: 10px; }
+.q-menu button:active { background: var(--bg); }
+.q-menu .qm-ico { font-size: 18px; width: 22px; text-align: center; }
 .composer textarea { flex: 1; resize: none; max-height: 120px; min-height: 42px;
   padding: 10px 14px; border: 1px solid var(--line); border-radius: 21px;
   font-size: 16px; font-family: inherit; line-height: 1.3; background: var(--bg); }

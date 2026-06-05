@@ -18,7 +18,15 @@
 // Home-Screen-Installation auf iOS/Android.
 // v23: Kunden-Archiv-Upload (Foto/PDF/Notiz in Drive-Ordner) im Kunden-Profil.
 // v24: „Zahlungen prüfen"-Button im Büro (Lexware-Bezahlstatus-Abgleich).
-const CACHE = "ga-app-v24";
+// v25: Q-Chat ist Startscreen; leerer Chat zeigt mittig den Netzwerk-Globus
+// (Sphere wie auf der Website, Three.js via CDN), Intro-Text entfernt.
+// v26: Visualisierung-Fenster aus dem Mehr-Hub entfernt; Q hat ein
+// Funktions-Dropdown (Termin/Rückruf/Material/Wissen/Kunde/Angebot/Rechnung/
+// Visualisierung) als Quick-Aktionen.
+// v27: "Start" -> "Aktuelles" (Rückrufe + Beratungs-Leads annehmen/ablehnen +
+// Auftrags-Pipeline mit 0-100%-Regler); Briefings nach "Termine"; 100% ->
+// Rechnung in Q vorbereiten (editierbares Anschreiben) + senden.
+const CACHE = "ga-app-v27";
 const SHELL = [
   "/app",
   "/app/static/app.css",

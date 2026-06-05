@@ -10,7 +10,7 @@
 const App = {
   me: null,
   view: document.getElementById("view"),
-  current: "start",
+  current: "aktuelles",
 };
 
 // ---------- Helpers ----------
@@ -40,7 +40,7 @@ function notifGranted() { return notifSupported() && Notification.permission ===
 
 // ---------- Tabs ----------
 const TABS = [
-  { key: "start",       label: "Start",    ico: "🏠" },
+  { key: "aktuelles",   label: "Aktuelles", ico: "📋" },
   { key: "assistent",   label: "Assistent", ico: "🤖" },
   { key: "anfragen",    label: "Anfragen", ico: "✉️", feature: "mail_intake" },
   { key: "termine",     label: "Termine",  ico: "📅", feature: "kalender" },
@@ -61,10 +61,11 @@ function buildTabbar() {
 }
 
 function navigate(key) {
+  if (App.qSphereStop) { try { App.qSphereStop(); } catch (e) {} App.qSphereStop = null; }
   App.current = key;
   document.querySelectorAll(".tabbar button").forEach((b) =>
     b.classList.toggle("active", b.dataset.tab === key));
-  const fn = SCREENS[key] || SCREENS.start;
+  const fn = SCREENS[key] || SCREENS.aktuelles;
   App.view.innerHTML = `<div class="loading">Lädt …</div>`;
   fn().catch((e) => {
     App.view.innerHTML = `<div class="card"><p class="empty">Konnte nicht laden.</p></div>`;
@@ -74,48 +75,93 @@ function navigate(key) {
 
 // ---------- Screens ----------
 const SCREENS = {
-  async start() {
-    const res = await api("/app/api/dashboard");
+  async aktuelles() {
+    const res = await api("/app/api/aktuelles");
     const d = res && res.ok ? await res.json() : {};
+    const beratung = d.beratung || [];
+    const auftraege = d.auftraege || [];
+    const rueckrufe = d.rueckrufe || [];
     const parts = [];
-    parts.push(`<h1 style="font-size:22px;margin:4px 4px 14px">Hallo${App.me.employee.name ? ", " + esc(App.me.employee.name.split(" ")[0]) : ""} 👋</h1>`);
+    parts.push(`<h1 style="font-size:22px;margin:4px 4px 14px">Aktuelles</h1>`);
 
     if (notifSupported() && !notifGranted()) {
       parts.push(`<div class="banner">Aktiviere Benachrichtigungen, damit du neue Buchungen und Rückrufe sofort siehst. <button class="btn-sm btn-ghost" id="enable-notif-inline">Aktivieren</button></div>`);
     }
 
-    const today = (d.termine_heute || []);
-    parts.push(`<div class="card"><h2>Heute (${today.length})</h2>${
-      today.length ? today.map((t) => row(t.zeit, t.kunde, t.ort)).join("") : emptyRow("Keine Termine heute")
-    }</div>`);
+    // --- Beratungsgespräche (Leads: annehmen / ablehnen) ---
+    if (beratung.length) {
+      parts.push(`<div class="section-title">Beratungsgespräche (${beratung.length})</div>`);
+      beratung.forEach((b) => {
+        parts.push(
+          `<div class="card lead">
+             <div><b>${esc(b.kunde)}</b>${b.termin ? `<div class="sub">📅 ${esc(b.termin)}</div>` : ""}${b.briefing ? `<div class="sub">${esc(b.briefing)}</div>` : ""}</div>
+             <div class="confirm-actions" style="margin-top:10px">
+               <button class="btn-sm" data-lead-ja="${esc(b.id)}">Annehmen</button>
+               <button class="btn-sm btn-ghost" data-lead-nein="${esc(b.id)}">Ablehnen</button>
+             </div>
+           </div>`);
+      });
+    }
 
-    parts.push(`<div class="card"><h2>Offene Rückrufe (${(d.rueckrufe || []).length})</h2>${
-      (d.rueckrufe || []).length ? d.rueckrufe.map((r) => row(r.kunde, r.telefon, r.anliegen)).join("") : emptyRow("Keine offenen Rückrufe")
-    }</div>`);
+    // --- Aufträge mit Status ---
+    parts.push(`<div class="section-title">Aufträge (${auftraege.length})</div>`);
+    if (!auftraege.length) {
+      parts.push(`<div class="card">${emptyRow("Keine laufenden Aufträge")}</div>`);
+    } else {
+      auftraege.forEach((a) => {
+        let extra = "";
+        if (a.in_arbeit) {
+          extra =
+            `<div class="slider-wrap">
+               <input type="range" min="0" max="100" step="5" value="${a.fortschritt}" data-slider="${esc(a.id)}">
+               <span class="slider-val" data-slider-val="${esc(a.id)}">${a.fortschritt}%</span>
+             </div>`;
+        } else if (a.fertig) {
+          extra = `<button class="btn-sm" data-rechnung="${esc(a.id)}" style="width:100%;margin-top:8px">🧾 Rechnung in Q vorbereiten</button>`;
+        } else if (a.typ === "lead_angenommen") {
+          extra = `<button class="btn-sm btn-ghost" data-angebot-neu="${esc(a.kunde)}" style="width:100%;margin-top:8px">📄 Angebot erstellen</button>`;
+        }
+        parts.push(
+          `<div class="card">
+             <div class="row" style="border:0;padding:0">
+               <div><div>${esc(a.kunde)}</div>${a.betrag ? `<div class="sub">${esc(a.betrag)}</div>` : ""}</div>
+               <span class="pill ${a.pill || ""}">${esc(a.status_label)}</span>
+             </div>${extra}
+           </div>`);
+      });
+    }
 
-    parts.push(`<div class="card"><h2>Neue Aufnahmen (${(d.aufnahmen || []).length})</h2>${
-      (d.aufnahmen || []).length ? d.aufnahmen.map((a) => rowTap(a.kunde || "Aufnahme", a.briefing || "", a.zeit, a.id)).join("") : emptyRow("Keine neuen Aufnahmen")
+    // --- Offene Rückrufe ---
+    parts.push(`<div class="section-title">Offene Rückrufe (${rueckrufe.length})</div>`);
+    parts.push(`<div class="card">${
+      rueckrufe.length ? rueckrufe.map((r) => row(r.kunde, r.telefon, r.anliegen)).join("") : emptyRow("Keine offenen Rückrufe")
     }</div>`);
 
     App.view.innerHTML = parts.join("");
     const inline = document.getElementById("enable-notif-inline");
     if (inline) inline.addEventListener("click", enablePush);
-    bindAufnahmen();
+    bindAktuelles();
   },
 
   async termine() {
-    const res = await api("/app/api/termine");
-    const d = res && res.ok ? await res.json() : { termine: [] };
+    const [t, a] = await Promise.all([api("/app/api/termine"), api("/app/api/aufnahmen")]);
+    const d = t && t.ok ? await t.json() : { termine: [] };
+    const ad = a && a.ok ? await a.json() : { aufnahmen: [] };
     const list = d.termine || [];
+    const aufnahmen = ad.aufnahmen || [];
     App.view.innerHTML =
       `<div style="display:flex;align-items:center;justify-content:space-between;margin:4px 4px 14px">
         <h1 style="font-size:22px;margin:0">Termine</h1>
         <button class="btn-sm" id="termin-new-btn" style="padding:8px 14px">+ Neu</button>
       </div>` +
       `<div class="card"><h2>Anstehende Termine</h2>${
-        list.length ? list.map((t) => rowAction(t.zeit, t.kunde, t.ort, t.id, "storno", "Stornieren")).join("") : emptyRow("Keine anstehenden Termine")
+        list.length ? list.map((x) => rowAction(x.zeit, x.kunde, x.ort, x.id, "storno", "Stornieren")).join("") : emptyRow("Keine anstehenden Termine")
+      }</div>` +
+      `<div class="card"><h2>Briefings</h2>${
+        aufnahmen.length ? aufnahmen.map((x) => rowTap(x.kunde || "Aufnahme", x.briefing || "", x.zeit, x.id)).join("") : emptyRow("Keine Briefings")
       }</div>`;
     bindStorno();
+    bindAufnahmen();
     document.getElementById("termin-new-btn").addEventListener("click", showNewTerminForm);
   },
 
@@ -470,7 +516,8 @@ const SCREENS = {
        <div id="viz-result"></div>` +
       (recent ? `<div class="card"><h2>Bisherige</h2>${recent}</div>` : "");
 
-    document.getElementById("back-mehr").addEventListener("click", () => navigate("mehr"));
+    // Visualisierung wird aus dem Q-Aktionsmenü gestartet → zurück in den Chat.
+    document.getElementById("back-mehr").addEventListener("click", () => navigate("assistent"));
     const fileEl = document.getElementById("viz-file");
     const promptEl = document.getElementById("viz-prompt");
     const goBtn = document.getElementById("viz-go");
@@ -917,7 +964,7 @@ const SCREENS = {
     menu.push(`<button class="row menu-item" data-go="kunden"><span>🔍 Kunden suchen</span><span class="sub">›</span></button>`);
     menu.push(`<button class="row menu-item" data-go="wissen"><span>📚 Wissensdatenbank</span><span class="sub">›</span></button>`);
     menu.push(`<button class="row menu-item" data-go="material"><span>🧰 Material</span><span class="sub">›</span></button>`);
-    if (feats.has("visualisierung")) menu.push(`<button class="row menu-item" data-go="visualisierung"><span>🎨 Visualisierung</span><span class="sub">›</span></button>`);
+    // Visualisierung ist als eigenes Fenster entfernt — jetzt über das Q-Aktionsmenü erreichbar.
     if (feats.has("mitarbeiter")) menu.push(`<button class="row menu-item" data-go="team"><span>👥 Team</span><span class="sub">›</span></button>`);
     if (feats.has("anfrage_formular") && m.employee.is_inhaber) menu.push(`<button class="row menu-item" data-go="formulare"><span>📝 Anfrage-Formular</span><span class="sub">›</span></button>`);
     menu.push(`<button class="row menu-item" data-go="einstellungen"><span>⚙️ Einstellungen</span><span class="sub">›</span></button>`);
@@ -943,12 +990,16 @@ const SCREENS = {
     App.qchat = App.qchat || [];
     App.view.innerHTML =
       `<div class="chat" id="q-chat"></div>
-       <div class="composer"><div class="composer-inner">
-         <button class="cbtn ghost" id="q-attach" title="Beleg/Foto hochladen">📎</button>
-         <textarea id="q-input" rows="1" placeholder="Schreib Q …"></textarea>
-         <button class="cbtn ghost" id="q-mic" title="Sprechen">🎤</button>
-         <button class="cbtn" id="q-send" title="Senden">➤</button>
-       </div></div>
+       <div class="composer">
+         <div class="q-menu" id="q-menu" hidden></div>
+         <div class="composer-inner">
+           <button class="cbtn ghost" id="q-actions" title="Funktionen">⚡</button>
+           <button class="cbtn ghost" id="q-attach" title="Beleg/Foto hochladen">📎</button>
+           <textarea id="q-input" rows="1" placeholder="Schreib Q …"></textarea>
+           <button class="cbtn ghost" id="q-mic" title="Sprechen">🎤</button>
+           <button class="cbtn" id="q-send" title="Senden">➤</button>
+         </div>
+       </div>
        <input type="file" id="q-file" accept="image/jpeg,image/png,application/pdf" style="display:none">`;
 
     const chatEl = document.getElementById("q-chat");
@@ -983,9 +1034,22 @@ const SCREENS = {
 
     function render() {
       if (!App.qchat.length) {
-        chatEl.innerHTML = `<div class="chat-intro"><div class="q-avatar">Q</div><p>Ich bin <b>Q</b>, dein Assistent.<br>Sag oder tipp, was zu tun ist — z.&nbsp;B. „Trag Frau Meier morgen 14 Uhr ein", „Bestell 20&nbsp;m Kupferrohr" oder „Mach Schmidt ein Angebot". Mit 📎 lädst du Belege hoch.</p></div>`;
+        chatEl.innerHTML =
+          `<div class="q-hero">
+             <div class="q-sphere-wrap" id="q-sphere-wrap" aria-hidden="true">
+               <canvas id="q-sphere-canvas"></canvas>
+               <svg class="q-sphere-fallback" viewBox="0 0 100 100" aria-hidden="true">
+                 <circle class="ring-1" cx="50" cy="50" r="35"/>
+                 <circle class="ring-2" cx="50" cy="50" r="28"/>
+                 <circle class="ring-3" cx="50" cy="50" r="22"/>
+                 <circle cx="50" cy="50" r="2" fill="#0066cc" stroke="none"/>
+               </svg>
+             </div>
+           </div>`;
+        mountQSphere();
         return;
       }
+      if (App.qSphereStop) { try { App.qSphereStop(); } catch (e) {} App.qSphereStop = null; }
       chatEl.innerHTML = App.qchat.map((m, i) => {
         if (m.role === "me") return `<div class="bubble me">${esc(m.text)}</div>`;
         if (m.role === "typing") return `<div class="bubble q typing"><span></span><span></span><span></span></div>`;
@@ -995,6 +1059,23 @@ const SCREENS = {
             ? `<div class="confirm-done">${m.cancelled ? "✕ Abgebrochen" : "✓ Bestätigt"}</div>`
             : `<div class="confirm-actions"><button class="btn-sm" data-cyes="${i}">Ausführen</button><button class="btn-sm btn-ghost" data-cno="${i}">Abbrechen</button></div>`;
           return `<div class="bubble q confirm">${m.frage ? `<p style="margin:0 0 8px">${esc(m.frage)}</p>` : ""}<p class="q-summary">${esc(m.summary)}</p>${btns}</div>`;
+        }
+        if (m.role === "rechnung") {
+          const r = m.data || {};
+          if (m.resolved) {
+            return `<div class="bubble q confirm"><p class="q-summary">Rechnung an ${esc(r.kunde)}</p><div class="confirm-done">${m.sent ? "✓ Rechnung gesendet" : "✕ Abgebrochen"}</div></div>`;
+          }
+          const pos = (r.positionen || []).map((p) =>
+            `<div class="row" style="padding:6px 0"><div><div>${esc(p.name)}</div>${p.beschreibung ? `<div class="sub">${esc(p.beschreibung)}</div>` : ""}</div><span class="sub">${esc(String(p.menge))} ${esc(p.einheit || "")} · ${esc(p.preis || "")}</span></div>`).join("");
+          return `<div class="bubble q confirm rechnung">
+             <p class="q-summary">Rechnung an ${esc(r.kunde)}${r.betrag ? " · " + esc(r.betrag) : ""}</p>
+             <div class="rech-pos">${pos || `<div class="sub">Keine Positionen hinterlegt</div>`}</div>
+             <label class="sub">Empfänger-E-Mail</label>
+             <input type="email" class="rech-input" data-rmail="${i}" value="${esc(r.kunde_email || "")}" placeholder="kunde@example.de">
+             <label class="sub">Anschreiben</label>
+             <textarea class="rech-input" data-rtext="${i}" rows="6">${esc(r.anschreiben || "")}</textarea>
+             <div class="confirm-actions"><button class="btn-sm" data-rsend="${i}">Rechnung senden</button><button class="btn-sm btn-ghost" data-rcancel="${i}">Abbrechen</button></div>
+           </div>`;
         }
         return `<div class="bubble q">${esc(m.text)}</div>`;
       }).join("");
@@ -1007,7 +1088,41 @@ const SCREENS = {
           App.qchat.push({ role: "q", text: "Okay, lasse ich." });
           render(); scrollDown();
         }));
+      // Rechnungs-Karte: Eingaben in m.data spiegeln (überleben Re-Renders)
+      chatEl.querySelectorAll("[data-rtext]").forEach((t) =>
+        t.addEventListener("input", () => { App.qchat[parseInt(t.dataset.rtext, 10)].data.anschreiben = t.value; }));
+      chatEl.querySelectorAll("[data-rmail]").forEach((t) =>
+        t.addEventListener("input", () => { App.qchat[parseInt(t.dataset.rmail, 10)].data.kunde_email = t.value; }));
+      chatEl.querySelectorAll("[data-rsend]").forEach((b) =>
+        b.addEventListener("click", () => doRechnungSenden(parseInt(b.dataset.rsend, 10))));
+      chatEl.querySelectorAll("[data-rcancel]").forEach((b) =>
+        b.addEventListener("click", () => {
+          const m = App.qchat[parseInt(b.dataset.rcancel, 10)];
+          m.resolved = true; m.cancelled = true;
+          App.qchat.push({ role: "q", text: "Okay, die Rechnung lasse ich erstmal." });
+          render(); scrollDown();
+        }));
       scrollDown();
+    }
+
+    async function doRechnungSenden(idx) {
+      const m = App.qchat[idx];
+      if (!m || m.resolved) return;
+      const r = m.data || {};
+      m.resolved = true; m.sent = false; render();
+      push({ role: "typing" });
+      let res, j = null;
+      try {
+        res = await fetch("/app/api/rechnung/senden", { method: "POST",
+          headers: { "X-CSRF-Token": App.me.csrf, "Content-Type": "application/json" },
+          body: JSON.stringify({ angebot_id: r.angebot_id, anschreiben: r.anschreiben, kunde_email: r.kunde_email }) });
+      } catch (e) { popTyping(); push({ role: "err", text: "Netzwerkfehler beim Senden." }); return; }
+      if (res.status === 303 || res.status === 401 || res.redirected) { location.href = "/app/login"; return; }
+      try { j = await res.json(); } catch (e) {}
+      popTyping();
+      if (j && j.ok && j.mail_sent) { m.sent = true; render(); push({ role: "q", text: `✓ Rechnung an ${esc(j.email_used || r.kunde)} gesendet — Auftrag abgeschlossen.` }); }
+      else if (j && j.ok) { m.sent = true; render(); push({ role: "q", text: `Rechnung in Lexware finalisiert${j.mail_error ? " (Mail offen: " + esc(j.mail_error) + ")" : ""}.` }); }
+      else { push({ role: "err", text: (j && (j.error || j.mail_error)) || "Rechnung konnte nicht gesendet werden." }); }
     }
 
     function push(m) { App.qchat.push(m); render(); }
@@ -1101,9 +1216,57 @@ const SCREENS = {
       Diktat.autostop = setTimeout(() => { if (Diktat.recording) micBtn.click(); }, 60 * 1000);
     });
 
+    // ---- Funktions-Dropdown (Quick-Aktionen) ----
+    // Damit der Handwerker nicht alles per Hand in eigenen Fenstern anlegt:
+    // er tippt eine Funktion an, Q bekommt den passenden Satz vorgeschrieben
+    // und legt die Sache an (Schreib-Aktionen weiterhin mit Bestätigung).
+    const actionsBtn = document.getElementById("q-actions");
+    const menuEl = document.getElementById("q-menu");
+    const feats = new Set(App.me.features || []);
+    const isInhaber = !!(App.me.employee && App.me.employee.is_inhaber);
+    const QACTIONS = [
+      { ico: "📅", label: "Termin eintragen",   seed: "Trag einen Termin ein: ",     feature: "kalender" },
+      { ico: "📞", label: "Rückruf anlegen",     seed: "Leg einen Rückruf an für " },
+      { ico: "🧰", label: "Material bestellen",  seed: "Bestell " },
+      { ico: "📚", label: "Wissen merken",       seed: "Merk dir: " },
+      { ico: "🔍", label: "Kunde nachschlagen",  seed: "Zeig mir alles zu " },
+      { ico: "✉️", label: "Anfrage beantworten", seed: "Beantworte die Anfrage von ", feature: "mail_intake" },
+      { ico: "📄", label: "Angebot erstellen",   seed: "Mach ein Angebot für ",       feature: "lexware", inhaber: true },
+      { ico: "🧾", label: "Rechnung erstellen",  seed: "Schreib eine Rechnung für ",  feature: "lexware", inhaber: true },
+      { ico: "🎨", label: "Visualisierung",      viz: true,                           feature: "visualisierung" },
+    ].filter((a) => (!a.feature || feats.has(a.feature)) && (!a.inhaber || isInhaber));
+
+    menuEl.innerHTML = QACTIONS.map((a, i) =>
+      `<button data-qa="${i}"><span class="qm-ico">${a.ico}</span>${esc(a.label)}</button>`).join("");
+
+    function toggleQMenu(show) {
+      const open = show === undefined ? menuEl.hidden : show;
+      menuEl.hidden = !open;
+      actionsBtn.classList.toggle("active", open);
+    }
+    actionsBtn.addEventListener("click", (e) => { e.stopPropagation(); toggleQMenu(); });
+    // Klick außerhalb schließt das Menü (alten Listener vorher entfernen, kein Leak).
+    if (App._qMenuDocClick) document.removeEventListener("click", App._qMenuDocClick);
+    App._qMenuDocClick = (e) => {
+      if (!menuEl.hidden && !menuEl.contains(e.target) && e.target !== actionsBtn) toggleQMenu(false);
+    };
+    document.addEventListener("click", App._qMenuDocClick);
+    menuEl.querySelectorAll("[data-qa]").forEach((b) =>
+      b.addEventListener("click", () => {
+        const a = QACTIONS[parseInt(b.dataset.qa, 10)];
+        toggleQMenu(false);
+        if (a.viz) { navigate("visualisierung"); return; }
+        input.value = a.seed; auto(); input.focus();
+        input.setSelectionRange(input.value.length, input.value.length);
+      }));
+
     render();
     auto();
-    input.focus();
+    // Vorbefüllung aus einem Quick-Aktion/„Angebot erstellen"-Tap.
+    if (App.qSeed) { input.value = App.qSeed; App.qSeed = null; auto(); input.focus(); input.setSelectionRange(input.value.length, input.value.length); }
+    // Im leeren Chat NICHT fokussieren: sonst poppt die Tastatur und verdeckt
+    // die Sphere. Erst fokussieren, wenn schon ein Verlauf da ist.
+    else if (App.qchat.length) input.focus();
   },
 };
 
@@ -2334,6 +2497,72 @@ function bindAufnahmen() {
     b.addEventListener("click", () => showAufnahme(b.dataset.aufnahme)));
 }
 
+// Event-Bindung für den "Aktuelles"-Screen: Beratungs-Leads annehmen/ablehnen,
+// Fortschritts-Regler, Rechnung-in-Q, Angebot-erstellen.
+function bindAktuelles() {
+  // Beratungs-Lead annehmen/ablehnen
+  document.querySelectorAll("[data-lead-ja]").forEach((b) =>
+    b.addEventListener("click", () => beratungEntscheidung(b.dataset.leadJa, "annehmen")));
+  document.querySelectorAll("[data-lead-nein]").forEach((b) =>
+    b.addEventListener("click", () => beratungEntscheidung(b.dataset.leadNein, "ablehnen")));
+
+  // Fortschritts-Regler
+  document.querySelectorAll("[data-slider]").forEach((sl) => {
+    const id = sl.dataset.slider;
+    const val = document.querySelector(`[data-slider-val="${id}"]`);
+    sl.addEventListener("input", () => { if (val) val.textContent = sl.value + "%"; });
+    sl.addEventListener("change", async () => {
+      sl.disabled = true;
+      let res, j = null;
+      try {
+        res = await fetch(`/app/api/auftraege/${encodeURIComponent(id)}/fortschritt`, {
+          method: "POST", headers: { "X-CSRF-Token": App.me.csrf, "Content-Type": "application/json" },
+          body: JSON.stringify({ fortschritt: parseInt(sl.value, 10) }) });
+      } catch (e) { sl.disabled = false; alert("Speichern fehlgeschlagen."); return; }
+      if (res.status === 303 || res.status === 401 || res.redirected) { location.href = "/app/login"; return; }
+      try { j = await res.json(); } catch (e) {}
+      if (j && j.ok && j.fertig) { openRechnungInQ(id); return; }
+      sl.disabled = false;
+    });
+  });
+
+  // Fertiger Auftrag -> Rechnung in Q vorbereiten
+  document.querySelectorAll("[data-rechnung]").forEach((b) =>
+    b.addEventListener("click", () => openRechnungInQ(b.dataset.rechnung)));
+
+  // Angenommener Lead -> Angebot über Q erstellen
+  document.querySelectorAll("[data-angebot-neu]").forEach((b) =>
+    b.addEventListener("click", () => { App.qSeed = "Mach ein Angebot für " + b.dataset.angebotNeu + ": "; navigate("assistent"); }));
+}
+
+async function beratungEntscheidung(id, entscheidung) {
+  let res;
+  try {
+    res = await fetch(`/app/api/beratung/${encodeURIComponent(id)}/entscheidung`, {
+      method: "POST", headers: { "X-CSRF-Token": App.me.csrf, "Content-Type": "application/json" },
+      body: JSON.stringify({ entscheidung }) });
+  } catch (e) { alert("Aktion fehlgeschlagen."); return; }
+  if (res.status === 303 || res.status === 401 || res.redirected) { location.href = "/app/login"; return; }
+  navigate("aktuelles");
+}
+
+// Lädt die Rechnungs-Vorschau (Positionen + KI-Anschreiben) und leitet in den
+// Q-Chat weiter, wo der Handwerker alles prüft/anpasst und dann sendet.
+async function openRechnungInQ(angebotId) {
+  App.qchat = App.qchat || [];
+  let res, j = null;
+  try {
+    res = await fetch("/app/api/rechnung/vorbereiten?angebot_id=" + encodeURIComponent(angebotId), {
+      headers: { "X-CSRF-Token": App.me.csrf } });
+  } catch (e) { alert("Konnte die Rechnung nicht vorbereiten."); return; }
+  if (res.status === 303 || res.status === 401 || res.redirected) { location.href = "/app/login"; return; }
+  try { j = await res.json(); } catch (e) {}
+  if (!j || !j.ok) { alert((j && j.error) || "Konnte die Rechnung nicht vorbereiten."); return; }
+  App.qchat.push({ role: "q", text: `Der Auftrag von ${j.kunde} ist fertig. Hier die Rechnung — prüf das Anschreiben und schick sie ab, wenn alles passt.` });
+  App.qchat.push({ role: "rechnung", data: j });
+  navigate("assistent");
+}
+
 async function showAufnahme(id) {
   App.view.innerHTML = `<div class="loading">Lädt …</div>`;
   const r = await api("/app/api/aufnahmen/" + encodeURIComponent(id));
@@ -2397,6 +2626,202 @@ async function enablePush() {
   } catch (e) { console.error(e); alert("Konnte Benachrichtigungen nicht aktivieren."); }
 }
 
+// ---------- Q-Sphere (Netzwerk-Globus wie auf der Website) ----------
+// Wireframe-Ikosaeder + Partikelwolke + Energie-Linien, lazy via Three.js (CDN).
+// Wird im leeren Chat mittig gezeigt; beim Tab-Wechsel/erster Nachricht gestoppt.
+const _sphereMobile = window.innerWidth < 768;
+const _sphereReducedMotion = !!(window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
+
+function sphereSupported() {
+  try {
+    const c = document.createElement("canvas");
+    return !!(c.getContext("webgl") || c.getContext("experimental-webgl"));
+  } catch (e) { return false; }
+}
+
+function loadThree() {
+  if (window.THREE) return Promise.resolve();
+  if (App._threeP) return App._threeP;
+  App._threeP = new Promise((resolve, reject) => {
+    const s = document.createElement("script");
+    s.src = "https://cdn.jsdelivr.net/npm/three@0.128.0/build/three.min.js";
+    s.onload = () => resolve();
+    s.onerror = reject;
+    document.head.appendChild(s);
+  });
+  return App._threeP;
+}
+
+// Baut die Sphere in wrap/canvas und gibt eine stop()-Funktion zum Aufräumen zurück.
+function buildQSphere(wrap, canvas) {
+  const THREE = window.THREE;
+  const isMobile = _sphereMobile;
+  let W = wrap.clientWidth || 280, H = wrap.clientHeight || 280;
+
+  const renderer = new THREE.WebGLRenderer({ canvas, alpha: true, antialias: !isMobile });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  renderer.setSize(W, H, false);
+
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(45, 1, 0.1, 100);
+  camera.position.z = 4.6;
+
+  const detail = isMobile ? 2 : 3;
+  const sphereGeom = new THREE.IcosahedronGeometry(1.55, detail);
+  const wireGeom = new THREE.WireframeGeometry(sphereGeom);
+  const lineMat = new THREE.LineBasicMaterial({ color: 0x0066cc, transparent: true, opacity: 0.55 });
+  const wireSphere = new THREE.LineSegments(wireGeom, lineMat);
+  scene.add(wireSphere);
+
+  const particleCount = isMobile ? 80 : 240;
+  const positions = new Float32Array(particleCount * 3);
+  const velocities = new Float32Array(particleCount * 3);
+  for (let i = 0; i < particleCount; i++) {
+    const r = Math.cbrt(Math.random()) * 1.4;
+    const theta = Math.random() * Math.PI * 2;
+    const phi = Math.acos(2 * Math.random() - 1);
+    positions[i*3]   = r * Math.sin(phi) * Math.cos(theta);
+    positions[i*3+1] = r * Math.sin(phi) * Math.sin(theta);
+    positions[i*3+2] = r * Math.cos(phi);
+    velocities[i*3]   = (Math.random() - 0.5) * 0.0035;
+    velocities[i*3+1] = (Math.random() - 0.5) * 0.0035;
+    velocities[i*3+2] = (Math.random() - 0.5) * 0.0035;
+  }
+  const particleGeom = new THREE.BufferGeometry();
+  particleGeom.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+  const particleMat = new THREE.PointsMaterial({
+    color: 0x9ec5ff, size: 0.025, transparent: true, opacity: 0.9,
+    sizeAttenuation: true, depthWrite: false });
+  const particles = new THREE.Points(particleGeom, particleMat);
+  scene.add(particles);
+
+  const energyLines = [];
+  const energyCount = isMobile ? 5 : 7;
+  for (let i = 0; i < energyCount; i++) {
+    const curveR = 1.55, arcAngle = Math.random() * Math.PI * 2, points = [], segs = 60;
+    for (let j = 0; j <= segs; j++) {
+      const t = j / segs, a = (t - 0.5) * Math.PI;
+      points.push(new THREE.Vector3(
+        curveR * Math.sin(a) * Math.cos(arcAngle + t * 0.4),
+        curveR * Math.cos(a),
+        curveR * Math.sin(a) * Math.sin(arcAngle + t * 0.4)));
+    }
+    const g = new THREE.BufferGeometry().setFromPoints(points);
+    const m = new THREE.LineBasicMaterial({ color: 0x3b82f6, transparent: true, opacity: 0.35 });
+    const line = new THREE.Line(g, m);
+    line.userData.speed = 0.0015 + Math.random() * 0.003;
+    line.userData.axis = ["x","y","z"][Math.floor(Math.random()*3)];
+    scene.add(line); energyLines.push(line);
+  }
+
+  scene.add(new THREE.AmbientLight(0xffffff, 0.5));
+  const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+  dirLight.position.set(2, 3, 4); scene.add(dirLight);
+  const corePoint = new THREE.PointLight(0x3b82f6, 0.6, 4); scene.add(corePoint);
+
+  const totalEdges = wireGeom.attributes.position.count / 2;
+  let buildComplete = false;
+  wireGeom.setDrawRange(0, 0);
+
+  let targetRotX = 0, targetRotY = 0, pulseScale = 1, pulseTarget = 1;
+  const onPointer = (e) => {
+    const rect = wrap.getBoundingClientRect();
+    const isTouch = e.type.startsWith("touch");
+    const cx = isTouch ? e.touches[0].clientX : e.clientX;
+    const cy = isTouch ? e.touches[0].clientY : e.clientY;
+    targetRotX = (((cy - rect.top) / rect.height) * 2 - 1) * 0.18;
+    targetRotY = (((cx - rect.left) / rect.width) * 2 - 1) * 0.18;
+  };
+  const onLeave = () => { targetRotX = 0; targetRotY = 0; };
+  const onTap = () => { pulseTarget = 1.15; setTimeout(() => { pulseTarget = 1; }, 140); };
+  wrap.addEventListener("mousemove", onPointer);
+  wrap.addEventListener("touchmove", onPointer, { passive: true });
+  wrap.addEventListener("mouseleave", onLeave);
+  wrap.addEventListener("click", onTap);
+
+  const onResize = () => {
+    W = wrap.clientWidth; H = wrap.clientHeight;
+    renderer.setSize(W, H, false);
+    camera.aspect = 1; camera.updateProjectionMatrix();
+  };
+  window.addEventListener("resize", onResize);
+
+  let baseRotY = 0, baseRotX = 0, raf = 0, stopped = false;
+  const t0 = performance.now(); let lastFrame = t0;
+  function animate(now) {
+    if (stopped) return;
+    raf = requestAnimationFrame(animate);
+    if (isMobile && now - lastFrame < 24) return;
+    lastFrame = now;
+    const dt = (now - t0) / 1000;
+    if (!buildComplete) {
+      const bt = Math.min(dt / 1.6, 1);
+      wireGeom.setDrawRange(0, Math.floor(bt * totalEdges) * 2);
+      if (bt >= 1) buildComplete = true;
+    }
+    if (!_sphereReducedMotion) { baseRotY += 0.0014; baseRotX = Math.sin(dt * 0.45) * 0.06; }
+    wireSphere.rotation.y += (baseRotY + targetRotY - wireSphere.rotation.y) * 0.08;
+    wireSphere.rotation.x += (baseRotX + targetRotX - wireSphere.rotation.x) * 0.08;
+    particles.rotation.copy(wireSphere.rotation);
+    const phase = _sphereReducedMotion ? 0 : (1 - Math.cos(dt * 2 * Math.PI / 3.5)) * 0.5;
+    pulseScale += (pulseTarget * (1 + phase * 0.05) - pulseScale) * 0.22;
+    wireSphere.scale.setScalar(pulseScale);
+    lineMat.opacity = 0.6 + phase * 0.4;
+    corePoint.intensity = 0.45 + phase * 0.5;
+    const pArr = particles.geometry.attributes.position.array;
+    for (let i = 0; i < particleCount; i++) {
+      pArr[i*3]   += velocities[i*3];
+      pArr[i*3+1] += velocities[i*3+1];
+      pArr[i*3+2] += velocities[i*3+2];
+      const dx = pArr[i*3], dy = pArr[i*3+1], dz = pArr[i*3+2];
+      if (Math.sqrt(dx*dx + dy*dy + dz*dz) > 1.45) {
+        velocities[i*3] *= -1; velocities[i*3+1] *= -1; velocities[i*3+2] *= -1;
+      }
+      if (Math.random() < 0.005) {
+        velocities[i*3]   = (Math.random() - 0.5) * 0.0035;
+        velocities[i*3+1] = (Math.random() - 0.5) * 0.0035;
+        velocities[i*3+2] = (Math.random() - 0.5) * 0.0035;
+      }
+    }
+    particles.geometry.attributes.position.needsUpdate = true;
+    energyLines.forEach((l) => { if (!_sphereReducedMotion) l.rotation[l.userData.axis] += l.userData.speed; });
+    renderer.render(scene, camera);
+  }
+  raf = requestAnimationFrame(animate);
+
+  return function stop() {
+    stopped = true;
+    if (raf) cancelAnimationFrame(raf);
+    window.removeEventListener("resize", onResize);
+    wrap.removeEventListener("mousemove", onPointer);
+    wrap.removeEventListener("touchmove", onPointer);
+    wrap.removeEventListener("mouseleave", onLeave);
+    wrap.removeEventListener("click", onTap);
+    try {
+      wireGeom.dispose(); sphereGeom.dispose(); particleGeom.dispose();
+      energyLines.forEach((l) => l.geometry.dispose());
+      renderer.dispose();
+    } catch (e) {}
+  };
+}
+
+// Hängt die Sphere an das aktuelle #q-sphere-wrap; fällt bei fehlendem WebGL
+// oder Three.js-Ladefehler auf das SVG-Ring-Muster zurück.
+function mountQSphere() {
+  if (App.qSphereStop) { try { App.qSphereStop(); } catch (e) {} App.qSphereStop = null; }
+  const wrap = document.getElementById("q-sphere-wrap");
+  const canvas = document.getElementById("q-sphere-canvas");
+  if (!wrap || !canvas) return;
+  const fb = wrap.querySelector(".q-sphere-fallback");
+  const fallback = () => { canvas.style.display = "none"; if (fb) fb.style.display = "block"; };
+  if (!sphereSupported()) { fallback(); return; }
+  loadThree().then(() => {
+    if (!document.body.contains(canvas)) return; // Tab inzwischen gewechselt
+    try { App.qSphereStop = buildQSphere(wrap, canvas); }
+    catch (e) { console.warn("Q-Sphere fehlgeschlagen", e); fallback(); }
+  }).catch(() => fallback());
+}
+
 // ---------- Boot ----------
 async function boot() {
   if ("serviceWorker" in navigator) {
@@ -2410,7 +2835,7 @@ async function boot() {
   const nb = document.getElementById("notif-btn");
   if (notifSupported() && !notifGranted()) { nb.hidden = false; nb.addEventListener("click", enablePush); }
   buildTabbar();
-  navigate("start");
+  navigate("assistent");
 }
 
 boot();
