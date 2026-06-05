@@ -9,7 +9,7 @@ import datetime as dt
 import uuid
 from decimal import Decimal
 
-from sqlalchemy import DateTime, ForeignKey, Numeric, String, Text, func
+from sqlalchemy import DateTime, ForeignKey, Integer, Numeric, String, Text, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -128,6 +128,13 @@ class Angebot(Base):
     # Falls aus dem Angebot eine Rechnung gebaut wurde
     rechnung_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), nullable=True
+    )
+
+    # Arbeits-Fortschritt 0-100 % (Regler im "Aktuelles"-Tab fuer laufende
+    # Auftraege im Status arbeit_laeuft). Bei 100 % wird der Auftrag
+    # fertiggemeldet und der Handwerker in Q zur Rechnung gefuehrt.
+    arbeit_fortschritt: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="0"
     )
 
     # Erstellung (fuer Listings/Sortierung)

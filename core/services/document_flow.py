@@ -307,10 +307,20 @@ async def send_angebot(
 # Rechnung finalisieren + versenden (Auftrag abrechnen)
 # ---------------------------------------------------------------------------
 
-async def finalize_and_send_invoice(tid: uuid.UUID, *, angebot_id: uuid.UUID) -> dict:
+async def finalize_and_send_invoice(
+    tid: uuid.UUID,
+    *,
+    angebot_id: uuid.UUID,
+    anschreiben: str | None = None,
+    kunde_email_override: str | None = None,
+) -> dict:
     """Finalisiert die Rechnung eines fertigen Auftrags in Lexware und
     schickt sie als PDF an den Kunden. Faktorisiert aus der Telegram-
     Pipeline ``_run_rechnung_versand_pipeline`` — EINE Quelle der Wahrheit.
+
+    ``anschreiben`` (optional): überschreibt die Einleitung auf der Rechnung
+    (vom Handwerker in Q editiert). ``kunde_email_override`` (optional):
+    abweichende Empfänger-Adresse.
 
     Strategie (wie bisher): Lexware kennt keine 'draft -> open'-Konvertierung,
     daher wird die Invoice NEU finalized angelegt; der alte Draft kann manuell
@@ -340,6 +350,9 @@ async def finalize_and_send_invoice(tid: uuid.UUID, *, angebot_id: uuid.UUID) ->
         kunde_email = ang.kunde_email
         kunde_strasse, kunde_plz, kunde_ort = ang.kunde_strasse, ang.kunde_plz, ang.kunde_ort
 
+    if kunde_email_override and kunde_email_override.strip():
+        kunde_email = kunde_email_override.strip()
+
     provider = await _lexware_provider(tid)
     if provider is None:
         return {"ok": False, "error": "Lexware ist nicht eingerichtet.",
@@ -359,7 +372,7 @@ async def finalize_and_send_invoice(tid: uuid.UUID, *, angebot_id: uuid.UUID) ->
     if kunde_ort:
         one_time_address["city"] = kunde_ort
 
-    intro_text = (
+    intro_text = (anschreiben or "").strip() or (
         "Sehr geehrte Damen und Herren,\n\nvielen Dank fuer Ihren Auftrag "
         "und das entgegengebrachte Vertrauen. Wie vereinbart stellen wir "
         "Ihnen die erbrachten Leistungen nachstehend in Rechnung.")

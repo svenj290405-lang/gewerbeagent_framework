@@ -24,6 +24,9 @@ from core.models.angebot import (
     Angebot,
     ANGEBOT_STATUS_ABGEBROCHEN,
     ANGEBOT_STATUS_ACCEPTED,
+    ANGEBOT_STATUS_MAIL_SENT,
+    ANGEBOT_STATUS_RECHNUNG_ERSTELLT,
+    ANGEBOT_STATUS_RECHNUNG_GESENDET,
     ANGEBOT_STATUS_WORK_DONE,
     ANGEBOT_STATUS_WORK_IN_PROGRESS,
     AUFTRAG_LIFECYCLE,
@@ -41,7 +44,12 @@ from core.models.email_conversation import (
     EmailConversation,
     STATE_CLOSED,
 )
-from core.models.kundengespraech import Kundengespraech
+from core.models.kundengespraech import (
+    Kundengespraech,
+    KUNDENGESPRAECH_STATUS_ABGELEHNT,
+    KUNDENGESPRAECH_STATUS_ANGENOMMEN,
+    KUNDENGESPRAECH_STATUS_ERFASST,
+)
 from core.models.rechnung import Rechnung
 from core.models.tenant_knowledge import KATEGORIE_LABELS, TenantKnowledge
 from core.models.rueckruf import (
@@ -105,6 +113,20 @@ def _label(table: dict, status: str | None) -> tuple[str, str]:
     return table.get(status or "", (status or "—", ""))
 
 
+# Auftrags-Status im "Aktuelles"-Tab: Angebot-Status -> (Label, Pill).
+# Deckt die Pipeline ab Versand ab (mail_sent) bis Rechnung raus.
+_AKTUELLES_AUFTRAG_LABELS = {
+    ANGEBOT_STATUS_MAIL_SENT: ("Angebot versendet", "ok"),
+    ANGEBOT_STATUS_ACCEPTED: ("Angenommen", "ok"),
+    ANGEBOT_STATUS_RECHNUNG_ERSTELLT: ("Angebot raus", ""),
+    ANGEBOT_STATUS_WORK_IN_PROGRESS: ("In Arbeit", "warn"),
+    ANGEBOT_STATUS_WORK_DONE: ("Fertig – Rechnung", "ok"),
+    ANGEBOT_STATUS_RECHNUNG_GESENDET: ("Rechnung versendet", "ok"),
+}
+# Status, die als laufender Auftrag in "Aktuelles" erscheinen.
+_AKTUELLES_AUFTRAG_STATES = list(_AKTUELLES_AUFTRAG_LABELS.keys())
+
+
 # =====================================================================
 # Datenquellen (alle tenant-gescoped)
 # =====================================================================
@@ -130,6 +152,7 @@ async def _recent_aufnahmen(tenant_id: uuid.UUID, limit: int = 20) -> list[dict]
         rows = (await s.execute(
             select(Kundengespraech)
             .where(Kundengespraech.tenant_id == tenant_id)
+            .where(Kundengespraech.status != KUNDENGESPRAECH_STATUS_ABGELEHNT)
             .order_by(Kundengespraech.gespraech_datum.desc())
             .limit(limit)
         )).scalars().all()
@@ -152,6 +175,7 @@ async def _termine(tenant_id: uuid.UUID, *, only_today: bool, limit: int = 50) -
             select(Kundengespraech)
             .where(Kundengespraech.tenant_id == tenant_id)
             .where(Kundengespraech.termin_datum.is_not(None))
+            .where(Kundengespraech.status != KUNDENGESPRAECH_STATUS_ABGELEHNT)
         )
         if only_today:
             start = dt.datetime(now.year, now.month, now.day)
@@ -340,6 +364,285 @@ async def api_auftrag_status(
         "ok": True, "status": new_status,
         "status_label": AUFTRAG_LIFECYCLE_LABELS.get(new_status, new_status),
     })
+
+
+# =====================================================================
+# "Aktuelles"-Tab: Rückrufe + Beratungs-Leads + Auftrags-Pipeline
+# =====================================================================
+
+async def _beratung_leads(tenant_id: uuid.UUID) -> list[dict]:
+    """Offene Beratungs-Leads: Kundengespräche mit Termin, noch nicht
+    entschieden (status 'erfasst'), ohne verknüpftes Angebot. Der Handwerker
+    nimmt sie in 'Aktuelles' an (-> Pipeline) oder lehnt ab (-> ausgeblendet).
+    """
+    async with get_session() as s:
+        rows = (await s.execute(
+            select(Kundengespraech)
+            .where(Kundengespraech.tenant_id == tenant_id)
+            .where(Kundengespraech.status == KUNDENGESPRAECH_STATUS_ERFASST)
+            .where(Kundengespraech.termin_datum.is_not(None))
+            .where(Kundengespraech.angebot_id.is_(None))
+            .order_by(Kundengespraech.termin_datum.asc())
+            .limit(50)
+        )).scalars().all()
+        return [{
+            "id": str(k.id),
+            "kunde": k.kunde_name,
+            "briefing": (k.briefing_kurz or "")[:200],
+            "termin": _fmt_dt(k.termin_datum),
+            "termin_iso": k.termin_datum.isoformat() if k.termin_datum else None,
+        } for k in rows]
+
+
+async def _aktuelle_auftraege(tenant_id: uuid.UUID) -> list[dict]:
+    """Laufende Aufträge für 'Aktuelles': Angebote ab Versand (mail_sent) bis
+    Rechnung raus, plus angenommene Beratungs-Leads, für die noch kein Angebot
+    existiert ('Angebot erstellen')."""
+    out: list[dict] = []
+    async with get_session() as s:
+        angebote = (await s.execute(
+            select(Angebot)
+            .where(Angebot.tenant_id == tenant_id)
+            .where(Angebot.status.in_(_AKTUELLES_AUFTRAG_STATES))
+            .order_by(Angebot.created_at.desc())
+            .limit(50)
+        )).scalars().all()
+        kunde_namen = {(a.kunde_name or "").strip().lower() for a in angebote}
+        for a in angebote:
+            label, pill = _label(_AKTUELLES_AUFTRAG_LABELS, a.status)
+            out.append({
+                "typ": "auftrag",
+                "id": str(a.id),
+                "kunde": a.kunde_name,
+                "betrag": _fmt_eur(a.gesamtbetrag_brutto_eur),
+                "status": a.status,
+                "status_label": label,
+                "pill": pill,
+                "in_arbeit": a.status == ANGEBOT_STATUS_WORK_IN_PROGRESS,
+                "fertig": a.status == ANGEBOT_STATUS_WORK_DONE,
+                "fortschritt": int(a.arbeit_fortschritt or 0),
+                "zeit": _fmt_dt(a.created_at),
+            })
+        # Angenommene Leads ohne (noch) erstelltes Angebot
+        leads = (await s.execute(
+            select(Kundengespraech)
+            .where(Kundengespraech.tenant_id == tenant_id)
+            .where(Kundengespraech.status == KUNDENGESPRAECH_STATUS_ANGENOMMEN)
+            .order_by(Kundengespraech.termin_datum.asc().nullslast())
+            .limit(50)
+        )).scalars().all()
+        for k in leads:
+            if (k.kunde_name or "").strip().lower() in kunde_namen:
+                continue  # es gibt schon ein Angebot für den Kunden
+            out.append({
+                "typ": "lead_angenommen",
+                "id": str(k.id),
+                "kunde": k.kunde_name,
+                "betrag": "",
+                "status": "angenommen_lead",
+                "status_label": "Angenommen – Angebot erstellen",
+                "pill": "warn",
+                "in_arbeit": False,
+                "fertig": False,
+                "fortschritt": 0,
+                "zeit": _fmt_dt(k.termin_datum),
+            })
+    return out
+
+
+@router.get("/aktuelles")
+async def api_aktuelles(request: Request, _e=Depends(require_app_user)) -> JSONResponse:
+    """Aggregiert alles Relevante für den Start-Screen 'Aktuelles'."""
+    tid = current_tenant_id(request)
+    return JSONResponse({
+        "rueckrufe": await _open_rueckrufe(tid),
+        "beratung": await _beratung_leads(tid),
+        "auftraege": await _aktuelle_auftraege(tid),
+    })
+
+
+@router.post("/beratung/{gespraech_id}/entscheidung")
+async def api_beratung_entscheidung(
+    gespraech_id: str,
+    request: Request,
+    _e=Depends(require_app_user),
+    _c=Depends(require_app_csrf),
+) -> JSONResponse:
+    """Beratungs-Lead annehmen (-> Pipeline) oder ablehnen (-> Soft-Delete,
+    ausgeblendet wie gelöscht). Tenant-gescoped, CSRF."""
+    tid = current_tenant_id(request)
+    try:
+        gid = uuid.UUID(gespraech_id)
+    except (ValueError, TypeError):
+        return JSONResponse({"ok": False, "error": "ungueltige id"}, status_code=400)
+    body = await request.json()
+    entscheidung = (body.get("entscheidung") or "").strip()
+    if entscheidung not in ("annehmen", "ablehnen"):
+        return JSONResponse({"ok": False, "error": "annehmen|ablehnen erwartet"}, status_code=400)
+    neuer_status = (
+        KUNDENGESPRAECH_STATUS_ANGENOMMEN if entscheidung == "annehmen"
+        else KUNDENGESPRAECH_STATUS_ABGELEHNT
+    )
+    async with get_session() as s:
+        k = (await s.execute(
+            select(Kundengespraech).where(
+                Kundengespraech.id == gid, Kundengespraech.tenant_id == tid)
+        )).scalar_one_or_none()
+        if k is None:
+            return JSONResponse({"ok": False, "error": "Lead nicht gefunden."}, status_code=404)
+        kunde = k.kunde_name
+        k.status = neuer_status
+        await s.commit()
+    logger.info("PWA-Beratung %s: id=%s tenant=%s", entscheidung, gid, tid)
+    return JSONResponse({"ok": True, "entscheidung": entscheidung, "kunde": kunde})
+
+
+@router.post("/auftraege/{angebot_id}/fortschritt")
+async def api_auftrag_fortschritt(
+    angebot_id: str,
+    request: Request,
+    _e=Depends(require_app_user),
+    _c=Depends(require_app_csrf),
+) -> JSONResponse:
+    """Setzt den Arbeits-Fortschritt 0-100 % eines laufenden Auftrags. Bei
+    100 % wird der Auftrag fertiggemeldet (status arbeit_fertig); der
+    Rechnungs-Schritt läuft danach im Q-Flow (eigener Inhaber-Endpunkt)."""
+    tid = current_tenant_id(request)
+    try:
+        aid = uuid.UUID(angebot_id)
+    except (ValueError, TypeError):
+        return JSONResponse({"ok": False, "error": "ungueltige id"}, status_code=400)
+    body = await request.json()
+    try:
+        pct = int(body.get("fortschritt"))
+    except (TypeError, ValueError):
+        return JSONResponse({"ok": False, "error": "fortschritt (0-100) erwartet"}, status_code=400)
+    pct = max(0, min(100, pct))
+    async with get_session() as s:
+        a = (await s.execute(
+            select(Angebot).where(Angebot.id == aid, Angebot.tenant_id == tid)
+        )).scalar_one_or_none()
+        if a is None:
+            return JSONResponse({"ok": False, "error": "Auftrag nicht gefunden."}, status_code=404)
+        a.arbeit_fortschritt = pct
+        fertig = False
+        if pct >= 100 and a.status == ANGEBOT_STATUS_WORK_IN_PROGRESS:
+            a.status = ANGEBOT_STATUS_WORK_DONE
+            fertig = True
+        neuer_status = a.status
+        await s.commit()
+    return JSONResponse({
+        "ok": True, "fortschritt": pct, "fertig": fertig, "status": neuer_status,
+    })
+
+
+# =====================================================================
+# Rechnungs-Flow aus "Aktuelles" (100 % -> Q): Vorschau + editierbar senden
+# =====================================================================
+
+_RECHNUNG_DEFAULT_ANSCHREIBEN = (
+    "Sehr geehrte Damen und Herren,\n\nvielen Dank für Ihren Auftrag und das "
+    "entgegengebrachte Vertrauen. Wie vereinbart stellen wir Ihnen die "
+    "erbrachten Leistungen nachstehend in Rechnung.")
+
+
+@router.get("/rechnung/vorbereiten")
+async def api_rechnung_vorbereiten(
+    request: Request, _e=Depends(require_app_inhaber),
+) -> JSONResponse:
+    """Baut die Rechnungs-Vorschau eines fertigen Auftrags (Positionen +
+    Betrag) und generiert ein KI-Anschreiben — beides wird in Q angezeigt und
+    kann editiert werden, bevor gesendet wird. Inhaber, feature lexware.
+    Erzeugt nichts in Lexware, kein Versand."""
+    from core.features.check import is_feature_enabled
+    tid = current_tenant_id(request)
+    if not await is_feature_enabled(tid, "lexware"):
+        return JSONResponse({"ok": False, "error": "Funktion nicht freigeschaltet."}, status_code=403)
+    try:
+        aid = uuid.UUID(request.query_params.get("angebot_id") or "")
+    except (ValueError, TypeError):
+        return JSONResponse({"ok": False, "error": "ungueltige id"}, status_code=400)
+
+    from core.models.angebot_position import AngebotPosition
+    async with get_session() as s:
+        a = (await s.execute(
+            select(Angebot).where(Angebot.id == aid, Angebot.tenant_id == tid)
+        )).scalar_one_or_none()
+        if a is None:
+            return JSONResponse({"ok": False, "error": "Auftrag nicht gefunden."}, status_code=404)
+        positions = (await s.execute(
+            select(AngebotPosition).where(AngebotPosition.angebot_id == aid)
+            .order_by(AngebotPosition.position_nr)
+        )).scalars().all()
+        kunde = a.kunde_name
+        betrag = _fmt_eur(a.gesamtbetrag_brutto_eur)
+        kunde_email = a.kunde_email or ""
+        pos_list = [{
+            "name": p.name,
+            "menge": float(p.menge) if p.menge is not None else 1.0,
+            "einheit": p.einheit or "Stück",
+            "preis": _fmt_eur(p.preis_brutto_eur),
+            "beschreibung": p.beschreibung or "",
+        } for p in positions]
+        extracted = {
+            "kunde_name": a.kunde_name,
+            "kunde_strasse": a.kunde_strasse, "kunde_plz": a.kunde_plz,
+            "kunde_ort": a.kunde_ort,
+            "gesamtbetrag_brutto_eur": float(a.gesamtbetrag_brutto_eur or 0),
+            "positionen": [{
+                "name": p.name,
+                "menge": float(p.menge) if p.menge is not None else 1.0,
+                "einheit": p.einheit, "beschreibung": p.beschreibung,
+                "preis_brutto_eur": float(p.preis_brutto_eur or 0),
+            } for p in positions],
+        }
+
+    anschreiben = _RECHNUNG_DEFAULT_ANSCHREIBEN
+    try:
+        from core.ai.gemini import generate_angebot_anschreiben
+        txt = await generate_angebot_anschreiben(
+            extracted,
+            "Schreibe ein freundliches, knappes Anschreiben für die RECHNUNG an "
+            "den Kunden: Dank für den Auftrag, die Leistungen wurden wie "
+            "vereinbart erbracht, höfliche Bitte um Begleichung binnen 14 Tagen. "
+            "Keine Betragsangaben im Text.",
+            tenant_id=tid,
+        )
+        if txt and txt.strip():
+            anschreiben = txt.strip()
+    except Exception:  # noqa: BLE001
+        logger.exception("Anschreiben-Generierung fehlgeschlagen (Fallback)")
+
+    return JSONResponse({
+        "ok": True, "angebot_id": str(aid), "kunde": kunde, "betrag": betrag,
+        "kunde_email": kunde_email, "positionen": pos_list, "anschreiben": anschreiben,
+    })
+
+
+@router.post("/rechnung/senden")
+async def api_q_rechnung_senden(
+    request: Request,
+    _e=Depends(require_app_inhaber),
+    _c=Depends(require_app_csrf),
+) -> JSONResponse:
+    """Finalisiert die Rechnung in Lexware (mit ggf. editiertem Anschreiben)
+    und schickt sie als PDF an den Kunden. Inhaber, CSRF, feature lexware."""
+    from core.features.check import is_feature_enabled
+    tid = current_tenant_id(request)
+    if not await is_feature_enabled(tid, "lexware"):
+        return JSONResponse({"ok": False, "error": "Funktion nicht freigeschaltet."}, status_code=403)
+    body = await request.json()
+    try:
+        aid = uuid.UUID(body.get("angebot_id") or "")
+    except (ValueError, TypeError):
+        return JSONResponse({"ok": False, "error": "ungueltige id"}, status_code=400)
+    anschreiben = (body.get("anschreiben") or "").strip() or None
+    kunde_email = (body.get("kunde_email") or "").strip() or None
+
+    from core.services.document_flow import finalize_and_send_invoice
+    res = await finalize_and_send_invoice(
+        tid, angebot_id=aid, anschreiben=anschreiben, kunde_email_override=kunde_email)
+    return JSONResponse(res, status_code=200 if res.get("ok") else 400)
 
 
 # =====================================================================

@@ -19,6 +19,16 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from core.database.base import Base
 
 
+# Status-Werte. "erfasst" ist der Default (frisch aufgenommen / offener
+# Beratungs-Lead). Im "Aktuelles"-Tab der PWA entscheidet der Handwerker
+# einen neuen Lead mit Termin: annehmen -> "angenommen" (geht in die
+# Auftrags-Pipeline), ablehnen -> "abgelehnt" (Soft-Delete, ueberall
+# ausgeblendet, wirkt wie geloescht).
+KUNDENGESPRAECH_STATUS_ERFASST = "erfasst"
+KUNDENGESPRAECH_STATUS_ANGENOMMEN = "angenommen"
+KUNDENGESPRAECH_STATUS_ABGELEHNT = "abgelehnt"
+
+
 class Kundengespraech(Base):
     __tablename__ = "kundengespraeche"
 
