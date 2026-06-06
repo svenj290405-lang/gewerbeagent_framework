@@ -28,7 +28,13 @@
 // Rechnung in Q vorbereiten (editierbares Anschreiben) + senden.
 // v28: Tabs "Anrufe" + "Anfragen" entfernt — in "Aktuelles" zusammengeführt
 // (Offene Anfragen tappbar, Rückrufe mit Erledigt, Diktat + Rückruf-Buttons).
-const CACHE = "ga-app-v28";
+// v29: ⚡-Funktionsmenü startet jetzt den Flow direkt — Sphere animiert
+// ("Q übernimmt") + Gemini fragt selbst nach, statt Seed-Text einzutippen.
+// v30: (Cache-Bump)
+// v31: Selbstheilung — App aktualisiert sich automatisch (controllerchange ->
+// reload) + "App zurücksetzen"-Link auf der Login-Seite (/app/login?reset=1),
+// damit niemand mehr auf einer alten, gecachten Version hängenbleibt.
+const CACHE = "ga-app-v31";
 const SHELL = [
   "/app",
   "/app/static/app.css",

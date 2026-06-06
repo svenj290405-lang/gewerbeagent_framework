@@ -122,6 +122,19 @@ button:disabled { opacity: .6; }
 @keyframes qring { 0%,100% { opacity: .3; transform: scale(.95); transform-origin: center; }
   50% { opacity: .8; transform: scale(1.02); transform-origin: center; } }
 
+/* "Q übernimmt"-Zustand: animierte Sphere + Label, wenn eine Funktion getippt wurde. */
+.q-hero.working { flex-direction: column; gap: 6px; }
+.q-hero.working .q-sphere-wrap { animation: qpulse 1.4s ease-in-out infinite; }
+@keyframes qpulse { 0%,100% { transform: scale(.97); } 50% { transform: scale(1.03); } }
+.q-working { display: flex; align-items: center; gap: 8px; font-size: 15px; font-weight: 600;
+  color: var(--primary); animation: bubblein .25s ease both; }
+.q-working .qm-ico { font-size: 18px; }
+.q-dots { display: inline-flex; gap: 4px; align-items: center; }
+.q-dots span { width: 6px; height: 6px; border-radius: 50%; background: var(--primary);
+  opacity: .4; animation: typingdot 1s infinite; }
+.q-dots span:nth-child(2) { animation-delay: .2s; }
+.q-dots span:nth-child(3) { animation-delay: .4s; }
+
 .bubble { max-width: 84%; padding: 10px 14px; border-radius: 18px; font-size: 15px;
   line-height: 1.42; white-space: pre-wrap; overflow-wrap: anywhere;
   box-shadow: 0 1px 2px rgba(0,0,0,.06); animation: bubblein .14s ease-out; }
@@ -181,7 +194,11 @@ button:disabled { opacity: .6; }
   font-size: 16px; font-family: inherit; line-height: 1.3; background: var(--bg); }
 .composer textarea:focus { outline: none; border-color: var(--primary); background: var(--card); }
 .composer .cbtn { flex: 0 0 auto; width: 42px; height: 42px; border-radius: 50%; padding: 0;
-  font-size: 18px; display: flex; align-items: center; justify-content: center; }
-.composer .cbtn.ghost { background: #eef2f7; color: var(--primary); }
+  display: flex; align-items: center; justify-content: center;
+  background: var(--primary); color: #fff; transition: background .15s, opacity .15s, color .15s; }
+.composer .cbtn svg { width: 21px; height: 21px; display: block; }
+.composer .cbtn.ghost { background: transparent; color: #5b6677; }
+.composer .cbtn.ghost:hover { background: #eef2f7; color: var(--primary); }
+.composer .cbtn.ghost:active { background: #e3e9f1; }
 .composer .cbtn.rec { background: var(--danger); color: #fff; animation: recpulse 1s infinite; }
 @keyframes recpulse { 0%,100% { box-shadow: 0 0 0 0 rgba(217,69,63,.4); } 50% { box-shadow: 0 0 0 7px rgba(217,69,63,0); } }

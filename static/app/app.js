@@ -60,6 +60,8 @@ function buildTabbar() {
 
 function navigate(key) {
   if (App.qSphereStop) { try { App.qSphereStop(); } catch (e) {} App.qSphereStop = null; }
+  App.qIntent = null;
+  App.qWorking = false;
   App.current = key;
   document.querySelectorAll(".tabbar button").forEach((b) =>
     b.classList.toggle("active", b.dataset.tab === key));
@@ -1025,16 +1027,24 @@ const SCREENS = {
 
   async assistent() {
     App.qchat = App.qchat || [];
+    // Schlanke Strich-Icons (currentColor) statt Emojis — Look moderner Chat-UIs.
+    const IC = {
+      spark: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l1.7 4.8L18.5 9.5l-4.8 1.7L12 16l-1.7-4.8L5.5 9.5l4.8-1.7L12 3z"/><path d="M19 14.5l.6 1.9 1.9.6-1.9.6-.6 1.9-.6-1.9-1.9-.6 1.9-.6.6-1.9z"/></svg>`,
+      clip: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>`,
+      mic: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="2" width="6" height="11" rx="3"/><path d="M5 10v1a7 7 0 0 0 14 0v-1"/><line x1="12" y1="19" x2="12" y2="22"/></svg>`,
+      stop: `<svg viewBox="0 0 24 24" fill="currentColor" stroke="none"><rect x="6" y="6" width="12" height="12" rx="3"/></svg>`,
+      send: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="20" x2="12" y2="5"/><polyline points="6 11 12 5 18 11"/></svg>`,
+    };
     App.view.innerHTML =
       `<div class="chat" id="q-chat"></div>
        <div class="composer">
          <div class="q-menu" id="q-menu" hidden></div>
          <div class="composer-inner">
-           <button class="cbtn ghost" id="q-actions" title="Funktionen">⚡</button>
-           <button class="cbtn ghost" id="q-attach" title="Beleg/Foto hochladen">📎</button>
+           <button class="cbtn ghost" id="q-actions" title="Funktionen" aria-label="Funktionen">${IC.spark}</button>
+           <button class="cbtn ghost" id="q-attach" title="Beleg/Foto hochladen" aria-label="Anhängen">${IC.clip}</button>
            <textarea id="q-input" rows="1" placeholder="Schreib Q …"></textarea>
-           <button class="cbtn ghost" id="q-mic" title="Sprechen">🎤</button>
-           <button class="cbtn" id="q-send" title="Senden">➤</button>
+           <button class="cbtn ghost" id="q-mic" title="Sprechen" aria-label="Sprechen">${IC.mic}</button>
+           <button class="cbtn" id="q-send" title="Senden" aria-label="Senden">${IC.send}</button>
          </div>
        </div>
        <input type="file" id="q-file" accept="image/jpeg,image/png,application/pdf" style="display:none">`;
@@ -1069,20 +1079,36 @@ const SCREENS = {
       return "Erledigt.";
     }
 
+    const sphereWrap =
+      `<div class="q-sphere-wrap" id="q-sphere-wrap" aria-hidden="true">
+         <canvas id="q-sphere-canvas"></canvas>
+         <svg class="q-sphere-fallback" viewBox="0 0 100 100" aria-hidden="true">
+           <circle class="ring-1" cx="50" cy="50" r="35"/>
+           <circle class="ring-2" cx="50" cy="50" r="28"/>
+           <circle class="ring-3" cx="50" cy="50" r="22"/>
+           <circle cx="50" cy="50" r="2" fill="#0066cc" stroke="none"/>
+         </svg>
+       </div>`;
+
     function render() {
-      if (!App.qchat.length) {
+      const hasMsgs = App.qchat.some((m) => m.role !== "typing");
+      // Funktion angetippt → animierte Sphere statt Seed-Text, während Q übernimmt.
+      if (App.qIntent && !hasMsgs) {
+        App.qWorking = true; // von buildQSphere beim (asynchronen) Mount gelesen
         chatEl.innerHTML =
-          `<div class="q-hero">
-             <div class="q-sphere-wrap" id="q-sphere-wrap" aria-hidden="true">
-               <canvas id="q-sphere-canvas"></canvas>
-               <svg class="q-sphere-fallback" viewBox="0 0 100 100" aria-hidden="true">
-                 <circle class="ring-1" cx="50" cy="50" r="35"/>
-                 <circle class="ring-2" cx="50" cy="50" r="28"/>
-                 <circle class="ring-3" cx="50" cy="50" r="22"/>
-                 <circle cx="50" cy="50" r="2" fill="#0066cc" stroke="none"/>
-               </svg>
+          `<div class="q-hero working">${sphereWrap}
+             <div class="q-working">
+               <span class="qm-ico">${App.qIntent.ico}</span>
+               <span>${esc(App.qIntent.label)}</span>
+               <span class="q-dots"><span></span><span></span><span></span></span>
              </div>
            </div>`;
+        mountQSphere();
+        return;
+      }
+      if (!hasMsgs) {
+        App.qWorking = false;
+        chatEl.innerHTML = `<div class="q-hero">${sphereWrap}</div>`;
         mountQSphere();
         return;
       }
@@ -1186,6 +1212,31 @@ const SCREENS = {
       else if (j.type === "confirm") push({ role: "confirm", tool: j.tool, args: j.args, summary: j.summary, frage: j.frage, resolved: false });
     }
 
+    // Funktion aus dem ⚡-Menü angetippt: Q übernimmt den Flow im Hintergrund.
+    // Statt den Befehl als Text einzutippen, animieren wir die Sphere ("Q
+    // arbeitet") und lassen Gemini selbst nach den fehlenden Angaben fragen.
+    async function startIntent(a) {
+      App.qIntent = { ico: a.ico, label: a.label };
+      // Sphere ist nur im leeren Chat sichtbar — sonst regulärer Tipp-Indikator.
+      if (App.qchat.some((m) => m.role !== "typing")) push({ role: "typing" });
+      else render();
+      let res, j = null;
+      try {
+        res = await fetch("/app/api/assistent", { method: "POST",
+          headers: { "X-CSRF-Token": App.me.csrf, "Content-Type": "application/json" },
+          body: JSON.stringify({ text: a.intent }) });
+      } catch (e) { App.qIntent = null; popTyping(); push({ role: "err", text: "Netzwerkfehler. Bitte erneut." }); return; }
+      if (res.status === 303 || res.status === 401 || res.redirected) { location.href = "/app/login"; return; }
+      try { j = await res.json(); } catch (e) {}
+      App.qIntent = null;
+      popTyping();
+      if (!j || !j.type) { push({ role: "err", text: "Konnte den Befehl nicht verarbeiten." }); }
+      else if (j.type === "message") push({ role: "q", text: j.text });
+      else if (j.type === "error") push({ role: "err", text: j.text });
+      else if (j.type === "confirm") push({ role: "confirm", tool: j.tool, args: j.args, summary: j.summary, frage: j.frage, resolved: false });
+      input.focus();
+    }
+
     async function doConfirm(idx) {
       const m = App.qchat[idx];
       if (!m || m.resolved) return;
@@ -1229,7 +1280,7 @@ const SCREENS = {
     micBtn.addEventListener("click", async () => {
       if (Diktat.recording) {
         const out = _diktatFinish();
-        micBtn.classList.remove("rec"); micBtn.textContent = "🎤";
+        micBtn.classList.remove("rec"); micBtn.innerHTML = IC.mic;
         if (out.durationSec < 1 || out.blob.size < 2000) { push({ role: "err", text: "Aufnahme war zu kurz." }); return; }
         push({ role: "typing" });
         let res, j = null;
@@ -1249,7 +1300,7 @@ const SCREENS = {
         push({ role: "err", text: (e && e.name === "NotAllowedError") ? "Mikrofon-Zugriff abgelehnt. Bitte im Browser erlauben." : "Mikrofon nicht verfügbar." });
         _diktatTeardown(); return;
       }
-      micBtn.classList.add("rec"); micBtn.textContent = "⏹";
+      micBtn.classList.add("rec"); micBtn.innerHTML = IC.stop;
       Diktat.autostop = setTimeout(() => { if (Diktat.recording) micBtn.click(); }, 60 * 1000);
     });
 
@@ -1261,16 +1312,18 @@ const SCREENS = {
     const menuEl = document.getElementById("q-menu");
     const feats = new Set(App.me.features || []);
     const isInhaber = !!(App.me.employee && App.me.employee.is_inhaber);
+    // `intent` = vollständiger Starter-Satz. Q (Gemini) übernimmt damit den Flow
+    // und fragt fehlende Angaben selbst nach — wir tippen nichts vor.
     const QACTIONS = [
-      { ico: "📅", label: "Termin eintragen",   seed: "Trag einen Termin ein: ",     feature: "kalender" },
-      { ico: "📞", label: "Rückruf anlegen",     seed: "Leg einen Rückruf an für " },
-      { ico: "🧰", label: "Material bestellen",  seed: "Bestell " },
-      { ico: "📚", label: "Wissen merken",       seed: "Merk dir: " },
-      { ico: "🔍", label: "Kunde nachschlagen",  seed: "Zeig mir alles zu " },
-      { ico: "✉️", label: "Anfrage beantworten", seed: "Beantworte die Anfrage von ", feature: "mail_intake" },
-      { ico: "📄", label: "Angebot erstellen",   seed: "Mach ein Angebot für ",       feature: "lexware", inhaber: true },
-      { ico: "🧾", label: "Rechnung erstellen",  seed: "Schreib eine Rechnung für ",  feature: "lexware", inhaber: true },
-      { ico: "🎨", label: "Visualisierung",      viz: true,                           feature: "visualisierung" },
+      { ico: "📅", label: "Termin eintragen",   intent: "Ich möchte einen Termin eintragen.",          feature: "kalender" },
+      { ico: "📞", label: "Rückruf anlegen",     intent: "Ich möchte einen Rückruf anlegen." },
+      { ico: "🧰", label: "Material bestellen",  intent: "Ich möchte Material bestellen." },
+      { ico: "📚", label: "Wissen merken",       intent: "Ich möchte mir etwas in der Wissensdatenbank merken." },
+      { ico: "🔍", label: "Kunde nachschlagen",  intent: "Ich möchte einen Kunden nachschlagen." },
+      { ico: "✉️", label: "Anfrage beantworten", intent: "Ich möchte eine Kundenanfrage beantworten.",  feature: "mail_intake" },
+      { ico: "📄", label: "Angebot erstellen",   intent: "Ich möchte ein Angebot erstellen.",           feature: "lexware", inhaber: true },
+      { ico: "🧾", label: "Rechnung erstellen",  intent: "Ich möchte eine Rechnung schreiben.",          feature: "lexware", inhaber: true },
+      { ico: "🎨", label: "Visualisierung",      viz: true,                                              feature: "visualisierung" },
     ].filter((a) => (!a.feature || feats.has(a.feature)) && (!a.inhaber || isInhaber));
 
     menuEl.innerHTML = QACTIONS.map((a, i) =>
@@ -1293,8 +1346,7 @@ const SCREENS = {
         const a = QACTIONS[parseInt(b.dataset.qa, 10)];
         toggleQMenu(false);
         if (a.viz) { navigate("visualisierung"); return; }
-        input.value = a.seed; auto(); input.focus();
-        input.setSelectionRange(input.value.length, input.value.length);
+        startIntent(a);
       }));
 
     render();
@@ -2783,7 +2835,11 @@ function buildQSphere(wrap, canvas) {
   };
   window.addEventListener("resize", onResize);
 
-  let baseRotY = 0, baseRotX = 0, raf = 0, stopped = false;
+  let baseRotY = 0, baseRotX = 0, raf = 0, stopped = false, active = !!App.qWorking;
+  // Während Q einen angetippten Flow bearbeitet, dreht/pulsiert die Sphere
+  // energischer (Hinweis "Q arbeitet"). Anfangszustand aus App.qWorking (render()
+  // setzt das Flag vor dem asynchronen Mount); Setter erlaubt späteres Umschalten.
+  App.qSphereActive = (on) => { active = !!on; };
   const t0 = performance.now(); let lastFrame = t0;
   function animate(now) {
     if (stopped) return;
@@ -2796,15 +2852,16 @@ function buildQSphere(wrap, canvas) {
       wireGeom.setDrawRange(0, Math.floor(bt * totalEdges) * 2);
       if (bt >= 1) buildComplete = true;
     }
-    if (!_sphereReducedMotion) { baseRotY += 0.0014; baseRotX = Math.sin(dt * 0.45) * 0.06; }
+    if (!_sphereReducedMotion) { baseRotY += active ? 0.006 : 0.0014; baseRotX = Math.sin(dt * (active ? 1.1 : 0.45)) * 0.06; }
     wireSphere.rotation.y += (baseRotY + targetRotY - wireSphere.rotation.y) * 0.08;
     wireSphere.rotation.x += (baseRotX + targetRotX - wireSphere.rotation.x) * 0.08;
     particles.rotation.copy(wireSphere.rotation);
-    const phase = _sphereReducedMotion ? 0 : (1 - Math.cos(dt * 2 * Math.PI / 3.5)) * 0.5;
-    pulseScale += (pulseTarget * (1 + phase * 0.05) - pulseScale) * 0.22;
+    const phasePeriod = active ? 1.4 : 3.5;
+    const phase = _sphereReducedMotion ? 0 : (1 - Math.cos(dt * 2 * Math.PI / phasePeriod)) * 0.5;
+    pulseScale += (pulseTarget * (1 + phase * (active ? 0.12 : 0.05)) - pulseScale) * 0.22;
     wireSphere.scale.setScalar(pulseScale);
     lineMat.opacity = 0.6 + phase * 0.4;
-    corePoint.intensity = 0.45 + phase * 0.5;
+    corePoint.intensity = (active ? 0.7 : 0.45) + phase * (active ? 0.8 : 0.5);
     const pArr = particles.geometry.attributes.position.array;
     for (let i = 0; i < particleCount; i++) {
       pArr[i*3]   += velocities[i*3];
@@ -2828,6 +2885,8 @@ function buildQSphere(wrap, canvas) {
 
   return function stop() {
     stopped = true;
+    active = false;
+    App.qSphereActive = null;
     if (raf) cancelAnimationFrame(raf);
     window.removeEventListener("resize", onResize);
     wrap.removeEventListener("mousemove", onPointer);
@@ -2862,8 +2921,20 @@ function mountQSphere() {
 // ---------- Boot ----------
 async function boot() {
   if ("serviceWorker" in navigator) {
-    try { await navigator.serviceWorker.register("/app/sw.js", { scope: "/app" }); }
-    catch (e) { console.warn("SW-Registrierung fehlgeschlagen", e); }
+    try {
+      // War schon ein SW aktiv? Dann ist ein späterer controllerchange ein echtes
+      // Update (nicht die Erst-Installation) → einmal neu laden, damit frisches
+      // JS/CSS greift. So bleibt niemand mehr auf einer alten Version hängen.
+      const hadController = !!navigator.serviceWorker.controller;
+      let reloaded = false;
+      navigator.serviceWorker.addEventListener("controllerchange", () => {
+        if (reloaded || !hadController) return;
+        reloaded = true;
+        location.reload();
+      });
+      const reg = await navigator.serviceWorker.register("/app/sw.js", { scope: "/app" });
+      reg.update().catch(() => {});
+    } catch (e) { console.warn("SW-Registrierung fehlgeschlagen", e); }
   }
   const res = await api("/app/api/me");
   if (!res) return;
