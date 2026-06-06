@@ -39,11 +39,13 @@ function notifSupported() { return typeof Notification !== "undefined"; }
 function notifGranted() { return notifSupported() && Notification.permission === "granted"; }
 
 // ---------- Tabs ----------
+// Chat-first: nur 3 Tabs. Q (Assistent) ist die Bedienzentrale, "Aktuelles"
+// bündelt ALLE Anzeigen (inkl. Termine/Angebote/Rechnungen), "Mehr" den
+// Kleinkram. Termine/Büro sind keine eigenen Tabs mehr; ihre Screens bleiben
+// per Q-Chat ("zeig mir die Rechnungen") erreichbar.
 const TABS = [
-  { key: "aktuelles",   label: "Aktuelles", ico: "📋" },
   { key: "assistent",   label: "Assistent", ico: "🤖" },
-  { key: "termine",     label: "Termine",  ico: "📅", feature: "kalender" },
-  { key: "buchhaltung", label: "Büro",     ico: "🧾", feature: "lexware" },
+  { key: "aktuelles",   label: "Aktuelles", ico: "📋" },
   { key: "mehr",        label: "Mehr",     ico: "⋯" },
 ];
 
@@ -78,15 +80,26 @@ const SCREENS = {
   async aktuelles() {
     const feats = new Set(App.me.features || []);
     const hasMail = feats.has("mail_intake");
-    const [res, ares] = await Promise.all([
+    const hasKal = feats.has("kalender");
+    const hasLex = feats.has("lexware");
+    const [res, ares, tres, angres, rechres] = await Promise.all([
       api("/app/api/aktuelles"),
       hasMail ? api("/app/api/anfragen") : Promise.resolve(null),
+      hasKal ? api("/app/api/termine") : Promise.resolve(null),
+      hasLex ? api("/app/api/angebote") : Promise.resolve(null),
+      hasLex ? api("/app/api/rechnungen") : Promise.resolve(null),
     ]);
     const d = res && res.ok ? await res.json() : {};
     const ad = ares && ares.ok ? await ares.json() : { items: [] };
+    const td = tres && tres.ok ? await tres.json() : { termine: [] };
+    const angd = angres && angres.ok ? await angres.json() : { angebote: [] };
+    const rechd = rechres && rechres.ok ? await rechres.json() : { rechnungen: [] };
     const beratung = d.beratung || [];
     const auftraege = d.auftraege || [];
     const rueckrufe = d.rueckrufe || [];
+    const termine = td.termine || [];
+    const angebote = angd.angebote || [];
+    const rechnungen = rechd.rechnungen || [];
     const anfragenOffen = (ad.items || []).filter((x) => !x.closed);
     const parts = [];
     parts.push(
@@ -114,7 +127,7 @@ const SCREENS = {
 
     // --- Offene Anfragen (E-Mail-Eingang) ---
     if (hasMail) {
-      parts.push(`<div class="section-title">Offene Anfragen (${anfragenOffen.length})</div>`);
+      parts.push(`<div class="section-title" id="sec-anfragen">Offene Anfragen (${anfragenOffen.length})</div>`);
       if (!anfragenOffen.length) {
         parts.push(`<div class="card">${emptyRow("Keine offenen Anfragen")}</div>`);
       } else {
@@ -128,6 +141,16 @@ const SCREENS = {
              </button>`);
         });
       }
+    }
+
+    // --- Termine (anstehend) ---
+    if (hasKal) {
+      parts.push(`<div class="section-title" id="sec-termine">Termine (${termine.length})</div>`);
+      parts.push(`<div class="card">${
+        termine.length ? termine.map((x) =>
+          rowAction(x.zeit, x.kunde, x.ort, x.id, "storno", "Stornieren")).join("")
+        : emptyRow("Keine anstehenden Termine")
+      }</div>`);
     }
 
     // --- Beratungsgespräche (Leads: annehmen / ablehnen) ---
@@ -146,7 +169,7 @@ const SCREENS = {
     }
 
     // --- Aufträge mit Status ---
-    parts.push(`<div class="section-title">Aufträge (${auftraege.length})</div>`);
+    parts.push(`<div class="section-title" id="sec-auftraege">Aufträge (${auftraege.length})</div>`);
     if (!auftraege.length) {
       parts.push(`<div class="card">${emptyRow("Keine laufenden Aufträge")}</div>`);
     } else {
@@ -173,8 +196,24 @@ const SCREENS = {
       });
     }
 
+    // --- Angebote + Rechnungen (Büro-Anzeigen) ---
+    if (hasLex) {
+      parts.push(`<div class="section-title" id="sec-angebote">Angebote (${angebote.length})</div>`);
+      parts.push(`<div class="card">${
+        angebote.length ? angebote.map((x) =>
+          rowPill(x.kunde, x.betrag + " · " + x.zeit, x.status, x.pill)).join("")
+        : emptyRow("Noch keine Angebote")
+      }</div>`);
+      parts.push(`<div class="section-title" id="sec-rechnungen">Rechnungen (${rechnungen.length})</div>`);
+      parts.push(`<div class="card">${
+        rechnungen.length ? rechnungen.map((x) =>
+          rowPill(x.kunde + (x.nummer ? " · " + esc(x.nummer) : ""), x.betrag + " · " + x.zeit, x.status, x.pill)).join("")
+        : emptyRow("Noch keine Rechnungen")
+      }</div>`);
+    }
+
     // --- Offene Rückrufe (mit Erledigt-Aktion) ---
-    parts.push(`<div class="section-title">Offene Rückrufe (${rueckrufe.length})</div>`);
+    parts.push(`<div class="section-title" id="sec-rueckrufe">Offene Rückrufe (${rueckrufe.length})</div>`);
     parts.push(`<div class="card">${
       rueckrufe.length ? rueckrufe.map((r) =>
         rowAction(r.kunde, r.telefon + (r.anliegen ? " · " + esc(r.anliegen) : ""), "", r.id, "rueckruf-done", "Erledigt")).join("")
@@ -192,7 +231,11 @@ const SCREENS = {
     if (briefRefresh) briefRefresh.addEventListener("click", () => loadBriefing(true));
     loadBriefing(false);
     bindRueckrufDone();
+    bindStorno();
     bindAktuelles();
+    // Q kann eine Ansicht per Chat öffnen → ggf. zum Abschnitt scrollen.
+    if (App._scrollTo) { const el = document.getElementById(App._scrollTo); App._scrollTo = null;
+      if (el) requestAnimationFrame(() => el.scrollIntoView({ behavior: "smooth", block: "start" })); }
   },
 
   async termine() {
@@ -1124,7 +1167,7 @@ const SCREENS = {
       }
       if (!hasMsgs) {
         App.qWorking = false;
-        chatEl.innerHTML = `<div class="q-hero">${sphereWrap}</div>`;
+        chatEl.innerHTML = `<div class="q-hero">${sphereWrap}<div class="q-word">Q</div></div>`;
         mountQSphere();
         return;
       }
@@ -1226,6 +1269,7 @@ const SCREENS = {
       if (j.type === "message") push({ role: "q", text: j.text });
       else if (j.type === "error") push({ role: "err", text: j.text });
       else if (j.type === "confirm") push({ role: "confirm", tool: j.tool, args: j.args, summary: j.summary, frage: j.frage, resolved: false });
+      else if (j.type === "navigate") { if (j.text) push({ role: "q", text: j.text }); handleNavigate(j.bereich); }
     }
 
     // Funktion aus dem ⚡-Menü angetippt: Q übernimmt den Flow im Hintergrund.
@@ -1250,6 +1294,7 @@ const SCREENS = {
       else if (j.type === "message") push({ role: "q", text: j.text });
       else if (j.type === "error") push({ role: "err", text: j.text });
       else if (j.type === "confirm") push({ role: "confirm", tool: j.tool, args: j.args, summary: j.summary, frage: j.frage, resolved: false });
+      else if (j.type === "navigate") { if (j.text) push({ role: "q", text: j.text }); handleNavigate(j.bereich); }
       input.focus();
     }
 
@@ -1388,6 +1433,21 @@ async function loadBriefing(refresh) {
   const cur = document.getElementById("q-briefing-text");
   if (!cur) return; // Tab inzwischen gewechselt
   cur.textContent = (j && j.ok && j.text) ? j.text : "Briefing gerade nicht verfügbar.";
+}
+
+// Q hat im Chat eine Ansicht angefordert ("zeig mir die Rechnungen") → die
+// passende Stelle öffnen. Anzeigen leben in "Aktuelles" (dorthin + zum
+// Abschnitt scrollen); Kleinkram (Kunden/Wissen/…) als eigener Screen.
+function handleNavigate(bereich) {
+  const b = (bereich || "aktuelles").toLowerCase();
+  const mehr = { kunden: 1, wissen: 1, material: 1, team: 1, einstellungen: 1, formulare: 1 };
+  const sektion = {
+    anfragen: "sec-anfragen", termine: "sec-termine", auftraege: "sec-auftraege",
+    angebote: "sec-angebote", rechnungen: "sec-rechnungen", rueckrufe: "sec-rueckrufe",
+  };
+  if (mehr[b]) { navigate(b); return; }
+  if (sektion[b]) { App._scrollTo = sektion[b]; navigate("aktuelles"); return; }
+  navigate("aktuelles");
 }
 
 function row(a, b, c) {

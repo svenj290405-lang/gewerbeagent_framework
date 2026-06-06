@@ -47,7 +47,11 @@
 // (forceContextLoss, Kontextverlust-/FPS-Fallback, kein Doppel-Mount) und
 // Three.js LOKAL gehostet (/app/static/vendor, kein CDN). Der CSS-Globus sah
 // „zerschossen" aus (sich kreuzende Großkreise statt sauberer Kugel).
-const CACHE = "ga-app-v35";
+// v36: Chat-first-Umbau — nur noch 3 Tabs (Assistent · Aktuelles · Mehr);
+// Termine/Büro raus, ihre Anzeigen jetzt als Abschnitte in „Aktuelles";
+// Q kann Ansichten per Chat öffnen ("zeig mir die Rechnungen"); schöner
+// „Q"-Schriftzug unter dem Globus.
+const CACHE = "ga-app-v36";
 const SHELL = [
   "/app",
   "/app/static/app.css",
