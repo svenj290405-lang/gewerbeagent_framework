@@ -120,6 +120,9 @@ def _system_instruction(ctx: Ctx) -> str:
         "mit dem passenden Such-Tool.\n"
         "- Willst du Material bestellen, hole dir zuerst die Material-Liste, "
         "um die richtige ID zu finden.\n"
+        "- Will der Nutzer eine Ansicht/Liste nur SEHEN ('zeig mir...', "
+        "'öffne...', 'geh zu...'), rufe das Tool anzeige_oeffnen mit dem "
+        "passenden Bereich auf.\n"
         "- Antworte kurz und auf Deutsch, in der Du-Form, wie ein Kollege."
     )
 
@@ -218,6 +221,11 @@ async def run_command(text: str, ctx: Ctx) -> dict:
             logger.warning("command_center: Gemini rief unzulässiges Tool %r auf", fc.name)
             return {"type": "message",
                     "text": "Das kann ich hier nicht. Frag mich z.B. nach Terminen, Rückrufen oder Material."}
+
+        if spec.name == "anzeige_oeffnen":
+            # Kein Datenzugriff — der App sagen, welche Ansicht sie öffnen soll.
+            bereich = (args.get("bereich") or "aktuelles").strip().lower()
+            return {"type": "navigate", "bereich": bereich, "text": say or None}
 
         if spec.kind == "write":
             # NICHT ausführen — Bestätigung einholen.
@@ -1078,6 +1086,12 @@ def _summary_anfrage_beantworten(ctx: Ctx, args: dict) -> str:
 # Registry
 # ---------------------------------------------------------------------------
 
+async def _run_anzeige_oeffnen(ctx: Ctx, args: dict) -> dict:
+    # Wird in run_command kurzgeschlossen (liefert {"type":"navigate"} an die
+    # App); diese Funktion ist nur der ToolSpec-Platzhalter.
+    return {"bereich": (args.get("bereich") or "aktuelles")}
+
+
 _S = "STRING"
 _I = "INTEGER"
 
@@ -1110,6 +1124,19 @@ _REGISTRY: list[ToolSpec] = [
         description="Zeigt die aktuell offenen Rückrufe.",
         parameters={"type": "OBJECT", "properties": {}},
         run=_run_offene_rueckrufe),
+    ToolSpec(
+        name="anzeige_oeffnen", kind="read",
+        description="Öffnet eine Ansicht/Liste in der App, wenn der Nutzer sie "
+                    "SEHEN will (z.B. 'zeig mir die Rechnungen', 'öffne die "
+                    "Termine', 'meine offenen Rückrufe', 'Kundenliste', 'geh zu "
+                    "Material'). Nur zum Anzeigen/Navigieren — keine Daten ändern.",
+        parameters={"type": "OBJECT", "properties": {
+            "bereich": {"type": _S, "description":
+                "Genau einer von: aktuelles, anfragen, termine, auftraege, "
+                "rueckrufe, angebote, rechnungen, kunden, wissen, material, "
+                "team, einstellungen."}},
+            "required": ["bereich"]},
+        run=_run_anzeige_oeffnen),
 
     # ---- WRITE ----
     ToolSpec(
