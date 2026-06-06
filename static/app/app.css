@@ -89,6 +89,21 @@ button:disabled { opacity: .6; }
 .banner { background: #fff7e0; border: 1px solid #f0dca0; color: #7a5c00;
   border-radius: 10px; padding: 12px 14px; font-size: 14px; margin-bottom: 12px; }
 
+/* Q-Tagesbriefing-Karte oben auf "Aktuelles" */
+.q-briefing { background: linear-gradient(135deg, #eaf2ff 0%, #ffffff 72%);
+  border: 1px solid #d6e4ff; }
+.q-briefing-head { display: flex; align-items: center; gap: 8px; font-size: 12px;
+  font-weight: 700; letter-spacing: .05em; text-transform: uppercase;
+  color: var(--primary); margin-bottom: 8px; }
+.q-briefing .q-badge { width: 22px; height: 22px; border-radius: 50%;
+  background: var(--primary); color: #fff; display: flex; align-items: center;
+  justify-content: center; font-size: 12px; font-weight: 700; }
+.q-briefing-refresh { margin-left: auto; background: none; border: 0; padding: 2px 6px;
+  width: auto; font-size: 14px; cursor: pointer; color: var(--muted); }
+.q-briefing-text { margin: 0; font-size: 15px; line-height: 1.5; color: var(--text); }
+.q-briefing-load { color: var(--muted); animation: pulseop 1.2s ease-in-out infinite; }
+@keyframes pulseop { 0%,100% { opacity: .5; } 50% { opacity: 1; } }
+
 /* Menü-Zeile (Button, der wie eine Listenzeile aussieht) */
 .menu-item { width: 100%; background: none; color: var(--text); border: 0;
   border-bottom: 1px solid var(--line); border-radius: 0; padding: 12px 0;
@@ -110,22 +125,30 @@ button:disabled { opacity: .6; }
 .q-hero::before { content: ""; position: absolute; top: 50%; left: 50%;
   width: 520px; height: 520px; transform: translate(-50%, -50%); pointer-events: none; z-index: -1;
   background: radial-gradient(circle, rgba(0,102,204,.18) 0%, rgba(158,197,255,.18) 28%, transparent 62%); }
+/* Q-Globus: reine CSS-3D-Animation (kein WebGL). Rotierender Drahtgitter-Globus
+   aus Meridian- und Breitenkreis-Ringen + pulsierender Kern. */
 .q-sphere-wrap { position: relative; width: min(72vw, 300px); aspect-ratio: 1;
-  cursor: grab; touch-action: pan-y; }
-.q-sphere-wrap:active { cursor: grabbing; }
-.q-sphere-wrap canvas { width: 100% !important; height: 100% !important; display: block; }
-.q-sphere-fallback { display: none; width: 100%; aspect-ratio: 1; opacity: .85; }
-.q-sphere-fallback circle { fill: none; stroke: #9ec5ff; stroke-width: .4; opacity: .7; }
-.q-sphere-fallback .ring-1 { animation: qring 4s ease-in-out infinite; }
-.q-sphere-fallback .ring-2 { animation: qring 4s ease-in-out infinite .5s; }
-.q-sphere-fallback .ring-3 { animation: qring 4s ease-in-out infinite 1s; }
-@keyframes qring { 0%,100% { opacity: .3; transform: scale(.95); transform-origin: center; }
-  50% { opacity: .8; transform: scale(1.02); transform-origin: center; } }
+  display: flex; align-items: center; justify-content: center; perspective: 760px; }
+.q-globe { position: relative; width: 76%; height: 76%; transform-style: preserve-3d;
+  transform: rotateX(14deg); animation: q-globe-spin 16s linear infinite; }
+.q-globe .q-ring { position: absolute; inset: 0; border-radius: 50%; box-sizing: border-box;
+  border: 1px solid rgba(0,102,204,.5); }
+.q-globe .q-mrd { border-color: rgba(0,102,204,.55); }
+.q-globe .q-lat { border-color: rgba(59,130,246,.3); }
+.q-globe .q-core { position: absolute; top: 50%; left: 50%; width: 9px; height: 9px;
+  margin: -4.5px 0 0 -4.5px; border-radius: 50%; background: #0066cc;
+  box-shadow: 0 0 12px 3px rgba(0,102,204,.55); transform: translateZ(0);
+  animation: q-core-pulse 2.4s ease-in-out infinite; }
+@keyframes q-globe-spin { from { transform: rotateX(14deg) rotateY(0); }
+  to { transform: rotateX(14deg) rotateY(360deg); } }
+@keyframes q-core-pulse { 0%,100% { opacity: .65; } 50% { opacity: 1; } }
+@media (prefers-reduced-motion: reduce) {
+  .q-globe { animation: none; } .q-globe .q-core { animation: none; } }
 
-/* "Q übernimmt"-Zustand: animierte Sphere + Label, wenn eine Funktion getippt wurde. */
+/* "Q übernimmt"-Zustand: Globus dreht schneller + Label, wenn eine Funktion getippt wurde. */
 .q-hero.working { flex-direction: column; gap: 6px; }
-.q-hero.working .q-sphere-wrap { animation: qpulse 1.4s ease-in-out infinite; }
-@keyframes qpulse { 0%,100% { transform: scale(.97); } 50% { transform: scale(1.03); } }
+.q-hero.working .q-globe { animation-duration: 5.5s; }
+.q-hero.working .q-globe .q-core { animation-duration: 1s; }
 .q-working { display: flex; align-items: center; gap: 8px; font-size: 15px; font-weight: 600;
   color: var(--primary); animation: bubblein .25s ease both; }
 .q-working .qm-ico { font-size: 18px; }

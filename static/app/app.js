@@ -59,7 +59,6 @@ function buildTabbar() {
 }
 
 function navigate(key) {
-  if (App.qSphereStop) { try { App.qSphereStop(); } catch (e) {} App.qSphereStop = null; }
   App.qIntent = null;
   App.qWorking = false;
   App.current = key;
@@ -96,6 +95,16 @@ const SCREENS = {
            <button class="btn-sm" id="ak-diktat" style="padding:8px 12px">🎤 Diktat</button>
            <button class="btn-sm btn-ghost" id="ak-rueckruf" style="padding:8px 12px">+ Rückruf</button>
          </div>
+       </div>`);
+
+    // --- Q-Tagesbriefing (oben): einmal morgens, knapp + intelligent ---
+    parts.push(
+      `<div class="card q-briefing">
+         <div class="q-briefing-head">
+           <span class="q-badge">Q</span><span>Dein Tag</span>
+           <button class="q-briefing-refresh" id="ak-briefing-refresh" title="Neu schreiben">🔄</button>
+         </div>
+         <p class="q-briefing-text" id="q-briefing-text"><span class="q-briefing-load">Q schreibt dein Briefing …</span></p>
        </div>`);
 
     if (notifSupported() && !notifGranted()) {
@@ -178,6 +187,9 @@ const SCREENS = {
     document.getElementById("ak-rueckruf").addEventListener("click", showNewRueckrufForm);
     document.querySelectorAll("[data-anfrage]").forEach((b) =>
       b.addEventListener("click", () => showAnfrage(b.dataset.anfrage)));
+    const briefRefresh = document.getElementById("ak-briefing-refresh");
+    if (briefRefresh) briefRefresh.addEventListener("click", () => loadBriefing(true));
+    loadBriefing(false);
     bindRueckrufDone();
     bindAktuelles();
   },
@@ -1079,22 +1091,23 @@ const SCREENS = {
       return "Erledigt.";
     }
 
+    // Q-Globus: reine CSS-3D-Animation (Meridiane + geneigte Breitenkreise +
+    // pulsierender Kern). KEIN WebGL/Three.js/CDN mehr — kann nicht crashen,
+    // läuft auf jedem Browser identisch und ohne externen Aufruf (DSGVO-Plus).
+    const meridians = Array.from({ length: 6 }, (_, i) =>
+      `<span class="q-ring q-mrd" style="transform:rotateY(${i * 30}deg)"></span>`).join("");
+    const latitudes = [70, 110, 90].map((a, i) =>
+      `<span class="q-ring q-lat" style="transform:rotateX(${a}deg) rotateY(${i * 35}deg)"></span>`).join("");
     const sphereWrap =
       `<div class="q-sphere-wrap" id="q-sphere-wrap" aria-hidden="true">
-         <canvas id="q-sphere-canvas"></canvas>
-         <svg class="q-sphere-fallback" viewBox="0 0 100 100" aria-hidden="true">
-           <circle class="ring-1" cx="50" cy="50" r="35"/>
-           <circle class="ring-2" cx="50" cy="50" r="28"/>
-           <circle class="ring-3" cx="50" cy="50" r="22"/>
-           <circle cx="50" cy="50" r="2" fill="#0066cc" stroke="none"/>
-         </svg>
+         <div class="q-globe">${meridians}${latitudes}<span class="q-core"></span></div>
        </div>`;
 
     function render() {
       const hasMsgs = App.qchat.some((m) => m.role !== "typing");
       // Funktion angetippt → animierte Sphere statt Seed-Text, während Q übernimmt.
       if (App.qIntent && !hasMsgs) {
-        App.qWorking = true; // von buildQSphere beim (asynchronen) Mount gelesen
+        App.qWorking = true; // .working-Klasse lässt den Globus schneller drehen
         chatEl.innerHTML =
           `<div class="q-hero working">${sphereWrap}
              <div class="q-working">
@@ -1103,16 +1116,13 @@ const SCREENS = {
                <span class="q-dots"><span></span><span></span><span></span></span>
              </div>
            </div>`;
-        mountQSphere();
         return;
       }
       if (!hasMsgs) {
         App.qWorking = false;
         chatEl.innerHTML = `<div class="q-hero">${sphereWrap}</div>`;
-        mountQSphere();
         return;
       }
-      if (App.qSphereStop) { try { App.qSphereStop(); } catch (e) {} App.qSphereStop = null; }
       chatEl.innerHTML = App.qchat.map((m, i) => {
         if (m.role === "me") return `<div class="bubble me">${esc(m.text)}</div>`;
         if (m.role === "typing") return `<div class="bubble q typing"><span></span><span></span><span></span></div>`;
@@ -1358,6 +1368,21 @@ const SCREENS = {
     else if (App.qchat.length) input.focus();
   },
 };
+
+// Q-Tagesbriefing laden + in die Karte schreiben. refresh=true erzwingt eine
+// Neuberechnung (sonst kommt die gecachte Tagesfassung sofort).
+async function loadBriefing(refresh) {
+  const el = document.getElementById("q-briefing-text");
+  if (!el) return;
+  if (refresh) el.innerHTML = '<span class="q-briefing-load">Q schreibt dein Briefing …</span>';
+  const r = await api("/app/api/briefing" + (refresh ? "?refresh=1" : ""));
+  if (!r) return; // api() hat ggf. zur Login-Seite umgeleitet
+  let j = null;
+  try { j = await r.json(); } catch (e) {}
+  const cur = document.getElementById("q-briefing-text");
+  if (!cur) return; // Tab inzwischen gewechselt
+  cur.textContent = (j && j.ok && j.text) ? j.text : "Briefing gerade nicht verfügbar.";
+}
 
 function row(a, b, c) {
   return `<div class="row"><div><div>${esc(a)}</div>${b ? `<div class="sub">${esc(b)}</div>` : ""}</div>${c ? `<span class="sub">${esc(c)}</span>` : ""}</div>`;
@@ -2713,209 +2738,6 @@ async function enablePush() {
     await api("/app/api/push/subscribe", { method: "POST", body: JSON.stringify({ subscription: sub }) });
     navigate(App.current);
   } catch (e) { console.error(e); alert("Konnte Benachrichtigungen nicht aktivieren."); }
-}
-
-// ---------- Q-Sphere (Netzwerk-Globus wie auf der Website) ----------
-// Wireframe-Ikosaeder + Partikelwolke + Energie-Linien, lazy via Three.js (CDN).
-// Wird im leeren Chat mittig gezeigt; beim Tab-Wechsel/erster Nachricht gestoppt.
-const _sphereMobile = window.innerWidth < 768;
-const _sphereReducedMotion = !!(window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
-
-function sphereSupported() {
-  try {
-    const c = document.createElement("canvas");
-    return !!(c.getContext("webgl") || c.getContext("experimental-webgl"));
-  } catch (e) { return false; }
-}
-
-function loadThree() {
-  if (window.THREE) return Promise.resolve();
-  if (App._threeP) return App._threeP;
-  App._threeP = new Promise((resolve, reject) => {
-    const s = document.createElement("script");
-    s.src = "https://cdn.jsdelivr.net/npm/three@0.128.0/build/three.min.js";
-    s.onload = () => resolve();
-    s.onerror = reject;
-    document.head.appendChild(s);
-  });
-  return App._threeP;
-}
-
-// Baut die Sphere in wrap/canvas und gibt eine stop()-Funktion zum Aufräumen zurück.
-function buildQSphere(wrap, canvas) {
-  const THREE = window.THREE;
-  const isMobile = _sphereMobile;
-  let W = wrap.clientWidth || 280, H = wrap.clientHeight || 280;
-
-  const renderer = new THREE.WebGLRenderer({ canvas, alpha: true, antialias: !isMobile });
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-  renderer.setSize(W, H, false);
-
-  const scene = new THREE.Scene();
-  const camera = new THREE.PerspectiveCamera(45, 1, 0.1, 100);
-  camera.position.z = 4.6;
-
-  const detail = isMobile ? 2 : 3;
-  const sphereGeom = new THREE.IcosahedronGeometry(1.55, detail);
-  const wireGeom = new THREE.WireframeGeometry(sphereGeom);
-  const lineMat = new THREE.LineBasicMaterial({ color: 0x0066cc, transparent: true, opacity: 0.55 });
-  const wireSphere = new THREE.LineSegments(wireGeom, lineMat);
-  scene.add(wireSphere);
-
-  const particleCount = isMobile ? 80 : 240;
-  const positions = new Float32Array(particleCount * 3);
-  const velocities = new Float32Array(particleCount * 3);
-  for (let i = 0; i < particleCount; i++) {
-    const r = Math.cbrt(Math.random()) * 1.4;
-    const theta = Math.random() * Math.PI * 2;
-    const phi = Math.acos(2 * Math.random() - 1);
-    positions[i*3]   = r * Math.sin(phi) * Math.cos(theta);
-    positions[i*3+1] = r * Math.sin(phi) * Math.sin(theta);
-    positions[i*3+2] = r * Math.cos(phi);
-    velocities[i*3]   = (Math.random() - 0.5) * 0.0035;
-    velocities[i*3+1] = (Math.random() - 0.5) * 0.0035;
-    velocities[i*3+2] = (Math.random() - 0.5) * 0.0035;
-  }
-  const particleGeom = new THREE.BufferGeometry();
-  particleGeom.setAttribute("position", new THREE.BufferAttribute(positions, 3));
-  const particleMat = new THREE.PointsMaterial({
-    color: 0x9ec5ff, size: 0.025, transparent: true, opacity: 0.9,
-    sizeAttenuation: true, depthWrite: false });
-  const particles = new THREE.Points(particleGeom, particleMat);
-  scene.add(particles);
-
-  const energyLines = [];
-  const energyCount = isMobile ? 5 : 7;
-  for (let i = 0; i < energyCount; i++) {
-    const curveR = 1.55, arcAngle = Math.random() * Math.PI * 2, points = [], segs = 60;
-    for (let j = 0; j <= segs; j++) {
-      const t = j / segs, a = (t - 0.5) * Math.PI;
-      points.push(new THREE.Vector3(
-        curveR * Math.sin(a) * Math.cos(arcAngle + t * 0.4),
-        curveR * Math.cos(a),
-        curveR * Math.sin(a) * Math.sin(arcAngle + t * 0.4)));
-    }
-    const g = new THREE.BufferGeometry().setFromPoints(points);
-    const m = new THREE.LineBasicMaterial({ color: 0x3b82f6, transparent: true, opacity: 0.35 });
-    const line = new THREE.Line(g, m);
-    line.userData.speed = 0.0015 + Math.random() * 0.003;
-    line.userData.axis = ["x","y","z"][Math.floor(Math.random()*3)];
-    scene.add(line); energyLines.push(line);
-  }
-
-  scene.add(new THREE.AmbientLight(0xffffff, 0.5));
-  const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
-  dirLight.position.set(2, 3, 4); scene.add(dirLight);
-  const corePoint = new THREE.PointLight(0x3b82f6, 0.6, 4); scene.add(corePoint);
-
-  const totalEdges = wireGeom.attributes.position.count / 2;
-  let buildComplete = false;
-  wireGeom.setDrawRange(0, 0);
-
-  let targetRotX = 0, targetRotY = 0, pulseScale = 1, pulseTarget = 1;
-  const onPointer = (e) => {
-    const rect = wrap.getBoundingClientRect();
-    const isTouch = e.type.startsWith("touch");
-    const cx = isTouch ? e.touches[0].clientX : e.clientX;
-    const cy = isTouch ? e.touches[0].clientY : e.clientY;
-    targetRotX = (((cy - rect.top) / rect.height) * 2 - 1) * 0.18;
-    targetRotY = (((cx - rect.left) / rect.width) * 2 - 1) * 0.18;
-  };
-  const onLeave = () => { targetRotX = 0; targetRotY = 0; };
-  const onTap = () => { pulseTarget = 1.15; setTimeout(() => { pulseTarget = 1; }, 140); };
-  wrap.addEventListener("mousemove", onPointer);
-  wrap.addEventListener("touchmove", onPointer, { passive: true });
-  wrap.addEventListener("mouseleave", onLeave);
-  wrap.addEventListener("click", onTap);
-
-  const onResize = () => {
-    W = wrap.clientWidth; H = wrap.clientHeight;
-    renderer.setSize(W, H, false);
-    camera.aspect = 1; camera.updateProjectionMatrix();
-  };
-  window.addEventListener("resize", onResize);
-
-  let baseRotY = 0, baseRotX = 0, raf = 0, stopped = false, active = !!App.qWorking;
-  // Während Q einen angetippten Flow bearbeitet, dreht/pulsiert die Sphere
-  // energischer (Hinweis "Q arbeitet"). Anfangszustand aus App.qWorking (render()
-  // setzt das Flag vor dem asynchronen Mount); Setter erlaubt späteres Umschalten.
-  App.qSphereActive = (on) => { active = !!on; };
-  const t0 = performance.now(); let lastFrame = t0;
-  function animate(now) {
-    if (stopped) return;
-    raf = requestAnimationFrame(animate);
-    if (isMobile && now - lastFrame < 24) return;
-    lastFrame = now;
-    const dt = (now - t0) / 1000;
-    if (!buildComplete) {
-      const bt = Math.min(dt / 1.6, 1);
-      wireGeom.setDrawRange(0, Math.floor(bt * totalEdges) * 2);
-      if (bt >= 1) buildComplete = true;
-    }
-    if (!_sphereReducedMotion) { baseRotY += active ? 0.006 : 0.0014; baseRotX = Math.sin(dt * (active ? 1.1 : 0.45)) * 0.06; }
-    wireSphere.rotation.y += (baseRotY + targetRotY - wireSphere.rotation.y) * 0.08;
-    wireSphere.rotation.x += (baseRotX + targetRotX - wireSphere.rotation.x) * 0.08;
-    particles.rotation.copy(wireSphere.rotation);
-    const phasePeriod = active ? 1.4 : 3.5;
-    const phase = _sphereReducedMotion ? 0 : (1 - Math.cos(dt * 2 * Math.PI / phasePeriod)) * 0.5;
-    pulseScale += (pulseTarget * (1 + phase * (active ? 0.12 : 0.05)) - pulseScale) * 0.22;
-    wireSphere.scale.setScalar(pulseScale);
-    lineMat.opacity = 0.6 + phase * 0.4;
-    corePoint.intensity = (active ? 0.7 : 0.45) + phase * (active ? 0.8 : 0.5);
-    const pArr = particles.geometry.attributes.position.array;
-    for (let i = 0; i < particleCount; i++) {
-      pArr[i*3]   += velocities[i*3];
-      pArr[i*3+1] += velocities[i*3+1];
-      pArr[i*3+2] += velocities[i*3+2];
-      const dx = pArr[i*3], dy = pArr[i*3+1], dz = pArr[i*3+2];
-      if (Math.sqrt(dx*dx + dy*dy + dz*dz) > 1.45) {
-        velocities[i*3] *= -1; velocities[i*3+1] *= -1; velocities[i*3+2] *= -1;
-      }
-      if (Math.random() < 0.005) {
-        velocities[i*3]   = (Math.random() - 0.5) * 0.0035;
-        velocities[i*3+1] = (Math.random() - 0.5) * 0.0035;
-        velocities[i*3+2] = (Math.random() - 0.5) * 0.0035;
-      }
-    }
-    particles.geometry.attributes.position.needsUpdate = true;
-    energyLines.forEach((l) => { if (!_sphereReducedMotion) l.rotation[l.userData.axis] += l.userData.speed; });
-    renderer.render(scene, camera);
-  }
-  raf = requestAnimationFrame(animate);
-
-  return function stop() {
-    stopped = true;
-    active = false;
-    App.qSphereActive = null;
-    if (raf) cancelAnimationFrame(raf);
-    window.removeEventListener("resize", onResize);
-    wrap.removeEventListener("mousemove", onPointer);
-    wrap.removeEventListener("touchmove", onPointer);
-    wrap.removeEventListener("mouseleave", onLeave);
-    wrap.removeEventListener("click", onTap);
-    try {
-      wireGeom.dispose(); sphereGeom.dispose(); particleGeom.dispose();
-      energyLines.forEach((l) => l.geometry.dispose());
-      renderer.dispose();
-    } catch (e) {}
-  };
-}
-
-// Hängt die Sphere an das aktuelle #q-sphere-wrap; fällt bei fehlendem WebGL
-// oder Three.js-Ladefehler auf das SVG-Ring-Muster zurück.
-function mountQSphere() {
-  if (App.qSphereStop) { try { App.qSphereStop(); } catch (e) {} App.qSphereStop = null; }
-  const wrap = document.getElementById("q-sphere-wrap");
-  const canvas = document.getElementById("q-sphere-canvas");
-  if (!wrap || !canvas) return;
-  const fb = wrap.querySelector(".q-sphere-fallback");
-  const fallback = () => { canvas.style.display = "none"; if (fb) fb.style.display = "block"; };
-  if (!sphereSupported()) { fallback(); return; }
-  loadThree().then(() => {
-    if (!document.body.contains(canvas)) return; // Tab inzwischen gewechselt
-    try { App.qSphereStop = buildQSphere(wrap, canvas); }
-    catch (e) { console.warn("Q-Sphere fehlgeschlagen", e); fallback(); }
-  }).catch(() => fallback());
 }
 
 // ---------- Boot ----------

@@ -34,7 +34,15 @@
 // v31: Selbstheilung — App aktualisiert sich automatisch (controllerchange ->
 // reload) + "App zurücksetzen"-Link auf der Login-Seite (/app/login?reset=1),
 // damit niemand mehr auf einer alten, gecachten Version hängenbleibt.
-const CACHE = "ga-app-v31";
+// v32: Q-Sphere abgesichert — bei WebGL-Kontextverlust/Render-Fehler sauberer
+// Fallback auf das SVG-Ring-Muster statt Tab-Absturz; neue Composer-Icons.
+// v33: WebGL-Kontext-Leck behoben — Sphere gibt beim Abbau den GL-Kontext hart
+// frei (forceContextLoss) + baut nicht doppelt auf; behebt „zerschossene"
+// Darstellung nach mehreren Funktionsaufrufen/Tab-Wechseln.
+// v34: Q-Globus komplett auf reine CSS-3D-Animation umgestellt — KEIN WebGL/
+// Three.js/CDN mehr. Beendet alle GPU-/Kontext-Abstürze, läuft überall identisch
+// und ohne externen Aufruf.
+const CACHE = "ga-app-v34";
 const SHELL = [
   "/app",
   "/app/static/app.css",
