@@ -1167,7 +1167,7 @@ const SCREENS = {
       }
       if (!hasMsgs) {
         App.qWorking = false;
-        chatEl.innerHTML = `<div class="q-hero">${sphereWrap}<div class="q-word">Q</div></div>`;
+        chatEl.innerHTML = `<div class="q-hero">${sphereWrap}</div>`;
         mountQSphere();
         return;
       }

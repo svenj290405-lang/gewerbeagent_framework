@@ -51,7 +51,8 @@
 // Termine/Büro raus, ihre Anzeigen jetzt als Abschnitte in „Aktuelles";
 // Q kann Ansichten per Chat öffnen ("zeig mir die Rechnungen"); schöner
 // „Q"-Schriftzug unter dem Globus.
-const CACHE = "ga-app-v36";
+// v37: „Q"-Schriftzug unter dem Globus wieder entfernt (nur noch der Globus).
+const CACHE = "ga-app-v37";
 const SHELL = [
   "/app",
   "/app/static/app.css",
