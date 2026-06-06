@@ -59,6 +59,7 @@ function buildTabbar() {
 }
 
 function navigate(key) {
+  if (App.qSphereStop) { try { App.qSphereStop(); } catch (e) {} App.qSphereStop = null; App.qSphereCanvas = null; }
   App.qIntent = null;
   App.qWorking = false;
   App.current = key;
@@ -1091,16 +1092,18 @@ const SCREENS = {
       return "Erledigt.";
     }
 
-    // Q-Globus: reine CSS-3D-Animation (Meridiane + geneigte Breitenkreise +
-    // pulsierender Kern). KEIN WebGL/Three.js/CDN mehr — kann nicht crashen,
-    // läuft auf jedem Browser identisch und ohne externen Aufruf (DSGVO-Plus).
-    const meridians = Array.from({ length: 6 }, (_, i) =>
-      `<span class="q-ring q-mrd" style="transform:rotateY(${i * 30}deg)"></span>`).join("");
-    const latitudes = [70, 110, 90].map((a, i) =>
-      `<span class="q-ring q-lat" style="transform:rotateX(${a}deg) rotateY(${i * 35}deg)"></span>`).join("");
+    // Q-Globus: WebGL-Netzwerk-Globus (Drahtgitter-Ikosaeder + Partikelwolke +
+    // Energiebögen) wie auf der Website; Three.js wird lokal geladen. Fallback
+    // auf das SVG-Ring-Muster bei fehlendem/instabilem WebGL.
     const sphereWrap =
       `<div class="q-sphere-wrap" id="q-sphere-wrap" aria-hidden="true">
-         <div class="q-globe">${meridians}${latitudes}<span class="q-core"></span></div>
+         <canvas id="q-sphere-canvas"></canvas>
+         <svg class="q-sphere-fallback" viewBox="0 0 100 100" aria-hidden="true">
+           <circle class="ring-1" cx="50" cy="50" r="35"/>
+           <circle class="ring-2" cx="50" cy="50" r="28"/>
+           <circle class="ring-3" cx="50" cy="50" r="22"/>
+           <circle cx="50" cy="50" r="2" fill="#0066cc" stroke="none"/>
+         </svg>
        </div>`;
 
     function render() {
@@ -1116,13 +1119,16 @@ const SCREENS = {
                <span class="q-dots"><span></span><span></span><span></span></span>
              </div>
            </div>`;
+        mountQSphere();
         return;
       }
       if (!hasMsgs) {
         App.qWorking = false;
         chatEl.innerHTML = `<div class="q-hero">${sphereWrap}</div>`;
+        mountQSphere();
         return;
       }
+      if (App.qSphereStop) { try { App.qSphereStop(); } catch (e) {} App.qSphereStop = null; App.qSphereCanvas = null; }
       chatEl.innerHTML = App.qchat.map((m, i) => {
         if (m.role === "me") return `<div class="bubble me">${esc(m.text)}</div>`;
         if (m.role === "typing") return `<div class="bubble q typing"><span></span><span></span><span></span></div>`;
@@ -2738,6 +2744,245 @@ async function enablePush() {
     await api("/app/api/push/subscribe", { method: "POST", body: JSON.stringify({ subscription: sub }) });
     navigate(App.current);
   } catch (e) { console.error(e); alert("Konnte Benachrichtigungen nicht aktivieren."); }
+}
+
+// ---------- Q-Sphere (Netzwerk-Globus wie auf der Website) ----------
+// Wireframe-Ikosaeder + Partikelwolke + Energie-Bögen via Three.js (LOKAL unter
+// /app/static/vendor gehostet — kein CDN). Im leeren Chat mittig; beim
+// Tab-Wechsel/erster Nachricht gestoppt. Bei fehlendem/instabilem WebGL
+// Fallback auf das statische SVG-Ring-Muster.
+const _sphereMobile = window.innerWidth < 768;
+const _sphereReducedMotion = !!(window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
+
+let _sphereSupportCache = null;
+function sphereSupported() {
+  // Ergebnis cachen: jeder Aufruf legt sonst einen eigenen WebGL-Kontext an.
+  if (_sphereSupportCache !== null) return _sphereSupportCache;
+  try {
+    const c = document.createElement("canvas");
+    _sphereSupportCache = !!(c.getContext("webgl") || c.getContext("experimental-webgl"));
+  } catch (e) { _sphereSupportCache = false; }
+  return _sphereSupportCache;
+}
+
+function loadThree() {
+  if (window.THREE) return Promise.resolve();
+  if (App._threeP) return App._threeP;
+  App._threeP = new Promise((resolve, reject) => {
+    const s = document.createElement("script");
+    s.src = "/app/static/vendor/three.min.js"; // lokal gehostet, kein CDN
+    s.onload = () => resolve();
+    s.onerror = reject;
+    document.head.appendChild(s);
+  });
+  return App._threeP;
+}
+
+// Baut die Sphere in wrap/canvas und gibt eine stop()-Funktion zum Aufräumen zurück.
+function buildQSphere(wrap, canvas) {
+  const THREE = window.THREE;
+  const isMobile = _sphereMobile;
+  let W = wrap.clientWidth || 280, H = wrap.clientHeight || 280;
+
+  const renderer = new THREE.WebGLRenderer({ canvas, alpha: true, antialias: !isMobile });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  renderer.setSize(W, H, false);
+
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(45, 1, 0.1, 100);
+  camera.position.z = 4.6;
+
+  const detail = isMobile ? 2 : 3;
+  const sphereGeom = new THREE.IcosahedronGeometry(1.55, detail);
+  const wireGeom = new THREE.WireframeGeometry(sphereGeom);
+  const lineMat = new THREE.LineBasicMaterial({ color: 0x0066cc, transparent: true, opacity: 0.55 });
+  const wireSphere = new THREE.LineSegments(wireGeom, lineMat);
+  scene.add(wireSphere);
+
+  const particleCount = isMobile ? 80 : 240;
+  const positions = new Float32Array(particleCount * 3);
+  const velocities = new Float32Array(particleCount * 3);
+  for (let i = 0; i < particleCount; i++) {
+    const r = Math.cbrt(Math.random()) * 1.4;
+    const theta = Math.random() * Math.PI * 2;
+    const phi = Math.acos(2 * Math.random() - 1);
+    positions[i*3]   = r * Math.sin(phi) * Math.cos(theta);
+    positions[i*3+1] = r * Math.sin(phi) * Math.sin(theta);
+    positions[i*3+2] = r * Math.cos(phi);
+    velocities[i*3]   = (Math.random() - 0.5) * 0.0035;
+    velocities[i*3+1] = (Math.random() - 0.5) * 0.0035;
+    velocities[i*3+2] = (Math.random() - 0.5) * 0.0035;
+  }
+  const particleGeom = new THREE.BufferGeometry();
+  particleGeom.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+  const particleMat = new THREE.PointsMaterial({
+    color: 0x9ec5ff, size: 0.025, transparent: true, opacity: 0.9,
+    sizeAttenuation: true, depthWrite: false });
+  const particles = new THREE.Points(particleGeom, particleMat);
+  scene.add(particles);
+
+  const energyLines = [];
+  const energyCount = isMobile ? 5 : 7;
+  for (let i = 0; i < energyCount; i++) {
+    const curveR = 1.55, arcAngle = Math.random() * Math.PI * 2, points = [], segs = 60;
+    for (let j = 0; j <= segs; j++) {
+      const t = j / segs, a = (t - 0.5) * Math.PI;
+      points.push(new THREE.Vector3(
+        curveR * Math.sin(a) * Math.cos(arcAngle + t * 0.4),
+        curveR * Math.cos(a),
+        curveR * Math.sin(a) * Math.sin(arcAngle + t * 0.4)));
+    }
+    const g = new THREE.BufferGeometry().setFromPoints(points);
+    const m = new THREE.LineBasicMaterial({ color: 0x3b82f6, transparent: true, opacity: 0.35 });
+    const line = new THREE.Line(g, m);
+    line.userData.speed = 0.0015 + Math.random() * 0.003;
+    line.userData.axis = ["x","y","z"][Math.floor(Math.random()*3)];
+    scene.add(line); energyLines.push(line);
+  }
+
+  scene.add(new THREE.AmbientLight(0xffffff, 0.5));
+  const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+  dirLight.position.set(2, 3, 4); scene.add(dirLight);
+  const corePoint = new THREE.PointLight(0x3b82f6, 0.6, 4); scene.add(corePoint);
+
+  const totalEdges = wireGeom.attributes.position.count / 2;
+  let buildComplete = false;
+  wireGeom.setDrawRange(0, 0);
+
+  let targetRotX = 0, targetRotY = 0, pulseScale = 1, pulseTarget = 1;
+  const onPointer = (e) => {
+    const rect = wrap.getBoundingClientRect();
+    const isTouch = e.type.startsWith("touch");
+    const cx = isTouch ? e.touches[0].clientX : e.clientX;
+    const cy = isTouch ? e.touches[0].clientY : e.clientY;
+    targetRotX = (((cy - rect.top) / rect.height) * 2 - 1) * 0.18;
+    targetRotY = (((cx - rect.left) / rect.width) * 2 - 1) * 0.18;
+  };
+  const onLeave = () => { targetRotX = 0; targetRotY = 0; };
+  const onTap = () => { pulseTarget = 1.15; setTimeout(() => { pulseTarget = 1; }, 140); };
+  wrap.addEventListener("mousemove", onPointer);
+  wrap.addEventListener("touchmove", onPointer, { passive: true });
+  wrap.addEventListener("mouseleave", onLeave);
+  wrap.addEventListener("click", onTap);
+
+  const onResize = () => {
+    W = wrap.clientWidth; H = wrap.clientHeight;
+    renderer.setSize(W, H, false);
+    camera.aspect = 1; camera.updateProjectionMatrix();
+  };
+  window.addEventListener("resize", onResize);
+
+  let baseRotY = 0, baseRotX = 0, raf = 0, stopped = false, active = !!App.qWorking;
+  // Robustheit: Verliert der Browser den WebGL-Kontext (Mobil, GPU-Speicher
+  // knapp), sauber stoppen + auf das SVG-Muster zurückfallen statt pro Frame
+  // zu werfen (kann den Tab abschießen).
+  const fbEl = wrap.querySelector(".q-sphere-fallback");
+  const showFallback = () => { try { canvas.style.display = "none"; if (fbEl) fbEl.style.display = "block"; } catch (e) {} };
+  const onContextLost = (ev) => { ev.preventDefault(); stopped = true; if (raf) cancelAnimationFrame(raf); showFallback(); };
+  canvas.addEventListener("webglcontextlost", onContextLost, false);
+  // Während Q einen angetippten Flow bearbeitet, dreht/pulsiert die Sphere
+  // energischer. Anfangszustand aus App.qWorking; Setter erlaubt Umschalten.
+  App.qSphereActive = (on) => { active = !!on; };
+  const t0 = performance.now(); let lastFrame = t0, renderedFrames = 0;
+  function animate(now) {
+    if (stopped) return;
+    raf = requestAnimationFrame(animate);
+    try {
+    if (isMobile && now - lastFrame < 24) return;
+    lastFrame = now;
+    // Watchdog: rendert es viel zu langsam (Software-Rasterizer), nach 30
+    // Frames die Rate prüfen und ggf. auf das SVG-Muster zurückfallen.
+    if (++renderedFrames === 30) {
+      const fps = 30 / ((now - t0) / 1000);
+      if (fps < 12) {
+        console.warn("Q-Sphere zu langsam (" + fps.toFixed(1) + " fps) — Fallback");
+        stopped = true; if (raf) cancelAnimationFrame(raf); showFallback(); return;
+      }
+    }
+    const dt = (now - t0) / 1000;
+    if (!buildComplete) {
+      const bt = Math.min(dt / 1.6, 1);
+      wireGeom.setDrawRange(0, Math.floor(bt * totalEdges) * 2);
+      if (bt >= 1) buildComplete = true;
+    }
+    if (!_sphereReducedMotion) { baseRotY += active ? 0.006 : 0.0014; baseRotX = Math.sin(dt * (active ? 1.1 : 0.45)) * 0.06; }
+    wireSphere.rotation.y += (baseRotY + targetRotY - wireSphere.rotation.y) * 0.08;
+    wireSphere.rotation.x += (baseRotX + targetRotX - wireSphere.rotation.x) * 0.08;
+    particles.rotation.copy(wireSphere.rotation);
+    const phasePeriod = active ? 1.4 : 3.5;
+    const phase = _sphereReducedMotion ? 0 : (1 - Math.cos(dt * 2 * Math.PI / phasePeriod)) * 0.5;
+    pulseScale += (pulseTarget * (1 + phase * (active ? 0.12 : 0.05)) - pulseScale) * 0.22;
+    wireSphere.scale.setScalar(pulseScale);
+    lineMat.opacity = 0.6 + phase * 0.4;
+    corePoint.intensity = (active ? 0.7 : 0.45) + phase * (active ? 0.8 : 0.5);
+    const pArr = particles.geometry.attributes.position.array;
+    for (let i = 0; i < particleCount; i++) {
+      pArr[i*3]   += velocities[i*3];
+      pArr[i*3+1] += velocities[i*3+1];
+      pArr[i*3+2] += velocities[i*3+2];
+      const dx = pArr[i*3], dy = pArr[i*3+1], dz = pArr[i*3+2];
+      if (Math.sqrt(dx*dx + dy*dy + dz*dz) > 1.45) {
+        velocities[i*3] *= -1; velocities[i*3+1] *= -1; velocities[i*3+2] *= -1;
+      }
+      if (Math.random() < 0.005) {
+        velocities[i*3]   = (Math.random() - 0.5) * 0.0035;
+        velocities[i*3+1] = (Math.random() - 0.5) * 0.0035;
+        velocities[i*3+2] = (Math.random() - 0.5) * 0.0035;
+      }
+    }
+    particles.geometry.attributes.position.needsUpdate = true;
+    energyLines.forEach((l) => { if (!_sphereReducedMotion) l.rotation[l.userData.axis] += l.userData.speed; });
+    renderer.render(scene, camera);
+    } catch (e) {
+      console.warn("Q-Sphere Render-Fehler — Fallback", e);
+      stopped = true; if (raf) cancelAnimationFrame(raf); showFallback();
+    }
+  }
+  raf = requestAnimationFrame(animate);
+
+  return function stop() {
+    stopped = true;
+    active = false;
+    App.qSphereActive = null;
+    if (raf) cancelAnimationFrame(raf);
+    window.removeEventListener("resize", onResize);
+    wrap.removeEventListener("mousemove", onPointer);
+    wrap.removeEventListener("touchmove", onPointer);
+    wrap.removeEventListener("mouseleave", onLeave);
+    wrap.removeEventListener("click", onTap);
+    canvas.removeEventListener("webglcontextlost", onContextLost);
+    try {
+      wireGeom.dispose(); sphereGeom.dispose(); particleGeom.dispose();
+      energyLines.forEach((l) => l.geometry.dispose());
+      renderer.dispose();
+      // dispose() gibt nur GL-Ressourcen frei, NICHT den Kontext. Ohne
+      // forceContextLoss sammeln sich tote Kontexte (Tab-Wechsel/Start) → ab
+      // ~16 wirft Chrome den ältesten weg → Sphere wird „zerschossen".
+      const gl = renderer.getContext && renderer.getContext();
+      const lose = gl && gl.getExtension && gl.getExtension("WEBGL_lose_context");
+      if (lose) lose.loseContext();
+    } catch (e) {}
+  };
+}
+
+// Hängt die Sphere an #q-sphere-wrap; Fallback auf das SVG-Ring-Muster bei
+// fehlendem WebGL oder Three.js-Ladefehler.
+function mountQSphere() {
+  const wrap = document.getElementById("q-sphere-wrap");
+  const canvas = document.getElementById("q-sphere-canvas");
+  if (!wrap || !canvas) return;
+  // Läuft schon eine Sphere auf genau diesem Canvas? Dann NICHT neu aufbauen
+  // (jeder Neuaufbau frisst einen WebGL-Kontext).
+  if (App.qSphereStop && App.qSphereCanvas === canvas && document.body.contains(canvas)) return;
+  if (App.qSphereStop) { try { App.qSphereStop(); } catch (e) {} App.qSphereStop = null; App.qSphereCanvas = null; }
+  const fb = wrap.querySelector(".q-sphere-fallback");
+  const fallback = () => { canvas.style.display = "none"; if (fb) fb.style.display = "block"; };
+  if (!sphereSupported()) { fallback(); return; }
+  loadThree().then(() => {
+    if (!document.body.contains(canvas)) return; // Tab inzwischen gewechselt
+    try { App.qSphereStop = buildQSphere(wrap, canvas); App.qSphereCanvas = canvas; }
+    catch (e) { console.warn("Q-Sphere fehlgeschlagen", e); fallback(); }
+  }).catch(() => fallback());
 }
 
 // ---------- Boot ----------

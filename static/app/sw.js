@@ -42,7 +42,12 @@
 // v34: Q-Globus komplett auf reine CSS-3D-Animation umgestellt — KEIN WebGL/
 // Three.js/CDN mehr. Beendet alle GPU-/Kontext-Abstürze, läuft überall identisch
 // und ohne externen Aufruf.
-const CACHE = "ga-app-v34";
+// v35: Q-Globus zurück auf den schönen WebGL-Netzwerk-Globus (Drahtgitter +
+// Partikel + Energiebögen) wie früher — aber MIT den Stabilitäts-Fixes
+// (forceContextLoss, Kontextverlust-/FPS-Fallback, kein Doppel-Mount) und
+// Three.js LOKAL gehostet (/app/static/vendor, kein CDN). Der CSS-Globus sah
+// „zerschossen" aus (sich kreuzende Großkreise statt sauberer Kugel).
+const CACHE = "ga-app-v35";
 const SHELL = [
   "/app",
   "/app/static/app.css",
