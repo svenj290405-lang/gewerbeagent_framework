@@ -461,6 +461,117 @@ async def api_aktuelles(request: Request, _e=Depends(require_app_user)) -> JSONR
     })
 
 
+# ---------------------------------------------------------------------------
+# Q-Tagesbriefing: einmal morgens generiert, oben auf "Aktuelles" angezeigt.
+# Cache pro (Tenant, Mitarbeiter, Datum) -> Gemini laeuft nur 1x/Tag (Kosten).
+# ---------------------------------------------------------------------------
+_BRIEFING_CACHE: dict = {}
+
+
+def _tageszeit_gruss() -> str:
+    h = dt.datetime.now().hour
+    if h < 11:
+        return "Guten Morgen"
+    if h < 18:
+        return "Guten Tag"
+    return "Guten Abend"
+
+
+async def _build_briefing_text(ctx) -> str:
+    """Sammelt die Tagesdaten und laesst Q (Gemini) ein knappes, intelligentes
+    Briefing schreiben. Faellt bei KI-Fehler auf eine deterministische
+    Kurzfassung zurueck (Karte bleibt also immer gefuellt)."""
+    import json
+    from core.ai.command_center import (
+        _run_anstehende_termine, _run_offene_anfragen, _run_team_status,
+    )
+    from core.ai.gemini import call_gemini
+
+    heute = dt.date.today()
+    termine = await _run_anstehende_termine(ctx, {"tage": 1})
+    rueckrufe = await _open_rueckrufe(ctx.tid)
+    auftraege = await _aktuelle_auftraege(ctx.tid)
+    beratung = await _beratung_leads(ctx.tid)
+    team = await _run_team_status(ctx, {})
+    anfragen = {"anzahl": 0, "anfragen": []}
+    if "mail_intake" in (ctx.features or set()):
+        anfragen = await _run_offene_anfragen(ctx, {})
+
+    abwesend = [f"{t['name']} ({t['abwesend_heute']})"
+                for t in team.get("team", []) if t.get("abwesend_heute")]
+    daten = {
+        "heutige_termine": termine.get("termine", []),
+        "offene_rueckrufe": [{"kunde": r.get("kunde"), "anliegen": r.get("anliegen")}
+                             for r in rueckrufe],
+        "neue_anfragen": anfragen.get("anfragen", []),
+        "team_abwesend_heute": abwesend,
+        "laufende_auftraege": [{"kunde": a.get("kunde"), "status": a.get("status_label")}
+                               for a in auftraege],
+        "neue_beratungs_leads": [{"kunde": b.get("kunde")} for b in beratung],
+    }
+    name = (getattr(ctx.employee, "name", "") or "").split(" ")[0] or "Chef"
+    betrieb = getattr(ctx.tenant, "company_name", "") or "deinem Betrieb"
+    gruss = _tageszeit_gruss()
+    wochentage = ["Montag", "Dienstag", "Mittwoch", "Donnerstag",
+                  "Freitag", "Samstag", "Sonntag"]
+    prompt = (
+        f"Du bist Q, der persoenliche Assistent von {name} bei {betrieb}. "
+        f"Heute ist {wochentage[heute.weekday()]}, der {heute.strftime('%d.%m.%Y')}. "
+        "Schreibe ein SEHR KURZES Tagesbriefing (2-4 Saetze, Du-Form, wie ein "
+        "cleverer, souveraener Kollege - nicht steif, nicht geschwaetzig). "
+        f"Beginne mit '{gruss}, {name}'. Fasse nur das Wichtigste zusammen, was "
+        "waehrend seiner Abwesenheit reinkam und heute ansteht: heutige Termine, "
+        "offene Rueckrufe, neue Anfragen, Team-Abwesenheiten, dringende Auftraege. "
+        "KEINE Aufzaehlungszeichen, KEIN Markdown, flieSSender Text, konkret mit "
+        "Zahlen und Namen. Wenn kaum etwas ansteht, sag es knapp und positiv. "
+        "Erfinde nichts - nutze ausschliesslich diese Daten (JSON):\n"
+        + json.dumps(daten, ensure_ascii=False)
+    )
+    try:
+        # max_output_tokens grosszuegig: Gemini 2.5 Flash verbraucht erst Tokens
+        # fuers "Thinking" — bei zu wenig bleibt die eigentliche Antwort leer
+        # (dann greift unten der Fallback). 2048 reicht fuer Thinking + Kurztext.
+        text = (await call_gemini(
+            prompt, temperature=0.6, max_output_tokens=2048,
+            tenant_id=str(ctx.tid), operation_kind="briefing")).strip()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Briefing-Gemini fehlgeschlagen: %s", e)
+        text = ""
+    if not text:
+        teile = []
+        if termine.get("anzahl"):
+            teile.append(f"{termine['anzahl']} Termin(e) heute")
+        if rueckrufe:
+            teile.append(f"{len(rueckrufe)} offene(r) Rueckruf(e)")
+        if anfragen.get("anzahl"):
+            teile.append(f"{anfragen['anzahl']} neue Anfrage(n)")
+        if abwesend:
+            teile.append("abwesend: " + ", ".join(abwesend))
+        kern = "; ".join(teile) if teile else "nichts Dringendes - ruhiger Tag."
+        text = f"{gruss}, {name}. {kern}"
+    return text
+
+
+@router.get("/briefing")
+async def api_briefing(request: Request, _e=Depends(require_app_user)) -> JSONResponse:
+    """Q-Tagesbriefing fuer 'Aktuelles'. Einmal pro Tag generiert (Cache pro
+    Tenant+Mitarbeiter+Datum); ?refresh=1 erzwingt Neuberechnung."""
+    ctx = await _build_command_ctx(request)
+    heute = dt.date.today().isoformat()
+    emp_id = str(getattr(ctx.employee, "id", "") or "")
+    key = (str(ctx.tid), emp_id, heute)
+    refresh = request.query_params.get("refresh") == "1"
+    cached = _BRIEFING_CACHE.get(key)
+    if cached and not refresh:
+        return JSONResponse({"ok": True, "text": cached, "datum": heute, "cached": True})
+    text = await _build_briefing_text(ctx)
+    _BRIEFING_CACHE[key] = text
+    # Cache schlank halten: nur die heutigen Eintraege behalten.
+    for old in [k for k in _BRIEFING_CACHE if k[2] != heute]:
+        _BRIEFING_CACHE.pop(old, None)
+    return JSONResponse({"ok": True, "text": text, "datum": heute, "cached": False})
+
+
 @router.post("/beratung/{gespraech_id}/entscheidung")
 async def api_beratung_entscheidung(
     gespraech_id: str,
