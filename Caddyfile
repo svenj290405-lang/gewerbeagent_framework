@@ -35,6 +35,12 @@ gewerbeagent.de {
 
     import security_headers
 
+    # Nacktes /app sauber (HTTPS) auf /app/ umleiten, BEVOR das Backend es sieht.
+    # Sonst erzeugt uvicorn (kennt die HTTPS-Herkunft nicht) eine http://-
+    # Weiterleitung; die verletzt die CSP "form-action 'self'" und der Browser
+    # blockt den kompletten Login. /app/ ist ohnehin die kanonische URL.
+    redir /app /app/ 308
+
     reverse_proxy framework:8001 {
         header_up Host {host}
         header_up X-Real-IP {remote}

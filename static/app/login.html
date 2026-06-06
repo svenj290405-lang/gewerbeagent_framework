@@ -38,6 +38,10 @@
              placeholder="du@betrieb.de" />
       <button type="submit" id="magic-btn">Login-Link senden</button>
     </form>
+
+    <p class="muted" style="margin-top:24px;font-size:13px">
+      App lädt nicht richtig? <a href="#" id="reset-app">App zurücksetzen</a>
+    </p>
   </main>
 
   <script>
@@ -47,6 +51,29 @@
     if (fehler === "login") msg.textContent = "E-Mail oder Passwort falsch.";
     else if (fehler === "rate") msg.textContent = "Zu viele Versuche. Bitte kurz warten.";
     else if (fehler === "link") msg.textContent = "Der Link ist abgelaufen oder schon benutzt.";
+
+    // Selbstheilung: alten Service-Worker + alle Caches wegwerfen und sauber neu
+    // laden. Diese Seite wird NIE gecacht, läuft also immer frisch — darum kann
+    // man sich hier zuverlässig aus einer hängengebliebenen Alt-Version befreien.
+    // Aufruf per Link oder direkt über /app/login?reset=1 (bookmarkbar).
+    async function resetApp() {
+      msg.textContent = "App wird zurückgesetzt …";
+      try {
+        if ("serviceWorker" in navigator) {
+          const regs = await navigator.serviceWorker.getRegistrations();
+          await Promise.all(regs.map((r) => r.unregister()));
+        }
+        if (window.caches) {
+          const keys = await caches.keys();
+          await Promise.all(keys.map((k) => caches.delete(k)));
+        }
+      } catch (e) { /* best effort */ }
+      location.replace("/app/login?frisch=" + Date.now());
+    }
+    document.getElementById("reset-app").addEventListener("click", (e) => {
+      e.preventDefault(); resetApp();
+    });
+    if (params.get("reset") === "1") resetApp();
 
     document.getElementById("show-magic").addEventListener("click", (e) => {
       e.preventDefault();
