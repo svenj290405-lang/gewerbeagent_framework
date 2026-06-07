@@ -52,7 +52,10 @@
 // Q kann Ansichten per Chat öffnen ("zeig mir die Rechnungen"); schöner
 // „Q"-Schriftzug unter dem Globus.
 // v37: „Q"-Schriftzug unter dem Globus wieder entfernt (nur noch der Globus).
-const CACHE = "ga-app-v37";
+// v38: Status-Screen (Verbindungen + Cron-Heartbeats + Mail-Pipeline +
+// Werkstatt), Test-Buttons in Verbindungen (Microsoft-Test-Mail, Kalender-/
+// Drive-/Lexware-Ping), Hilfe & Tour mit Feature-Übersicht.
+const CACHE = "ga-app-v38";
 const SHELL = [
   "/app",
   "/app/static/app.css",

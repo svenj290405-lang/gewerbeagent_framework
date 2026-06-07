@@ -822,16 +822,19 @@ const SCREENS = {
       const gSub = g.connected
         ? `✓ ${esc(g.account || "verbunden")}${gScopes ? ` · ${gScopes}` : ""}`
         : "Kalender & Drive verbinden";
-      const gBtns = g.connected
+      const gTestBtns = g.connected
+        ? `${g.kalender ? `<button class="btn-sm btn-ghost" data-test="kalender">Kalender testen</button>` : ""}${g.drive ? `<button class="btn-sm btn-ghost" data-test="drive">Drive testen</button>` : ""}`
+        : "";
+      const gBtns = (g.connected
         ? `<button class="btn-sm btn-ghost" data-oauth="google">Neu verbinden</button><button class="btn-sm btn-ghost" data-trennen="google">Trennen</button>`
-        : `<button class="btn-sm" data-oauth="google">Verbinden</button>`;
+        : `<button class="btn-sm" data-oauth="google">Verbinden</button>`) + gTestBtns;
 
       const m = v.microsoft || {};
       let mSub, mBtns;
       if (!m.available) { mSub = "Nicht verfügbar — bitte Support kontaktieren"; mBtns = ""; }
       else if (m.connected) {
         mSub = `✓ ${esc(m.account || "verbunden")}`;
-        mBtns = `<button class="btn-sm btn-ghost" data-oauth="microsoft">Neu verbinden</button><button class="btn-sm btn-ghost" data-trennen="microsoft">Trennen</button>`;
+        mBtns = `<button class="btn-sm btn-ghost" data-oauth="microsoft">Neu verbinden</button><button class="btn-sm btn-ghost" data-trennen="microsoft">Trennen</button><button class="btn-sm btn-ghost" data-test="microsoft">Test-Mail</button>`;
       } else {
         mSub = "Outlook-Postfach & Kalender verbinden";
         mBtns = `<button class="btn-sm" data-oauth="microsoft">Verbinden</button>`;
@@ -842,7 +845,7 @@ const SCREENS = {
         ? `✓ verbunden${lx.account ? ` · Org ${esc(lx.account)}` : ""}`
         : "Buchhaltung verbinden (API-Schlüssel)";
       const lxBtns = lx.connected
-        ? `<button class="btn-sm btn-ghost" data-lexware="1">Schlüssel ändern</button><button class="btn-sm btn-ghost" data-trennen="lexware">Trennen</button>`
+        ? `<button class="btn-sm btn-ghost" data-lexware="1">Schlüssel ändern</button><button class="btn-sm btn-ghost" data-trennen="lexware">Trennen</button><button class="btn-sm btn-ghost" data-test="lexware">Lexware testen</button>`
         : `<button class="btn-sm" data-lexware="1">Verbinden</button>`;
 
       mount.innerHTML = `<div class="card"><h2>Verbindungen</h2>
@@ -862,6 +865,18 @@ const SCREENS = {
         b.addEventListener("click", () => startOAuth(b.getAttribute("data-oauth"))));
       mount.querySelectorAll("[data-trennen]").forEach((b) =>
         b.addEventListener("click", () => trennen(b.getAttribute("data-trennen"))));
+      mount.querySelectorAll("[data-test]").forEach((b) =>
+        b.addEventListener("click", async () => {
+          const dienst = b.getAttribute("data-test");
+          const orig = b.textContent;
+          b.disabled = true; b.textContent = "Teste …";
+          const r = await api(`/app/api/verbindungen/${encodeURIComponent(dienst)}/test`,
+            { method: "POST", body: "{}" });
+          const j = r ? await r.json().catch(() => null) : null;
+          b.disabled = false; b.textContent = orig;
+          if (j && j.ok) alert("✓ " + (j.detail || "Verbindung funktioniert."));
+          else alert("✗ " + ((j && j.error) || "Test fehlgeschlagen."));
+        }));
       mount.querySelectorAll("[data-lexware]").forEach((b) =>
         b.addEventListener("click", () => {
           const f = document.getElementById("lexware-form");
@@ -1052,6 +1067,114 @@ const SCREENS = {
     await load();
   },
 
+  async diagnose() {
+    // Aggregierter Health-Report: Verbindungen, Cron-Heartbeats,
+    // Mail-Pipeline, Werkstatt-Adresse. Sichtbar fuer alle Rollen.
+    const render = async () => {
+      App.view.innerHTML = `<div class="loading">Lädt …</div>`;
+      const r = await api("/app/api/diagnose");
+      if (!r || !r.ok) {
+        App.view.innerHTML = `<div class="card"><p class="empty">Konnte Status nicht laden.</p></div>`;
+        return;
+      }
+      const d = await r.json();
+      const pill = (s) => `<span class="pill ${esc(s)}">${s === "ok" ? "OK" : (s === "warn" ? "Hinweis" : "Problem")}</span>`;
+
+      // Verbindungen
+      const vList = (d.verbindungen || []).map((v) =>
+        `<div class="row"><div><div>${esc(v.label)}</div><div class="sub">${esc(v.detail || "")}</div></div>${pill(v.status)}</div>`
+      ).join("");
+
+      // Crons
+      const cList = (d.crons || []).map((c) => {
+        const status = c.ok ? "ok" : "danger";
+        const age = c.age_min == null ? "—" : `${c.age_min} Min`;
+        return `<div class="row"><div><div>${esc(c.name)}</div><div class="sub">letzter Heartbeat: ${esc(age)}${c.max_min ? ` · max. ${esc(String(c.max_min))} Min` : ""}</div></div>${pill(status)}</div>`;
+      }).join("") || `<div class="empty">Noch keine Cron-Daten.</div>`;
+
+      // Mail-Pipeline
+      const mailOk = d.mail && (d.mail.failed_queue || 0) === 0 ? "ok" : "warn";
+      const mailDetail = d.mail
+        ? `${d.mail.last_eingang_fmt ? "Letzte Mail: " + esc(d.mail.last_eingang_fmt) : "Noch keine Mails verarbeitet"} · ${d.mail.failed_queue} in Warteschlange`
+        : "—";
+
+      // Werkstatt
+      const w = d.werkstatt || {};
+      const wDetail = w.gesetzt
+        ? `${esc(w.strasse)} · ${esc(w.plz)} ${esc(w.ort)}`
+        : "Adresse fehlt — Einstellungen prüfen.";
+      const wStatus = w.gesetzt ? "ok" : "warn";
+
+      App.view.innerHTML =
+        `<button class="btn-sm btn-ghost" id="back-mehr" style="margin-bottom:10px">← Zurück</button>` +
+        `<div style="display:flex;align-items:center;justify-content:space-between;margin:4px 4px 14px">
+           <h1 style="font-size:22px;margin:0">Status</h1>
+           <button class="btn-sm btn-ghost" id="diag-refresh">Aktualisieren</button>
+         </div>` +
+        `<div class="card"><h2>Verbindungen</h2>${vList}</div>` +
+        `<div class="card"><h2>Hintergrund-Prozesse (Crons)</h2>${cList}</div>` +
+        `<div class="card"><h2>Mail-Pipeline</h2>
+           <div class="row"><div><div>${esc(mailDetail)}</div></div>${pill(mailOk)}</div>
+         </div>` +
+        `<div class="card"><h2>Werkstatt-Adresse</h2>
+           <div class="row"><div><div>${esc(wDetail)}</div></div>${pill(wStatus)}</div>
+         </div>`;
+      document.getElementById("back-mehr").addEventListener("click", () => navigate("mehr"));
+      document.getElementById("diag-refresh").addEventListener("click", render);
+    };
+    await render();
+  },
+
+  async hilfe() {
+    // Statische Feature-Übersicht. Inhaber sieht alles, Mitarbeiter
+    // nur die fuer ihn relevanten Bereiche.
+    const isInhaber = App.me.employee.is_inhaber;
+    const card = (title, items) =>
+      `<div class="card"><h2>${esc(title)}</h2>` +
+      items.map((it) =>
+        `<button class="row menu-item" data-go="${esc(it.go)}">
+           <div><div><b>${esc(it.icon)} ${esc(it.label)}</b></div>
+             <div class="sub">${esc(it.hint)}</div></div>
+           <span class="sub">›</span>
+         </button>`).join("") +
+      `</div>`;
+
+    const tagesarbeit = [
+      { icon: "📋", label: "Aktuelles", go: "aktuelles", hint: "Rückrufe, Beratungs-Leads, Auftrags-Pipeline" },
+      { icon: "📅", label: "Termine", go: "termine", hint: "Termine anschauen + neu anlegen" },
+      { icon: "📞", label: "Anrufe", go: "anrufe", hint: "Aufnahmen + offene Rückrufe + Briefings" },
+      { icon: "✉️", label: "Anfragen", go: "anfragen", hint: "Mail-Anfragen lesen + direkt antworten" },
+    ];
+    const buero = [
+      { icon: "🧾", label: "Büro", go: "buchhaltung", hint: "Angebote + Rechnungen anlegen + senden" },
+      { icon: "🤖", label: "Q-Assistent", go: "assistent", hint: "Diktiere Termin/Rückruf/Angebot/Rechnung" },
+    ];
+    const stammdaten = [
+      { icon: "🔍", label: "Kunden", go: "kunden", hint: "Kunden suchen + Profil + Archiv-Upload" },
+      { icon: "📚", label: "Wissen", go: "wissen", hint: "Häufige Antworten + Preise" },
+      { icon: "🧰", label: "Material", go: "material", hint: "Bestell-Links + Lieferanten" },
+      { icon: "👥", label: "Team", go: "team", hint: "Mitarbeiter anlegen + Krank/Urlaub" },
+      { icon: "📝", label: "Anfrage-Formular", go: "formulare", hint: "Welche Felder Kunden ausfüllen sollen" },
+    ];
+    const diagnose = [
+      { icon: "🩺", label: "Status", go: "diagnose", hint: "Läuft alles? Verbindungen + Crons + Pipeline" },
+      { icon: "⚙️", label: "Einstellungen", go: "einstellungen", hint: "Firma, Verbindungen, Werkstatt-Adresse" },
+    ];
+
+    App.view.innerHTML =
+      `<button class="btn-sm btn-ghost" id="back-mehr" style="margin-bottom:10px">← Zurück</button>` +
+      `<h1 style="font-size:22px;margin:4px 4px 14px">Hilfe &amp; Tour</h1>` +
+      `<p class="muted" style="margin:0 4px 14px">So findest du dich zurecht — tippe auf einen Bereich um direkt dorthin zu springen.</p>` +
+      card("Tagesarbeit", tagesarbeit) +
+      (isInhaber ? card("Büro", buero) : "") +
+      (isInhaber ? card("Stammdaten", stammdaten) : "") +
+      card("Diagnose & Einstellungen", diagnose);
+
+    document.getElementById("back-mehr").addEventListener("click", () => navigate("mehr"));
+    document.querySelectorAll(".menu-item[data-go]").forEach((b) =>
+      b.addEventListener("click", () => navigate(b.dataset.go)));
+  },
+
   async mehr() {
     const m = App.me;
     const feats = new Set(m.features || []);
@@ -1062,6 +1185,8 @@ const SCREENS = {
     // Visualisierung ist als eigenes Fenster entfernt — jetzt über das Q-Aktionsmenü erreichbar.
     if (feats.has("mitarbeiter")) menu.push(`<button class="row menu-item" data-go="team"><span>👥 Team</span><span class="sub">›</span></button>`);
     if (feats.has("anfrage_formular") && m.employee.is_inhaber) menu.push(`<button class="row menu-item" data-go="formulare"><span>📝 Anfrage-Formular</span><span class="sub">›</span></button>`);
+    menu.push(`<button class="row menu-item" data-go="diagnose"><span>🩺 Status</span><span class="sub">›</span></button>`);
+    menu.push(`<button class="row menu-item" data-go="hilfe"><span>❓ Hilfe &amp; Tour</span><span class="sub">›</span></button>`);
     menu.push(`<button class="row menu-item" data-go="einstellungen"><span>⚙️ Einstellungen</span><span class="sub">›</span></button>`);
     App.view.innerHTML =
       `<div class="card"><h2>${esc(m.tenant.company_name || "Mein Betrieb")}</h2>

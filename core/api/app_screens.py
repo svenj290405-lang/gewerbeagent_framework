@@ -3436,3 +3436,222 @@ async def api_assistent_transkript(
             status_code=502,
         )
     return JSONResponse({"ok": True, "text": (text or "").strip()})
+
+
+# =================== Welle 7: Diagnose + Verbindungs-Tests ===================
+#
+# Spiegelt die Telegram-Diagnose-Befehle (/status, /microsoft_check,
+# /lexware_status, /kalender_status, /werkstatt_status). Beantwortet
+# fuer den Inhaber/Mitarbeiter die Frage "laeuft das Tool gerade?" ohne
+# dass er ueber den Server-Status-Page muss.
+
+
+@router.get("/diagnose")
+async def api_diagnose(
+    request: Request, _e=Depends(require_app_user),
+) -> JSONResponse:
+    """Aggregierter Health-Report fuer die App: Verbindungen, Cron-
+    Heartbeats, Mail-Pipeline-Stand, Werkstatt-Adresse.
+
+    Sichtbar fuer alle Rollen — der Inhaber will wissen "geht meine
+    Investition", der Mitarbeiter will wissen "warum kommen meine Mails
+    gerade nicht durch".
+    """
+    tid = current_tenant_id(request)
+    emp = request.state.app_employee
+
+    # 1) Verbindungs-Status — Reuse _verbindungen_status (Inhaber-Schutz
+    # entfaellt hier: alle Rollen sehen das Verbindungs-Tableau, aber
+    # weder Email-Adresse-Detail noch Lexware-Org-ID sind sensibel genug
+    # um die Sichtbarkeit zu begrenzen).
+    raw = await _verbindungen_status(tid, emp.id)
+    verbindungen = [
+        {
+            "dienst": "microsoft", "label": "Outlook / Mail",
+            "status": "ok" if raw["microsoft"]["connected"] else "danger",
+            "detail": raw["microsoft"]["account"] or (
+                "nicht eingerichtet" if not raw["microsoft"]["available"]
+                else "nicht verbunden"
+            ),
+        },
+        {
+            "dienst": "kalender", "label": "Google Kalender",
+            "status": "ok" if raw["google"]["kalender"] else (
+                "warn" if raw["google"]["connected"] else "danger"
+            ),
+            "detail": raw["google"]["account"] or "nicht verbunden",
+        },
+        {
+            "dienst": "drive", "label": "Google Drive (Kunden-Archiv)",
+            "status": "ok" if raw["google"]["drive"] else (
+                "warn" if raw["google"]["connected"] else "danger"
+            ),
+            "detail": raw["google"]["account"] or "nicht verbunden",
+        },
+        {
+            "dienst": "lexware", "label": "Lexware (Buchhaltung)",
+            "status": "ok" if raw["lexware"]["connected"] else "danger",
+            "detail": raw["lexware"]["account"] or "nicht verbunden",
+        },
+    ]
+
+    # 2) Cron-Heartbeats — process-globaler Report, nicht tenant-spezifisch.
+    # Wir zeigen ihn trotzdem an, weil die Crons den Tenant indirekt
+    # bedienen (Mail-Polling, DSGVO-Cleanup, etc.).
+    from core.integrations.cron_health import get_health_report
+    health = get_health_report()
+    crons = []
+    for name, info in (health.get("crons") or {}).items():
+        crons.append({
+            "name": name,
+            "ok": bool(info.get("alive")),
+            "age_min": info.get("minutes_since"),
+            "max_min": info.get("max_minutes"),
+        })
+
+    # 3) Mail-Pipeline-Stand
+    from core.models.failed_mail_queue import FailedMailQueue
+    async with get_session() as s:
+        last_mail = (await s.execute(
+            select(func.max(EmailConversation.updated_at))
+            .where(EmailConversation.tenant_id == tid)
+        )).scalar_one_or_none()
+        failed_count = (await s.execute(
+            select(func.count(FailedMailQueue.id))
+            .where(FailedMailQueue.tenant_id == tid)
+        )).scalar_one() or 0
+    mail_info = {
+        "last_eingang": last_mail.isoformat() if last_mail else None,
+        "last_eingang_fmt": _fmt_dt(last_mail) if last_mail else "",
+        "failed_queue": int(failed_count),
+    }
+
+    # 4) Werkstatt-Adresse — spiegelt /werkstatt_status. Aus dem Default-
+    # Employee weil dort die Quelle der Wahrheit ist (Telegram-Code
+    # spiegelt den Wert anschliessend auf tenant.heimat_*, aber Employee
+    # ist die kanonische Stelle).
+    async with get_session() as s:
+        default_emp = (await s.execute(
+            select(Employee).where(Employee.tenant_id == tid)
+            .where(Employee.is_default == True)  # noqa: E712
+            .limit(1)
+        )).scalar_one_or_none()
+    if default_emp is not None:
+        werkstatt = {
+            "strasse": default_emp.heimat_strasse or "",
+            "plz": default_emp.heimat_plz or "",
+            "ort": default_emp.heimat_ort or "",
+            "gesetzt": bool(default_emp.heimat_strasse and default_emp.heimat_ort),
+        }
+    else:
+        werkstatt = {"strasse": "", "plz": "", "ort": "", "gesetzt": False}
+
+    return JSONResponse({
+        "verbindungen": verbindungen,
+        "crons": crons,
+        "mail": mail_info,
+        "werkstatt": werkstatt,
+    })
+
+
+@router.post("/verbindungen/{dienst}/test")
+async def api_verbindung_test(
+    dienst: str, request: Request,
+    _e=Depends(require_app_inhaber),
+    _c=Depends(require_app_csrf),
+) -> JSONResponse:
+    """Live-Test einer eingerichteten Verbindung. Inhaber-only weil
+    der Test echte API-Aufrufe macht (Test-Mail kostet ggf. Kontingent).
+
+    dienst ∈ {microsoft, kalender, lexware, drive}
+    """
+    tid = current_tenant_id(request)
+    tenant = request.state.app_tenant
+    emp = request.state.app_employee
+
+    if dienst == "microsoft":
+        # Test-Mail an die im Employee-Profil hinterlegte Kontakt-Adresse.
+        # Faellt zurueck auf contact_email vom Tenant, falls Employee keine hat.
+        to_email = (
+            getattr(emp, "contact_email", None)
+            or getattr(tenant, "contact_email", None)
+        )
+        if not to_email:
+            return JSONResponse(
+                {"ok": False,
+                 "error": "Keine Empfaenger-Mail im Profil. Bitte in Einstellungen ergaenzen."},
+                status_code=400,
+            )
+        try:
+            from core.integrations.microsoft import send_mail_as_user
+            ok = await send_mail_as_user(
+                tenant_id=tid,
+                to_email=to_email,
+                subject="Gewerbeagent Test-Mail",
+                body_html=(
+                    "<p>Hallo,</p>"
+                    "<p>diese Test-Mail bestaetigt, dass dein verbundenes "
+                    "Microsoft-/Outlook-Konto in Gewerbeagent funktioniert.</p>"
+                    "<p>Du kannst diese Mail jetzt loeschen.</p>"
+                ),
+                body_text=(
+                    "Gewerbeagent Test-Mail — dein Microsoft-/Outlook-Konto ist verbunden."
+                ),
+                employee_id=getattr(emp, "id", None),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("microsoft test crash: %s", exc)
+            return JSONResponse({"ok": False, "error": "Test fehlgeschlagen."}, status_code=502)
+        if not ok:
+            return JSONResponse({"ok": False, "error": "Microsoft Graph hat den Versand abgelehnt."}, status_code=502)
+        return JSONResponse({"ok": True, "detail": f"Test-Mail an {to_email} gesendet."})
+
+    if dienst == "kalender":
+        kalender = await get_plugin_for_tenant(tenant.slug, "kalender")
+        if kalender is None:
+            return JSONResponse({"ok": False, "error": "Kalender-Plugin nicht eingerichtet."}, status_code=400)
+        try:
+            out = await kalender.on_webhook("find_free_slots", {"days_ahead": 3})
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("kalender test crash: %s", exc)
+            return JSONResponse({"ok": False, "error": "Kalender-Aufruf gescheitert."}, status_code=502)
+        slots = out.get("slots") or []
+        return JSONResponse({
+            "ok": True,
+            "detail": f"{len(slots)} freie Slot(s) in den naechsten 3 Tagen gefunden.",
+        })
+
+    if dienst == "lexware":
+        provider = await _build_lexware_provider(tid)
+        if provider is None:
+            return JSONResponse({"ok": False, "error": "Lexware nicht verbunden."}, status_code=400)
+        try:
+            info = await provider.health_check()
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("lexware test crash: %s", exc)
+            return JSONResponse({"ok": False, "error": f"Lexware-API antwortet nicht: {str(exc)[:200]}"}, status_code=502)
+        org = (info or {}).get("organizationId") or (info or {}).get("companyName") or "OK"
+        return JSONResponse({"ok": True, "detail": f"Lexware antwortet — {org}"})
+
+    if dienst == "drive":
+        from core.integrations.google_drive import (
+            get_drive_service, list_tenant_kunde_drives,
+        )
+        from core.security.oauth_token_lookup import find_oauth_token
+        token = await find_oauth_token(tid, "google", emp.id)
+        if token is None:
+            return JSONResponse({"ok": False, "error": "Google nicht verbunden."}, status_code=400)
+        try:
+            # Erst Service holen (testet Token-Refresh-Pfad), dann eine
+            # leichtgewichtige Listing-Funktion aufrufen.
+            await get_drive_service(token)
+            kunden_dirs = await list_tenant_kunde_drives(tenant)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("drive test crash: %s", exc)
+            return JSONResponse({"ok": False, "error": f"Drive-API: {str(exc)[:200]}"}, status_code=502)
+        return JSONResponse({
+            "ok": True,
+            "detail": f"Drive-Verbindung ok — {len(kunden_dirs)} Kunden-Ordner gefunden.",
+        })
+
+    return JSONResponse({"ok": False, "error": f"Unbekannter Dienst '{dienst}'."}, status_code=400)
