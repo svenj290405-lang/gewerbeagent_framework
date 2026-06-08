@@ -1187,6 +1187,7 @@ const SCREENS = {
     if (feats.has("anfrage_formular") && m.employee.is_inhaber) menu.push(`<button class="row menu-item" data-go="formulare"><span>📝 Anfrage-Formular</span><span class="sub">›</span></button>`);
     menu.push(`<button class="row menu-item" data-go="diagnose"><span>🩺 Status</span><span class="sub">›</span></button>`);
     menu.push(`<button class="row menu-item" data-go="hilfe"><span>❓ Hilfe &amp; Tour</span><span class="sub">›</span></button>`);
+    menu.push(`<button class="row menu-item" data-tour="1"><span>🚀 Einrichtung starten</span><span class="sub">›</span></button>`);
     menu.push(`<button class="row menu-item" data-go="einstellungen"><span>⚙️ Einstellungen</span><span class="sub">›</span></button>`);
     App.view.innerHTML =
       `<div class="card"><h2>${esc(m.tenant.company_name || "Mein Betrieb")}</h2>
@@ -1203,7 +1204,7 @@ const SCREENS = {
     const b = document.getElementById("enable-notif-more");
     if (b) b.addEventListener("click", enablePush);
     document.querySelectorAll(".menu-item").forEach((mi) =>
-      mi.addEventListener("click", () => navigate(mi.dataset.go)));
+      mi.addEventListener("click", () => { if (mi.dataset.tour) openTutorial(); else navigate(mi.dataset.go); }));
   },
 
   async assistent() {
@@ -3170,6 +3171,197 @@ function mountQSphere() {
   }).catch(() => fallback());
 }
 
+// ---------- Einrichtungs-Tour / Onboarding ----------
+// Gefuehrte Ersteinrichtung fuer neue Nutzer: erklaert die drei Bereiche +
+// was Q erledigt und fuehrt den Inhaber durch das Verbinden von Google/
+// Outlook/Lexware — dieselben Endpunkte wie der Einstellungen-Screen, kein
+// Telegram-Umweg mehr. Startet beim ersten App-Start automatisch (Server-
+// Flag onboarding_done am Employee) und ist jederzeit ueber „Mehr →
+// Einrichtung starten" erneut aufrufbar.
+function finishTutorial(overlay) {
+  if (App.me) App.me.onboarding_done = true;
+  // Server-seitig als gesehen markieren (geraeteuebergreifend). Fehler
+  // schlucken — beim naechsten /api/me wird es ggf. erneut gesetzt.
+  api("/app/api/onboarding/complete", { method: "POST", body: "{}" }).catch(() => {});
+  if (overlay) overlay.remove();
+}
+
+function openTutorial() {
+  const existing = document.getElementById("tut-overlay");
+  if (existing) existing.remove();
+  const isInhaber = !!(App.me && App.me.employee && App.me.employee.is_inhaber);
+  const firstName = (((App.me && App.me.employee && App.me.employee.name) || "").trim().split(/\s+/)[0]) || "";
+  const hallo = firstName ? `Hallo ${esc(firstName)}!` : "Willkommen!";
+
+  // OAuth-Popup synchron im Klick-Gesture oeffnen (Popup-Blocker), dann
+  // Ziel-URL setzen sobald die Authorize-URL da ist. onClose feuert, wenn
+  // der Nutzer das Popup schliesst -> Status neu laden.
+  const startOAuth = (provider, onClose) => {
+    const w = window.open("", "ga_oauth", "width=520,height=720");
+    api("/app/api/oauth/start", { method: "POST", body: JSON.stringify({ provider }) })
+      .then((r) => (r && r.ok ? r.json() : null))
+      .then((j) => {
+        if (j && j.ok && j.auth_url) {
+          if (w) {
+            w.location = j.auth_url;
+            const iv = setInterval(() => { if (w.closed) { clearInterval(iv); onClose && onClose(); } }, 1000);
+            setTimeout(() => clearInterval(iv), 300000);
+          } else { window.location = j.auth_url; }
+        } else { if (w) w.close(); alert((j && j.error) || "Verbindung konnte nicht gestartet werden."); }
+      })
+      .catch(() => { if (w) w.close(); alert("Verbindung konnte nicht gestartet werden."); });
+  };
+
+  async function renderConns(mount) {
+    mount.innerHTML = `<p class="muted" style="text-align:center;padding:12px 0">Lädt …</p>`;
+    const r = await api("/app/api/verbindungen");
+    if (!r || !r.ok) { mount.innerHTML = `<p class="muted" style="text-align:center;padding:12px 0">Konnte Verbindungen nicht laden.</p>`; return; }
+    const v = await r.json();
+    const g = v.google || {}, m = v.microsoft || {}, lx = v.lexware || {};
+    const conn = (ico, name, desc, statusHtml, btnHtml) =>
+      `<div class="tut-conn">
+         <div class="tut-conn-ico">${ico}</div>
+         <div class="tut-conn-main">
+           <div class="tut-conn-name">${esc(name)}</div>
+           <div class="tut-conn-desc">${statusHtml || esc(desc)}</div>
+         </div>
+         <div class="tut-conn-act">${btnHtml}</div>
+       </div>`;
+    // Google — ein Login deckt Kalender UND Drive (Kunden-Archiv)
+    const gScopes = [g.kalender ? "Kalender" : null, g.drive ? "Drive" : null].filter(Boolean).join(" + ");
+    const gStatus = g.connected
+      ? `<span class="tut-ok">✓ ${esc(g.account || "verbunden")}</span>${gScopes ? ` · ${esc(gScopes)}` : ""}`
+      : "";
+    const gBtn = g.connected
+      ? `<button class="btn-sm btn-ghost" data-c-oauth="google">Neu</button>`
+      : `<button class="btn-sm" data-c-oauth="google">Verbinden</button>`;
+    // Microsoft / Outlook
+    let mStatus = "", mBtn = "";
+    if (!m.available) { mStatus = `<span class="muted">Nicht verfügbar</span>`; }
+    else if (m.connected) { mStatus = `<span class="tut-ok">✓ ${esc(m.account || "verbunden")}</span>`; mBtn = `<button class="btn-sm btn-ghost" data-c-oauth="microsoft">Neu</button>`; }
+    else { mBtn = `<button class="btn-sm" data-c-oauth="microsoft">Verbinden</button>`; }
+    // Lexware — API-Key
+    const lxStatus = lx.connected ? `<span class="tut-ok">✓ verbunden${lx.account ? ` · Org ${esc(lx.account)}` : ""}</span>` : "";
+    const lxBtn = lx.connected
+      ? `<button class="btn-sm btn-ghost" data-c-lex="1">Ändern</button>`
+      : `<button class="btn-sm" data-c-lex="1">Verbinden</button>`;
+
+    mount.innerHTML =
+      conn("📅", "Google", "Kalender & Kunden-Archiv (Drive)", gStatus, gBtn) +
+      conn("✉️", "Microsoft / Outlook", "Mail-Postfach & Kalender", mStatus, mBtn) +
+      conn("🧾", "Lexware Office", "Angebote & Rechnungen", lxStatus, lxBtn) +
+      `<div class="tut-lex-form" id="tut-lex-form" hidden>
+         <label>Lexware API-Schlüssel</label>
+         <input type="text" id="tut-lex-key" placeholder="aus app.lexware.de → Profil → API-Keys" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" />
+         <button class="btn-sm" id="tut-lex-save">Schlüssel speichern</button>
+         <p class="muted tut-lex-msg" id="tut-lex-msg"></p>
+       </div>`;
+
+    mount.querySelectorAll("[data-c-oauth]").forEach((b) =>
+      b.addEventListener("click", () => startOAuth(b.getAttribute("data-c-oauth"), () => renderConns(mount))));
+    mount.querySelectorAll("[data-c-lex]").forEach((b) =>
+      b.addEventListener("click", () => {
+        const f = document.getElementById("tut-lex-form");
+        f.hidden = !f.hidden;
+        if (!f.hidden) document.getElementById("tut-lex-key").focus();
+      }));
+    const save = document.getElementById("tut-lex-save");
+    if (save) save.addEventListener("click", async () => {
+      const inp = document.getElementById("tut-lex-key");
+      const msg = document.getElementById("tut-lex-msg");
+      const key = (inp.value || "").trim();
+      if (key.length < 20) { msg.textContent = "Bitte einen gültigen Schlüssel eingeben."; return; }
+      save.disabled = true; save.textContent = "Prüfe …"; msg.textContent = "";
+      const rr = await api("/app/api/lexware/verbinden", { method: "POST", body: JSON.stringify({ api_key: key }) });
+      const j = rr ? await rr.json().catch(() => null) : null;
+      save.disabled = false; save.textContent = "Schlüssel speichern";
+      if (j && j.ok) renderConns(mount);
+      else { msg.textContent = (j && j.error) || "Konnte nicht speichern."; }
+    });
+  }
+
+  const steps = [
+    (b) => {
+      b.innerHTML =
+        `<div class="tut-icon tut-q">Q</div>
+         <h2 class="tut-title">${hallo}</h2>
+         <p class="tut-lead">Gewerbeagent ist dein digitaler Büro-Mitarbeiter <b>Q</b>. Er nimmt Anrufe an, beantwortet Kunden-Mails, bucht Termine und schreibt Angebote &amp; Rechnungen — du gibst nur die Richtung vor.</p>
+         <p class="tut-lead">In ein paar kurzen Schritten zeigen wir dir, wie alles funktioniert und wie du deine Konten verbindest.</p>`;
+    },
+    (b) => {
+      b.innerHTML =
+        `<div class="tut-icon">🧭</div>
+         <h2 class="tut-title">Deine drei Bereiche</h2>
+         <div class="tut-feat"><div class="tut-feat-ico">🤖</div><div><b>Assistent</b><span>Sprich oder schreib mit Q: „Trag Herrn Meier Dienstag 9 Uhr ein", „zeig mir die offenen Rechnungen" — oder lade einfach einen Beleg/Foto hoch.</span></div></div>
+         <div class="tut-feat"><div class="tut-feat-ico">📋</div><div><b>Aktuelles</b><span>Dein Tagesbriefing, offene Rückrufe, neue Anfragen und die Auftrags-Pipeline: Beratung → Angebot → In Arbeit → Rechnung.</span></div></div>
+         <div class="tut-feat"><div class="tut-feat-ico">⋯</div><div><b>Mehr</b><span>Kunden, Wissensdatenbank, Material, Team und die Einstellungen.</span></div></div>`;
+    },
+    (b) => {
+      b.innerHTML =
+        `<div class="tut-icon">🔌</div>
+         <h2 class="tut-title">Was Q für dich erledigt</h2>
+         <div class="tut-feat"><div class="tut-feat-ico">📞</div><div><b>Anrufe & Rückrufe</b><span>Q geht ans Telefon, hält Anliegen fest und legt Rückrufe an, wenn du gerade nicht kannst.</span></div></div>
+         <div class="tut-feat"><div class="tut-feat-ico">✉️</div><div><b>Mail-Anfragen</b><span>Kunden-Mails werden gelesen, eingeordnet und beantwortet — Termine schlägt Q gleich mit vor.</span></div></div>
+         <div class="tut-feat"><div class="tut-feat-ico">🧾</div><div><b>Angebote & Rechnungen</b><span>Per Lexware erstellt und direkt an den Kunden gesendet — diktiere sie einfach Q.</span></div></div>
+         <div class="tut-feat"><div class="tut-feat-ico">📂</div><div><b>Kunden-Archiv</b><span>Fotos, PDFs & Notizen landen automatisch sortiert im Google-Drive-Ordner des Kunden.</span></div></div>`;
+    },
+    (b) => {
+      b.innerHTML =
+        `<div class="tut-icon">🔗</div>
+         <h2 class="tut-title">Konten verbinden</h2>
+         <p class="tut-lead">Damit Q wirklich für dich arbeiten kann, verbinde deine Konten. Das geht jetzt direkt hier — kein Umweg mehr über Telegram.</p>
+         <div id="tut-conns"></div>
+         <p class="muted tut-hint">Alles optional und jederzeit später unter „Mehr → Einstellungen" änderbar.</p>`;
+      const mount = b.querySelector("#tut-conns");
+      if (!isInhaber) {
+        mount.innerHTML = `<div class="tut-conn"><div class="tut-conn-main"><div class="tut-conn-desc">Die Konten (Google, Outlook, Lexware) richtet der Inhaber deines Betriebs ein. Du kannst Q trotzdem sofort nutzen.</div></div></div>`;
+        return;
+      }
+      renderConns(mount);
+    },
+    (b) => {
+      b.innerHTML =
+        `<div class="tut-icon">✅</div>
+         <h2 class="tut-title">Fertig — los geht's!</h2>
+         <p class="tut-lead">Du bist startklar. Frag Q einfach, was du brauchst — er erklärt sich selbst und fragt nach, wenn ihm etwas fehlt.</p>
+         <p class="tut-lead">💡 Tipp: Aktiviere unter „Mehr" die Push-Benachrichtigungen, damit du neue Anfragen und Rückrufe sofort bekommst.</p>
+         <p class="muted tut-hint">Diese Tour findest du jederzeit wieder unter „Mehr → Einrichtung starten".</p>`;
+    },
+  ];
+
+  let idx = 0;
+  const overlay = el(`<div class="tut-overlay" id="tut-overlay">
+    <div class="tut-head">
+      <div class="tut-dots" id="tut-dots"></div>
+      <button class="tut-skip" id="tut-skip" type="button">Überspringen</button>
+    </div>
+    <div class="tut-body" id="tut-body"></div>
+    <div class="tut-foot">
+      <button class="btn-sm btn-ghost" id="tut-back" type="button">Zurück</button>
+      <button class="btn-sm" id="tut-next" type="button">Weiter</button>
+    </div>
+  </div>`);
+  document.body.appendChild(overlay);
+
+  const body = overlay.querySelector("#tut-body");
+  const dots = overlay.querySelector("#tut-dots");
+  const backBtn = overlay.querySelector("#tut-back");
+  const nextBtn = overlay.querySelector("#tut-next");
+
+  function paint() {
+    dots.innerHTML = steps.map((_, i) => `<span class="tut-dot ${i === idx ? "on" : ""}"></span>`).join("");
+    backBtn.style.visibility = idx === 0 ? "hidden" : "visible";
+    nextBtn.textContent = idx === steps.length - 1 ? "Los geht's" : "Weiter";
+    body.scrollTop = 0;
+    steps[idx](body);
+  }
+
+  overlay.querySelector("#tut-skip").addEventListener("click", () => finishTutorial(overlay));
+  backBtn.addEventListener("click", () => { if (idx > 0) { idx--; paint(); } });
+  nextBtn.addEventListener("click", () => { if (idx < steps.length - 1) { idx++; paint(); } else { finishTutorial(overlay); } });
+  paint();
+}
+
 // ---------- Boot ----------
 async function boot() {
   if ("serviceWorker" in navigator) {
@@ -3196,6 +3388,8 @@ async function boot() {
   if (notifSupported() && !notifGranted()) { nb.hidden = false; nb.addEventListener("click", enablePush); }
   buildTabbar();
   navigate("assistent");
+  // Neue Nutzer: Einrichtungs-Tour automatisch starten (Server-Flag).
+  if (!App.me.onboarding_done) openTutorial();
 }
 
 boot();

@@ -28,6 +28,7 @@ from config.settings import settings
 from core.database.connection import get_session
 from core.features.check import enabled_features_for_tenant
 from core.models.app_account import PushSubscription
+from core.models.employee import Employee
 from core.models.oauth_token import OAuthToken
 from core.models.tenant import Tenant
 from core.security.app_auth import (
@@ -346,9 +347,31 @@ async def app_api_me(request: Request, _emp=Depends(require_app_user)) -> JSONRe
             "company_name": tenant.company_name,
         },
         "features": features,
+        "onboarding_done": emp.app_onboarding_completed_at is not None,
         "csrf": request.state.app_csrf,
         "vapid_public_key": settings.vapid_public_key,
     })
+
+
+@router.post("/api/onboarding/complete")
+async def app_onboarding_complete(
+    request: Request,
+    _emp=Depends(require_app_user),
+    _csrf=Depends(require_app_csrf),
+) -> JSONResponse:
+    """Markiert die PWA-Einrichtungs-Tour fuer den eingeloggten Nutzer als
+    abgeschlossen (idempotent — setzt den Zeitstempel nur, wenn noch NULL).
+    Wird vom Frontend beim Beenden/Ueberspringen der Tour aufgerufen, damit
+    sie nicht erneut automatisch startet. Geraeteuebergreifend (am Employee)."""
+    import datetime as _dt
+    emp = request.state.app_employee
+    if emp.app_onboarding_completed_at is None:
+        async with get_session() as s:
+            db_emp = await s.get(Employee, emp.id)
+            if db_emp is not None and db_emp.app_onboarding_completed_at is None:
+                db_emp.app_onboarding_completed_at = _dt.datetime.now(_dt.timezone.utc)
+                await s.commit()
+    return JSONResponse({"ok": True})
 
 
 @router.post("/api/push/subscribe")

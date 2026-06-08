@@ -26,6 +26,7 @@ Migration noetig wird wenn Phase 2/3/4 implementiert werden:
 """
 from __future__ import annotations
 
+import datetime
 import decimal
 import uuid
 from typing import TYPE_CHECKING
@@ -33,6 +34,7 @@ from typing import TYPE_CHECKING
 from sqlalchemy import (
     BigInteger,
     Boolean,
+    DateTime,
     ForeignKey,
     Index,
     Integer,
@@ -117,6 +119,14 @@ class Employee(Base):
     # PWA-Login (optional): bcrypt-Hash fuer klassisches E-Mail+Passwort-Login.
     # NULL = kein Passwort gesetzt (dann nur Magic-Link/Login-Link moeglich).
     app_password_hash: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # PWA-Onboarding: Zeitpunkt, zu dem dieser Nutzer die Einrichtungs-Tour
+    # (Funktions-Erklaerung + Konten verbinden) in der App abgeschlossen oder
+    # uebersprungen hat. NULL = noch nie gesehen -> Tour startet beim
+    # naechsten App-Start automatisch. Geraeteuebergreifend (am Employee, nicht
+    # localStorage). Bestandsnutzer wurden per Migration als "fertig" markiert.
+    app_onboarding_completed_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
     is_default: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default="false", default=False,
     )

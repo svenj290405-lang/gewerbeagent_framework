@@ -55,7 +55,11 @@
 // v38: Status-Screen (Verbindungen + Cron-Heartbeats + Mail-Pipeline +
 // Werkstatt), Test-Buttons in Verbindungen (Microsoft-Test-Mail, Kalender-/
 // Drive-/Lexware-Ping), Hilfe & Tour mit Feature-Übersicht.
-const CACHE = "ga-app-v38";
+// v39: Einrichtungs-Tour für neue Nutzer (Overlay) — erklärt die drei
+// Bereiche + was Q erledigt und führt den Inhaber durch Google/Outlook/
+// Lexware verbinden; startet automatisch beim ersten Start (Server-Flag
+// onboarding_done), erneut über „Mehr → Einrichtung starten".
+const CACHE = "ga-app-v39";
 const SHELL = [
   "/app",
   "/app/static/app.css",
