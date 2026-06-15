@@ -63,7 +63,10 @@
 // Freigabe ein (Berechtigungs-Dialog), bevor die Halte-Aufnahme startet.
 // v45: Q behält den Gesprächsverlauf (Mehrfach-Rückfragen) — kein erneutes
 // Nachfragen nach schon Gesagtem mehr.
-const CACHE = "ga-app-v45";
+// v46: Q-geführtes Onboarding im Chat (ersetzt das Overlay-Tutorial) — Q
+// erklärt sich und führt mit klickbaren Verbinden-Karten durch Google/
+// Outlook/Lexware/Push.
+const CACHE = "ga-app-v46";
 const SHELL = [
   "/app",
   "/app/static/app.css",
