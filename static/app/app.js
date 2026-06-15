@@ -1325,6 +1325,9 @@ const SCREENS = {
       if (tool === "rechnung_erstellen") return `Rechnung für ${r.kunde} erstellt${r.lexware_voucher_number ? " (" + r.lexware_voucher_number + ")" : ""}.${r.warning ? " " + r.warning : ""}`;
       if (tool === "rechnung_abrechnen") return r.mail_sent ? `Rechnung an ${r.email_used} gesendet — Auftrag abgeschlossen.` : `Rechnung in Lexware angelegt${r.mail_error ? " (Mail offen: " + r.mail_error + ")" : ""}.`;
       if (tool === "anfrage_beantworten") return `Antwort an ${r.kunde} gesendet${r.closed ? " (Anfrage geschlossen)" : ""}.`;
+      if (tool === "termin_verschieben") return `Termin von ${r.kunde} verschoben${r.alter_termin_entfernt === false ? " (alten Termin bitte im Kalender prüfen)" : ""}.`;
+      if (tool === "drive_ordner_anlegen") return `Drive-Ordner für ${r.kunde} bereit${r.link ? ": " + r.link : ""}.`;
+      if (tool === "drive_notiz_anlegen") return `Notiz für ${r.kunde} in Drive abgelegt${r.link ? " (" + r.link + ")" : ""}.`;
       return "Erledigt.";
     }
 
@@ -1691,7 +1694,10 @@ const SCREENS = {
     // und fragt fehlende Angaben selbst nach — wir tippen nichts vor.
     const QACTIONS = [
       { ico: "📅", label: "Termin eintragen",   intent: "Ich möchte einen Termin eintragen.",          feature: "kalender" },
+      { ico: "🔁", label: "Termin verschieben",  intent: "Ich möchte einen Termin verschieben.",        feature: "kalender" },
       { ico: "📞", label: "Rückruf anlegen",     intent: "Ich möchte einen Rückruf anlegen." },
+      { ico: "📁", label: "Drive-Ordner anlegen", intent: "Ich möchte einen Drive-Ordner für einen Kunden anlegen.", feature: "drive_archiv" },
+      { ico: "📝", label: "Notiz in Drive ablegen", intent: "Ich möchte eine Notiz für einen Kunden in Drive ablegen.", feature: "drive_archiv" },
       { ico: "🧰", label: "Material bestellen",  intent: "Ich möchte Material bestellen." },
       { ico: "📚", label: "Wissen merken",       intent: "Ich möchte mir etwas in der Wissensdatenbank merken." },
       { ico: "🔍", label: "Kunde nachschlagen",  intent: "Ich möchte einen Kunden nachschlagen." },

@@ -66,7 +66,9 @@
 // v46: Q-geführtes Onboarding im Chat (ersetzt das Overlay-Tutorial) — Q
 // erklärt sich und führt mit klickbaren Verbinden-Karten durch Google/
 // Outlook/Lexware/Push.
-const CACHE = "ga-app-v46";
+// v47: Q kann mehr — Termin verschieben + Drive-Ordner/Notiz anlegen
+// (neue Assistent-Tools + Schnellaktionen).
+const CACHE = "ga-app-v47";
 const SHELL = [
   "/app",
   "/app/static/app.css",

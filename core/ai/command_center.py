@@ -120,6 +120,10 @@ def _system_instruction(ctx: Ctx) -> str:
         "mit dem passenden Such-Tool.\n"
         "- Willst du Material bestellen, hole dir zuerst die Material-Liste, "
         "um die richtige ID zu finden.\n"
+        "- Soll ein bestehender Termin VERSCHOBEN werden, nutze "
+        "termin_verschieben (nicht stornieren und neu anlegen).\n"
+        "- Notizen oder einen Ordner für einen Kunden im Drive-Archiv legst "
+        "du mit drive_notiz_anlegen bzw. drive_ordner_anlegen an.\n"
         "- Will der Nutzer eine Ansicht/Liste nur SEHEN ('zeig mir...', "
         "'öffne...', 'geh zu...'), rufe das Tool anzeige_oeffnen mit dem "
         "passenden Bereich auf.\n"
@@ -1098,6 +1102,186 @@ def _summary_anfrage_beantworten(ctx: Ctx, args: dict) -> str:
             f"„{a[:90]}{'…' if len(a) > 90 else ''}\"?")
 
 
+# ---- WRITE (Drive-Archiv) -------------------------------------------------
+#
+# Schreiben in Google Drive: Kunden-Ordner anlegen und Text-Notizen ablegen.
+# Nutzt dieselben Primitive wie der /archiv-Upload-Flow der App
+# (get_or_create_kunde_folder / upload_file_to_kunde_folder) — keine eigene
+# Drive-API-Logik. Datei-Uploads laufen weiter ueber den 📎-Button (dort
+# liegen die Bytes vor); per Sprach-/Textbefehl geht das Ablegen von Notizen.
+
+async def _run_drive_ordner_anlegen(ctx: Ctx, args: dict) -> dict:
+    from core.integrations.google_drive import get_or_create_kunde_folder
+
+    name = (args.get("kunde_name") or "").strip()
+    if len(name) < 2:
+        return {"ok": False, "error": "Bitte den Kundennamen nennen."}
+    try:
+        _folder_id, folder_url = await get_or_create_kunde_folder(
+            ctx.tid, name, getattr(ctx.employee, "id", None),
+            kunde_email=(args.get("kunde_email") or "").strip() or None,
+            kunde_telefon=(args.get("kunde_telefon") or "").strip() or None)
+    except ValueError:
+        return {"ok": False, "error": "Google Drive ist nicht verbunden."}
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("drive_ordner_anlegen crash: %s", exc)
+        return {"ok": False, "error": "Ordner konnte nicht angelegt werden."}
+    return {"ok": True, "kunde": name, "link": folder_url}
+
+
+def _summary_drive_ordner(ctx: Ctx, args: dict) -> str:
+    return f"Drive-Ordner für {(args.get('kunde_name') or '—').strip()} anlegen?"
+
+
+async def _run_drive_notiz_anlegen(ctx: Ctx, args: dict) -> dict:
+    import re
+    from core.integrations.google_drive import upload_file_to_kunde_folder
+
+    name = (args.get("kunde_name") or "").strip()
+    text = (args.get("text") or "").strip()
+    if len(name) < 2:
+        return {"ok": False, "error": "Bitte den Kundennamen nennen."}
+    if len(text) < 2:
+        return {"ok": False, "error": "Bitte den Notiz-Text nennen."}
+    titel = (args.get("titel") or "").strip()
+    stamp = dt.datetime.now().strftime("%d.%m.%Y %H:%M")
+    body = f"Notiz für {name}\n{stamp}\n\n{text}\n"
+    safe = re.sub(r"[^\w\- ]", "", titel)[:60].strip() if titel else ""
+    filename = f"{safe or 'Notiz-' + dt.datetime.now().strftime('%Y%m%d-%H%M')}.txt"
+    try:
+        res = await upload_file_to_kunde_folder(
+            ctx.tid, name, body.encode("utf-8"), filename, "text/plain",
+            getattr(ctx.employee, "id", None),
+            kunde_email=(args.get("kunde_email") or "").strip() or None,
+            kunde_telefon=(args.get("kunde_telefon") or "").strip() or None)
+    except ValueError:
+        return {"ok": False, "error": "Google Drive ist nicht verbunden."}
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("drive_notiz_anlegen crash: %s", exc)
+        return {"ok": False, "error": "Notiz konnte nicht abgelegt werden."}
+    return {"ok": True, "kunde": name, "datei": filename,
+            "link": (res or {}).get("kunde_folder_url")}
+
+
+def _summary_drive_notiz(ctx: Ctx, args: dict) -> str:
+    t = (args.get("text") or "").strip()
+    return (f"Notiz im Drive-Ordner von {(args.get('kunde_name') or '—').strip()} "
+            f"ablegen: „{t[:70]}{'…' if len(t) > 70 else ''}\"?")
+
+
+# ---- WRITE (Termin verschieben) -------------------------------------------
+#
+# Es gibt KEINE native Reschedule-Funktion im Kalender-Plugin. Wir komponieren
+# aus den vorhandenen Primitiven: zuerst den NEUEN Termin buchen (damit bei
+# einem Buchungsfehler der alte erhalten bleibt), dann den alten stornieren.
+# Bewusst OHNE Storno-Mail an den Kunden (es ist eine Verschiebung, keine
+# Absage). Details (Anliegen/Adresse, Dauer) werden vom alten Event uebernommen.
+
+async def _run_termin_verschieben(ctx: Ctx, args: dict) -> dict:
+    from core.database.connection import get_session
+    from core.models.kundengespraech import Kundengespraech
+    from sqlalchemy import select
+
+    name = (args.get("kunde_name") or "").strip()
+    neues_datum = (args.get("neues_datum") or "").strip()
+    neue_uhrzeit = (args.get("neue_uhrzeit") or "").strip()
+    if len(name) < 2 or not neues_datum or not neue_uhrzeit:
+        return {"ok": False, "error": "Bitte Kundenname, neues Datum und neue Uhrzeit nennen."}
+    try:
+        neu_dt = dt.datetime.strptime(f"{neues_datum} {neue_uhrzeit}", "%d.%m.%Y %H:%M")
+    except ValueError:
+        return {"ok": False, "error": "Datum/Uhrzeit ungültig (Datum TT.MM.JJJJ, Uhrzeit HH:MM)."}
+
+    heute = dt.date.today()
+    async with get_session() as s:
+        treffer = (await s.execute(
+            select(Kundengespraech)
+            .where(Kundengespraech.tenant_id == ctx.tid)
+            .where(Kundengespraech.kunde_name.ilike(f"%{name}%"))
+            .where(Kundengespraech.termin_datum.is_not(None))
+            .where(Kundengespraech.termin_datum >= heute)
+            .order_by(Kundengespraech.termin_datum.asc())
+        )).scalars().all()
+    if len(treffer) != 1:
+        return {"ok": False, "error": (
+            f"Kein eindeutiger anstehender Termin für '{name}' gefunden "
+            f"({len(treffer)} Treffer). Bitte im Kalender direkt verschieben.")}
+
+    k = treffer[0]
+    kalender = await _get_kalender(ctx)
+    if kalender is None:
+        return {"ok": False, "error": "Kalender nicht eingerichtet."}
+    tmin = (k.termin_datum - dt.timedelta(days=1)).isoformat()
+    tmax = (k.termin_datum + dt.timedelta(days=1)).isoformat()
+    found = await kalender.on_webhook("find_events", {
+        "kunde_name": k.kunde_name, "time_min": tmin, "time_max": tmax})
+    termine = (found or {}).get("termine") or []
+    if len(termine) != 1:
+        return {"ok": False, "error": (
+            f"Kein eindeutiger Kalender-Termin gefunden ({len(termine)} Treffer). "
+            "Bitte im Kalender direkt verschieben.")}
+    match = termine[0]
+    old_event_id = match.get("event_id")
+
+    # Dauer aus args, sonst aus dem alten Event ableiten, sonst 60.
+    dauer = None
+    if args.get("dauer_minuten"):
+        try:
+            dauer = int(args["dauer_minuten"])
+        except (TypeError, ValueError):
+            dauer = None
+    if dauer is None:
+        try:
+            sdt = dt.datetime.fromisoformat(match["start_dt"])
+            edt = dt.datetime.fromisoformat(match["end_dt"])
+            dauer = max(15, int((edt - sdt).total_seconds() // 60))
+        except Exception:  # noqa: BLE001
+            dauer = 60
+
+    # 1) Neuen Termin zuerst buchen (alter bleibt erhalten, falls das scheitert).
+    book_payload = {
+        "name": k.kunde_name, "datum": neues_datum, "uhrzeit": neue_uhrzeit,
+        "dauer_minuten": dauer,
+        "anliegen": (match.get("summary") or "").strip() or None,
+        "adresse": (match.get("location") or "").strip() or None,
+    }
+    res_book = await kalender.on_webhook("book_appointment", book_payload)
+    if (res_book or {}).get("error") or not (res_book or {}).get("event_id"):
+        return {"ok": False, "error": (
+            (res_book or {}).get("error")
+            or "Neuer Termin konnte nicht gebucht werden — der alte bleibt bestehen.")}
+
+    # 2) Alten Termin stornieren (ohne Storno-Mail — es ist eine Verschiebung).
+    cancel_payload: dict = {"event_id": old_event_id}
+    if match.get("employee_id"):
+        try:
+            cancel_payload["employee_id"] = uuid.UUID(match["employee_id"])
+        except (ValueError, TypeError):
+            pass
+    res_cancel = await kalender.on_webhook("cancel_appointment", cancel_payload)
+    cancel_ok = bool((res_cancel or {}).get("erfolg"))
+
+    # 3) Termin-Datum im Kundengespräch nachziehen.
+    alt_iso = k.termin_datum.isoformat()
+    try:
+        async with get_session() as s:
+            obj = await s.get(Kundengespraech, k.id)
+            if obj is not None:
+                obj.termin_datum = neu_dt
+                await s.commit()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("termin_verschieben: Gespräch-Update fehlgeschlagen: %s", exc)
+
+    return {"ok": True, "kunde": k.kunde_name, "alt": alt_iso,
+            "neu": neu_dt.isoformat(), "alter_termin_entfernt": cancel_ok}
+
+
+def _summary_termin_verschieben(ctx: Ctx, args: dict) -> str:
+    return (f"Termin von {(args.get('kunde_name') or '—').strip()} auf "
+            f"{(args.get('neues_datum') or '?').strip()} um "
+            f"{(args.get('neue_uhrzeit') or '?').strip()} Uhr verschieben?")
+
+
 # ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
@@ -1372,4 +1556,38 @@ _REGISTRY: list[ToolSpec] = [
             "abschliessen": {"type": "BOOLEAN", "description": "Anfrage danach als erledigt schliessen?"}},
             "required": ["kunde_name", "antwort_text"]},
         run=_run_anfrage_beantworten, summarize=_summary_anfrage_beantworten),
+    ToolSpec(
+        name="termin_verschieben", kind="write", feature="kalender",
+        description="Verschiebt den anstehenden Termin eines Kunden auf ein "
+                    "neues Datum/eine neue Uhrzeit. Bucht den neuen Termin und "
+                    "storniert den alten (ohne Storno-Mail an den Kunden).",
+        parameters={"type": "OBJECT", "properties": {
+            "kunde_name": {"type": _S, "description": "Name des Kunden, dessen Termin verschoben wird."},
+            "neues_datum": {"type": _S, "description": "Neues Datum im Format TT.MM.JJJJ."},
+            "neue_uhrzeit": {"type": _S, "description": "Neue Uhrzeit im Format HH:MM."},
+            "dauer_minuten": {"type": _I, "description": "Dauer in Minuten (optional; sonst wie beim alten Termin)."}},
+            "required": ["kunde_name", "neues_datum", "neue_uhrzeit"]},
+        run=_run_termin_verschieben, summarize=_summary_termin_verschieben),
+    ToolSpec(
+        name="drive_ordner_anlegen", kind="write", feature="drive_archiv",
+        description="Legt im Google Drive einen Archiv-Ordner für einen Kunden "
+                    "an (oder gibt den bestehenden Ordner-Link zurück).",
+        parameters={"type": "OBJECT", "properties": {
+            "kunde_name": {"type": _S, "description": "Name des Kunden."},
+            "kunde_email": {"type": _S, "description": "E-Mail des Kunden (optional, für stabile Zuordnung)."},
+            "kunde_telefon": {"type": _S, "description": "Telefon des Kunden (optional)."}},
+            "required": ["kunde_name"]},
+        run=_run_drive_ordner_anlegen, summarize=_summary_drive_ordner),
+    ToolSpec(
+        name="drive_notiz_anlegen", kind="write", feature="drive_archiv",
+        description="Legt eine Text-Notiz als Datei im Drive-Archiv-Ordner "
+                    "eines Kunden ab (z.B. Gesprächsnotiz, Aufmaß, Absprache).",
+        parameters={"type": "OBJECT", "properties": {
+            "kunde_name": {"type": _S, "description": "Name des Kunden."},
+            "text": {"type": _S, "description": "Der Notiz-Inhalt."},
+            "titel": {"type": _S, "description": "Optionaler Titel/Dateiname der Notiz."},
+            "kunde_email": {"type": _S, "description": "E-Mail des Kunden (optional)."},
+            "kunde_telefon": {"type": _S, "description": "Telefon des Kunden (optional)."}},
+            "required": ["kunde_name", "text"]},
+        run=_run_drive_notiz_anlegen, summarize=_summary_drive_notiz),
 ]
