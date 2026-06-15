@@ -31,6 +31,13 @@ function esc(s) {
   return String(s == null ? "" : s)
     .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
+// Wandelt http(s)-URLs in bereits ge-esc()-tem Text in klickbare Links um
+// (öffnet in neuem Tab). Muss NACH esc() laufen — die URL kann dann &amp;
+// enthalten (im href harmlos, der Browser dekodiert es zurück).
+function linkify(escapedHtml) {
+  return String(escapedHtml).replace(/https?:\/\/[^\s<]+/g, (u) =>
+    `<a href="${u.replace(/"/g, "%22")}" target="_blank" rel="noopener noreferrer">${u}</a>`);
+}
 function el(html) { const t = document.createElement("template"); t.innerHTML = html.trim(); return t.content.firstChild; }
 
 // Notification-API ist nicht überall da (z.B. iOS Safari ohne Home-Screen-
@@ -1331,6 +1338,21 @@ const SCREENS = {
       return "Erledigt.";
     }
 
+    // Für Drive-Aktionen eine HTML-Antwort mit echtem, klickbarem Link direkt
+    // zum Drive-Ordner. Gibt null zurück, wenn kein (gültiger) Link da ist →
+    // dann greift der normale Text-Pfad (resultText).
+    function resultHtml(tool, r) {
+      const raw = r && r.link;
+      if (!raw || !/^https:\/\//i.test(String(raw))) return null;
+      if (tool !== "drive_ordner_anlegen" && tool !== "drive_notiz_anlegen") return null;
+      const href = String(raw).replace(/&/g, "&amp;").replace(/"/g, "%22");
+      const kunde = esc(r.kunde || "Kunde");
+      const lead = tool === "drive_ordner_anlegen"
+        ? `✓ Drive-Ordner für ${kunde} bereit`
+        : `✓ Notiz für ${kunde} in Drive abgelegt`;
+      return `${lead} — <a href="${href}" target="_blank" rel="noopener noreferrer">in Drive öffnen ↗</a>`;
+    }
+
     // Q-Globus: WebGL-Netzwerk-Globus (Drahtgitter-Ikosaeder + Partikelwolke +
     // Energiebögen) wie auf der Website; Three.js wird lokal geladen. Fallback
     // auf das SVG-Ring-Muster bei fehlendem/instabilem WebGL.
@@ -1419,8 +1441,9 @@ const SCREENS = {
            </div>`;
         }
         // Onboarding-Texte dürfen einfaches Markup (z.B. <b>) führen; dynamische
-        // Teile (Name) sind in der Quelle bereits mit esc() gefiltert.
-        return `<div class="bubble q">${m.html ? m.text : esc(m.text)}</div>`;
+        // Teile (Name) sind in der Quelle bereits mit esc() gefiltert. Plain-Texte
+        // werden ge-esc()-t und enthaltene URLs klickbar gemacht (linkify).
+        return `<div class="bubble q">${m.html ? m.text : linkify(esc(m.text))}</div>`;
       }).join("");
       chatEl.querySelectorAll("[data-cyes]").forEach((b) =>
         b.addEventListener("click", () => doConfirm(parseInt(b.dataset.cyes, 10))));
@@ -1560,7 +1583,11 @@ const SCREENS = {
       if (res.status === 303 || res.status === 401 || res.redirected) { location.href = "/app/login"; return; }
       try { j = await res.json(); } catch (e) {}
       popTyping();
-      if (j && j.type === "done" && j.result && j.result.ok) push({ role: "q", text: "✓ " + resultText(m.tool, j.result) });
+      if (j && j.type === "done" && j.result && j.result.ok) {
+        const html = resultHtml(m.tool, j.result);
+        if (html) push({ role: "q", text: html, html: true });
+        else push({ role: "q", text: "✓ " + resultText(m.tool, j.result) });
+      }
       else push({ role: "err", text: (j && (j.text || (j.result && j.result.error))) || "Aktion fehlgeschlagen." });
     }
 

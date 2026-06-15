@@ -68,7 +68,9 @@
 // Outlook/Lexware/Push.
 // v47: Q kann mehr — Termin verschieben + Drive-Ordner/Notiz anlegen
 // (neue Assistent-Tools + Schnellaktionen).
-const CACHE = "ga-app-v47";
+// v48: Drive-Links im Chat sind jetzt echte klickbare Hyperlinks (linkify +
+// „in Drive öffnen ↗"); URLs in Q-Antworten generell anklickbar.
+const CACHE = "ga-app-v48";
 const SHELL = [
   "/app",
   "/app/static/app.css",
