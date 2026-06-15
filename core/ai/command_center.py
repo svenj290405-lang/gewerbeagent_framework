@@ -149,8 +149,13 @@ def _build_genai_tool(specs: list[ToolSpec]):
     return types.Tool(function_declarations=decls)
 
 
-async def run_command(text: str, ctx: Ctx) -> dict:
+async def run_command(text: str, ctx: Ctx, history: list | None = None) -> dict:
     """Führt einen Befehl aus.
+
+    ``history`` ist der bisherige Gesprächsverlauf als Liste von
+    ``{"role": "user"|"model", "text": str}`` — nötig, damit Q bei
+    Mehrfach-Rückfragen (z.B. „Wie heißt der Kunde?" → „Sven" → …) den
+    Kontext behält und nicht erneut nach schon Gesagtem fragt.
 
     Rückgabe (genau einer der Typen):
       * {"type": "message", "text": str}
@@ -180,9 +185,20 @@ async def run_command(text: str, ctx: Ctx) -> dict:
         system_instruction=_system_instruction(ctx),
         tools=[tool],
     )
-    contents: list = [
-        types.Content(role="user", parts=[types.Part.from_text(text=text)])
-    ]
+    contents: list = []
+    # Früheren Verlauf voranstellen. Gemini verlangt, dass der erste Turn
+    # eine User-Rolle hat → führende Model-Turns überspringen.
+    started = False
+    for turn in (history or []):
+        role = "model" if (turn or {}).get("role") == "model" else "user"
+        t = ((turn or {}).get("text") or "").strip()
+        if not t:
+            continue
+        if not started and role != "user":
+            continue
+        started = True
+        contents.append(types.Content(role=role, parts=[types.Part.from_text(text=t)]))
+    contents.append(types.Content(role="user", parts=[types.Part.from_text(text=text)]))
 
     def _sync_call(_contents):
         client = _get_genai_client(location=GENAI_TEXT_LOCATION)

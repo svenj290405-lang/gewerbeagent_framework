@@ -11,6 +11,7 @@ const App = {
   me: null,
   view: document.getElementById("view"),
   current: "aktuelles",
+  lastScreen: null,
 };
 
 // ---------- Helpers ----------
@@ -82,36 +83,36 @@ const SCREENS = {
     const hasMail = feats.has("mail_intake");
     const hasKal = feats.has("kalender");
     const hasLex = feats.has("lexware");
-    const [res, ares, tres, angres, rechres] = await Promise.all([
+    const [akRes, termRes, anfRes, angebRes, rechRes] = await Promise.all([
       api("/app/api/aktuelles"),
-      hasMail ? api("/app/api/anfragen") : Promise.resolve(null),
       hasKal ? api("/app/api/termine") : Promise.resolve(null),
+      hasMail ? api("/app/api/anfragen") : Promise.resolve(null),
       hasLex ? api("/app/api/angebote") : Promise.resolve(null),
       hasLex ? api("/app/api/rechnungen") : Promise.resolve(null),
     ]);
-    const d = res && res.ok ? await res.json() : {};
-    const ad = ares && ares.ok ? await ares.json() : { items: [] };
-    const td = tres && tres.ok ? await tres.json() : { termine: [] };
-    const angd = angres && angres.ok ? await angres.json() : { angebote: [] };
-    const rechd = rechres && rechres.ok ? await rechres.json() : { rechnungen: [] };
-    const beratung = d.beratung || [];
-    const auftraege = d.auftraege || [];
-    const rueckrufe = d.rueckrufe || [];
+    const ak = akRes && akRes.ok ? await akRes.json() : {};
+    const td = termRes && termRes.ok ? await termRes.json() : { termine: [] };
+    const ad = anfRes && anfRes.ok ? await anfRes.json() : { items: [] };
+    const angd = angebRes && angebRes.ok ? await angebRes.json() : { angebote: [] };
+    const rechd = rechRes && rechRes.ok ? await rechRes.json() : { rechnungen: [] };
+    const beratung = ak.beratung || [];
+    const auftraege = ak.auftraege || [];
+    const rueckrufe = ak.rueckrufe || [];
     const termine = td.termine || [];
+    const anfragenOffen = (ad.items || []).filter((x) => !x.closed);
     const angebote = angd.angebote || [];
     const rechnungen = rechd.rechnungen || [];
-    const anfragenOffen = (ad.items || []).filter((x) => !x.closed);
     const parts = [];
+
     parts.push(
       `<div style="display:flex;align-items:center;justify-content:space-between;margin:4px 4px 14px">
-         <h1 style="font-size:22px;margin:0">Aktuelles</h1>
+         <h1 style="font-size:22px;margin:0">Übersicht</h1>
          <div style="display:flex;gap:6px">
            <button class="btn-sm" id="ak-diktat" style="padding:8px 12px">🎤 Diktat</button>
            <button class="btn-sm btn-ghost" id="ak-rueckruf" style="padding:8px 12px">+ Rückruf</button>
          </div>
        </div>`);
 
-    // --- Q-Tagesbriefing (oben): einmal morgens, knapp + intelligent ---
     parts.push(
       `<div class="card q-briefing">
          <div class="q-briefing-head">
@@ -125,37 +126,8 @@ const SCREENS = {
       parts.push(`<div class="banner">Aktiviere Benachrichtigungen, damit du neue Buchungen und Rückrufe sofort siehst. <button class="btn-sm btn-ghost" id="enable-notif-inline">Aktivieren</button></div>`);
     }
 
-    // --- Offene Anfragen (E-Mail-Eingang) ---
-    if (hasMail) {
-      parts.push(`<div class="section-title" id="sec-anfragen">Offene Anfragen (${anfragenOffen.length})</div>`);
-      if (!anfragenOffen.length) {
-        parts.push(`<div class="card">${emptyRow("Keine offenen Anfragen")}</div>`);
-      } else {
-        anfragenOffen.forEach((x) => {
-          parts.push(
-            `<button class="row menu-item" data-anfrage="${esc(x.id)}" style="display:block;text-align:left;padding:14px">
-               <div class="row" style="align-items:flex-start;border:0;padding:0">
-                 <div style="flex:1;min-width:0"><div><b>${esc(x.kunde_name || x.kunde_email)}</b></div><div class="sub" style="margin-top:2px">${esc(x.subject)}</div>${x.preview ? `<div class="sub" style="margin-top:4px;opacity:.8">${esc(x.preview)}</div>` : ""}</div>
-                 ${x.classification_label ? `<span class="pill ${x.classification_style || ""}" style="margin-left:8px">${esc(x.classification_label)}</span>` : ""}
-               </div>
-             </button>`);
-        });
-      }
-    }
-
-    // --- Termine (anstehend) ---
-    if (hasKal) {
-      parts.push(`<div class="section-title" id="sec-termine">Termine (${termine.length})</div>`);
-      parts.push(`<div class="card">${
-        termine.length ? termine.map((x) =>
-          rowAction(x.zeit, x.kunde, x.ort, x.id, "storno", "Stornieren")).join("")
-        : emptyRow("Keine anstehenden Termine")
-      }</div>`);
-    }
-
-    // --- Beratungsgespräche (Leads: annehmen / ablehnen) ---
     if (beratung.length) {
-      parts.push(`<div class="section-title">Beratungsgespräche (${beratung.length})</div>`);
+      parts.push(`<div class="section-title">Neue Beratungsgespräche (${beratung.length})</div>`);
       beratung.forEach((b) => {
         parts.push(
           `<div class="card lead">
@@ -168,74 +140,156 @@ const SCREENS = {
       });
     }
 
-    // --- Aufträge mit Status ---
-    parts.push(`<div class="section-title" id="sec-auftraege">Aufträge (${auftraege.length})</div>`);
-    if (!auftraege.length) {
-      parts.push(`<div class="card">${emptyRow("Keine laufenden Aufträge")}</div>`);
-    } else {
-      auftraege.forEach((a) => {
-        let extra = "";
-        if (a.in_arbeit) {
-          extra =
-            `<div class="slider-wrap">
-               <input type="range" min="0" max="100" step="5" value="${a.fortschritt}" data-slider="${esc(a.id)}">
-               <span class="slider-val" data-slider-val="${esc(a.id)}">${a.fortschritt}%</span>
-             </div>`;
-        } else if (a.fertig) {
-          extra = `<button class="btn-sm" data-rechnung="${esc(a.id)}" style="width:100%;margin-top:8px">🧾 Rechnung in Q vorbereiten</button>`;
-        } else if (a.typ === "lead_angenommen") {
-          extra = `<button class="btn-sm btn-ghost" data-angebot-neu="${esc(a.kunde)}" style="width:100%;margin-top:8px">📄 Angebot erstellen</button>`;
-        }
-        parts.push(
-          `<div class="card">
-             <div class="row" style="border:0;padding:0">
-               <div><div>${esc(a.kunde)}</div>${a.betrag ? `<div class="sub">${esc(a.betrag)}</div>` : ""}</div>
-               <span class="pill ${a.pill || ""}">${esc(a.status_label)}</span>
-             </div>${extra}
-           </div>`);
-      });
-    }
-
-    // --- Angebote + Rechnungen (Büro-Anzeigen) ---
-    if (hasLex) {
-      parts.push(`<div class="section-title" id="sec-angebote">Angebote (${angebote.length})</div>`);
-      parts.push(`<div class="card">${
-        angebote.length ? angebote.map((x) =>
-          rowPill(x.kunde, x.betrag + " · " + x.zeit, x.status, x.pill)).join("")
-        : emptyRow("Noch keine Angebote")
-      }</div>`);
-      parts.push(`<div class="section-title" id="sec-rechnungen">Rechnungen (${rechnungen.length})</div>`);
-      parts.push(`<div class="card">${
-        rechnungen.length ? rechnungen.map((x) =>
-          rowPill(x.kunde + (x.nummer ? " · " + esc(x.nummer) : ""), x.betrag + " · " + x.zeit, x.status, x.pill)).join("")
-        : emptyRow("Noch keine Rechnungen")
-      }</div>`);
-    }
-
-    // --- Offene Rückrufe (mit Erledigt-Aktion) ---
-    parts.push(`<div class="section-title" id="sec-rueckrufe">Offene Rückrufe (${rueckrufe.length})</div>`);
-    parts.push(`<div class="card">${
-      rueckrufe.length ? rueckrufe.map((r) =>
-        rowAction(r.kunde, r.telefon + (r.anliegen ? " · " + esc(r.anliegen) : ""), "", r.id, "rueckruf-done", "Erledigt")).join("")
-      : emptyRow("Keine offenen Rückrufe")
-    }</div>`);
+    parts.push(`<div class="section-title">Bereiche</div>`);
+    const tiles = [];
+    if (hasKal) tiles.push({
+      ico: "📅", label: "Termine", screen: "termine",
+      count: termine.length ? `${termine.length} anstehend` : "Keine anstehend",
+      badge: null,
+    });
+    if (hasMail) tiles.push({
+      ico: "✉️", label: "Anfragen", screen: "anfragen",
+      count: anfragenOffen.length ? `${anfragenOffen.length} offen` : "Keine offen",
+      badge: anfragenOffen.length || null, badgeClass: "",
+    });
+    if (hasLex) tiles.push({
+      ico: "📄", label: "Angebote", screen: "angebote_page",
+      count: angebote.length ? `${angebote.length} gesamt` : "Keine",
+      badge: null,
+    });
+    if (hasLex) tiles.push({
+      ico: "🧾", label: "Rechnungen", screen: "rechnungen_page",
+      count: rechnungen.length ? `${rechnungen.length} gesamt` : "Keine",
+      badge: null,
+    });
+    tiles.push({
+      ico: "🛠️", label: "Aufträge", screen: "auftraege_page",
+      count: auftraege.length ? `${auftraege.length} laufend` : "Keine laufenden",
+      badge: null,
+    });
+    tiles.push({
+      ico: "📞", label: "Rückrufe", screen: "rueckrufe_page",
+      count: rueckrufe.length ? `${rueckrufe.length} offen` : "Keine offen",
+      badge: rueckrufe.length || null, badgeClass: "warn",
+    });
+    parts.push(`<div class="homescreen-grid">`);
+    tiles.forEach((t) => {
+      const badge = (t.badge && t.badge > 0)
+        ? `<span class="tile-badge ${t.badgeClass || ""}">${t.badge}</span>` : "";
+      parts.push(
+        `<button class="home-tile" data-go="${esc(t.screen)}">
+           ${badge}
+           <span class="tile-ico">${t.ico}</span>
+           <span class="tile-label">${esc(t.label)}</span>
+           <span class="tile-count">${esc(t.count)}</span>
+         </button>`);
+    });
+    parts.push(`</div>`);
 
     App.view.innerHTML = parts.join("");
     const inline = document.getElementById("enable-notif-inline");
     if (inline) inline.addEventListener("click", enablePush);
     document.getElementById("ak-diktat").addEventListener("click", showDiktatForm);
     document.getElementById("ak-rueckruf").addEventListener("click", showNewRueckrufForm);
-    document.querySelectorAll("[data-anfrage]").forEach((b) =>
-      b.addEventListener("click", () => showAnfrage(b.dataset.anfrage)));
     const briefRefresh = document.getElementById("ak-briefing-refresh");
     if (briefRefresh) briefRefresh.addEventListener("click", () => loadBriefing(true));
     loadBriefing(false);
-    bindRueckrufDone();
-    bindStorno();
     bindAktuelles();
-    // Q kann eine Ansicht per Chat öffnen → ggf. zum Abschnitt scrollen.
-    if (App._scrollTo) { const el = document.getElementById(App._scrollTo); App._scrollTo = null;
-      if (el) requestAnimationFrame(() => el.scrollIntoView({ behavior: "smooth", block: "start" })); }
+    document.querySelectorAll(".home-tile[data-go]").forEach((b) =>
+      b.addEventListener("click", () => navigate(b.dataset.go)));
+  },
+
+  async auftraege_page() {
+    App.view.innerHTML = `<div class="loading">Lädt …</div>`;
+    const res = await api("/app/api/auftraege");
+    const d = res && res.ok ? await res.json() : { auftraege: [] };
+    const isInhaber = App.me.employee.is_inhaber;
+    const list = (d.auftraege || []).map((a) => auftragCard(a, isInhaber)).join("");
+    App.view.innerHTML =
+      `<button class="btn-sm btn-ghost" id="back-db" style="margin-bottom:10px">← Übersicht</button>` +
+      `<h1 style="font-size:22px;margin:4px 4px 14px">Aufträge</h1>` +
+      (list || `<div class="card">${emptyRow("Keine laufenden Aufträge")}</div>`);
+    document.getElementById("back-db").addEventListener("click", () => navigate("aktuelles"));
+    if (isInhaber) bindAuftragActions();
+  },
+
+  async rechnungen_page() {
+    const feats = new Set(App.me.features || []);
+    if (!feats.has("lexware")) { navigate("aktuelles"); return; }
+    const isInhaber = App.me.employee.is_inhaber;
+    const res = await api("/app/api/rechnungen");
+    const d = res && res.ok ? await res.json() : { rechnungen: [] };
+    const rechnungen = d.rechnungen || [];
+    const btns = isInhaber
+      ? `<div style="display:flex;gap:6px;flex-wrap:wrap">
+           <button class="btn-sm btn-ghost" id="rech-pruefen-btn" style="padding:8px 12px">🔄 Prüfen</button>
+           <button class="btn-sm" id="rech-new-btn" style="padding:8px 14px">+ Neu</button>
+         </div>` : "";
+    App.view.innerHTML =
+      `<button class="btn-sm btn-ghost" id="back-db" style="margin-bottom:10px">← Übersicht</button>` +
+      `<div style="display:flex;align-items:center;justify-content:space-between;margin:4px 4px 14px">
+         <h1 style="font-size:22px;margin:0">Rechnungen</h1>${btns}
+       </div>` +
+      `<div class="card">${rechnungen.length
+        ? rechnungen.map((x) => rowPill(x.kunde + (x.nummer ? " · " + esc(x.nummer) : ""), x.betrag + " · " + x.zeit, x.status, x.pill)).join("")
+        : emptyRow("Noch keine Rechnungen")
+      }</div>`;
+    document.getElementById("back-db").addEventListener("click", () => navigate("aktuelles"));
+    const rBtn = document.getElementById("rech-new-btn");
+    if (rBtn) rBtn.addEventListener("click", () => { App.lastScreen = "rechnungen_page"; showRechnungForm(); });
+    const pBtn = document.getElementById("rech-pruefen-btn");
+    if (pBtn) pBtn.addEventListener("click", async () => {
+      const orig = pBtn.textContent;
+      pBtn.disabled = true; pBtn.textContent = "Prüfe …";
+      const r = await api("/app/api/rechnungen/pruefen", { method: "POST", body: "{}" });
+      const j = r ? await r.json().catch(() => null) : null;
+      pBtn.disabled = false; pBtn.textContent = orig;
+      if (j && j.ok) {
+        if ((j.bezahlt || 0) > 0) { alert(`✓ ${j.bezahlt} Rechnung(en) als bezahlt markiert (${j.geprueft} geprüft).`); navigate("rechnungen_page"); }
+        else { alert(`Geprüft: ${j.geprueft || 0} offene Rechnung(en) — keine neuen Zahlungen.`); }
+      } else { alert((j && j.error) || "Konnte nicht prüfen."); }
+    });
+  },
+
+  async angebote_page() {
+    const feats = new Set(App.me.features || []);
+    if (!feats.has("lexware")) { navigate("aktuelles"); return; }
+    const isInhaber = App.me.employee.is_inhaber;
+    const res = await api("/app/api/angebote");
+    const d = res && res.ok ? await res.json() : { angebote: [] };
+    const angebote = d.angebote || [];
+    App.view.innerHTML =
+      `<button class="btn-sm btn-ghost" id="back-db" style="margin-bottom:10px">← Übersicht</button>` +
+      `<div style="display:flex;align-items:center;justify-content:space-between;margin:4px 4px 14px">
+         <h1 style="font-size:22px;margin:0">Angebote</h1>
+         ${isInhaber ? `<button class="btn-sm" id="ang-new-btn" style="padding:8px 14px">+ Neu</button>` : ""}
+       </div>` +
+      `<div class="card">${angebote.length
+        ? angebote.map((x) => rowPill(x.kunde, x.betrag + " · " + x.zeit, x.status, x.pill)).join("")
+        : emptyRow("Noch keine Angebote")
+      }</div>`;
+    document.getElementById("back-db").addEventListener("click", () => navigate("aktuelles"));
+    const aBtn = document.getElementById("ang-new-btn");
+    if (aBtn) aBtn.addEventListener("click", () => { App.lastScreen = "angebote_page"; showAngebotForm(); });
+  },
+
+  async rueckrufe_page() {
+    const res = await api("/app/api/rueckrufe");
+    const d = res && res.ok ? await res.json() : { rueckrufe: [] };
+    const rueckrufe = d.rueckrufe || [];
+    App.view.innerHTML =
+      `<button class="btn-sm btn-ghost" id="back-db" style="margin-bottom:10px">← Übersicht</button>` +
+      `<div style="display:flex;align-items:center;justify-content:space-between;margin:4px 4px 14px">
+         <h1 style="font-size:22px;margin:0">Offene Rückrufe</h1>
+         <button class="btn-sm btn-ghost" id="rr-new-btn" style="padding:8px 12px">+ Rückruf</button>
+       </div>` +
+      `<div class="card">${rueckrufe.length
+        ? rueckrufe.map((r) => rowAction(r.kunde, r.telefon + (r.anliegen ? " · " + esc(r.anliegen) : ""), "", r.id, "rueckruf-done", "Erledigt")).join("")
+        : emptyRow("Keine offenen Rückrufe")
+      }</div>`;
+    document.getElementById("back-db").addEventListener("click", () => navigate("aktuelles"));
+    document.getElementById("rr-new-btn").addEventListener("click", showNewRueckrufForm);
+    bindRueckrufDone();
   },
 
   async termine() {
@@ -245,6 +299,7 @@ const SCREENS = {
     const list = d.termine || [];
     const aufnahmen = ad.aufnahmen || [];
     App.view.innerHTML =
+      `<button class="btn-sm btn-ghost" id="back-db" style="margin-bottom:10px">← Übersicht</button>` +
       `<div style="display:flex;align-items:center;justify-content:space-between;margin:4px 4px 14px">
         <h1 style="font-size:22px;margin:0">Termine</h1>
         <button class="btn-sm" id="termin-new-btn" style="padding:8px 14px">+ Neu</button>
@@ -255,6 +310,7 @@ const SCREENS = {
       `<div class="card"><h2>Briefings</h2>${
         aufnahmen.length ? aufnahmen.map((x) => rowTap(x.kunde || "Aufnahme", x.briefing || "", x.zeit, x.id)).join("") : emptyRow("Keine Briefings")
       }</div>`;
+    document.getElementById("back-db").addEventListener("click", () => navigate("aktuelles"));
     bindStorno();
     bindAufnahmen();
     document.getElementById("termin-new-btn").addEventListener("click", showNewTerminForm);
@@ -477,6 +533,7 @@ const SCREENS = {
     };
 
     let html =
+      `<button class="btn-sm btn-ghost" id="back-db" style="margin-bottom:10px">← Übersicht</button>` +
       `<h1 style="font-size:22px;margin:4px 4px 14px">Anfragen</h1>` +
       `<div class="card"><h2>Offen (${open.length})</h2>` +
       (open.length ? open.map(renderItem).join("") : emptyRow("Keine offenen Anfragen.")) +
@@ -487,6 +544,7 @@ const SCREENS = {
         `</details>`;
     }
     App.view.innerHTML = html;
+    document.getElementById("back-db").addEventListener("click", () => navigate("aktuelles"));
     document.querySelectorAll("[data-anfrage]").forEach((b) =>
       b.addEventListener("click", () => showAnfrage(b.dataset.anfrage)));
   },
@@ -1140,10 +1198,13 @@ const SCREENS = {
       `</div>`;
 
     const tagesarbeit = [
-      { icon: "📋", label: "Aktuelles", go: "aktuelles", hint: "Rückrufe, Beratungs-Leads, Auftrags-Pipeline" },
+      { icon: "📋", label: "Übersicht", go: "aktuelles", hint: "Dashboard mit allen 6 Bereichen auf einen Blick" },
       { icon: "📅", label: "Termine", go: "termine", hint: "Termine anschauen + neu anlegen" },
-      { icon: "📞", label: "Anrufe", go: "anrufe", hint: "Aufnahmen + offene Rückrufe + Briefings" },
+      { icon: "📞", label: "Rückrufe", go: "rueckrufe_page", hint: "Offene Rückrufe abhaken oder neu anlegen" },
       { icon: "✉️", label: "Anfragen", go: "anfragen", hint: "Mail-Anfragen lesen + direkt antworten" },
+      { icon: "🛠️", label: "Aufträge", go: "auftraege_page", hint: "Laufende Aufträge + Fortschritt" },
+      { icon: "📄", label: "Angebote", go: "angebote_page", hint: "Angebote anlegen + senden" },
+      { icon: "🧾", label: "Rechnungen", go: "rechnungen_page", hint: "Rechnungen anlegen + Zahlungen prüfen" },
     ];
     const buero = [
       { icon: "🧾", label: "Büro", go: "buchhaltung", hint: "Angebote + Rechnungen anlegen + senden" },
@@ -1209,6 +1270,11 @@ const SCREENS = {
 
   async assistent() {
     App.qchat = App.qchat || [];
+    // Gesprächsverlauf für Q (Mehrfach-Rückfragen behalten den Kontext).
+    // Getrennt von App.qchat, weil Schnellaktionen (startIntent) ihren
+    // Befehl NICHT als sichtbare Bubble ablegen, der Kontext aber zählt.
+    App.qhistory = App.qhistory || [];
+    const QHIST_MAX = 12; // wie viele frühere Turns an Q mitgeschickt werden
     // Schlanke Strich-Icons (currentColor) statt Emojis — Look moderner Chat-UIs.
     const IC = {
       spark: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l1.7 4.8L18.5 9.5l-4.8 1.7L12 16l-1.7-4.8L5.5 9.5l4.8-1.7L12 3z"/><path d="M19 14.5l.6 1.9 1.9.6-1.9.6-.6 1.9-.6-1.9-1.9-.6 1.9-.6.6-1.9z"/></svg>`,
@@ -1225,7 +1291,6 @@ const SCREENS = {
            <button class="cbtn ghost" id="q-actions" title="Funktionen" aria-label="Funktionen">${IC.spark}</button>
            <button class="cbtn ghost" id="q-attach" title="Beleg/Foto hochladen" aria-label="Anhängen">${IC.clip}</button>
            <textarea id="q-input" rows="1" placeholder="Schreib Q …"></textarea>
-           <button class="cbtn ghost" id="q-mic" title="Sprechen" aria-label="Sprechen">${IC.mic}</button>
            <button class="cbtn" id="q-send" title="Senden" aria-label="Senden">${IC.send}</button>
          </div>
        </div>
@@ -1234,7 +1299,6 @@ const SCREENS = {
     const chatEl = document.getElementById("q-chat");
     const input = document.getElementById("q-input");
     const sendBtn = document.getElementById("q-send");
-    const micBtn = document.getElementById("q-mic");
     const attachBtn = document.getElementById("q-attach");
     const fileEl = document.getElementById("q-file");
 
@@ -1265,7 +1329,7 @@ const SCREENS = {
     // Energiebögen) wie auf der Website; Three.js wird lokal geladen. Fallback
     // auf das SVG-Ring-Muster bei fehlendem/instabilem WebGL.
     const sphereWrap =
-      `<div class="q-sphere-wrap" id="q-sphere-wrap" aria-hidden="true">
+      `<div class="q-sphere-wrap" id="q-sphere-wrap" role="button" tabindex="0" aria-label="Halten zum Sprechen">
          <canvas id="q-sphere-canvas"></canvas>
          <svg class="q-sphere-fallback" viewBox="0 0 100 100" aria-hidden="true">
            <circle class="ring-1" cx="50" cy="50" r="35"/>
@@ -1293,7 +1357,7 @@ const SCREENS = {
       }
       if (!hasMsgs) {
         App.qWorking = false;
-        chatEl.innerHTML = `<div class="q-hero">${sphereWrap}</div>`;
+        chatEl.innerHTML = `<div class="q-hero">${sphereWrap}<p class="q-sphere-hint" id="q-sphere-hint">Halten zum Sprechen</p></div>`;
         mountQSphere();
         return;
       }
@@ -1380,22 +1444,35 @@ const SCREENS = {
       const text = (input.value || "").trim();
       if (!text) return;
       input.value = ""; auto();
+      const history = App.qhistory.slice(-QHIST_MAX);
+      App.qhistory.push({ role: "user", text });
       push({ role: "me", text });
       push({ role: "typing" });
       let res, j = null;
       try {
         res = await fetch("/app/api/assistent", { method: "POST",
           headers: { "X-CSRF-Token": App.me.csrf, "Content-Type": "application/json" },
-          body: JSON.stringify({ text }) });
+          body: JSON.stringify({ text, history }) });
       } catch (e) { popTyping(); push({ role: "err", text: "Netzwerkfehler. Bitte erneut." }); return; }
       if (res.status === 303 || res.status === 401 || res.redirected) { location.href = "/app/login"; return; }
       try { j = await res.json(); } catch (e) {}
       popTyping();
       if (!j || !j.type) { push({ role: "err", text: "Konnte den Befehl nicht verarbeiten." }); return; }
+      qHistoryRecord(j);
       if (j.type === "message") push({ role: "q", text: j.text });
       else if (j.type === "error") push({ role: "err", text: j.text });
       else if (j.type === "confirm") push({ role: "confirm", tool: j.tool, args: j.args, summary: j.summary, frage: j.frage, resolved: false });
       else if (j.type === "navigate") { if (j.text) push({ role: "q", text: j.text }); handleNavigate(j.bereich); }
+    }
+
+    // Q-Antwort als Modell-Turn in den Verlauf übernehmen, damit die nächste
+    // Rückfrage den Faden behält. Bei error NICHTS speichern (kein echter Turn).
+    function qHistoryRecord(j) {
+      if (!j) return;
+      let say = null;
+      if (j.type === "message" || j.type === "navigate") say = j.text;
+      else if (j.type === "confirm") say = j.frage || j.summary;
+      if (say) App.qhistory.push({ role: "model", text: say });
     }
 
     // Funktion aus dem ⚡-Menü angetippt: Q übernimmt den Flow im Hintergrund.
@@ -1406,16 +1483,19 @@ const SCREENS = {
       // Sphere ist nur im leeren Chat sichtbar — sonst regulärer Tipp-Indikator.
       if (App.qchat.some((m) => m.role !== "typing")) push({ role: "typing" });
       else render();
+      const history = App.qhistory.slice(-QHIST_MAX);
+      App.qhistory.push({ role: "user", text: a.intent });
       let res, j = null;
       try {
         res = await fetch("/app/api/assistent", { method: "POST",
           headers: { "X-CSRF-Token": App.me.csrf, "Content-Type": "application/json" },
-          body: JSON.stringify({ text: a.intent }) });
+          body: JSON.stringify({ text: a.intent, history }) });
       } catch (e) { App.qIntent = null; popTyping(); push({ role: "err", text: "Netzwerkfehler. Bitte erneut." }); return; }
       if (res.status === 303 || res.status === 401 || res.redirected) { location.href = "/app/login"; return; }
       try { j = await res.json(); } catch (e) {}
       App.qIntent = null;
       popTyping();
+      qHistoryRecord(j);
       if (!j || !j.type) { push({ role: "err", text: "Konnte den Befehl nicht verarbeiten." }); }
       else if (j.type === "message") push({ role: "q", text: j.text });
       else if (j.type === "error") push({ role: "err", text: j.text });
@@ -1464,32 +1544,101 @@ const SCREENS = {
     attachBtn.addEventListener("click", () => fileEl.click());
     fileEl.addEventListener("change", () => { if (fileEl.files && fileEl.files[0]) doUpload(fileEl.files[0]); fileEl.value = ""; });
 
-    micBtn.addEventListener("click", async () => {
-      if (Diktat.recording) {
-        const out = _diktatFinish();
-        micBtn.classList.remove("rec"); micBtn.innerHTML = IC.mic;
-        if (out.durationSec < 1 || out.blob.size < 2000) { push({ role: "err", text: "Aufnahme war zu kurz." }); return; }
-        push({ role: "typing" });
-        let res, j = null;
+    // Sphere → Halten zum Sprechen (Press-and-Hold ersetzt den alten Mic-Button)
+    let _sphereHoldTimer = null;
+    let _sphereDown = false;
+
+    // Mikrofon-Freigabe: War sie in diesem Browser schon erteilt, darf der
+    // Globus sofort aufnehmen. Diese Vorab-Abfrage blockiert nicht (Permissions-
+    // API), sodass wiederkehrende Nutzer ohne Extra-Tipp loslegen können.
+    if (navigator.permissions && navigator.permissions.query) {
+      navigator.permissions.query({ name: "microphone" })
+        .then((st) => { if (st.state === "granted") App.micReady = true; })
+        .catch(() => {}); // Safari/iOS kennt 'microphone' nicht — dann fragt der erste Druck
+    }
+
+    // Erster Druck auf den Globus: einmalig die Browser-Mikrofon-Freigabe
+    // einholen, BEVOR aufgenommen wird. Sonst unterbricht der Berechtigungs-
+    // Dialog die Halte-Geste und die allererste Aufnahme geht verloren.
+    async function _primeMic() {
+      const hint = document.getElementById("q-sphere-hint");
+      if (hint) hint.textContent = "Mikrofon erlauben …";
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        stream.getTracks().forEach((t) => t.stop());
+        App.micReady = true;
+        if (hint) hint.textContent = "Mikrofon erlaubt — zum Sprechen halten";
+      } catch (er) {
+        if (hint) hint.textContent = (er && er.name === "NotAllowedError")
+          ? "Mikrofon abgelehnt — im Browser erlauben"
+          : "Mikrofon nicht verfügbar";
+      }
+    }
+
+    async function _sphereRelease(shouldUpload) {
+      clearTimeout(_sphereHoldTimer); _sphereHoldTimer = null;
+      if (!_sphereDown) return;
+      _sphereDown = false;
+      const wrap = document.getElementById("q-sphere-wrap");
+      const hint = document.getElementById("q-sphere-hint");
+      if (wrap) wrap.classList.remove("recording");
+      if (hint) { hint.textContent = "Halten zum Sprechen"; hint.classList.remove("rec"); }
+      if (App.qSphereActive) App.qSphereActive(false);
+      if (!shouldUpload || !Diktat.recording) { _diktatTeardown(); return; }
+      const out = _diktatFinish();
+      if (out.durationSec < 1 || out.blob.size < 2000) {
+        push({ role: "err", text: "Aufnahme war zu kurz — bitte länger halten." }); return;
+      }
+      push({ role: "typing" });
+      let res; let j = null;
+      try {
+        res = await fetch("/app/api/assistent/transkript", {
+          method: "POST",
+          headers: { "X-CSRF-Token": App.me.csrf, "Content-Type": "audio/wav" },
+          body: out.blob,
+        });
+      } catch (e) { popTyping(); push({ role: "err", text: "Netzwerkfehler." }); return; }
+      if (res.status === 303 || res.status === 401 || res.redirected) { location.href = "/app/login"; return; }
+      try { j = await res.json(); } catch (e) {}
+      popTyping();
+      if (res.ok && j && j.ok && j.text) { input.value = j.text; send(); }
+      else push({ role: "err", text: (j && j.error) || "Nichts verstanden — bitte erneut halten." });
+    }
+
+    chatEl.addEventListener("pointerdown", (e) => {
+      const wrap = e.target.closest("#q-sphere-wrap");
+      if (!wrap) return;
+      e.preventDefault();
+      // Beim ersten Mal nur die Freigabe einholen — noch nicht aufnehmen.
+      if (!App.micReady) { _primeMic(); return; }
+      wrap.setPointerCapture(e.pointerId);
+      _sphereHoldTimer = setTimeout(async () => {
+        _sphereDown = true;
+        const w = document.getElementById("q-sphere-wrap");
+        const hint = document.getElementById("q-sphere-hint");
+        if (w) w.classList.add("recording");
+        if (hint) { hint.textContent = "🔴 Aufnahme läuft …"; hint.classList.add("rec"); }
         try {
-          res = await fetch("/app/api/assistent/transkript", { method: "POST",
-            headers: { "X-CSRF-Token": App.me.csrf, "Content-Type": "audio/wav" }, body: out.blob });
-        } catch (e) { popTyping(); push({ role: "err", text: "Netzwerkfehler." }); return; }
-        if (res.status === 303 || res.status === 401 || res.redirected) { location.href = "/app/login"; return; }
-        try { j = await res.json(); } catch (e) {}
-        popTyping();
-        if (res.ok && j && j.ok && j.text) { input.value = j.text; send(); }
-        else push({ role: "err", text: (j && j.error) || "Nichts verstanden. Bitte erneut." });
-        return;
-      }
-      try { await _diktatStartRecording(); }
-      catch (e) {
-        push({ role: "err", text: (e && e.name === "NotAllowedError") ? "Mikrofon-Zugriff abgelehnt. Bitte im Browser erlauben." : "Mikrofon nicht verfügbar." });
-        _diktatTeardown(); return;
-      }
-      micBtn.classList.add("rec"); micBtn.innerHTML = IC.stop;
-      Diktat.autostop = setTimeout(() => { if (Diktat.recording) micBtn.click(); }, 60 * 1000);
+          await _diktatStartRecording();
+          Diktat.autostop = setTimeout(() => { if (Diktat.recording) _sphereRelease(true); }, 60 * 1000);
+        } catch (er) {
+          _sphereDown = false;
+          if (w) w.classList.remove("recording");
+          if (hint) { hint.textContent = "Halten zum Sprechen"; hint.classList.remove("rec"); }
+          if (App.qSphereActive) App.qSphereActive(false);
+          _diktatTeardown();
+          push({ role: "err", text: (er && er.name === "NotAllowedError")
+            ? "Mikrofon-Zugriff abgelehnt. Bitte im Browser erlauben."
+            : "Mikrofon nicht verfügbar." });
+        }
+      }, 200);
     });
+
+    chatEl.addEventListener("pointerup", () => {
+      if (_sphereDown || _sphereHoldTimer) _sphereRelease(true);
+    });
+
+    chatEl.addEventListener("pointercancel", () => _sphereRelease(false));
 
     // ---- Funktions-Dropdown (Quick-Aktionen) ----
     // Damit der Handwerker nicht alles per Hand in eigenen Fenstern anlegt:
@@ -1567,12 +1716,13 @@ async function loadBriefing(refresh) {
 function handleNavigate(bereich) {
   const b = (bereich || "aktuelles").toLowerCase();
   const mehr = { kunden: 1, wissen: 1, material: 1, team: 1, einstellungen: 1, formulare: 1 };
-  const sektion = {
-    anfragen: "sec-anfragen", termine: "sec-termine", auftraege: "sec-auftraege",
-    angebote: "sec-angebote", rechnungen: "sec-rechnungen", rueckrufe: "sec-rueckrufe",
+  const subscreen = {
+    auftraege: "auftraege_page", rechnungen: "rechnungen_page",
+    angebote: "angebote_page", rueckrufe: "rueckrufe_page",
+    anfragen: "anfragen", termine: "termine",
   };
   if (mehr[b]) { navigate(b); return; }
-  if (sektion[b]) { App._scrollTo = sektion[b]; navigate("aktuelles"); return; }
+  if (subscreen[b]) { navigate(subscreen[b]); return; }
   navigate("aktuelles");
 }
 
@@ -1736,7 +1886,8 @@ function showAngebotForm() {
      </div>` +
     `<button class="btn-sm" id="c-save" style="width:100%;margin-top:8px">Angebot anlegen</button>`;
 
-  document.getElementById("back-buero").addEventListener("click", () => navigate("buchhaltung"));
+  document.getElementById("back-buero").addEventListener("click", () => navigate(App.lastScreen || "buchhaltung"));
+  App.lastScreen = null;
   _renderPositionen();
   document.getElementById("pos-add").addEventListener("click", () => {
     _composerPositionen.push({ name: "", menge: 1, einheit: "Stueck", preis_brutto_eur: 0 });
@@ -1818,7 +1969,8 @@ function showRechnungForm() {
      </div>` +
     `<button class="btn-sm" id="c-save" style="width:100%;margin-top:8px">Rechnung anlegen</button>`;
 
-  document.getElementById("back-buero").addEventListener("click", () => navigate("buchhaltung"));
+  document.getElementById("back-buero").addEventListener("click", () => navigate(App.lastScreen || "buchhaltung"));
+  App.lastScreen = null;
 
   document.querySelectorAll("[data-rmode]").forEach((b) =>
     b.addEventListener("click", () => {
@@ -1899,8 +2051,10 @@ function _showAccountingResult(typ, j, sendPath) {
        <p class="muted" style="font-size:13px;margin-top:0">Schickt das PDF aus Lexware an die hinterlegte Mail-Adresse.</p>
        <button class="btn-sm" id="send-pdf" style="width:100%">PDF jetzt senden</button>
      </div>` : ""}
-     <button class="btn-sm btn-ghost" id="back-buero" style="width:100%;margin-top:8px">Zurück zum Büro</button>`;
-  document.getElementById("back-buero").addEventListener("click", () => navigate("buchhaltung"));
+     <button class="btn-sm btn-ghost" id="back-buero" style="width:100%;margin-top:8px">Zurück</button>`;
+  const _backTarget = App.lastScreen || "buchhaltung";
+  App.lastScreen = null;
+  document.getElementById("back-buero").addEventListener("click", () => navigate(_backTarget));
   const sendBtn = document.getElementById("send-pdf");
   if (sendBtn) sendBtn.addEventListener("click", async () => {
     sendBtn.disabled = true; sendBtn.textContent = "Sende …";
@@ -1910,7 +2064,7 @@ function _showAccountingResult(typ, j, sendPath) {
       const k = await r.json();
       if (k.ok) {
         alert("Mail erfolgreich gesendet.");
-        navigate("buchhaltung"); return;
+        navigate(_backTarget); return;
       }
       alert("Versand fehlgeschlagen: " + (k.error || "unbekannt"));
     } else {
@@ -2898,11 +3052,12 @@ function bindStorno() {
     }));
 }
 function bindRueckrufDone() {
+  const backTo = App.current === "rueckrufe_page" ? "rueckrufe_page" : "aktuelles";
   document.querySelectorAll('[data-action="rueckruf-done"]').forEach((b) =>
     b.addEventListener("click", async () => {
       b.disabled = true;
       const res = await api("/app/api/rueckrufe/erledigt", { method: "POST", body: JSON.stringify({ id: b.dataset.id }) });
-      if (res && res.ok) navigate("aktuelles"); else { b.disabled = false; alert("Konnte nicht abhaken."); }
+      if (res && res.ok) navigate(backTo); else { b.disabled = false; alert("Konnte nicht abhaken."); }
     }));
 }
 

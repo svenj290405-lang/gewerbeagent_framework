@@ -3365,8 +3365,21 @@ async def api_assistent(
     if len(text) > 1000:
         text = text[:1000]
 
+    # Gesprächsverlauf (frühere Turns) für Mehrfach-Rückfragen — der Client
+    # schickt eine Liste {role: "user"|"model", text: str}. Defensiv begrenzt.
+    history_raw = (body or {}).get("history")
+    history = []
+    if isinstance(history_raw, list):
+        for turn in history_raw[-12:]:
+            if not isinstance(turn, dict):
+                continue
+            role = "model" if turn.get("role") == "model" else "user"
+            t = (turn.get("text") or "").strip()
+            if t:
+                history.append({"role": role, "text": t[:1000]})
+
     ctx = await _build_command_ctx(request)
-    result = await run_command(text, ctx)
+    result = await run_command(text, ctx, history=history)
     from core.models.app_usage_event import record_app_usage, USAGE_ASSISTENT_BEFEHL
     await record_app_usage(ctx.tid, getattr(ctx.employee, "id", None), USAGE_ASSISTENT_BEFEHL)
     return JSONResponse(result)

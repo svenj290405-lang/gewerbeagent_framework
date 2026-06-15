@@ -59,7 +59,11 @@
 // Bereiche + was Q erledigt und führt den Inhaber durch Google/Outlook/
 // Lexware verbinden; startet automatisch beim ersten Start (Server-Flag
 // onboarding_done), erneut über „Mehr → Einrichtung starten".
-const CACHE = "ga-app-v39";
+// v44: Erster Druck auf den Globus holt einmalig die Browser-Mikrofon-
+// Freigabe ein (Berechtigungs-Dialog), bevor die Halte-Aufnahme startet.
+// v45: Q behält den Gesprächsverlauf (Mehrfach-Rückfragen) — kein erneutes
+// Nachfragen nach schon Gesagtem mehr.
+const CACHE = "ga-app-v45";
 const SHELL = [
   "/app",
   "/app/static/app.css",
