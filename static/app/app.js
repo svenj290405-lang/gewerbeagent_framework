@@ -47,13 +47,13 @@ function notifSupported() { return typeof Notification !== "undefined"; }
 function notifGranted() { return notifSupported() && Notification.permission === "granted"; }
 
 // ---------- Tabs ----------
-// Chat-first: nur 3 Tabs. Q (Assistent) ist die Bedienzentrale, "Aktuelles"
+// Chat-first: nur 3 Tabs. Q (Assistent) ist die Bedienzentrale, "Aktionen"
 // bündelt ALLE Anzeigen (inkl. Termine/Angebote/Rechnungen), "Mehr" den
 // Kleinkram. Termine/Büro sind keine eigenen Tabs mehr; ihre Screens bleiben
 // per Q-Chat ("zeig mir die Rechnungen") erreichbar.
 const TABS = [
   { key: "assistent",   label: "Assistent", ico: "🤖" },
-  { key: "aktuelles",   label: "Aktuelles", ico: "📋" },
+  { key: "aktuelles",   label: "Aktionen", ico: "📋" },
   { key: "mehr",        label: "Mehr",     ico: "⋯" },
 ];
 
@@ -105,15 +105,17 @@ const SCREENS = {
     const beratung = ak.beratung || [];
     const auftraege = ak.auftraege || [];
     const rueckrufe = ak.rueckrufe || [];
+    const aufnahmenCount = ak.aufnahmen_count || 0;
     const termine = td.termine || [];
     const anfragenOffen = (ad.items || []).filter((x) => !x.closed);
     const angebote = angd.angebote || [];
     const rechnungen = rechd.rechnungen || [];
+    const rechnungenOffen = rechnungen.filter((x) => x.status === "Versendet").length;
     const parts = [];
 
     parts.push(
       `<div style="display:flex;align-items:center;justify-content:space-between;margin:4px 4px 14px">
-         <h1 style="font-size:22px;margin:0">Übersicht</h1>
+         <h1 style="font-size:22px;margin:0">Aktionen</h1>
          <div style="display:flex;gap:6px">
            <button class="btn-sm" id="ak-diktat" style="padding:8px 12px">🎤 Diktat</button>
            <button class="btn-sm btn-ghost" id="ak-rueckruf" style="padding:8px 12px">+ Rückruf</button>
@@ -121,13 +123,13 @@ const SCREENS = {
        </div>`);
 
     parts.push(
-      `<div class="card q-briefing">
-         <div class="q-briefing-head">
+      `<details class="card q-briefing" open>
+         <summary class="q-briefing-head" style="list-style:none;cursor:pointer">
            <span class="q-badge">Q</span><span>Dein Tag</span>
-           <button class="q-briefing-refresh" id="ak-briefing-refresh" title="Neu schreiben">🔄</button>
-         </div>
+           <button class="q-briefing-refresh" id="ak-briefing-refresh" title="Neu schreiben" onclick="event.stopPropagation()">🔄</button>
+         </summary>
          <p class="q-briefing-text" id="q-briefing-text"><span class="q-briefing-load">Q schreibt dein Briefing …</span></p>
-       </div>`);
+       </details>`);
 
     if (notifSupported() && !notifGranted()) {
       parts.push(`<div class="banner">Aktiviere Benachrichtigungen, damit du neue Buchungen und Rückrufe sofort siehst. <button class="btn-sm btn-ghost" id="enable-notif-inline">Aktivieren</button></div>`);
@@ -152,7 +154,7 @@ const SCREENS = {
     if (hasKal) tiles.push({
       ico: "📅", label: "Termine", screen: "termine",
       count: termine.length ? `${termine.length} anstehend` : "Keine anstehend",
-      badge: null,
+      badge: termine.length || null, badgeClass: "",
     });
     if (hasMail) tiles.push({
       ico: "✉️", label: "Anfragen", screen: "anfragen",
@@ -167,7 +169,7 @@ const SCREENS = {
     if (hasLex) tiles.push({
       ico: "🧾", label: "Rechnungen", screen: "rechnungen_page",
       count: rechnungen.length ? `${rechnungen.length} gesamt` : "Keine",
-      badge: null,
+      badge: rechnungenOffen || null, badgeClass: "warn",
     });
     tiles.push({
       ico: "🛠️", label: "Aufträge", screen: "auftraege_page",
@@ -179,6 +181,13 @@ const SCREENS = {
       count: rueckrufe.length ? `${rueckrufe.length} offen` : "Keine offen",
       badge: rueckrufe.length || null, badgeClass: "warn",
     });
+    tiles.push({
+      ico: "🎙️", label: "Anrufe", screen: "anrufe",
+      count: aufnahmenCount ? `${aufnahmenCount} Aufnahmen` : "Keine Aufnahmen",
+      badge: null,
+    });
+    // Tiles mit Badge (= Handlungsbedarf) nach oben sortieren
+    tiles.sort((a, b) => (b.badge || 0) - (a.badge || 0));
     parts.push(`<div class="homescreen-grid">`);
     tiles.forEach((t) => {
       const badge = (t.badge && t.badge > 0)
@@ -1246,23 +1255,25 @@ const SCREENS = {
   async mehr() {
     const m = App.me;
     const feats = new Set(m.features || []);
-    const menu = [];
-    menu.push(`<button class="row menu-item" data-go="kunden"><span>🔍 Kunden suchen</span><span class="sub">›</span></button>`);
-    menu.push(`<button class="row menu-item" data-go="wissen"><span>📚 Wissensdatenbank</span><span class="sub">›</span></button>`);
-    menu.push(`<button class="row menu-item" data-go="material"><span>🧰 Material</span><span class="sub">›</span></button>`);
-    // Visualisierung ist als eigenes Fenster entfernt — jetzt über das Q-Aktionsmenü erreichbar.
-    if (feats.has("mitarbeiter")) menu.push(`<button class="row menu-item" data-go="team"><span>👥 Team</span><span class="sub">›</span></button>`);
-    if (feats.has("anfrage_formular") && m.employee.is_inhaber) menu.push(`<button class="row menu-item" data-go="formulare"><span>📝 Anfrage-Formular</span><span class="sub">›</span></button>`);
-    menu.push(`<button class="row menu-item" data-go="diagnose"><span>🩺 Status</span><span class="sub">›</span></button>`);
-    menu.push(`<button class="row menu-item" data-go="hilfe"><span>❓ Hilfe &amp; Tour</span><span class="sub">›</span></button>`);
-    menu.push(`<button class="row menu-item" data-tour="1"><span>🚀 Einrichtung starten</span><span class="sub">›</span></button>`);
-    menu.push(`<button class="row menu-item" data-go="einstellungen"><span>⚙️ Einstellungen</span><span class="sub">›</span></button>`);
+    const schnell = [];
+    schnell.push(`<button class="row menu-item" data-go="kunden"><span>🔍 Kunden suchen</span><span class="sub">›</span></button>`);
+    schnell.push(`<button class="row menu-item" data-go="material"><span>🧰 Material</span><span class="sub">›</span></button>`);
+    if (feats.has("visualisierung")) schnell.push(`<button class="row menu-item" data-go="visualisierung"><span>🎨 Visualisierung</span><span class="sub">›</span></button>`);
+    schnell.push(`<button class="row menu-item" data-go="wissen"><span>📚 Wissensdatenbank</span><span class="sub">›</span></button>`);
+    const einst = [];
+    if (feats.has("mitarbeiter")) einst.push(`<button class="row menu-item" data-go="team"><span>👥 Team</span><span class="sub">›</span></button>`);
+    if (feats.has("anfrage_formular") && m.employee.is_inhaber) einst.push(`<button class="row menu-item" data-go="formulare"><span>📝 Anfrage-Formular</span><span class="sub">›</span></button>`);
+    einst.push(`<button class="row menu-item" data-go="einstellungen"><span>⚙️ Einstellungen</span><span class="sub">›</span></button>`);
+    einst.push(`<button class="row menu-item" data-go="diagnose"><span>🩺 Status</span><span class="sub">›</span></button>`);
+    einst.push(`<button class="row menu-item" data-go="hilfe"><span>❓ Hilfe &amp; Tour</span><span class="sub">›</span></button>`);
+    einst.push(`<button class="row menu-item" data-tour="1"><span>🚀 Einrichtung starten</span><span class="sub">›</span></button>`);
     App.view.innerHTML =
       `<div class="card"><h2>${esc(m.tenant.company_name || "Mein Betrieb")}</h2>
         <div class="row"><span>Angemeldet als</span><span class="sub">${esc(m.employee.name)}${m.employee.is_inhaber ? " (Inhaber)" : ""}</span></div>
         <div class="row"><span>Freigeschaltete Funktionen</span><span class="sub">${(m.features || []).length}</span></div>
       </div>` +
-      (menu.length ? `<div class="card"><h2>Verwaltung</h2>${menu.join("")}</div>` : "") +
+      `<div class="card"><h2>Schnellzugriff</h2>${schnell.join("")}</div>` +
+      `<div class="card"><h2>Einstellungen</h2>${einst.join("")}</div>` +
       `<div class="card"><h2>Benachrichtigungen</h2>
         <div class="row"><span>Push auf diesem Gerät</span><span class="pill ${notifGranted() ? "ok" : "warn"}">${notifGranted() ? "aktiv" : (notifSupported() ? "aus" : "nicht unterstützt")}</span></div>
         ${notifSupported() ? `<button class="btn-sm btn-ghost" id="enable-notif-more" style="margin-top:8px">Push aktivieren</button>` : `<p class="muted" style="margin-top:6px">Auf dem iPhone: erst „Zum Home-Bildschirm" hinzufügen, dann sind Benachrichtigungen möglich.</p>`}
@@ -1885,7 +1896,7 @@ const SCREENS = {
 
       const steps = [];
       steps.push((n) => obSay(`${first ? "Hallo " + esc(first) + "!" : "Willkommen!"} Ich bin <b>Q</b> — dein digitaler Büro-Mitarbeiter. Ich gehe ans Telefon, beantworte Kunden-Mails, buche Termine und schreibe Angebote &amp; Rechnungen.`, n));
-      steps.push((n) => obSay(`Wir machen dich in ein paar Schritten startklar. Du hast drei Bereiche: <b>Assistent</b> (hier mit mir reden), <b>Aktuelles</b> (Briefing, Anfragen, Aufträge) und <b>Mehr</b> (Kunden, Team, Einstellungen).`, n));
+      steps.push((n) => obSay(`Wir machen dich in ein paar Schritten startklar. Du hast drei Bereiche: <b>Assistent</b> (hier mit mir reden), <b>Aktionen</b> (Briefing, Anfragen, Aufträge) und <b>Mehr</b> (Kunden, Team, Einstellungen).`, n));
 
       if (isInhaber) {
         steps.push((n) => obSay("Damit ich wirklich für dich arbeiten kann, verbinden wir kurz deine Konten. Alles optional und jederzeit später unter „Mehr → Einstellungen“ änderbar.", n));

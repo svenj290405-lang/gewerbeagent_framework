@@ -454,10 +454,12 @@ async def _aktuelle_auftraege(tenant_id: uuid.UUID) -> list[dict]:
 async def api_aktuelles(request: Request, _e=Depends(require_app_user)) -> JSONResponse:
     """Aggregiert alles Relevante für den Start-Screen 'Aktuelles'."""
     tid = current_tenant_id(request)
+    aufnahmen = await _recent_aufnahmen(tid, limit=20)
     return JSONResponse({
         "rueckrufe": await _open_rueckrufe(tid),
         "beratung": await _beratung_leads(tid),
         "auftraege": await _aktuelle_auftraege(tid),
+        "aufnahmen_count": len(aufnahmen),
     })
 
 

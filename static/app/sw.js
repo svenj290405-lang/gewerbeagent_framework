@@ -70,7 +70,11 @@
 // (neue Assistent-Tools + Schnellaktionen).
 // v48: Drive-Links im Chat sind jetzt echte klickbare Hyperlinks (linkify +
 // „in Drive öffnen ↗"); URLs in Q-Antworten generell anklickbar.
-const CACHE = "ga-app-v48";
+// v49: Dashboard-Umbau — Tab „Aktuelles" → „Aktionen", Kachel-Grid mit
+// Handlungs-Badges (offene Rechnungen/Rückrufe nach oben sortiert) + Anrufe-
+// Kachel, ausklappbares Q-Briefing, aufgeräumter „Mehr"-Screen
+// (Schnellzugriff + Einstellungen), Globus-Aufnahme-Animation (Spin + Hint).
+const CACHE = "ga-app-v49";
 const SHELL = [
   "/app",
   "/app/static/app.css",
