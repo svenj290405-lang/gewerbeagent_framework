@@ -1435,22 +1435,39 @@ const SCREENS = {
           return `<div class="bubble q confirm">${m.frage ? `<p style="margin:0 0 8px">${esc(m.frage)}</p>` : ""}<p class="q-summary">${esc(m.summary)}</p>${btns}</div>`;
         }
         if (m.role === "upload") {
+          const thumb = m.previewUrl
+            ? `<img src="${m.previewUrl}" alt="${esc(m.name)}" style="width:100%;max-height:220px;object-fit:cover;border-radius:10px;margin-bottom:8px">` : "";
           if (m.resolved) {
             const lbl = m.cancelled ? "✕ Abgebrochen"
-              : m.choice === "viz" ? "🎨 Visualisierung" : "📄 Als Beleg abgelegt";
-            return `<div class="bubble q confirm"><p class="q-summary">${esc(m.name)}</p><div class="confirm-done">${lbl}</div></div>`;
+              : m.choice === "viz" ? "🎨 Visualisierung"
+              : m.choice === "archiv" ? "📁 Im Archiv gespeichert"
+              : "📄 Als Beleg abgelegt";
+            return `<div class="bubble q confirm">${thumb}<p class="q-summary">${esc(m.name)}</p><div class="confirm-done">${lbl}</div></div>`;
           }
           if (m.stage === "vizprompt") {
-            return `<div class="bubble q confirm">
+            return `<div class="bubble q confirm">${thumb}
                <p class="q-summary">🎨 Was soll am Bild verändert werden?</p>
                <textarea class="rech-input" data-upvtext="${i}" rows="3" placeholder="z.B. Wände in warmem Grau streichen, Eichenparkett verlegen">${esc(m.vizText || "")}</textarea>
                <div class="confirm-actions"><button class="btn-sm" data-upvizgo="${i}">Visualisieren</button><button class="btn-sm btn-ghost" data-upcancel="${i}">Abbrechen</button></div>
              </div>`;
           }
-          return `<div class="bubble q confirm">
+          if (m.stage === "archivkunde") {
+            return `<div class="bubble q confirm">${thumb}
+               <p class="q-summary">📁 Für welchen Kunden ablegen?</p>
+               <input type="text" class="rech-input" data-upktext="${i}" value="${esc(m.kundeName || "")}" placeholder="z.B. Müller, Hauptstr. 3" autocomplete="off">
+               <div class="confirm-actions"><button class="btn-sm" data-uparchgo="${i}">Speichern</button><button class="btn-sm btn-ghost" data-upcancel="${i}">Abbrechen</button></div>
+             </div>`;
+          }
+          const feats = new Set(App.me.features || []);
+          const opts = [];
+          if (feats.has("visualisierung")) opts.push(`<button class="btn-sm" data-upviz="${i}">🎨 Visualisieren</button>`);
+          if (feats.has("lexware")) opts.push(`<button class="btn-sm btn-ghost" data-upbeleg="${i}">📄 Als Beleg</button>`);
+          if (feats.has("drive_archiv")) opts.push(`<button class="btn-sm btn-ghost" data-uparchiv="${i}">📁 Speichern</button>`);
+          opts.push(`<button class="btn-sm btn-ghost" data-upcancel="${i}">Abbrechen</button>`);
+          return `<div class="bubble q confirm">${thumb}
              <p class="q-summary">📎 ${esc(m.name)}</p>
              <p style="margin:0 0 8px">Was soll ich damit machen?</p>
-             <div class="confirm-actions"><button class="btn-sm" data-upviz="${i}">🎨 Visualisieren</button><button class="btn-sm btn-ghost" data-upbeleg="${i}">📄 Als Beleg</button></div>
+             <div class="confirm-actions" style="flex-wrap:wrap">${opts.join("")}</div>
            </div>`;
         }
         if (m.role === "rechnung") {
@@ -1498,9 +1515,11 @@ const SCREENS = {
           App.qchat.push({ role: "q", text: "Okay, die Rechnung lasse ich erstmal." });
           render(); scrollDown();
         }));
-      // 📎-Upload-Karte: Bild visualisieren oder als Beleg ablegen
+      // 📎-Upload-Karte: Bild visualisieren, als Beleg ablegen oder im Archiv speichern
       chatEl.querySelectorAll("[data-upviz]").forEach((b) =>
         b.addEventListener("click", () => { App.qchat[parseInt(b.dataset.upviz, 10)].stage = "vizprompt"; render(); }));
+      chatEl.querySelectorAll("[data-uparchiv]").forEach((b) =>
+        b.addEventListener("click", () => { App.qchat[parseInt(b.dataset.uparchiv, 10)].stage = "archivkunde"; render(); }));
       chatEl.querySelectorAll("[data-upbeleg]").forEach((b) =>
         b.addEventListener("click", () => {
           const m = App.qchat[parseInt(b.dataset.upbeleg, 10)];
@@ -1508,12 +1527,21 @@ const SCREENS = {
         }));
       chatEl.querySelectorAll("[data-upvtext]").forEach((t) =>
         t.addEventListener("input", () => { App.qchat[parseInt(t.dataset.upvtext, 10)].vizText = t.value; }));
+      chatEl.querySelectorAll("[data-upktext]").forEach((t) =>
+        t.addEventListener("input", () => { App.qchat[parseInt(t.dataset.upktext, 10)].kundeName = t.value; }));
       chatEl.querySelectorAll("[data-upvizgo]").forEach((b) =>
         b.addEventListener("click", () => {
           const m = App.qchat[parseInt(b.dataset.upvizgo, 10)];
           const prompt = (m.vizText || "").trim();
           if (prompt.length < 5) { push({ role: "err", text: "Bitte etwas genauer beschreiben (min. 5 Zeichen)." }); return; }
           m.resolved = true; m.choice = "viz"; render(); doVisualisieren(m.file, prompt);
+        }));
+      chatEl.querySelectorAll("[data-uparchgo]").forEach((b) =>
+        b.addEventListener("click", () => {
+          const m = App.qchat[parseInt(b.dataset.uparchgo, 10)];
+          const kunde = (m.kundeName || "").trim();
+          if (kunde.length < 2) { push({ role: "err", text: "Bitte einen Kundennamen angeben." }); return; }
+          m.resolved = true; m.choice = "archiv"; render(); doArchiv(m.file, kunde);
         }));
       chatEl.querySelectorAll("[data-upcancel]").forEach((b) =>
         b.addEventListener("click", () => {
@@ -1652,8 +1680,29 @@ const SCREENS = {
     function onFilePicked(file) {
       if (!file) return;
       const isImg = file.type === "image/jpeg" || file.type === "image/png";
-      if (isImg) push({ role: "upload", file, name: file.name, stage: "choice" });
-      else doUploadBeleg(file);
+      if (isImg) {
+        let previewUrl = null;
+        try { previewUrl = URL.createObjectURL(file); } catch (e) {}
+        push({ role: "upload", file, name: file.name, previewUrl, stage: "choice" });
+      } else {
+        doUploadBeleg(file);
+      }
+    }
+
+    async function doArchiv(file, kundeName) {
+      push({ role: "me", text: "📁 " + file.name + " → " + kundeName });
+      push({ role: "typing" });
+      let res, j = null;
+      const url = "/app/api/archiv/upload?kunde_name=" + encodeURIComponent(kundeName)
+        + "&filename=" + encodeURIComponent(file.name);
+      try {
+        res = await fetch(url, { method: "POST", headers: { "X-CSRF-Token": App.me.csrf, "Content-Type": file.type }, body: file });
+      } catch (e) { popTyping(); push({ role: "err", text: "Upload fehlgeschlagen." }); return; }
+      if (res.status === 303 || res.status === 401 || res.redirected) { location.href = "/app/login"; return; }
+      try { j = await res.json(); } catch (e) {}
+      popTyping();
+      if (res.ok && j && j.ok) push({ role: "q", text: "📁 Im Archiv von " + kundeName + " gespeichert." });
+      else push({ role: "err", text: (j && j.error) || "Konnte nicht im Archiv speichern." });
     }
 
     async function doVisualisieren(file, prompt) {

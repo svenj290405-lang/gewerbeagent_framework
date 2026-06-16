@@ -77,7 +77,10 @@
 // v50: 📎-Upload im Q-Chat fragt bei Bildern nach: 🎨 Visualisieren (Foto +
 // Beschreibung → Gemini-Rendering direkt im Chat) oder 📄 als Beleg ablegen.
 // PDFs gehen wie bisher direkt in den Beleg-Upload.
-const CACHE = "ga-app-v50";
+// v51: 📎-Bild-Upload zeigt jetzt eine Vorschau + fragt mit allen
+// freigeschalteten Optionen (🎨 Visualisieren / 📄 Beleg / 📁 Im Kunden-Archiv
+// speichern). Archiv fragt nach dem Kundennamen.
+const CACHE = "ga-app-v51";
 const SHELL = [
   "/app",
   "/app/static/app.css",
