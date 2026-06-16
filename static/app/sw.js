@@ -74,7 +74,10 @@
 // Handlungs-Badges (offene Rechnungen/Rückrufe nach oben sortiert) + Anrufe-
 // Kachel, ausklappbares Q-Briefing, aufgeräumter „Mehr"-Screen
 // (Schnellzugriff + Einstellungen), Globus-Aufnahme-Animation (Spin + Hint).
-const CACHE = "ga-app-v49";
+// v50: 📎-Upload im Q-Chat fragt bei Bildern nach: 🎨 Visualisieren (Foto +
+// Beschreibung → Gemini-Rendering direkt im Chat) oder 📄 als Beleg ablegen.
+// PDFs gehen wie bisher direkt in den Beleg-Upload.
+const CACHE = "ga-app-v50";
 const SHELL = [
   "/app",
   "/app/static/app.css",

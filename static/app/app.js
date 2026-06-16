@@ -1310,7 +1310,7 @@ const SCREENS = {
          <div class="q-menu" id="q-menu" hidden></div>
          <div class="composer-inner">
            <button class="cbtn ghost" id="q-actions" title="Funktionen" aria-label="Funktionen">${IC.spark}</button>
-           <button class="cbtn ghost" id="q-attach" title="Beleg/Foto hochladen" aria-label="Anhängen">${IC.clip}</button>
+           <button class="cbtn ghost" id="q-attach" title="Foto visualisieren oder Beleg hochladen" aria-label="Anhängen">${IC.clip}</button>
            <textarea id="q-input" rows="1" placeholder="Schreib Q …"></textarea>
            <button class="cbtn" id="q-send" title="Senden" aria-label="Senden">${IC.send}</button>
          </div>
@@ -1434,6 +1434,25 @@ const SCREENS = {
             : `<div class="confirm-actions"><button class="btn-sm" data-cyes="${i}">Ausführen</button><button class="btn-sm btn-ghost" data-cno="${i}">Abbrechen</button></div>`;
           return `<div class="bubble q confirm">${m.frage ? `<p style="margin:0 0 8px">${esc(m.frage)}</p>` : ""}<p class="q-summary">${esc(m.summary)}</p>${btns}</div>`;
         }
+        if (m.role === "upload") {
+          if (m.resolved) {
+            const lbl = m.cancelled ? "✕ Abgebrochen"
+              : m.choice === "viz" ? "🎨 Visualisierung" : "📄 Als Beleg abgelegt";
+            return `<div class="bubble q confirm"><p class="q-summary">${esc(m.name)}</p><div class="confirm-done">${lbl}</div></div>`;
+          }
+          if (m.stage === "vizprompt") {
+            return `<div class="bubble q confirm">
+               <p class="q-summary">🎨 Was soll am Bild verändert werden?</p>
+               <textarea class="rech-input" data-upvtext="${i}" rows="3" placeholder="z.B. Wände in warmem Grau streichen, Eichenparkett verlegen">${esc(m.vizText || "")}</textarea>
+               <div class="confirm-actions"><button class="btn-sm" data-upvizgo="${i}">Visualisieren</button><button class="btn-sm btn-ghost" data-upcancel="${i}">Abbrechen</button></div>
+             </div>`;
+          }
+          return `<div class="bubble q confirm">
+             <p class="q-summary">📎 ${esc(m.name)}</p>
+             <p style="margin:0 0 8px">Was soll ich damit machen?</p>
+             <div class="confirm-actions"><button class="btn-sm" data-upviz="${i}">🎨 Visualisieren</button><button class="btn-sm btn-ghost" data-upbeleg="${i}">📄 Als Beleg</button></div>
+           </div>`;
+        }
         if (m.role === "rechnung") {
           const r = m.data || {};
           if (m.resolved) {
@@ -1477,6 +1496,30 @@ const SCREENS = {
           const m = App.qchat[parseInt(b.dataset.rcancel, 10)];
           m.resolved = true; m.cancelled = true;
           App.qchat.push({ role: "q", text: "Okay, die Rechnung lasse ich erstmal." });
+          render(); scrollDown();
+        }));
+      // 📎-Upload-Karte: Bild visualisieren oder als Beleg ablegen
+      chatEl.querySelectorAll("[data-upviz]").forEach((b) =>
+        b.addEventListener("click", () => { App.qchat[parseInt(b.dataset.upviz, 10)].stage = "vizprompt"; render(); }));
+      chatEl.querySelectorAll("[data-upbeleg]").forEach((b) =>
+        b.addEventListener("click", () => {
+          const m = App.qchat[parseInt(b.dataset.upbeleg, 10)];
+          m.resolved = true; m.choice = "beleg"; render(); doUploadBeleg(m.file);
+        }));
+      chatEl.querySelectorAll("[data-upvtext]").forEach((t) =>
+        t.addEventListener("input", () => { App.qchat[parseInt(t.dataset.upvtext, 10)].vizText = t.value; }));
+      chatEl.querySelectorAll("[data-upvizgo]").forEach((b) =>
+        b.addEventListener("click", () => {
+          const m = App.qchat[parseInt(b.dataset.upvizgo, 10)];
+          const prompt = (m.vizText || "").trim();
+          if (prompt.length < 5) { push({ role: "err", text: "Bitte etwas genauer beschreiben (min. 5 Zeichen)." }); return; }
+          m.resolved = true; m.choice = "viz"; render(); doVisualisieren(m.file, prompt);
+        }));
+      chatEl.querySelectorAll("[data-upcancel]").forEach((b) =>
+        b.addEventListener("click", () => {
+          const m = App.qchat[parseInt(b.dataset.upcancel, 10)];
+          m.resolved = true; m.cancelled = true;
+          App.qchat.push({ role: "q", text: "Okay, lasse ich." });
           render(); scrollDown();
         }));
       // Onboarding-Karten (Q führt durch die Ersteinrichtung)
@@ -1602,7 +1645,39 @@ const SCREENS = {
       else push({ role: "err", text: (j && (j.text || (j.result && j.result.error))) || "Aktion fehlgeschlagen." });
     }
 
-    async function doUpload(file) {
+    // 📎-Upload: Bilder kann Q visualisieren ODER als Beleg ablegen → fragen.
+    // PDFs sind klar Belege → direkt in den Lexware-Upload. Die Bytes liegen
+    // nur hier im File-Objekt vor; wir hängen es an die Chat-Nachricht — das
+    // überlebt Re-Renders, weil App.qchat rein im Speicher lebt.
+    function onFilePicked(file) {
+      if (!file) return;
+      const isImg = file.type === "image/jpeg" || file.type === "image/png";
+      if (isImg) push({ role: "upload", file, name: file.name, stage: "choice" });
+      else doUploadBeleg(file);
+    }
+
+    async function doVisualisieren(file, prompt) {
+      push({ role: "me", text: "🖼️ " + file.name + " — „" + prompt + "“" });
+      push({ role: "typing" });
+      let res, j = null;
+      try {
+        res = await fetch("/app/api/visualisierungen?prompt=" + encodeURIComponent(prompt),
+          { method: "POST", headers: { "X-CSRF-Token": App.me.csrf, "Content-Type": file.type }, body: file });
+      } catch (e) { popTyping(); push({ role: "err", text: "Netzwerkfehler beim Rendern." }); return; }
+      if (res.status === 303 || res.status === 401 || res.redirected) { location.href = "/app/login"; return; }
+      try { j = await res.json(); } catch (e) {}
+      popTyping();
+      if (res.ok && j && j.ok && j.bild_url) {
+        const url = String(j.bild_url).replace(/"/g, "%22");
+        push({ role: "q", html: true, text:
+          `🖼️ Fertig! <a href="${url}" target="_blank" rel="noopener noreferrer">in voller Größe öffnen ↗</a>`
+          + `<img src="${url}" alt="Visualisierung" style="width:100%;border-radius:10px;margin-top:8px">` });
+      } else {
+        push({ role: "err", text: (j && j.error) || "Konnte kein Bild erzeugen — bitte anderes Foto/Beschreibung versuchen." });
+      }
+    }
+
+    async function doUploadBeleg(file) {
       if (!file) return;
       push({ role: "me", text: "📄 " + file.name });
       push({ role: "typing" });
@@ -1622,7 +1697,7 @@ const SCREENS = {
     input.addEventListener("input", auto);
     input.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } });
     attachBtn.addEventListener("click", () => fileEl.click());
-    fileEl.addEventListener("change", () => { if (fileEl.files && fileEl.files[0]) doUpload(fileEl.files[0]); fileEl.value = ""; });
+    fileEl.addEventListener("change", () => { if (fileEl.files && fileEl.files[0]) onFilePicked(fileEl.files[0]); fileEl.value = ""; });
 
     // Sphere → Halten zum Sprechen (Press-and-Hold ersetzt den alten Mic-Button)
     let _sphereHoldTimer = null;
