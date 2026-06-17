@@ -213,10 +213,28 @@ async def run_command(text: str, ctx: Ctx, history: list | None = None) -> dict:
         )
 
     for _step in range(MAX_STEPS):
-        try:
-            resp = await asyncio.to_thread(_sync_call, contents)
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("command_center Gemini-Call fehlgeschlagen: %s", exc)
+        # Bis zu 3 Versuche mit Backoff: ein 429 (RESOURCE_EXHAUSTED) ist meist
+        # nur ein kurzer Burst des Vertex-Minutenkontingents (z.B. direkt nach
+        # einer Bildgenerierung) und ist nach ein paar Sekunden weg.
+        resp = None
+        last_exc = None
+        for attempt in range(3):
+            try:
+                resp = await asyncio.to_thread(_sync_call, contents)
+                break
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                if ("RESOURCE_EXHAUSTED" in str(exc) or "429" in str(exc)) and attempt < 2:
+                    await asyncio.sleep(2.0 * (attempt + 1))
+                    continue
+                break
+        if resp is None:
+            logger.exception("command_center Gemini-Call fehlgeschlagen: %s",
+                             last_exc, exc_info=last_exc)
+            if "RESOURCE_EXHAUSTED" in str(last_exc) or "429" in str(last_exc):
+                return {"type": "error",
+                        "text": "Gerade ist viel los (Kontingent kurz erschöpft) — "
+                                "probier es in einer Minute nochmal."}
             return {"type": "error",
                     "text": "Der Assistent ist gerade nicht erreichbar. Bitte gleich nochmal."}
 
