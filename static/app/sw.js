@@ -88,7 +88,12 @@
 // erkannt (klarerer Tool-/System-Prompt, Gemini lehnt nicht mehr fälschlich
 // als „kann keine Bilder bearbeiten" ab); aktueller Text steht nicht mehr
 // doppelt im Kontext der Rückfrage-Runde.
-const CACHE = "ga-app-v53";
+// v54: Fix — angehängtes Bild „klebt" jetzt über Tab-Wechsel hinweg (vorher
+// nullte navigate() qPendingFile → Folge-Befehl nach der Rückfrage landete im
+// Text-Pfad und Gemini lehnte mangels Bild/Tool ab). Vorschau wird beim
+// Wiederbetreten des Assistenten wiederhergestellt; Bild-Router macht 1 Retry
+// bei 429 (Vertex-Kontingent-Burst).
+const CACHE = "ga-app-v54";
 const SHELL = [
   "/app",
   "/app/static/app.css",

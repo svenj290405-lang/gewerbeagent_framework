@@ -390,10 +390,27 @@ async def route_image_intent(
         return client.models.generate_content(
             model="gemini-2.5-flash", contents=contents, config=config)
 
-    try:
-        resp = await asyncio.to_thread(_sync_call)
-    except Exception:
-        logger.exception("route_image_intent: Gemini-Call fehlgeschlagen")
+    # Bis zu 2 Versuche: ein 429 (RESOURCE_EXHAUSTED) ist oft nur ein kurzer
+    # Burst des Vertex-Minutenkontingents und ist nach kurzem Warten weg.
+    resp = None
+    last_exc = None
+    for attempt in range(2):
+        try:
+            resp = await asyncio.to_thread(_sync_call)
+            break
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            is_429 = "RESOURCE_EXHAUSTED" in str(exc) or "429" in str(exc)
+            if is_429 and attempt == 0:
+                await asyncio.sleep(2.0)
+                continue
+            break
+    if resp is None:
+        logger.exception("route_image_intent: Gemini-Call fehlgeschlagen", exc_info=last_exc)
+        if "RESOURCE_EXHAUSTED" in str(last_exc) or "429" in str(last_exc):
+            return {"type": "message",
+                    "text": "Ich bin gerade kurz ausgelastet (Kontingent). Probier es "
+                            "in einem Moment nochmal."}
         return {"type": "message",
                 "text": "Konnte das Bild gerade nicht verarbeiten — bitte gleich nochmal."}
 

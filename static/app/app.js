@@ -71,9 +71,9 @@ function buildTabbar() {
 function navigate(key) {
   if (App.qSphereStop) { try { App.qSphereStop(); } catch (e) {} App.qSphereStop = null; App.qSphereCanvas = null; }
   if (App._qPasteListener) { document.removeEventListener("paste", App._qPasteListener); App._qPasteListener = null; }
-  if (App.qPendingPreviewUrl) { try { URL.revokeObjectURL(App.qPendingPreviewUrl); } catch (e) {} App.qPendingPreviewUrl = null; }
-  App.qPendingFile = null;
-  App.qImgChat = [];
+  // Ein angehängtes Bild bleibt absichtlich „kleben" — sonst ginge ein Tab-
+  // Wechsel zwischen Rückfrage und Antwort verloren und der Folge-Befehl
+  // landete im Text-Pfad. clearPending() räumt es auf (Aktion/Entfernen).
   App.qIntent = null;
   App.qWorking = false;
   App.current = key;
@@ -1749,6 +1749,23 @@ const SCREENS = {
     // Nutzer kann eine Anweisung dazu tippen und senden — Q entscheidet dann
     // (visualisieren / im Archiv ablegen / als Beleg) oder fragt nach.
     // PDFs → nach wie vor direkt als Beleg hochladen (kein Bild-Pfad).
+    // Composer-Vorschau aus App.qPendingFile (neu) befüllen — wird auch beim
+    // Wiederbetreten des Screens aufgerufen, damit ein „klebendes" Bild nach
+    // einem Tab-Wechsel sichtbar bleibt.
+    function showPendingPreview() {
+      const previewEl = document.getElementById("composer-preview");
+      if (!previewEl || !App.qPendingFile) return;
+      const url = App.qPendingPreviewUrl;
+      const name = App.qPendingFile.name || "Bild";
+      previewEl.innerHTML =
+        `<div class="composer-preview-item">
+           ${url ? `<img src="${url}" alt="${esc(name)}">` : `<span class="composer-preview-file">📷 ${esc(name)}</span>`}
+           <button class="cp-remove" id="q-preview-remove" aria-label="Anhang entfernen">✕</button>
+         </div>`;
+      previewEl.hidden = false;
+      document.getElementById("q-preview-remove").addEventListener("click", clearPending);
+    }
+
     function onFilePicked(file) {
       if (!file) return;
       const isImg = /^image\/(jpeg|png|webp)$/.test(file.type);
@@ -1762,13 +1779,7 @@ const SCREENS = {
         let previewUrl = null;
         try { previewUrl = URL.createObjectURL(file); } catch (_) {}
         App.qPendingPreviewUrl = previewUrl;
-        previewEl.innerHTML =
-          `<div class="composer-preview-item">
-             ${previewUrl ? `<img src="${previewUrl}" alt="${esc(file.name)}">` : `<span class="composer-preview-file">📷 ${esc(file.name)}</span>`}
-             <button class="cp-remove" id="q-preview-remove" aria-label="Anhang entfernen">✕</button>
-           </div>`;
-        previewEl.hidden = false;
-        document.getElementById("q-preview-remove").addEventListener("click", clearPending);
+        showPendingPreview();
         input.focus();
       } else {
         // PDF und andere → bisheriger Flow (Beleg hochladen)
@@ -2167,6 +2178,8 @@ const SCREENS = {
 
     render();
     auto();
+    // Ein „klebendes" Bild (über Tab-Wechsel hinweg) wieder als Vorschau zeigen.
+    if (App.qPendingFile) showPendingPreview();
     // Q-Onboarding beim ersten Start (oder „Mehr → Einrichtung starten").
     if (App.startOnboarding) { App.startOnboarding = false; runOnboarding(); }
     // Vorbefüllung aus einem Quick-Aktion/„Angebot erstellen"-Tap.
