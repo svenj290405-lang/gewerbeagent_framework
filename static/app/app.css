@@ -231,6 +231,22 @@ button:disabled { opacity: .6; }
 .composer .cbtn.rec { background: var(--danger); color: #fff; animation: recpulse 1s infinite; }
 @keyframes recpulse { 0%,100% { box-shadow: 0 0 0 0 rgba(217,69,63,.4); } 50% { box-shadow: 0 0 0 7px rgba(217,69,63,0); } }
 
+/* Anhang-Vorschau im Composer (Bild vor dem Senden) */
+.composer-preview { display: flex; gap: 8px; flex-wrap: wrap; max-width: 720px; width: 100%; margin: 0 auto; padding: 2px 0 4px; }
+.composer-preview[hidden] { display: none; }
+.composer-preview-item { position: relative; display: inline-flex; align-items: center;
+  background: var(--bg); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+.composer-preview-item img { width: 80px; height: 60px; object-fit: cover; display: block; }
+.composer-preview-item .cp-remove { position: absolute; top: 3px; right: 3px;
+  width: 20px; height: 20px; border-radius: 50%; background: rgba(0,0,0,.55);
+  color: #fff; border: none; font-size: 13px; line-height: 1; cursor: pointer;
+  display: flex; align-items: center; justify-content: center; padding: 0; flex-shrink: 0; }
+.composer-preview-file { padding: 8px 28px 8px 10px; font-size: 13px; color: var(--text);
+  max-width: 160px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* Bild-Bubble auf der "Ich"-Seite */
+.bubble.me img.msg-img { max-width: 100%; max-height: 180px; object-fit: cover;
+  border-radius: 10px; display: block; margin-bottom: 4px; }
+
 /* ---------- Einrichtungs-Tour / Onboarding-Overlay ---------- */
 .tut-overlay { position: fixed; inset: 0; z-index: 50; background: var(--bg);
   display: flex; flex-direction: column; animation: tutfade .2s ease; }

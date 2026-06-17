@@ -70,6 +70,10 @@ function buildTabbar() {
 
 function navigate(key) {
   if (App.qSphereStop) { try { App.qSphereStop(); } catch (e) {} App.qSphereStop = null; App.qSphereCanvas = null; }
+  if (App._qPasteListener) { document.removeEventListener("paste", App._qPasteListener); App._qPasteListener = null; }
+  if (App.qPendingPreviewUrl) { try { URL.revokeObjectURL(App.qPendingPreviewUrl); } catch (e) {} App.qPendingPreviewUrl = null; }
+  App.qPendingFile = null;
+  App.qImgChat = [];
   App.qIntent = null;
   App.qWorking = false;
   App.current = key;
@@ -1308,14 +1312,15 @@ const SCREENS = {
       `<div class="chat" id="q-chat"></div>
        <div class="composer">
          <div class="q-menu" id="q-menu" hidden></div>
+         <div class="composer-preview" id="composer-preview" hidden></div>
          <div class="composer-inner">
            <button class="cbtn ghost" id="q-actions" title="Funktionen" aria-label="Funktionen">${IC.spark}</button>
-           <button class="cbtn ghost" id="q-attach" title="Foto visualisieren oder Beleg hochladen" aria-label="Anhängen">${IC.clip}</button>
-           <textarea id="q-input" rows="1" placeholder="Schreib Q …"></textarea>
+           <button class="cbtn ghost" id="q-attach" title="Foto oder Datei anhängen" aria-label="Anhängen">${IC.clip}</button>
+           <textarea id="q-input" rows="1" placeholder="Schreib Q … (Bilder einfügen mit Strg+V)"></textarea>
            <button class="cbtn" id="q-send" title="Senden" aria-label="Senden">${IC.send}</button>
          </div>
        </div>
-       <input type="file" id="q-file" accept="image/jpeg,image/png,application/pdf" style="display:none">`;
+       <input type="file" id="q-file" accept="image/jpeg,image/png,image/webp,application/pdf" style="display:none">`;
 
     const chatEl = document.getElementById("q-chat");
     const input = document.getElementById("q-input");
@@ -1402,7 +1407,10 @@ const SCREENS = {
       }
       if (App.qSphereStop) { try { App.qSphereStop(); } catch (e) {} App.qSphereStop = null; App.qSphereCanvas = null; }
       chatEl.innerHTML = App.qchat.map((m, i) => {
-        if (m.role === "me") return `<div class="bubble me">${esc(m.text)}</div>`;
+        if (m.role === "me") {
+          const imgTag = m.previewUrl ? `<img class="msg-img" src="${m.previewUrl}" alt="${esc(m.fileName || "Bild")}">` : "";
+          return `<div class="bubble me">${imgTag}${m.text ? esc(m.text) : ""}</div>`;
+        }
         if (m.role === "typing") return `<div class="bubble q typing"><span></span><span></span><span></span></div>`;
         if (m.role === "err") return `<div class="bubble q err">${esc(m.text)}</div>`;
         if (m.role === "onb") {
@@ -1587,10 +1595,70 @@ const SCREENS = {
     function push(m) { App.qchat.push(m); render(); }
     function popTyping() { const i = App.qchat.findIndex((x) => x.role === "typing"); if (i >= 0) App.qchat.splice(i, 1); }
 
+    // Bild-Anhang verwerfen (nach ausgefuehrter Aktion oder Abbruch). Der
+    // Composer-Vorschau-Blob wird hier freigegeben; die in den Chat-Blasen
+    // gerenderten Thumbnails halten eigene Blob-URLs (bewusst nicht revoked,
+    // sonst zeigen sie nach einem Re-Render kaputte Bilder).
+    function clearPending() {
+      App.qPendingFile = null;
+      App.qImgChat = [];
+      if (App.qPendingPreviewUrl) {
+        try { URL.revokeObjectURL(App.qPendingPreviewUrl); } catch (_) {}
+        App.qPendingPreviewUrl = null;
+      }
+      const el = document.getElementById("composer-preview");
+      if (el) { el.innerHTML = ""; el.hidden = true; }
+    }
+
+    // Ein Bild-Turn: Bild + (optionaler) Text an Q. Q entscheidet, was zu tun
+    // ist. Bei einer Rückfrage bleibt das Bild angehängt, damit die Antwort
+    // des Nutzers ("bei Müller ablegen") im selben Kontext weiterläuft.
+    async function sendImageTurn(text, file) {
+      App.qImgChat = App.qImgChat || [];
+      App.qImgChat.push({ role: "user", text: text || "(Bild angehängt)" });
+      let bubbleUrl = null;
+      try { bubbleUrl = URL.createObjectURL(file); } catch (_) {}
+      push({ role: "me", text, previewUrl: bubbleUrl, fileName: file.name });
+      push({ role: "typing" });
+      let res, j = null;
+      const hist = encodeURIComponent(JSON.stringify(
+        App.qImgChat.slice(-8).map((t) => ({ role: t.role, text: (t.text || "").slice(0, 500) }))));
+      const url = "/app/api/assistent/mit-bild?text=" + encodeURIComponent(text) + "&hist=" + hist;
+      try {
+        res = await fetch(url, { method: "POST",
+          headers: { "X-CSRF-Token": App.me.csrf, "Content-Type": file.type }, body: file });
+      } catch (_) { popTyping(); push({ role: "err", text: "Netzwerkfehler. Bitte erneut." }); return; }
+      if (res.status === 303 || res.status === 401 || res.redirected) { location.href = "/app/login"; return; }
+      try { j = await res.json(); } catch (_) {}
+      popTyping();
+      if (!j || !j.type) { push({ role: "err", text: "Konnte das Bild nicht verarbeiten." }); return; }
+
+      if (j.type === "action") {
+        // Q hat sich für eine Aktion entschieden → im Hintergrund ausführen.
+        clearPending();
+        if (j.action === "visualisieren") doVisualisieren(file, j.beschreibung || text);
+        else if (j.action === "archiv") doArchiv(file, j.kunde_name || "");
+        else if (j.action === "beleg") doUploadBeleg(file);
+        else push({ role: "err", text: "Unbekannte Aktion." });
+        return;
+      }
+
+      // message/error → Rückfrage oder Antwort; Bild bleibt für die Folge an.
+      const msg = j.text || "Was soll ich mit dem Bild machen?";
+      App.qImgChat.push({ role: "model", text: msg });
+      push({ role: (j.type === "error" ? "err" : "q"), text: msg });
+    }
+
     async function send() {
       const text = (input.value || "").trim();
-      if (!text) return;
+      const pendingFile = App.qPendingFile || null;
+      if (!text && !pendingFile) return;
       input.value = ""; auto();
+
+      // Bild angehängt → Q entscheidet, was damit passiert.
+      if (pendingFile) { await sendImageTurn(text, pendingFile); return; }
+
+      // ── Nur Text an /assistent ───────────────────────────────
       const history = App.qhistory.slice(-QHIST_MAX);
       App.qhistory.push({ role: "user", text });
       push({ role: "me", text });
@@ -1600,9 +1668,9 @@ const SCREENS = {
         res = await fetch("/app/api/assistent", { method: "POST",
           headers: { "X-CSRF-Token": App.me.csrf, "Content-Type": "application/json" },
           body: JSON.stringify({ text, history }) });
-      } catch (e) { popTyping(); push({ role: "err", text: "Netzwerkfehler. Bitte erneut." }); return; }
+      } catch (_) { popTyping(); push({ role: "err", text: "Netzwerkfehler. Bitte erneut." }); return; }
       if (res.status === 303 || res.status === 401 || res.redirected) { location.href = "/app/login"; return; }
-      try { j = await res.json(); } catch (e) {}
+      try { j = await res.json(); } catch (_) {}
       popTyping();
       if (!j || !j.type) { push({ role: "err", text: "Konnte den Befehl nicht verarbeiten." }); return; }
       qHistoryRecord(j);
@@ -1673,18 +1741,33 @@ const SCREENS = {
       else push({ role: "err", text: (j && (j.text || (j.result && j.result.error))) || "Aktion fehlgeschlagen." });
     }
 
-    // 📎-Upload: Bilder kann Q visualisieren ODER als Beleg ablegen → fragen.
-    // PDFs sind klar Belege → direkt in den Lexware-Upload. Die Bytes liegen
-    // nur hier im File-Objekt vor; wir hängen es an die Chat-Nachricht — das
-    // überlebt Re-Renders, weil App.qchat rein im Speicher lebt.
+    // 📎-Upload: Bilder → als Vorschau in den Composer (Gemini/Claude-Stil).
+    // Nutzer kann eine Anweisung dazu tippen und senden — Q entscheidet dann
+    // (visualisieren / im Archiv ablegen / als Beleg) oder fragt nach.
+    // PDFs → nach wie vor direkt als Beleg hochladen (kein Bild-Pfad).
     function onFilePicked(file) {
       if (!file) return;
-      const isImg = file.type === "image/jpeg" || file.type === "image/png";
+      const isImg = /^image\/(jpeg|png|webp)$/.test(file.type);
       if (isImg) {
+        const previewEl = document.getElementById("composer-preview");
+        if (!previewEl) return;
+        // evtl. vorheriger Anhang weg, neuen Bild-Verlauf starten
+        clearPending();
+        App.qPendingFile = file;
+        App.qImgChat = [];
         let previewUrl = null;
-        try { previewUrl = URL.createObjectURL(file); } catch (e) {}
-        push({ role: "upload", file, name: file.name, previewUrl, stage: "choice" });
+        try { previewUrl = URL.createObjectURL(file); } catch (_) {}
+        App.qPendingPreviewUrl = previewUrl;
+        previewEl.innerHTML =
+          `<div class="composer-preview-item">
+             ${previewUrl ? `<img src="${previewUrl}" alt="${esc(file.name)}">` : `<span class="composer-preview-file">📷 ${esc(file.name)}</span>`}
+             <button class="cp-remove" id="q-preview-remove" aria-label="Anhang entfernen">✕</button>
+           </div>`;
+        previewEl.hidden = false;
+        document.getElementById("q-preview-remove").addEventListener("click", clearPending);
+        input.focus();
       } else {
+        // PDF und andere → bisheriger Flow (Beleg hochladen)
         doUploadBeleg(file);
       }
     }
@@ -1747,6 +1830,29 @@ const SCREENS = {
     input.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } });
     attachBtn.addEventListener("click", () => fileEl.click());
     fileEl.addEventListener("change", () => { if (fileEl.files && fileEl.files[0]) onFilePicked(fileEl.files[0]); fileEl.value = ""; });
+
+    // Paste-Handler: Bilder aus Zwischenablage (Strg+V / Cmd+V) direkt anhängen
+    function onPaste(e) {
+      const items = (e.clipboardData || {}).items;
+      if (!items) return;
+      for (const item of items) {
+        if (/^image\//.test(item.type)) {
+          const file = item.getAsFile();
+          if (file) { e.preventDefault(); onFilePicked(file); break; }
+        }
+      }
+    }
+    if (App._qPasteListener) document.removeEventListener("paste", App._qPasteListener);
+    App._qPasteListener = onPaste;
+    document.addEventListener("paste", onPaste);
+
+    // Drag & Drop: Bilder auf den Chat-Bereich ziehen
+    chatEl.addEventListener("dragover", (e) => { e.preventDefault(); e.dataTransfer.dropEffect = "copy"; });
+    chatEl.addEventListener("drop", (e) => {
+      e.preventDefault();
+      const files = e.dataTransfer.files;
+      if (files && files[0]) onFilePicked(files[0]);
+    });
 
     // Sphere → Halten zum Sprechen (Press-and-Hold ersetzt den alten Mic-Button)
     let _sphereHoldTimer = null;

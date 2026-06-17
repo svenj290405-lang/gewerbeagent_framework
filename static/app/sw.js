@@ -80,7 +80,11 @@
 // v51: 📎-Bild-Upload zeigt jetzt eine Vorschau + fragt mit allen
 // freigeschalteten Optionen (🎨 Visualisieren / 📄 Beleg / 📁 Im Kunden-Archiv
 // speichern). Archiv fragt nach dem Kundennamen.
-const CACHE = "ga-app-v51";
+// v52: Bild-Upload ohne Buttons — Q entscheidet per Chat. Bild anhängen + (optional)
+// Anweisung tippen → Q routet selbst (visualisieren / im Kundenarchiv ablegen /
+// als Beleg) oder fragt nach, was damit passieren soll. Bild bleibt über die
+// Rückfrage angehängt. Statt Frontend-Stichwörter entscheidet Gemini.
+const CACHE = "ga-app-v52";
 const SHELL = [
   "/app",
   "/app/static/app.css",

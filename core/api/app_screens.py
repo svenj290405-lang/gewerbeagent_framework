@@ -3417,6 +3417,95 @@ async def api_assistent_ausfuehren(
     return JSONResponse(result, status_code=status)
 
 
+@router.post("/assistent/mit-bild")
+async def api_assistent_mit_bild(
+    request: Request,
+    _e=Depends(require_app_user),
+    _c=Depends(require_app_csrf),
+) -> JSONResponse:
+    """Bild + (optionaler) Freitext an Q. Q entscheidet per Function-Calling,
+    was mit dem Bild geschehen soll — visualisieren, im Kundenarchiv ablegen
+    oder als Beleg erfassen — oder fragt nach bzw. beantwortet eine Frage zum
+    Bild. Die eigentliche Aktion fuehrt das Frontend danach mit den
+    vorhandenen Endpunkten aus (es haelt die Bytes ohnehin).
+
+    Body: rohe Bild-Bytes. Content-Type = MIME (image/jpeg|png|webp).
+    Query: ?text=... (URL-kodiert, max 1000 Zeichen),
+           ?hist=... (URL-kodiertes JSON [{role,text}], fuer Rueckfragen)
+
+    Antwort (eines von):
+      { "type": "message", "text": ... }                       — Antwort/Rueckfrage
+      { "type": "action", "action": "visualisieren", "beschreibung": ... }
+      { "type": "action", "action": "archiv", "kunde_name": ... }
+      { "type": "action", "action": "beleg" }
+    """
+    import json
+
+    from core.ai.gemini import route_image_intent
+
+    image_bytes = await request.body()
+    if not image_bytes or len(image_bytes) < 100:
+        return JSONResponse({"type": "error", "text": "Kein Bild empfangen."}, status_code=400)
+    if len(image_bytes) > 15 * 1024 * 1024:
+        return JSONResponse(
+            {"type": "error", "text": "Bild zu groß (max 15 MB)."},
+            status_code=413,
+        )
+
+    mime = (request.headers.get("content-type") or "").split(";")[0].strip().lower()
+    if mime not in ("image/jpeg", "image/png", "image/webp"):
+        return JSONResponse(
+            {"type": "error", "text": "Nur Bilder (JPEG, PNG, WebP) werden unterstützt."},
+            status_code=415,
+        )
+
+    text = (request.query_params.get("text") or "").strip()[:1000]
+
+    # Kurzer Verlauf der Bild-Konversation (fuer Rueckfragen wie „welcher
+    # Kunde?" → „Müller"). Defensiv geparst und begrenzt.
+    history = []
+    raw_hist = request.query_params.get("hist") or ""
+    if raw_hist:
+        try:
+            parsed = json.loads(raw_hist)
+        except (ValueError, TypeError):
+            parsed = None
+        if isinstance(parsed, list):
+            for turn in parsed[-8:]:
+                if not isinstance(turn, dict):
+                    continue
+                role = "model" if turn.get("role") == "model" else "user"
+                t = (turn.get("text") or "").strip()
+                if t:
+                    history.append({"role": role, "text": t[:500]})
+
+    ctx = await _build_command_ctx(request)
+    company_name = getattr(ctx.tenant, "company_name", "") or "dem Betrieb"
+    raw_name = getattr(ctx.employee, "name", "") or ""
+    employee_name = raw_name.split()[0] if raw_name.strip() else "dir"
+
+    try:
+        result = await route_image_intent(
+            image_bytes,
+            mime_type=mime,
+            text=text,
+            features=ctx.features,
+            company_name=company_name,
+            employee_name=employee_name,
+            history=history,
+        )
+    except Exception as exc:
+        logger.exception("api_assistent_mit_bild: %s", exc)
+        return JSONResponse(
+            {"type": "error", "text": "Fehler beim Verarbeiten des Bildes."},
+            status_code=500,
+        )
+
+    from core.models.app_usage_event import record_app_usage, USAGE_ASSISTENT_BEFEHL
+    await record_app_usage(ctx.tid, getattr(ctx.employee, "id", None), USAGE_ASSISTENT_BEFEHL)
+    return JSONResponse(result)
+
+
 @router.post("/assistent/transkript")
 async def api_assistent_transkript(
     request: Request,

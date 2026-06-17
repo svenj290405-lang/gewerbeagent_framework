@@ -221,6 +221,185 @@ async def generate_image_from_image(
 
 
 # =====================================================================
+# Bild-Intent-Routing: Bild + Freitext → Q entscheidet, was zu tun ist
+# =====================================================================
+#
+# Der Nutzer haengt ein Bild im Q-Chat an und tippt (optional) dazu, was
+# damit passieren soll. Gemini entscheidet per Function-Calling zwischen
+# den freigeschalteten Aktionen — visualisieren, im Kundenarchiv ablegen,
+# als Beleg erfassen — oder beantwortet eine Frage zum Bild als Text.
+#
+# Ist KEIN klarer Auftrag dabei, fragt Q in einem Satz nach (statt das Bild
+# einfach nur zu beschreiben). Die eigentliche Aktion fuehrt das Frontend
+# danach mit den vorhandenen Endpunkten aus (es haelt die Bytes ohnehin) —
+# diese Funktion liefert nur Intent + extrahierte Argumente.
+
+# action -> (feature-flag, Tool-Beschreibung, Argument-Schema-Bauer)
+_BILD_AKTIONEN = {
+    "visualisieren": (
+        "visualisierung",
+        "Erstellt aus dem Foto eine fotorealistische Visualisierung mit der "
+        "gewuenschten Aenderung (z.B. Waende streichen, anderer Bodenbelag, "
+        "Moebel umstellen). Nur waehlen, wenn der Nutzer eine VERAENDERUNG am "
+        "Bild sehen will.",
+        {"beschreibung": "Was am Bild geaendert/visualisiert werden soll, "
+                         "moeglichst konkret (z.B. 'Waende in warmem Grau, "
+                         "Eichenparkett verlegen')."},
+    ),
+    "archiv": (
+        "drive_archiv",
+        "Legt das Foto/Dokument im Google-Drive-Ordner eines Kunden ab "
+        "(Kunden-Archiv). Waehlen, wenn der Nutzer das Bild bei einem Kunden "
+        "speichern/ablegen/archivieren will.",
+        {"kunde_name": "Name des Kunden, zu dem das Bild abgelegt wird."},
+    ),
+    "beleg": (
+        "lexware",
+        "Erfasst das Foto als Beleg/Rechnung in der Buchhaltung. Waehlen, wenn "
+        "es sich um eine Quittung, einen Kassenbon oder eine Rechnung handelt.",
+        {},
+    ),
+}
+
+
+async def route_image_intent(
+    image_bytes: bytes,
+    mime_type: str,
+    text: str,
+    *,
+    features: set[str] | None = None,
+    company_name: str = "dem Betrieb",
+    employee_name: str = "dir",
+    history: list | None = None,
+) -> dict:
+    """Bild + (optionaler) Freitext → Intent. Gemini 2.5 Flash, Function-Calling.
+
+    Rueckgabe (genau einer der Typen):
+      * {"type": "message", "text": str}
+            Q hat geantwortet oder nachgefragt — keine Aktion noetig.
+      * {"type": "action", "action": "visualisieren", "beschreibung": str}
+      * {"type": "action", "action": "archiv", "kunde_name": str}
+      * {"type": "action", "action": "beleg"}
+
+    Die Aktion fuehrt das Frontend mit den vorhandenen Endpunkten aus.
+    Verarbeitung in europe-west3 (Frankfurt) — DSGVO-konform.
+    """
+    import datetime as _dt
+    from google.genai import types
+
+    feats = features or set()
+    heute = _dt.date.today()
+    wochentag = ["Montag", "Dienstag", "Mittwoch", "Donnerstag",
+                 "Freitag", "Samstag", "Sonntag"][heute.weekday()]
+
+    # Nur freigeschaltete Aktionen anbieten.
+    decls = []
+    aktiv: list[str] = []
+    for action, (feature, beschreibung, schema) in _BILD_AKTIONEN.items():
+        if feature not in feats:
+            continue
+        aktiv.append(action)
+        params = {
+            "type": "OBJECT",
+            "properties": {k: {"type": "STRING", "description": v}
+                           for k, v in schema.items()},
+            "required": list(schema.keys()),
+        }
+        decls.append(types.FunctionDeclaration(
+            name=action, description=beschreibung, parameters=params))
+
+    aktions_text = {
+        "visualisieren": "eine Visualisierung erstellen (Aenderung am Foto)",
+        "archiv": "im Kundenarchiv (Google Drive) ablegen",
+        "beleg": "als Beleg in der Buchhaltung erfassen",
+    }
+    optionen = "; ".join(aktions_text[a] for a in aktiv) or "keine"
+
+    system_text = (
+        f"Du bist Q, der Assistent von {employee_name} bei {company_name}. "
+        f"Heute ist {wochentag}, der {heute.strftime('%d.%m.%Y')}. "
+        "Der Nutzer hat ein Bild angehaengt. Entscheide, was er damit moechte.\n"
+        f"Moegliche Aktionen mit dem Bild: {optionen}.\n"
+        "Regeln:\n"
+        "- Verlangt der Text klar eine dieser Aktionen, rufe die passende "
+        "Funktion mit den extrahierten Argumenten auf.\n"
+        "- Fehlt eine Pflichtangabe (z.B. der Kundenname zum Ablegen), dann "
+        "FRAGE kurz nach, statt zu raten — rufe noch keine Funktion auf.\n"
+        "- Stellt der Nutzer eine FRAGE zum Bild ('was ist das?', 'was "
+        "stimmt hier nicht?'), beantworte sie kurz als Text, ohne Funktion.\n"
+        "- Hat der Nutzer NICHTS oder nur Unklares geschrieben, frage in EINEM "
+        "kurzen Satz nach, was mit dem Bild passieren soll, und nenne die "
+        "moeglichen Aktionen. Beschreibe das Bild dann nicht von dir aus.\n"
+        "- Antworte immer kurz, auf Deutsch, in der Du-Form, wie ein Kollege."
+    )
+
+    config = types.GenerateContentConfig(
+        temperature=0.1,
+        max_output_tokens=1024,
+        system_instruction=system_text,
+        tools=[types.Tool(function_declarations=decls)] if decls else None,
+    )
+
+    # Verlauf voranstellen (Text-Turns); das Bild haengt am letzten User-Turn.
+    contents: list = []
+    started = False
+    for turn in (history or []):
+        role = "model" if (turn or {}).get("role") == "model" else "user"
+        t = ((turn or {}).get("text") or "").strip()
+        if not t or (not started and role != "user"):
+            continue
+        started = True
+        contents.append(types.Content(role=role, parts=[types.Part.from_text(text=t)]))
+
+    frage = text.strip() or "(Ich habe ein Bild angehaengt.)"
+    contents.append(types.Content(role="user", parts=[
+        types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
+        types.Part.from_text(text=frage),
+    ]))
+
+    client = _get_genai_client(location=GENAI_TEXT_LOCATION)
+
+    def _sync_call():
+        return client.models.generate_content(
+            model="gemini-2.5-flash", contents=contents, config=config)
+
+    try:
+        resp = await asyncio.to_thread(_sync_call)
+    except Exception:
+        logger.exception("route_image_intent: Gemini-Call fehlgeschlagen")
+        return {"type": "message",
+                "text": "Konnte das Bild gerade nicht verarbeiten — bitte gleich nochmal."}
+
+    if not resp.candidates or not resp.candidates[0].content:
+        return {"type": "message", "text": "Keine Antwort erhalten — bitte erneut."}
+
+    parts = resp.candidates[0].content.parts or []
+    fc = next((p.function_call for p in parts if getattr(p, "function_call", None)), None)
+    say = "".join(p.text for p in parts if getattr(p, "text", None)).strip()
+
+    if fc is not None and fc.name in aktiv:
+        args = {k: v for k, v in dict(fc.args or {}).items()}
+        if fc.name == "visualisieren":
+            beschreibung = (args.get("beschreibung") or text).strip()
+            if len(beschreibung) < 5:
+                return {"type": "message",
+                        "text": "Beschreib mir kurz, was ich am Foto aendern soll."}
+            return {"type": "action", "action": "visualisieren",
+                    "beschreibung": beschreibung[:500]}
+        if fc.name == "archiv":
+            kunde = (args.get("kunde_name") or "").strip()
+            if len(kunde) < 2:
+                return {"type": "message",
+                        "text": "Bei welchem Kunden soll ich das Bild ablegen?"}
+            return {"type": "action", "action": "archiv", "kunde_name": kunde[:200]}
+        if fc.name == "beleg":
+            return {"type": "action", "action": "beleg"}
+
+    return {"type": "message",
+            "text": say or "Was soll ich mit dem Bild machen?"}
+
+
+# =====================================================================
 # Rechnung-Extraktion (Text + Audio) via google-genai (europe-west3)
 # =====================================================================
 
