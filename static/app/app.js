@@ -1615,14 +1615,16 @@ const SCREENS = {
     // des Nutzers ("bei Müller ablegen") im selben Kontext weiterläuft.
     async function sendImageTurn(text, file) {
       App.qImgChat = App.qImgChat || [];
-      App.qImgChat.push({ role: "user", text: text || "(Bild angehängt)" });
+      // hist = bisheriger Verlauf OHNE den aktuellen Turn — der aktuelle Text
+      // geht als ?text= mit und wird serverseitig als finaler Bild-Turn
+      // angehängt; sonst stünde er doppelt im Kontext und verwirrt die Runde.
+      const hist = encodeURIComponent(JSON.stringify(
+        App.qImgChat.slice(-8).map((t) => ({ role: t.role, text: (t.text || "").slice(0, 500) }))));
       let bubbleUrl = null;
       try { bubbleUrl = URL.createObjectURL(file); } catch (_) {}
       push({ role: "me", text, previewUrl: bubbleUrl, fileName: file.name });
       push({ role: "typing" });
       let res, j = null;
-      const hist = encodeURIComponent(JSON.stringify(
-        App.qImgChat.slice(-8).map((t) => ({ role: t.role, text: (t.text || "").slice(0, 500) }))));
       const url = "/app/api/assistent/mit-bild?text=" + encodeURIComponent(text) + "&hist=" + hist;
       try {
         res = await fetch(url, { method: "POST",
@@ -1644,7 +1646,9 @@ const SCREENS = {
       }
 
       // message/error → Rückfrage oder Antwort; Bild bleibt für die Folge an.
+      // Jetzt erst Frage + Antwort in den Verlauf für die nächste Runde.
       const msg = j.text || "Was soll ich mit dem Bild machen?";
+      App.qImgChat.push({ role: "user", text: text || "(Bild angehängt)" });
       App.qImgChat.push({ role: "model", text: msg });
       push({ role: (j.type === "error" ? "err" : "q"), text: msg });
     }

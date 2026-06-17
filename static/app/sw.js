@@ -84,7 +84,11 @@
 // Anweisung tippen → Q routet selbst (visualisieren / im Kundenarchiv ablegen /
 // als Beleg) oder fragt nach, was damit passieren soll. Bild bleibt über die
 // Rückfrage angehängt. Statt Frontend-Stichwörter entscheidet Gemini.
-const CACHE = "ga-app-v52";
+// v53: Fix — „mach daraus ..."-Wünsche werden zuverlässig als Visualisierung
+// erkannt (klarerer Tool-/System-Prompt, Gemini lehnt nicht mehr fälschlich
+// als „kann keine Bilder bearbeiten" ab); aktueller Text steht nicht mehr
+// doppelt im Kontext der Rückfrage-Runde.
+const CACHE = "ga-app-v53";
 const SHELL = [
   "/app",
   "/app/static/app.css",

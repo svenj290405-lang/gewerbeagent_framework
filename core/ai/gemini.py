@@ -238,13 +238,16 @@ async def generate_image_from_image(
 _BILD_AKTIONEN = {
     "visualisieren": (
         "visualisierung",
-        "Erstellt aus dem Foto eine fotorealistische Visualisierung mit der "
-        "gewuenschten Aenderung (z.B. Waende streichen, anderer Bodenbelag, "
-        "Moebel umstellen). Nur waehlen, wenn der Nutzer eine VERAENDERUNG am "
-        "Bild sehen will.",
+        "Erzeugt aus dem angehaengten Foto ein NEUES, fotorealistisches Bild "
+        "mit der gewuenschten Aenderung (z.B. Waende streichen, anderer "
+        "Bodenbelag, andere Treppe, Moebel umstellen, Material aendern). "
+        "Waehle dieses Tool immer, wenn der Nutzer das Foto veraendert oder "
+        "umgestaltet sehen will — auch bei Formulierungen wie 'mach daraus "
+        "...', 'verwandle das in ...', 'gestalte ... um', 'zeig das als ...', "
+        "'wie sieht das mit ... aus'.",
         {"beschreibung": "Was am Bild geaendert/visualisiert werden soll, "
-                         "moeglichst konkret (z.B. 'Waende in warmem Grau, "
-                         "Eichenparkett verlegen')."},
+                         "moeglichst konkret (z.B. 'Treppe aus Schiefer', "
+                         "'Waende in warmem Grau, Eichenparkett verlegen')."},
     ),
     "archiv": (
         "drive_archiv",
@@ -315,6 +318,21 @@ async def route_image_intent(
     }
     optionen = "; ".join(aktions_text[a] for a in aktiv) or "keine"
 
+    # Nur wenn Visualisieren freigeschaltet ist: dem Modell explizit sagen,
+    # dass es Bilder veraendern KANN (sonst lehnt es 'mach daraus ...' faelsch
+    # mit 'ich kann keine Bilder bearbeiten' ab, statt das Tool zu rufen).
+    viz_hinweis = ""
+    if "visualisieren" in aktiv:
+        viz_hinweis = (
+            "- WICHTIG: Du KANNST Fotos veraendern lassen — das Tool "
+            "visualisieren erzeugt aus dem Foto ein neues Bild mit der "
+            "gewuenschten Aenderung. Wuensche wie 'mach daraus eine ...', "
+            "'verwandle das in ...', 'streiche die Waende ...', 'andere "
+            "Treppe/Boden/Farbe' lehnst du NIEMALS mit 'ich kann keine "
+            "Bilder bearbeiten' o.ae. ab — du rufst dann immer das Tool "
+            "visualisieren auf.\n"
+        )
+
     system_text = (
         f"Du bist Q, der Assistent von {employee_name} bei {company_name}. "
         f"Heute ist {wochentag}, der {heute.strftime('%d.%m.%Y')}. "
@@ -323,6 +341,7 @@ async def route_image_intent(
         "Regeln:\n"
         "- Verlangt der Text klar eine dieser Aktionen, rufe die passende "
         "Funktion mit den extrahierten Argumenten auf.\n"
+        + viz_hinweis +
         "- Fehlt eine Pflichtangabe (z.B. der Kundenname zum Ablegen), dann "
         "FRAGE kurz nach, statt zu raten — rufe noch keine Funktion auf.\n"
         "- Stellt der Nutzer eine FRAGE zum Bild ('was ist das?', 'was "
@@ -341,9 +360,17 @@ async def route_image_intent(
     )
 
     # Verlauf voranstellen (Text-Turns); das Bild haengt am letzten User-Turn.
+    # Einen abschliessenden User-Turn, der dem aktuellen Text entspricht,
+    # weglassen — sonst stuende er doppelt im Kontext (alte Clients schickten
+    # den aktuellen Turn noch mit in hist).
+    hist_turns = list(history or [])
+    cur = text.strip()
+    while hist_turns and (hist_turns[-1] or {}).get("role") != "model" \
+            and ((hist_turns[-1] or {}).get("text") or "").strip() == cur and cur:
+        hist_turns.pop()
     contents: list = []
     started = False
-    for turn in (history or []):
+    for turn in hist_turns:
         role = "model" if (turn or {}).get("role") == "model" else "user"
         t = ((turn or {}).get("text") or "").strip()
         if not t or (not started and role != "user"):
