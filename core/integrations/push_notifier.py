@@ -3,8 +3,13 @@
 Loest die Telegram-Pushes ab. **DSGVO-Kern:** der Payload ist bewusst
 minimal/inhaltslos — er enthaelt KEINE Endkunden-PII. FCM/APNs/Mozilla
 sehen nur einen verschluesselten Blob mit z.B. {"title": "Neue Buchung",
-"body": "In der App ansehen", "url": "/app/termine"}. Die eigentlichen
+"body": "In der App ansehen", "url": "/app#termine"}. Die eigentlichen
 Daten laedt die App erst nach Login vom EU-Server.
+
+``url`` muss die Hash-Form "/app#<screen>" haben — die PWA hat nur die
+Route /app und waehlt den Screen anhand des Hashs (screenFromHash() in
+app.js). Ein Pfad wie "/app/termine" existiert serverseitig nicht und
+liefe ins 404.
 
 ``pywebpush`` wird lazy importiert, damit das Modul auch ladbar bleibt
 bevor die Dependency im Image ist. Fehlende VAPID-Keys oder fehlende Lib

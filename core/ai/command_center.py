@@ -96,12 +96,54 @@ def _spec_by_name(name: str) -> ToolSpec | None:
 # Gemini-Schleife
 # ---------------------------------------------------------------------------
 
-def _system_instruction(ctx: Ctx) -> str:
+_SCREEN_LABELS: dict[str, str] = {
+    "aktuelles":        "Aktionen / Übersicht",
+    "kunden":           "Kundensuche",
+    "kunden_profil":    "Kundenprofil",
+    "assistent":        "Q-Assistent",
+    "mehr":             "Mehr",
+    "rechnungen_page":  "Rechnungen",
+    "angebote_page":    "Angebote",
+    "buchhaltung":      "Buchhaltung",
+    "team":             "Team",
+    "material":         "Materialien",
+    "wissen":           "Wissensbasis",
+    "visualisierung":   "Visualisierung",
+    "aufnahmen":        "Aufnahmen (Kundengespräche)",
+    "rueckrufe_page":   "Rückrufe",
+}
+
+
+def _system_instruction(ctx: Ctx, screen_context: dict | None = None) -> str:
     heute = dt.date.today()
     wochentag = ["Montag", "Dienstag", "Mittwoch", "Donnerstag",
                  "Freitag", "Samstag", "Sonntag"][heute.weekday()]
     name = (getattr(ctx.employee, "name", "") or "").split(" ")[0] or "der Nutzer"
     betrieb = getattr(ctx.tenant, "company_name", "") or "dem Betrieb"
+
+    context_line = ""
+    if screen_context:
+        screen   = screen_context.get("screen") or ""
+        kunde    = screen_context.get("kunde")
+        notizen  = (screen_context.get("notizen") or "").strip()
+        briefing = (screen_context.get("briefing") or "").strip()
+        if screen == "kunden_profil" and kunde:
+            context_line = (
+                f"\n\nAktueller Kontext: {name} schaut gerade auf das Profil"
+                f' des Kunden "{kunde}". Nutze diesen Kunden als Standard,'
+                " wenn kein anderer Kunde ausdruecklich genannt wird."
+            )
+            if notizen:
+                context_line += (
+                    f'\n\nAktuelle Gesprächsnotizen von "{kunde}" '
+                    f"(die der Nutzer gerade liest):\n{notizen}"
+                )
+            elif briefing:
+                context_line += f"\nBriefing: {briefing}"
+        elif screen:
+            label = _SCREEN_LABELS.get(screen, screen)
+            context_line = f'\n\nAktueller Kontext: {name} befindet sich gerade im Bereich "{label}".'
+
     return (
         "Du bist der Assistent in der App eines Handwerksbetriebs. "
         f"Du hilfst {name} von {betrieb}, Aufgaben per Sprach- oder "
@@ -114,6 +156,9 @@ def _system_instruction(ctx: Ctx) -> str:
         "Regeln:\n"
         "- Nutze immer ein Tool, wenn der Befehl eine Aktion verlangt. "
         "Erfinde niemals Ergebnisse.\n"
+        "- Sind im Kontext unten bereits Notizen oder ein Briefing eines Kunden "
+        "sichtbar, beantworte Fragen dazu (zusammenfassen, vorlesen, erklären) "
+        "DIREKT als Text — kein Tool nötig.\n"
         "- Fehlt eine Pflichtangabe (z.B. Name, Datum oder Uhrzeit für "
         "einen Termin), dann FRAGE kurz nach, statt zu raten.\n"
         "- Brauchst du für eine Buchung einen freien Slot, suche ihn erst "
@@ -127,7 +172,13 @@ def _system_instruction(ctx: Ctx) -> str:
         "- Will der Nutzer eine Ansicht/Liste nur SEHEN ('zeig mir...', "
         "'öffne...', 'geh zu...'), rufe das Tool anzeige_oeffnen mit dem "
         "passenden Bereich auf.\n"
+        "- Will der Nutzer die NOTIZEN eines Kunden sehen ('zeig mir die "
+        "Notizen von...', 'Notizen Kunde X', 'was steht bei X', 'Archiv-Notizen'), "
+        "rufe anzeige_oeffnen mit bereich='kunden_archiv', "
+        "kunde_name=<exakter Kundenname>, kategorie='notizen' auf — "
+        "NICHT kunden_profil.\n"
         "- Antworte kurz und auf Deutsch, in der Du-Form, wie ein Kollege."
+        + context_line
     )
 
 
@@ -153,7 +204,7 @@ def _build_genai_tool(specs: list[ToolSpec]):
     return types.Tool(function_declarations=decls)
 
 
-async def run_command(text: str, ctx: Ctx, history: list | None = None) -> dict:
+async def run_command(text: str, ctx: Ctx, history: list | None = None, screen_context: dict | None = None) -> dict:
     """Führt einen Befehl aus.
 
     ``history`` ist der bisherige Gesprächsverlauf als Liste von
@@ -186,7 +237,7 @@ async def run_command(text: str, ctx: Ctx, history: list | None = None) -> dict:
     config = types.GenerateContentConfig(
         temperature=0.1,
         max_output_tokens=2048,
-        system_instruction=_system_instruction(ctx),
+        system_instruction=_system_instruction(ctx, screen_context=screen_context),
         tools=[tool],
     )
     contents: list = []
@@ -263,7 +314,10 @@ async def run_command(text: str, ctx: Ctx, history: list | None = None) -> dict:
         if spec.name == "anzeige_oeffnen":
             # Kein Datenzugriff — der App sagen, welche Ansicht sie öffnen soll.
             bereich = (args.get("bereich") or "aktuelles").strip().lower()
-            return {"type": "navigate", "bereich": bereich, "text": say or None}
+            kunde = (args.get("kunde_name") or "").strip() or None
+            kategorie = (args.get("kategorie") or "").strip().lower() or None
+            return {"type": "navigate", "bereich": bereich,
+                    "kunde": kunde, "kategorie": kategorie, "text": say or None}
 
         if spec.kind == "write":
             # NICHT ausführen — Bestätigung einholen.
@@ -534,6 +588,10 @@ async def _run_rueckruf_anlegen(ctx: Ctx, args: dict) -> dict:
             anliegen=anliegen, status=RUECKRUF_STATUS_OFFEN,
             assigned_employee_id=getattr(ctx.employee, "id", None))
         s.add(r)
+        from core.services.kunde_identity import resolve_kunde_id_safe
+        r.kunde_id = await resolve_kunde_id_safe(
+            s, ctx.tid, kunde_name, email=r.kunde_email,
+            telefon=kunde_telefon)
         await s.commit()
         await s.refresh(r)
     return {"ok": True, "id": str(r.id), "kunde": kunde_name}
@@ -1347,12 +1405,21 @@ _REGISTRY: list[ToolSpec] = [
         description="Öffnet eine Ansicht/Liste in der App, wenn der Nutzer sie "
                     "SEHEN will (z.B. 'zeig mir die Rechnungen', 'öffne die "
                     "Termine', 'meine offenen Rückrufe', 'Kundenliste', 'geh zu "
-                    "Material'). Nur zum Anzeigen/Navigieren — keine Daten ändern.",
+                    "Material'). Für ein konkretes Kundenprofil: bereich='kunden_profil' "
+                    "und kunde_name=<Name>. Für Ablage-Kategorien eines Kunden: "
+                    "bereich='kunden_archiv', kunde_name=<Name>, kategorie=bilder|pdfs|notizen. "
+                    "Nur zum Anzeigen/Navigieren — keine Daten ändern.",
         parameters={"type": "OBJECT", "properties": {
             "bereich": {"type": _S, "description":
                 "Genau einer von: aktuelles, anfragen, termine, auftraege, "
-                "rueckrufe, angebote, rechnungen, kunden, wissen, material, "
-                "team, einstellungen."}},
+                "rueckrufe, aufnahmen, angebote, rechnungen, kunden, kunden_profil, "
+                "kunden_archiv, wissen, material, team, einstellungen. "
+                "'rueckrufe' = offene Rueckrufbitten vom Telefon-Agenten (To-do-"
+                "Liste), 'aufnahmen' = aufgezeichnete Kundengespraeche/Diktate."},
+            "kunde_name": {"type": _S, "description":
+                "Nur bei bereich='kunden_profil' oder 'kunden_archiv': exakter Kundenname."},
+            "kategorie": {"type": _S, "description":
+                "Nur bei bereich='kunden_archiv': bilder, pdfs oder notizen."}},
             "required": ["bereich"]},
         run=_run_anzeige_oeffnen),
 

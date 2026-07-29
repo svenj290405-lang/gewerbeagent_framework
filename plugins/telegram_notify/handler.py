@@ -127,6 +127,13 @@ from core.models.angebot import (
 from core.models.angebot_position import AngebotPosition
 from core.security import decrypt, encrypt
 from core.security.encryption import try_decrypt
+from core.services.kunde_identity import (
+    compose_adresse,
+    create_kunde_explizit_neu,
+    kunde_anzeige_merkmal,
+    resolve_kunde_id_safe,
+    resolve_kunde_name_only,
+)
 from core.ai import (
     extract_rechnung_from_audio,
     extract_rechnung_from_text,
@@ -2998,6 +3005,9 @@ async def _viz_queue_for_retry(
                 if viz:
                     viz.status = VIZ_STATUS_MAIL_QUEUED
                     viz.kunde_email = recipient_email
+                    viz.kunde_id = await resolve_kunde_id_safe(
+                        s, viz.tenant_id, viz.kunde_name,
+                        email=recipient_email)
                     await s.commit()
         except Exception as exc:
             logger.warning(f"viz-status auf MAIL_QUEUED setzen ignored: {exc}")
@@ -3135,6 +3145,8 @@ async def _handle_viz_mail_email_input(chat_id, text, state_data):
                 if viz:
                     viz.status = VIZ_STATUS_SENT
                     viz.kunde_email = email
+                    viz.kunde_id = await resolve_kunde_id_safe(
+                        s, viz.tenant_id, viz.kunde_name, email=email)
                     await s.commit()
         except Exception as exc_status:
             logger.exception(f"viz-status auf SENT setzen failed (egal): {exc_status}")
@@ -4155,6 +4167,11 @@ async def _handle_rechnung_input_received(
             status=RECHNUNG_STATUS_PREVIEWING,
         )
         s.add(rg)
+        rg.kunde_id = await resolve_kunde_id_safe(
+            s, tenant.id, rg.kunde_name, email=rg.kunde_email,
+            adresse=compose_adresse(
+                rg.kunde_strasse, rg.kunde_plz, rg.kunde_ort),
+        )
         await s.commit()
         await s.refresh(rg)
         rechnung_id = rg.id
@@ -5621,6 +5638,21 @@ async def _handle_aufnahme_audio_received(chat_id, voice_dict, bot_token=None):
                 logger.warning(f"Konnte termin_datum nicht parsen: {termin_str!r} | {e}")
 
         session.add(gespraech)
+        # Phase 6: Nur-Name-Anlage raet nie. Gibt es schon Kunden mit
+        # diesem Namen, bleibt kunde_id offen und der Nutzer bekommt
+        # Zuordnungs-Buttons unter der Vorschau.
+        kunde_kandidaten = []
+        try:
+            gespraech.kunde_id, kunde_kandidaten = (
+                await resolve_kunde_name_only(
+                    session, tenant.id, gespraech.kunde_name))
+        except Exception:
+            logger.exception(
+                "Kundenaufloesung fehlgeschlagen — kunde_id bleibt NULL")
+        kunde_kandidaten_info = [
+            (_uuid_b64(k.id), kunde_anzeige_merkmal(k))
+            for k in kunde_kandidaten
+        ]
         await session.commit()
         gespraech_id = gespraech.id
 
@@ -5667,6 +5699,25 @@ async def _handle_aufnahme_audio_received(chat_id, voice_dict, bot_token=None):
                 {"text": "❌ Verwerfen", "callback_data": f"aufnahme:verwerfen:{gespraech_id}"},
             ],
         ]
+
+    # Phase 6: Rueckfrage bei namensgleichen Bestandskunden — „Ist das
+    # derselbe Thomas Mueller wie am 3. Mai, oder ein neuer?"
+    if kunde_kandidaten_info:
+        preview += (
+            f"\n\n⚠️ <b>Kunde zuordnen:</b> Es gibt bereits "
+            f"{len(kunde_kandidaten_info)} Kunden namens "
+            f"„{_h_safe(extracted['kunde_name'])}“ — derselbe oder ein neuer?"
+        )
+        gid64 = _uuid_b64(gespraech_id)
+        for kid64, merkmal in kunde_kandidaten_info[:4]:
+            keyboard.append([{
+                "text": f"👤 Derselbe ({merkmal})",
+                "callback_data": f"aufnahme:kunde:{gid64}:{kid64}",
+            }])
+        keyboard.append([{
+            "text": "🆕 Neuer Kunde",
+            "callback_data": f"aufnahme:kunde:{gid64}:neu",
+        }])
 
     await _send_with_inline_buttons(chat_id, preview, keyboard)
     return None  # Nachricht ist schon gesendet
@@ -5750,6 +5801,72 @@ async def _handle_rechnung_callback(chat_id, callback_data, callback_query_id, b
 
 
 
+def _uuid_b64(u) -> str:
+    """UUID -> 22-Zeichen-Base64 (Telegram callback_data max 64 Bytes —
+    zwei volle UUID-Strings passen nicht rein)."""
+    import base64
+    return base64.urlsafe_b64encode(u.bytes).decode().rstrip("=")
+
+
+def _uuid_from_b64(s: str):
+    import base64
+    import uuid as _uuid
+    return _uuid.UUID(bytes=base64.urlsafe_b64decode(s + "=="))
+
+
+async def _handle_aufnahme_kunde_zuordnung(
+    chat_id, gid_b64, kid_part, callback_query_id, bot_token,
+):
+    """Phase 6: Nutzer beantwortet die Kunden-Rueckfrage unter der
+    Aufnahme-Vorschau — ordnet das nur-Name-Gespraech einem bestehenden
+    Kunden zu oder legt bewusst einen neuen an."""
+    from sqlalchemy import select
+    try:
+        gespraech_id = _uuid_from_b64(gid_b64)
+    except Exception:
+        await _answer_callback_query(callback_query_id, "Ungueltige Aktion", bot_token)
+        return
+    tenant = await _get_tenant_by_chat(chat_id)
+    if not tenant:
+        await _answer_callback_query(callback_query_id, "Tenant nicht gefunden", bot_token)
+        return
+    async with AsyncSessionLocal() as session:
+        gespraech = (await session.execute(
+            select(Kundengespraech).where(
+                Kundengespraech.id == gespraech_id,
+                Kundengespraech.tenant_id == tenant.id,
+            )
+        )).scalar_one_or_none()
+        if not gespraech:
+            await _answer_callback_query(callback_query_id, "Gespraech nicht gefunden", bot_token)
+            return
+        if gespraech.kunde_id is not None:
+            await _answer_callback_query(callback_query_id, "Schon zugeordnet", bot_token)
+            return
+        if kid_part == "neu":
+            kunde = await create_kunde_explizit_neu(
+                session, tenant.id, gespraech.kunde_name)
+        else:
+            from core.models import Kunde
+            try:
+                kunde = await session.get(Kunde, _uuid_from_b64(kid_part))
+            except Exception:
+                kunde = None
+            if kunde is None or kunde.tenant_id != tenant.id:
+                await _answer_callback_query(callback_query_id, "Kunde nicht gefunden", bot_token)
+                return
+        gespraech.kunde_id = kunde.id
+        kunde_name = kunde.name
+        merkmal = kunde_anzeige_merkmal(kunde)
+        await session.commit()
+    await _answer_callback_query(callback_query_id, "Zugeordnet", bot_token)
+    await _send_to_chat(
+        chat_id,
+        f"👤 Gespraech dem Kunden <b>{_h_safe(kunde_name)}</b> "
+        f"({_h_safe(merkmal)}) zugeordnet.",
+    )
+
+
 async def _handle_aufnahme_callback(chat_id, callback_data, callback_query_id, bot_token):
     """Verarbeitet Callbacks von Aufnahme-Buttons.
 
@@ -5758,11 +5875,17 @@ async def _handle_aufnahme_callback(chat_id, callback_data, callback_query_id, b
       - angebot   = Lexware-Angebots-Draft erstellen + verknuepfen
       - speichern = Nur in DB lassen, kein Angebot
       - verwerfen = DB-Eintrag loeschen
+      - kunde     = Phase-6-Rueckfrage; 4 Teile mit Base64-IDs:
+                    aufnahme:kunde:<gespraech-b64>:<kunde-b64|neu>
     """
     import uuid as _uuid
     from sqlalchemy import select
 
     parts = callback_data.split(":")
+    if len(parts) == 4 and parts[1] == "kunde":
+        await _handle_aufnahme_kunde_zuordnung(
+            chat_id, parts[2], parts[3], callback_query_id, bot_token)
+        return
     if len(parts) != 3:
         await _answer_callback_query(callback_query_id, "Ungueltige Aktion", bot_token)
         return
@@ -5875,6 +5998,17 @@ async def _handle_aufnahme_callback(chat_id, callback_data, callback_query_id, b
                 status="erstellt",
                 confidence=extracted.get("extraction_confidence"),
             )
+            # Kunde vom Quell-Gespraech uebernehmen (Phase 2/3 gesetzt);
+            # nur wenn das leer ist, selbst aufloesen.
+            if gespraech.kunde_id is not None:
+                angebot.kunde_id = gespraech.kunde_id
+            else:
+                angebot.kunde_id = await resolve_kunde_id_safe(
+                    session, tenant.id, gespraech.kunde_name,
+                    adresse=compose_adresse(
+                        extracted.get("kunde_strasse"),
+                        extracted.get("kunde_plz"),
+                        extracted.get("kunde_ort")))
             session.add(angebot)
             await session.flush()  # ID generieren
 
@@ -6294,6 +6428,15 @@ async def _persist_angebot_and_show_preview(
             confidence=extracted.get("extraction_confidence"),
         )
         s.add(ang)
+        # Bewusst die Roh-Extraktion statt ang.kunde_name: der
+        # "(unbekannt)"-Fallback darf keinen Slug-Kunden erzeugen.
+        ang.kunde_id = await resolve_kunde_id_safe(
+            s, tenant.id, extracted.get("kunde_name"),
+            email=extracted.get("kunde_email"),
+            adresse=compose_adresse(
+                extracted.get("kunde_strasse"),
+                extracted.get("kunde_plz"),
+                extracted.get("kunde_ort")))
         await s.flush()
         for i, pos in enumerate(positionen, 1):
             menge = Decimal(str(round(float(pos.get("menge") or 1), 4)))
@@ -7130,6 +7273,8 @@ async def _create_rechnung_in_lexware(chat_id, rechnung_id, bot_token):
         kunde_ort = rg.kunde_ort
         kunde_strasse = rg.kunde_strasse
         kunde_plz = rg.kunde_plz
+        kunde_email = rg.kunde_email
+        rechnung_kunde_id = rg.kunde_id
         leistung_titel = rg.leistung_titel
         leistung_beschreibung = rg.leistung_beschreibung
         betrag = float(rg.betrag_brutto_eur) if rg.betrag_brutto_eur is not None else 0.0
@@ -7196,28 +7341,23 @@ async def _create_rechnung_in_lexware(chat_id, rechnung_id, bot_token):
     ))
 
     try:
-        existing = await provider.search_contacts(kunde_name or "", customer_only=True)
-        match = None
-        if kunde_name:
-            for cand in existing:
-                if cand.name.strip().lower() == kunde_name.strip().lower():
-                    if not kunde_ort or (cand.city and cand.city.lower() == kunde_ort.lower()):
-                        match = cand
-                        break
-
-        if match:
-            contact_id = match.contact_id
-            logger.info(f"Lexware-Kontakt match: {match.name} -> {contact_id}")
-        else:
-            new_contact = await provider.create_customer_contact(
-                name=kunde_name or "Kunde",
-                street=kunde_strasse,
-                zip_code=kunde_plz,
-                city=kunde_ort,
-                is_company=is_company,
-            )
-            contact_id = new_contact.contact_id
-            logger.info(f"Lexware-Kontakt angelegt: {new_contact.name} -> {contact_id}")
+        # Aufloesung ueber den Kundenstamm (kunde_external_ref): eine
+        # gepinnte Kontakt-ID gewinnt, sonst einmalig Name+Ort-Match
+        # bzw. Neuanlage — danach ist der Kontakt am Kunden fixiert
+        # (Kundendatenbank Phase 4, ersetzt den frueheren Inline-Match).
+        contact, created = await provider.upsert_customer_contact(
+            name=kunde_name or "Kunde",
+            email=kunde_email,
+            is_company=is_company,
+            tenant_id=tenant.id if tenant else None,
+            kunde_id=rechnung_kunde_id,
+            street=kunde_strasse,
+            zip_code=kunde_plz,
+            city=kunde_ort,
+        )
+        contact_id = contact.contact_id
+        if created:
+            logger.info(f"Lexware-Kontakt angelegt: {contact.name} -> {contact_id}")
             # Metrik: Neuanlage zaehlen (failsafe, darf Rechnung nie stoppen)
             try:
                 from core.billing.usage import track_api_usage
@@ -7229,6 +7369,8 @@ async def _create_rechnung_in_lexware(chat_id, rechnung_id, bot_token):
                     )
             except Exception:
                 logger.debug("kunde_neu-Tracking uebersprungen", exc_info=True)
+        else:
+            logger.info(f"Lexware-Kontakt aufgeloest: {contact.name} -> {contact_id}")
     except Exception as e:
         logger.warning(f"Contact-Handling fehlgeschlagen, fallback auf one-time-address: {e}")
         contact_id = None

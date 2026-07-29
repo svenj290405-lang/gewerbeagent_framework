@@ -420,6 +420,10 @@ async def create_anfrage_token(
             expires_at=expires_at,
         )
         session.add(token_obj)
+        from core.services.kunde_identity import resolve_kunde_id_safe
+        token_obj.kunde_id = await resolve_kunde_id_safe(
+            session, tenant_id, kunde_name, email=kunde_email,
+            telefon=telefon_norm)
         await session.commit()
         await session.refresh(token_obj)
 

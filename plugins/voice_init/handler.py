@@ -1498,6 +1498,16 @@ class Plugin(BasePlugin):
             for kw in ("gmbh", "ag", "kg", "ohg", "ug", "gbr", "e.k.", "ev", "verein", "bauunternehmen", "firma")
         ))
 
+        # Kunde im eigenen Kundenstamm aufloesen/anlegen — die Lexware-
+        # Aufloesung laeuft dann ueber den gepinnten Ref statt ueber den
+        # Namen (Kundendatenbank Phase 4). Failsafe: None ist okay.
+        from core.services.kunde_identity import resolve_kunde_id_safe
+        kunde_id = None
+        async with AsyncSessionLocal() as s:
+            kunde_id = await resolve_kunde_id_safe(
+                s, tenant_id, name, email=email, telefon=phone)
+            await s.commit()
+
         # Upsert in Lexware
         try:
             contact, created = await provider.upsert_customer_contact(
@@ -1506,6 +1516,8 @@ class Plugin(BasePlugin):
                 email=email,
                 anliegen=anliegen,
                 is_company=is_company,
+                tenant_id=tenant_id,
+                kunde_id=kunde_id,
             )
         except AccountingError as e:
             logger.exception(f"save_contact Lexware-Fehler: {e}")
@@ -1681,6 +1693,10 @@ class Plugin(BasePlugin):
                 assigned_employee_id=assigned_employee_id,
             )
             s.add(rueckruf)
+            from core.services.kunde_identity import resolve_kunde_id_safe
+            rueckruf.kunde_id = await resolve_kunde_id_safe(
+                s, tenant_id, kunde_name, email=kunde_email,
+                telefon=kunde_telefon)
             await s.commit()
             await s.refresh(rueckruf)
             rueckruf_id = rueckruf.id

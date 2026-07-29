@@ -305,6 +305,36 @@ class LexwareProvider(AccountingProvider):
         )
         return results
 
+    async def list_contacts_page(
+        self,
+        page: int = 0,
+        size: int = 100,
+        customer_only: bool = True,
+    ) -> tuple[list[dict], bool]:
+        """GET /v1/contacts?page=...&size=... — eine Seite roher
+        Kontakt-Objekte fuer den Onboarding-Import (Kundendatenbank
+        Phase 8, scripts/import_lexware_contacts.py).
+
+        Liefert (eintraege, letzte_seite). Bewusst rohe Dicts statt
+        ContactMatch: der Import braucht mehr Felder (volle
+        Billing-Adresse, Telefonnummern) als die Such-UI.
+        """
+        await self._rate_limit()
+        params: dict = {"page": page, "size": size}
+        if customer_only:
+            params["customer"] = "true"
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            r = await client.get(
+                f"{LEXWARE_API_BASE}/v1/contacts",
+                headers=self._headers,
+                params=params,
+            )
+            self._raise_for_status(r, "list_contacts_page")
+            data = r.json()
+        entries = data.get("content") or []
+        last = bool(data.get("last", True))
+        return entries, last
+
 
     async def create_customer_contact(
         self,
@@ -509,6 +539,37 @@ class LexwareProvider(AccountingProvider):
         )
 
 
+    async def _complete_contact(
+        self,
+        contact: ContactMatch,
+        phone: str | None,
+        email: str | None,
+    ) -> ContactMatch:
+        """Ergaenzt fehlende Mail/Telefon am bestehenden Kontakt.
+        Failsafe: Update-Fehler werden geloggt, der Kontakt kommt
+        trotzdem zurueck."""
+        updated = False
+        if email and not contact.email:
+            try:
+                await self.update_contact_email(contact.contact_id, email)
+                updated = True
+                logger.info(f"upsert: Mail ergaenzt fuer {contact.contact_id}")
+            except Exception as e:
+                logger.warning(f"upsert: Mail-Update fehlgeschlagen: {e}")
+        if phone:
+            try:
+                await self.update_contact_phone(contact.contact_id, phone)
+                if updated:
+                    logger.info(f"upsert: Phone+Mail ergaenzt fuer {contact.contact_id}")
+                else:
+                    logger.info(f"upsert: Phone ergaenzt fuer {contact.contact_id}")
+                updated = True
+            except Exception as e:
+                logger.warning(f"upsert: Phone-Update fehlgeschlagen: {e}")
+        if updated:
+            contact = await self.get_contact(contact.contact_id) or contact
+        return contact
+
     async def upsert_customer_contact(
         self,
         name: str,
@@ -516,16 +577,47 @@ class LexwareProvider(AccountingProvider):
         email: str | None = None,
         anliegen: str | None = None,
         is_company: bool = False,
+        *,
+        tenant_id=None,
+        kunde_id=None,
+        street: str | None = None,
+        zip_code: str | None = None,
+        city: str | None = None,
     ) -> tuple[ContactMatch, bool]:
         """
-        Findet einen Kontakt nach Name oder legt einen neuen an.
+        Loest einen Lexware-Kontakt auf oder legt einen neuen an.
         Bei vorhandenem Kontakt: ergaenzt Phone/Mail falls fehlend.
-        Bei mehreren gleichnamigen Treffern: nimmt den ersten und logged Warnung.
+
+        Mit tenant_id + kunde_id (Kundendatenbank Phase 4) laeuft die
+        Aufloesung ueber kunde_external_ref: eine gepinnte Kontakt-ID
+        gewinnt immer — kein namensbasiertes Raten mehr. Existiert noch
+        kein Ref, wird einmalig namensbasiert gematcht bzw. angelegt und
+        das Ergebnis zurueckgepinnt; ab dann ist der Kontakt fixiert.
+        Ist der gepinnte Kontakt in Lexware geloescht worden, wird neu
+        aufgeloest und der Ref repariert.
+
+        Ohne kunde_id (Alt-Verhalten): Name-Match, bei mehreren
+        gleichnamigen Treffern der erste + Warnung; ein mitgegebenes
+        `city` bevorzugt den Treffer mit gleichem Ort.
 
         Returns: (ContactMatch, created_new) - True wenn neu angelegt.
         """
         if not name or len(name.strip()) < 2:
             raise ValueError("Kontakt-Name fehlt")
+
+        # 0) Gepinnter Kontakt aus kunde_external_ref gewinnt immer.
+        stale_contact_id = None
+        if tenant_id and kunde_id:
+            pinned = await lookup_lexware_contact_ref(tenant_id, kunde_id)
+            if pinned:
+                full = await self.get_contact(pinned)
+                if full is not None:
+                    return await self._complete_contact(full, phone, email), False
+                logger.warning(
+                    "upsert: gepinnter Lexware-Kontakt %s nicht ladbar "
+                    "(in Lexware geloescht?) — loese neu auf", pinned,
+                )
+                stale_contact_id = pinned
 
         # 1) Existierende suchen
         try:
@@ -534,51 +626,53 @@ class LexwareProvider(AccountingProvider):
             logger.warning(f"upsert_customer_contact search fehlgeschlagen: {e}")
             existing = []
 
-        # 2) Genauer Name-Match
+        # 2) Genauer Name-Match. Ist ein Ort bekannt, zaehlt NUR ein
+        # ortsgleicher Treffer (zwei "Thomas Mueller" in verschiedenen
+        # Staedten sind verschiedene Kontakte — dann lieber neu anlegen).
+        exact = [c for c in existing
+                 if c.name.strip().lower() == name.strip().lower()]
+        # Kontakte, die schon einem ANDEREN Kunden gepinnt sind, duerfen
+        # nicht gematcht werden — sonst kaeme die Vermischung durch die
+        # Hintertuer zurueck (Rechnung an fremden Kontakt).
+        if exact and tenant_id and kunde_id:
+            frei = []
+            for c in exact:
+                owner = await lookup_lexware_ref_owner(tenant_id, c.contact_id)
+                if owner is not None and owner != kunde_id:
+                    logger.info(
+                        "upsert: Kontakt %s (%r) gehoert schon Kunde %s — "
+                        "uebersprungen", c.contact_id, c.name, owner,
+                    )
+                    continue
+                frei.append(c)
+            exact = frei
         match = None
-        for cand in existing:
-            if cand.name.strip().lower() == name.strip().lower():
-                match = cand
-                break
-
-        if match:
-            if len(existing) > 1:
+        if exact:
+            if city:
+                match = next(
+                    (c for c in exact
+                     if c.city and c.city.strip().lower() == city.strip().lower()),
+                    None,
+                )
+            else:
+                match = exact[0]
+            if match is not None and len(existing) > 1:
                 logger.warning(
-                    "upsert_customer_contact: %d Treffer fuer %r - nehme ersten Match %s",
+                    "upsert_customer_contact: %d Treffer fuer %r - nehme Match %s",
                     len(existing), name, match.contact_id,
                 )
-            updated = False
 
+        if match:
             # Voller Datensatz holen (fuer Phone/Mail-Check)
             full = await self.get_contact(match.contact_id)
             if full is None:
                 logger.warning(f"upsert: Kontakt {match.contact_id} nicht ladbar")
                 return match, False
-
-            # Email ergaenzen
-            if email and not full.email:
-                try:
-                    await self.update_contact_email(match.contact_id, email)
-                    updated = True
-                    logger.info(f"upsert: Mail ergaenzt fuer {match.contact_id}")
-                except Exception as e:
-                    logger.warning(f"upsert: Mail-Update fehlgeschlagen: {e}")
-
-            # Telefon ergaenzen (analog Mail-Update)
-            if phone:
-                try:
-                    await self.update_contact_phone(match.contact_id, phone)
-                    if updated:
-                        logger.info(f"upsert: Phone+Mail ergaenzt fuer {match.contact_id}")
-                    else:
-                        logger.info(f"upsert: Phone ergaenzt fuer {match.contact_id}")
-                    updated = True
-                except Exception as e:
-                    logger.warning(f"upsert: Phone-Update fehlgeschlagen: {e}")
-
-            # Refresh wenn was geaendert
-            if updated:
-                full = await self.get_contact(match.contact_id) or full
+            full = await self._complete_contact(full, phone, email)
+            if tenant_id and kunde_id:
+                await persist_lexware_contact_ref(
+                    tenant_id, kunde_id, full.contact_id,
+                    replace_contact_id=stale_contact_id)
             return full, False
 
         # 3) Neu anlegen
@@ -586,8 +680,15 @@ class LexwareProvider(AccountingProvider):
             name=name,
             email=email,
             phone=phone,
+            street=street,
+            zip_code=zip_code,
+            city=city,
             is_company=is_company,
         )
+        if tenant_id and kunde_id:
+            await persist_lexware_contact_ref(
+                tenant_id, kunde_id, new_contact.contact_id,
+                replace_contact_id=stale_contact_id)
         return new_contact, True
 
 
@@ -975,3 +1076,126 @@ class LexwareProvider(AccountingProvider):
     def voucher_deeplink(voucher_id: UUID) -> str:
         """Lexware-App-URL um Voucher direkt zu oeffnen."""
         return f"{LEXWARE_APP_BASE}/permalink/vouchers/view/{voucher_id}"
+
+
+# ---------------------------------------------------------------------------
+# kunde_external_ref: Kunde <-> Lexware-Kontakt (Kundendatenbank Phase 4)
+#
+# Die Verknuepfung interner Kunde -> Lexware-Kontakt-ID lebt in der
+# generischen Tabelle kunde_external_ref. Beide Helper sind failsafe
+# (werfen nie) — ein Ref-Problem darf keine Rechnung blockieren,
+# schlimmstenfalls laeuft die Aufloesung einmal mehr ueber den Namen.
+# ---------------------------------------------------------------------------
+
+async def lookup_lexware_contact_ref(tenant_id, kunde_id) -> str | None:
+    """Liefert die gepinnte Lexware-Kontakt-ID des Kunden oder None."""
+    if not tenant_id or not kunde_id:
+        return None
+    try:
+        from sqlalchemy import select
+        from core.database import AsyncSessionLocal
+        from core.models import KundeExternalRef, REF_SYSTEM_LEXWARE
+        async with AsyncSessionLocal() as s:
+            ref = (await s.execute(
+                select(KundeExternalRef).where(
+                    KundeExternalRef.tenant_id == tenant_id,
+                    KundeExternalRef.kunde_id == kunde_id,
+                    KundeExternalRef.system == REF_SYSTEM_LEXWARE,
+                )
+            )).scalars().first()
+            return ref.external_id if ref else None
+    except Exception:
+        logger.exception("lookup_lexware_contact_ref fehlgeschlagen (egal)")
+        return None
+
+
+async def lookup_lexware_ref_owner(tenant_id, contact_id):
+    """Liefert die kunde_id, die diesen Lexware-Kontakt gepinnt hat —
+    oder None. Fuer den Namens-Match: ein Kontakt, der schon einem
+    anderen Kunden gehoert, darf nicht nochmal gematcht werden."""
+    if not tenant_id or not contact_id:
+        return None
+    try:
+        from sqlalchemy import select
+        from core.database import AsyncSessionLocal
+        from core.models import KundeExternalRef, REF_SYSTEM_LEXWARE
+        async with AsyncSessionLocal() as s:
+            ref = (await s.execute(
+                select(KundeExternalRef).where(
+                    KundeExternalRef.tenant_id == tenant_id,
+                    KundeExternalRef.system == REF_SYSTEM_LEXWARE,
+                    KundeExternalRef.external_id == str(contact_id).lower(),
+                )
+            )).scalars().first()
+            return ref.kunde_id if ref else None
+    except Exception:
+        logger.exception("lookup_lexware_ref_owner fehlgeschlagen (egal)")
+        return None
+
+
+async def persist_lexware_contact_ref(
+    tenant_id, kunde_id, contact_id, *, replace_contact_id=None,
+) -> None:
+    """Pinnt die Lexware-Kontakt-ID am Kunden.
+
+    Ein bestehender abweichender Ref wird NIE stillschweigend
+    ueberschrieben — nur wenn replace_contact_id explizit den alten
+    Wert benennt (Repair, nachdem der Kontakt in Lexware geloescht
+    wurde). Zeigt ein anderer Kunde schon auf diesen Kontakt
+    (Unique-Constraint), wird gewarnt und nichts geschrieben.
+    """
+    if not tenant_id or not kunde_id or not contact_id:
+        return
+    cid = str(contact_id).lower()
+    try:
+        from sqlalchemy import select
+        from core.database import AsyncSessionLocal
+        from core.models import KundeExternalRef, REF_SYSTEM_LEXWARE
+        async with AsyncSessionLocal() as s:
+            eigener = (await s.execute(
+                select(KundeExternalRef).where(
+                    KundeExternalRef.tenant_id == tenant_id,
+                    KundeExternalRef.kunde_id == kunde_id,
+                    KundeExternalRef.system == REF_SYSTEM_LEXWARE,
+                ).with_for_update()
+            )).scalars().first()
+            if eigener is not None:
+                if eigener.external_id == cid:
+                    return
+                if (replace_contact_id
+                        and eigener.external_id == str(replace_contact_id).lower()):
+                    eigener.external_id = cid
+                    await s.commit()
+                    logger.info(
+                        "lexware-ref repariert: kunde=%s %s -> %s",
+                        kunde_id, replace_contact_id, cid,
+                    )
+                    return
+                logger.warning(
+                    "lexware-ref-Konflikt: kunde=%s hat schon %s, "
+                    "neuer Kontakt %s wird NICHT gepinnt",
+                    kunde_id, eigener.external_id, cid,
+                )
+                return
+            fremder = (await s.execute(
+                select(KundeExternalRef).where(
+                    KundeExternalRef.tenant_id == tenant_id,
+                    KundeExternalRef.system == REF_SYSTEM_LEXWARE,
+                    KundeExternalRef.external_id == cid,
+                )
+            )).scalars().first()
+            if fremder is not None:
+                logger.warning(
+                    "lexware-ref-Konflikt: Kontakt %s gehoert schon "
+                    "Kunde %s, nicht auch Kunde %s",
+                    cid, fremder.kunde_id, kunde_id,
+                )
+                return
+            s.add(KundeExternalRef(
+                tenant_id=tenant_id, kunde_id=kunde_id,
+                system=REF_SYSTEM_LEXWARE, external_id=cid,
+            ))
+            await s.commit()
+            logger.info("lexware-ref gepinnt: kunde=%s -> %s", kunde_id, cid)
+    except Exception:
+        logger.exception("persist_lexware_contact_ref fehlgeschlagen (egal)")

@@ -23,7 +23,7 @@ import asyncio
 import io
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy import select, update
@@ -31,6 +31,14 @@ from sqlalchemy import select, update
 from core.database import AsyncSessionLocal
 from core.models.tenant_kunde_drive import TenantKundeDrive
 from core.models import Tenant
+# Kunden-Identitaet lebt seit Kundendatenbank-Phase 2 im Service —
+# hier re-importiert, damit Drive-Ordner-Keys und Kunden-Keys dasselbe
+# Format bleiben und Bestandsimporte (tests, __all__) weiter tragen.
+from core.services.kunde_identity import (
+    _kunde_identity_key,
+    _slugify_kunde,
+    resolve_kunde_id_safe,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -94,27 +102,26 @@ async def _fire_drive_upload_alert(
         logger.exception(f"Tenant-Alert (drive_upload_loop) failed: {exc}")
 
 
-def _slugify_kunde(name: str) -> str:
-    """'Müller-Bauunternehmen GmbH' -> 'mueller-bauunternehmen-gmbh'."""
-    s = (name or "").strip().lower()
-    s = (s.replace("ä", "ae").replace("ö", "oe").replace("ü", "ue")
-         .replace("ß", "ss"))
-    out = []
-    last_dash = False
-    for ch in s:
-        if ch.isalnum():
-            out.append(ch)
-            last_dash = False
-        elif not last_dash:
-            out.append("-")
-            last_dash = True
-    result = "".join(out).strip("-")
-    return result[:120] or "kunde"
-
-
 def _root_folder_name(tenant) -> str:
     company = (tenant.company_name or tenant.slug or "Tenant").strip()
     return f"Gewerbeagent — {company}"[:200]
+
+
+# Sicherheitsabstand zum Token-Ablauf. Laeuft der Token in weniger als
+# dieser Zeit ab, refreshen wir vorsorglich statt ihn noch zu benutzen —
+# sonst kippt ein laufender Upload mitten im Request in ein 401.
+TOKEN_REFRESH_MARGIN = timedelta(minutes=2)
+
+
+async def _build_drive_service(creds):
+    """Baut den Drive-Client. Kein Netzverkehr (statische Discovery-Docs),
+    aber ein spuerbarer JSON-Parse — daher im Thread, damit paralleles
+    Laden (Archiv-Galerie) den Event-Loop nicht blockiert."""
+    from googleapiclient.discovery import build
+
+    return await asyncio.to_thread(
+        build, "drive", "v3", credentials=creds, cache_discovery=False,
+    )
 
 
 async def get_drive_service(
@@ -130,7 +137,6 @@ async def get_drive_service(
     from plugins.kalender.google_auth import _get_google_client_creds
     from google.auth.transport.requests import Request as GRequest
     from google.oauth2.credentials import Credentials
-    from googleapiclient.discovery import build
     from core.models import OAuthToken
 
     oauth_token = await find_oauth_token(tenant_id, "google", employee_id)
@@ -149,10 +155,37 @@ async def get_drive_service(
             "Bitte einmal /drive_verbinden im Telegram ausfuehren."
         )
 
-    # Race-Schutz: SELECT FOR UPDATE auf der Token-Zeile damit zwei
-    # parallele Drive-Uploads nicht beide gleichzeitig refresh() callen
-    # (Google revoked dann manchmal den alten Token sofort -> 401).
-    # Pattern identisch zu core/integrations/microsoft.py:50.
+    client_id, client_secret = _get_google_client_creds()
+
+    def _creds_for(access_token: str) -> Credentials:
+        return Credentials(
+            token=access_token,
+            refresh_token=oauth_token.refresh_token,
+            token_uri="https://oauth2.googleapis.com/token",
+            client_id=client_id,
+            client_secret=client_secret,
+            scopes=scopes,
+        )
+
+    # Schnellpfad: Access-Token ist noch lange genug gueltig -> weder Lock
+    # noch Refresh noetig. Das ist der Normalfall (Token laeuft 1h), und er
+    # ist der Grund, warum die Archiv-Galerie ueberhaupt parallel laedt: das
+    # SELECT FOR UPDATE unten serialisiert sonst JEDEN Drive-Zugriff des
+    # Tenants, also auch 20 gleichzeitige Thumbnail-Requests.
+    now = datetime.now(timezone.utc)
+    expires_at = oauth_token.access_token_expires_at
+    if (
+        oauth_token.access_token
+        and expires_at is not None
+        and expires_at > now + TOKEN_REFRESH_MARGIN
+    ):
+        return await _build_drive_service(_creds_for(oauth_token.access_token))
+
+    # Langsampfad (Token abgelaufen/unbekannt): Race-Schutz per SELECT FOR
+    # UPDATE auf der Token-Zeile, damit zwei parallele Drive-Zugriffe nicht
+    # beide gleichzeitig refresh() callen (Google revoked dann manchmal den
+    # alten Token sofort -> 401). Pattern identisch zu
+    # core/integrations/microsoft.py:50.
     async with AsyncSessionLocal() as session:
         result = await session.execute(
             select(OAuthToken)
@@ -161,15 +194,7 @@ async def get_drive_service(
         )
         oauth_token = result.scalar_one()
 
-        client_id, client_secret = _get_google_client_creds()
-        creds = Credentials(
-            token=oauth_token.access_token,
-            refresh_token=oauth_token.refresh_token,
-            token_uri="https://oauth2.googleapis.com/token",
-            client_id=client_id,
-            client_secret=client_secret,
-            scopes=scopes,
-        )
+        creds = _creds_for(oauth_token.access_token)
 
         # Re-Check: Hat ein paralleler Request schon refreshed? Dann
         # nutzen wir den frischen Token statt nochmal zu refreshen.
@@ -183,7 +208,9 @@ async def get_drive_service(
 
         if not creds.valid and creds.refresh_token and not already_fresh:
             try:
-                creds.refresh(GRequest())
+                # refresh() macht einen blockierenden HTTP-Call zu Google —
+                # gehoert in einen Thread, sonst steht der Event-Loop.
+                await asyncio.to_thread(creds.refresh, GRequest())
             except Exception as exc:
                 # invalid_grant / Refresh-Token revoked? Tenant per Telegram
                 # alarmieren damit er re-authorizen kann. Pipeline wirft
@@ -212,18 +239,9 @@ async def get_drive_service(
         elif already_fresh:
             # Der Token wurde von einem parallelen Request bereits erneuert.
             # Wir bauen creds mit dem frischen access_token aus der DB neu.
-            creds = Credentials(
-                token=oauth_token.access_token,
-                refresh_token=oauth_token.refresh_token,
-                token_uri="https://oauth2.googleapis.com/token",
-                client_id=client_id,
-                client_secret=client_secret,
-                scopes=scopes,
-            )
+            creds = _creds_for(oauth_token.access_token)
 
-    # Drive-Service synchron bauen (googleapiclient ist sync, also blockt
-    # nicht — der Build-Call macht keinen Netzverkehr).
-    return build("drive", "v3", credentials=creds, cache_discovery=False)
+    return await _build_drive_service(creds)
 
 
 async def _ensure_root_folder(
@@ -321,29 +339,6 @@ async def _ensure_root_folder(
     return found_id
 
 
-def _kunde_identity_key(
-    kunde_name: str,
-    kunde_email: str | None = None,
-    kunde_telefon: str | None = None,
-) -> str:
-    """Stabile Kunden-Identitaet fuer den Ordner-Key:
-    E-Mail > Telefon (normalisiert) > Namens-Slug (Fallback).
-
-    So teilen sich zwei gleichnamige Kunden NICHT denselben Ordner, und
-    dieselbe Person (gleiche Mail/Telefon) trifft ihren Ordner auch bei
-    leicht abweichendem Namen wieder.
-    """
-    email = (kunde_email or "").strip().lower()
-    if email:
-        return f"email:{email}"[:120]
-    if kunde_telefon:
-        from core.utils.phone import normalize_phone
-        tel = normalize_phone(kunde_telefon)
-        if tel:
-            return f"tel:{tel}"[:120]
-    return _slugify_kunde(kunde_name)[:120]
-
-
 async def get_or_create_kunde_folder(
     tenant_id: uuid.UUID,
     kunde_name: str,
@@ -407,6 +402,10 @@ async def get_or_create_kunde_folder(
                 legacy.kunde_telefon = tel_norm
                 if kunde_name:
                     legacy.kunde_name = kunde_name
+                if legacy.kunde_id is None:
+                    legacy.kunde_id = await resolve_kunde_id_safe(
+                        s, tenant_id, kunde_name, email=email_norm,
+                        telefon=tel_norm)
                 await s.commit()
                 logger.info(
                     f"Kundenordner adoptiert: {name_slug!r} -> {kunde_key!r} "
@@ -480,6 +479,9 @@ async def get_or_create_kunde_folder(
                 upload_count=0,
             )
             s.add(row)
+            row.kunde_id = await resolve_kunde_id_safe(
+                s, tenant_id, kunde_name, email=email_norm,
+                telefon=tel_norm)
             await s.commit()
         except Exception as e:
             # Race: anderer Request hat schon einen Eintrag erstellt.
@@ -643,6 +645,189 @@ def is_drive_configured(oauth_token) -> bool:
     return any("drive" in s for s in scopes)
 
 
+async def list_files_in_kunde_folder(
+    tenant_id: uuid.UUID,
+    kunde_name: str,
+    employee_id: uuid.UUID | None = None,
+    *,
+    page_size: int = 50,
+) -> list[dict]:
+    """Listet Dateien im Kunden-Drive-Ordner (neueste zuerst).
+
+    Failsafe: leere Liste bei fehlendem Ordner oder Drive-Fehler —
+    niemals eine Exception nach oben.
+    """
+    try:
+        async with AsyncSessionLocal() as s:
+            # Aufloesung (Phase 5) statt willkuerlichem ilike+limit(1):
+            # 1. Kundenstamm (Lookup-Kaskade) -> Ordner via kunde_id
+            # 2. Identitaets-Key (gleiches Format wie kunde_key)
+            # 3. Uebergangs-Fallback exakter Name — fuer Alt-Zeilen
+            #    ohne kunde_id (faellt in Phase 7 weg)
+            from core.services.kunde_identity import resolve_kunde
+            drvs: list[TenantKundeDrive] = []
+            kunde = await resolve_kunde(s, tenant_id, name=kunde_name)
+            if kunde is not None:
+                # ALLE Ordner des Kunden, nicht nur der erste: nach einem
+                # Merge haengen mehrere Drive-Zeilen am selben Kunden (die
+                # Dateien bleiben physisch verteilt, Hinweis drive_keys im
+                # Merge-Service) — die Liste fuehrt sie hier zusammen.
+                drvs = list((await s.execute(
+                    select(TenantKundeDrive).where(
+                        TenantKundeDrive.tenant_id == tenant_id,
+                        TenantKundeDrive.kunde_id == kunde.id,
+                    )
+                )).scalars().all())
+            if not drvs:
+                drv = (await s.execute(
+                    select(TenantKundeDrive).where(
+                        TenantKundeDrive.tenant_id == tenant_id,
+                        TenantKundeDrive.kunde_key
+                        == _kunde_identity_key(kunde_name),
+                    )
+                )).scalars().first()
+                if drv is None:
+                    drv = (await s.execute(
+                        select(TenantKundeDrive)
+                        .where(
+                            TenantKundeDrive.tenant_id == tenant_id,
+                            TenantKundeDrive.kunde_name.ilike(kunde_name),
+                        )
+                        .limit(1)
+                    )).scalars().first()
+                if drv is not None:
+                    drvs = [drv]
+
+        if not drvs:
+            return []
+
+        # Doppelte Folder-IDs raus (defensiv); eine Drive-Query ueber alle
+        # Ordner per ODER-verknuepftem parents-Filter.
+        folder_ids = list(dict.fromkeys(d.drive_folder_id for d in drvs))
+        service = await get_drive_service(tenant_id, employee_id)
+
+        def _sync_list():
+            parents = " or ".join(f"'{fid}' in parents" for fid in folder_ids)
+            return service.files().list(
+                q=f"({parents}) and trashed=false",
+                fields="files(id,name,mimeType,size,createdTime,webViewLink)",
+                orderBy="createdTime desc",
+                pageSize=page_size,
+            ).execute()
+
+        result = await asyncio.to_thread(_sync_list)
+        return [
+            {
+                "id": f["id"],
+                "name": f.get("name", ""),
+                "mime_type": f.get("mimeType", ""),
+                "size": int(f["size"]) if f.get("size") else 0,
+                "created_at": f.get("createdTime", ""),
+                "web_link": f.get("webViewLink", ""),
+                "is_image": (f.get("mimeType", "") or "").startswith("image/"),
+            }
+            for f in result.get("files", [])
+        ]
+    except ValueError:
+        return []
+    except Exception as exc:
+        logger.warning(
+            "list_files_in_kunde_folder fehlgeschlagen (tenant=%s kunde=%s): %s",
+            tenant_id, kunde_name, exc,
+        )
+        return []
+
+
+_PROXY_MAX_BYTES = 10 * 1024 * 1024  # 10 MB
+
+# Kantenlaenge der Vorschaubilder. Drive haengt die Groesse als "=sNNN" an
+# den thumbnailLink; 400px reicht fuer das 3-spaltige Galerie-Raster auch
+# auf Retina-Displays.
+_THUMB_SIZE_PX = 400
+
+
+async def get_thumbnail_bytes(
+    tenant_id: uuid.UUID,
+    file_id: str,
+    employee_id: uuid.UUID | None = None,
+) -> tuple[bytes, str] | None:
+    """Laedt das von Drive generierte Vorschaubild (statt des Originals).
+
+    Ein Galerie-Thumbnail sind ein paar Dutzend KB, das Original bis zu
+    10 MB — bei 20 Bildern ist das der Unterschied zwischen "laedt sofort"
+    und "laedt ewig". Returns (bytes, mime) oder None wenn Drive fuer die
+    Datei kein Thumbnail hat (dann faellt der Caller aufs Original zurueck).
+
+    Raises ValueError wenn Drive nicht verbunden ist (wie get_file_bytes).
+    """
+    service = await get_drive_service(tenant_id, employee_id)
+
+    def _sync_thumb() -> tuple[bytes, str] | None:
+        meta = service.files().get(
+            fileId=file_id, fields="thumbnailLink,mimeType",
+        ).execute()
+        link = meta.get("thumbnailLink")
+        if not link:
+            return None
+        # Drive liefert den Link mit einer Default-Groesse ("=s220"). Die
+        # ersetzen wir durch unsere — sonst sind die Kacheln matschig.
+        base = link.rsplit("=", 1)[0] if "=s" in link.rsplit("/", 1)[-1] else link
+        sized = f"{base}=s{_THUMB_SIZE_PX}"
+        # service._http ist der bereits autorisierte HTTP-Client des
+        # Discovery-Clients — thumbnailLinks brauchen den OAuth-Header,
+        # ein blanker GET gibt 403.
+        resp, content = service._http.request(sized)
+        if resp.status != 200 or not content:
+            return None
+        mime = resp.get("content-type") or meta.get("mimeType") or "image/jpeg"
+        return content, mime.split(";")[0].strip()
+
+    try:
+        return await asyncio.to_thread(_sync_thumb)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Thumbnail fehlgeschlagen (tenant=%s file=%s): %s",
+            tenant_id, file_id, exc,
+        )
+        return None
+
+
+async def get_file_bytes(
+    tenant_id: uuid.UUID,
+    file_id: str,
+    employee_id: uuid.UUID | None = None,
+) -> tuple[bytes, str]:
+    """Laedt Datei-Bytes aus Drive fuer den Proxy-Endpunkt.
+
+    Returns (bytes, mime_type).
+    Raises ValueError wenn Drive nicht verbunden.
+    Raises RuntimeError wenn Datei > 10 MB.
+    """
+    service = await get_drive_service(tenant_id, employee_id)
+
+    def _sync_download() -> tuple[bytes, str]:
+        from googleapiclient.http import MediaIoBaseDownload
+
+        meta = service.files().get(
+            fileId=file_id, fields="mimeType,size,name",
+        ).execute()
+        size = int(meta.get("size") or 0)
+        if size > _PROXY_MAX_BYTES:
+            raise RuntimeError(
+                f"Datei zu gross fuer Proxy ({size // 1024 // 1024} MB, max 10 MB)."
+            )
+        mime = meta.get("mimeType") or "application/octet-stream"
+        fh = io.BytesIO()
+        req = service.files().get_media(fileId=file_id)
+        dl = MediaIoBaseDownload(fh, req)
+        done = False
+        while not done:
+            _, done = dl.next_chunk()
+        return fh.getvalue(), mime
+
+    return await asyncio.to_thread(_sync_download)
+
+
 __all__ = [
     "get_drive_service",
     "get_or_create_kunde_folder",
@@ -650,5 +835,8 @@ __all__ = [
     "get_kunde_folder_link",
     "list_tenant_kunde_drives",
     "is_drive_configured",
+    "list_files_in_kunde_folder",
+    "get_file_bytes",
+    "get_thumbnail_bytes",
     "_slugify_kunde",
 ]

@@ -109,6 +109,12 @@ async def create_angebot(
         )
         s.add(ang)
         await s.flush()
+        from core.services.kunde_identity import (
+            compose_adresse, resolve_kunde_id_safe)
+        ang.kunde_id = await resolve_kunde_id_safe(
+            s, tid, kunde_name, email=kunde_email,
+            adresse=compose_adresse(kunde_strasse, kunde_plz, kunde_ort),
+        )
         for i, p in enumerate(positionen, start=1):
             name = (p.get("name") or "").strip()
             if not name:
@@ -230,6 +236,12 @@ async def create_rechnung(
             betrag_brutto_eur=betrag_gesamt,
             status=RECHNUNG_STATUS_EXTRACTING)
         s.add(r)
+        from core.services.kunde_identity import (
+            compose_adresse, resolve_kunde_id_safe)
+        r.kunde_id = await resolve_kunde_id_safe(
+            s, tid, kunde_name, email=kunde_email,
+            adresse=compose_adresse(kunde_strasse, kunde_plz, kunde_ort),
+        )
         await s.commit()
         await s.refresh(r)
         rid = r.id

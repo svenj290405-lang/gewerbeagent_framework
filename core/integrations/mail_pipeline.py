@@ -245,6 +245,9 @@ async def create_conversation(
             termin_datum=termin_datum,
         )
         s.add(conv)
+        from core.services.kunde_identity import resolve_kunde_id_safe
+        conv.kunde_id = await resolve_kunde_id_safe(
+            s, tenant_id, sender_name, email=conv.kunde_email)
         await s.commit()
         await s.refresh(conv)
         s.expunge(conv)
