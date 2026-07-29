@@ -114,7 +114,7 @@ async def notify_oauth_token_invalid(
     from config.settings import settings
     from core.database import AsyncSessionLocal
     from core.models import Tenant
-    from plugins.telegram_notify.handler import TelegramNotifier
+    from core.integrations.notify import notify_tenant
 
     if provider not in ("google", "microsoft"):
         logger.warning(f"notify_oauth_token_invalid: unbekannter provider={provider!r}")
@@ -154,10 +154,19 @@ async def notify_oauth_token_invalid(
     )
 
     try:
-        ok = await TelegramNotifier.send_for_tenant(tenant_id, text)
+        ok = await notify_tenant(
+            tenant_id,
+            title="Verbindung unterbrochen",
+            body=(
+                f"Die {provider.capitalize()}-Verbindung muss neu "
+                f"hergestellt werden. In der App öffnen."
+            ),
+            url="/app#mehr", tag=f"oauth-{provider}",
+            telegram_text=text, inhaber_only=True,
+        )
     except Exception as e:
         logger.warning(
-            f"notify_oauth_token_invalid: Telegram-Send fehlgeschlagen "
+            f"notify_oauth_token_invalid: Versand fehlgeschlagen "
             f"tenant={tenant.slug} provider={provider}: {e}"
         )
         return False

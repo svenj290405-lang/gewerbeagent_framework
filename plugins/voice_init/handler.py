@@ -1295,10 +1295,10 @@ class Plugin(BasePlugin):
                 pass
         result = await kalender.on_webhook("cancel_appointment", cancel_payload)
 
-        # Telegram-Push an den zustaendigen Mitarbeiter
+        # Benachrichtigung an den zustaendigen Mitarbeiter (Push + Telegram)
         # (silent fail; loggen aber blockieren nie das Storno-Response).
         try:
-            from plugins.telegram_notify.handler import TelegramNotifier
+            from core.integrations.notify import notify_employee
             emp_uuid = None
             if employee_id_str:
                 try:
@@ -1312,11 +1312,15 @@ class Plugin(BasePlugin):
             )
             if bestaetigung:
                 push += f"\n<b>Aussage Kunde:</b> {bestaetigung}"
-            await TelegramNotifier.send_for_employee(
-                tenant.id, push, employee_id=emp_uuid,
+            await notify_employee(
+                tenant.id, emp_uuid,
+                title="Termin telefonisch storniert",
+                body="In der App ansehen.",
+                url="/app#termine", tag="storno",
+                telegram_text=push,
             )
         except Exception as exc:  # noqa: BLE001
-            logger.warning(f"storniere_termin telegram-push failed: {exc}")
+            logger.warning(f"storniere_termin push failed: {exc}")
 
         logger.info(
             f"storniere_termin: tenant={tenant_slug} event={event_id[:12]}… "
@@ -1595,10 +1599,13 @@ class Plugin(BasePlugin):
             f"{anliegen_str}\n\n"
             f'<a href="{deeplink}">In Lexware oeffnen</a>'
         )
-        from plugins.telegram_notify.handler import TelegramNotifier
-        await TelegramNotifier.send_for_employee(
-            tenant_id, msg,
-            employee_id=routing.employee_id if routing else None,
+        from core.integrations.notify import notify_employee
+        await notify_employee(
+            tenant_id, routing.employee_id if routing else None,
+            title="Neuer Anruf",
+            body=f"Kontakt {action} — Details in der App.",
+            url="/app#aufnahmen", tag="anruf",
+            telegram_text=msg,
         )
 
         return {
@@ -1736,13 +1743,17 @@ class Plugin(BasePlugin):
             ]]
         }
         try:
-            from plugins.telegram_notify.handler import TelegramNotifier
-            await TelegramNotifier.send_for_employee_with_keyboard(
-                tenant_id, msg, keyboard,
-                employee_id=assigned_employee_id,
+            from core.integrations.notify import notify_employee
+            await notify_employee(
+                tenant_id, assigned_employee_id,
+                title="Rückrufbitte",
+                body="Ein Kunde bittet um Rückruf — in der App ansehen.",
+                url="/app#rueckrufe", tag="rueckruf",
+                telegram_text=msg,
+                telegram_keyboard=keyboard,
             )
         except Exception as e:
-            logger.exception(f"rueckruf: Telegram-Push fehlgeschlagen: {e}")
+            logger.exception(f"rueckruf: Push fehlgeschlagen: {e}")
 
         return {
             "success": True,

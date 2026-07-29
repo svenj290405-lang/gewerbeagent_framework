@@ -340,8 +340,16 @@ class Plugin(BasePlugin):
                 f"{adresse_line}"
                 f"{telefon_line}"
             )
-            await TelegramNotifier.send_for_employee(
-                self.tenant_id, push_text, employee_id=employee_id,
+            from core.integrations.notify import notify_employee
+            await notify_employee(
+                self.tenant_id, employee_id,
+                title="Neuer Termin",
+                body=(
+                    f"{start.strftime('%a %d.%m., %H:%M')} Uhr — "
+                    f"Details in der App."
+                ),
+                url="/app#termine", tag="buchung",
+                telegram_text=push_text,
             )
 
             booking_response = {

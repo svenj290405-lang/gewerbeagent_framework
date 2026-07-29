@@ -392,7 +392,7 @@ async def _handle_callback_microsoft(
                 f"werden im Outlook-Client verschoben angezeigt."
             )
             try:
-                from plugins.telegram_notify.handler import TelegramNotifier
+                from core.integrations.notify import notify_employee
                 warn = (
                     "⚠️ <b>Outlook-Kalender verbunden — aber Zeitzone pruefen!</b>\n\n"
                     f"Account: <code>{account_email}</code>\n"
@@ -407,8 +407,15 @@ async def _handle_callback_microsoft(
                     f"unabhaengig davon im Hintergrund korrekt — nur die "
                     f"Outlook-Anzeige ist betroffen."
                 )
-                await TelegramNotifier.send_for_employee(
-                    tenant.id, warn, employee_id=employee_id,
+                await notify_employee(
+                    tenant.id, employee_id,
+                    title="Outlook verbunden — Zeitzone prüfen",
+                    body=(
+                        f"Mailbox steht auf {mailbox_tz}. "
+                        f"Anleitung in der App."
+                    ),
+                    url="/app#mehr", tag="tz-warnung",
+                    telegram_text=warn,
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.warning(f"TZ-Warning-Push failed: {exc}")

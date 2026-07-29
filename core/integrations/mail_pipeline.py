@@ -557,9 +557,13 @@ async def push_tenant_followup_mail(
     )
 
     try:
-        from plugins.telegram_notify.handler import TelegramNotifier
-        ok = await TelegramNotifier.send_for_tenant(
-            tenant.id, text, employee_id=target_employee_id,
+        from core.integrations.notify import notify_tenant
+        ok = await notify_tenant(
+            tenant.id,
+            title="Neue Nachricht",
+            body="Zu einem laufenden Vorgang — in der App ansehen.",
+            url="/app#aktuelles", tag="mail",
+            telegram_text=text, employee_id=target_employee_id,
         )
         return bool(ok)
     except Exception as e:
@@ -1209,9 +1213,13 @@ async def push_tenant_bounce_notification(
     )
 
     try:
-        from plugins.telegram_notify.handler import TelegramNotifier
-        ok = await TelegramNotifier.send_for_tenant(
-            tenant.id, text, employee_id=target_employee_id,
+        from core.integrations.notify import notify_tenant
+        ok = await notify_tenant(
+            tenant.id,
+            title="Antwort nicht zugestellt",
+            body="Bitte in der App prüfen und ggf. manuell antworten.",
+            url="/app#aktuelles", tag="bounce",
+            telegram_text=text, employee_id=target_employee_id,
         )
         return bool(ok)
     except Exception as e:
@@ -1263,9 +1271,13 @@ async def push_tenant_new_anfrage_notification(
     )
 
     try:
-        from plugins.telegram_notify.handler import TelegramNotifier
-        ok = await TelegramNotifier.send_for_tenant(
-            tenant.id, text, employee_id=employee_id,
+        from core.integrations.notify import notify_tenant
+        ok = await notify_tenant(
+            tenant.id,
+            title="Neue Kundenanfrage",
+            body="In der App öffnen, um zu antworten.",
+            url="/app#aktuelles", tag="anfrage",
+            telegram_text=text, employee_id=employee_id,
         )
         return bool(ok)
     except Exception as e:
@@ -1308,9 +1320,15 @@ async def push_tenant_intent_event(
     )
 
     try:
-        from plugins.telegram_notify.handler import TelegramNotifier
-        ok = await TelegramNotifier.send_for_tenant(
-            tenant.id, text, employee_id=employee_id,
+        from core.integrations.notify import notify_tenant
+        ok = await notify_tenant(
+            tenant.id,
+            # label ist eine feste interne Bezeichnung (Storno/Verschiebung/
+            # Rechnungsanfrage), keine Kunden-PII — darf in den Push.
+            title=label,
+            body="Details in der App.",
+            url="/app#aktuelles", tag="intent",
+            telegram_text=text, employee_id=employee_id,
         )
         return bool(ok)
     except Exception as e:

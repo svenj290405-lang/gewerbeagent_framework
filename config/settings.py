@@ -95,6 +95,13 @@ class Settings(BaseSettings):
     # 'sub'-Claim fuer VAPID — eine Kontakt-Mailadresse des Betreibers.
     vapid_subject: str = "mailto:datenschutz@gewerbeagent.de"
 
+    # Telegram-Ausstieg (Art. 28 / Drittland, siehe LEGAL/Subprozessoren-Liste).
+    # Solange True laufen Benachrichtigungen parallel ueber Web-Push UND
+    # Telegram. Auf False stellen, sobald alle Mitarbeiter ein Push-Abo haben:
+    # dann verstummt Telegram schlagartig, ohne Code-Deploy. Der Bot-Code kann
+    # danach entfernt werden. Siehe core/integrations/notify.py.
+    telegram_enabled: bool = True
+
     @property
     def app_url(self) -> str:
         """Basis-URL der PWA — app_base_url falls gesetzt, sonst public_url."""

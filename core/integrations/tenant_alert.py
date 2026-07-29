@@ -78,7 +78,27 @@ async def _send_alert(
     *, tenant_id: UUID, message: str,
     employee_id: UUID | None = None,
 ) -> bool:
-    """Schickt Push an passenden Telegram-Chat. Failsafe."""
+    """Benachrichtigt den Betrieb per Web-Push und (noch) per Telegram.
+
+    Failsafe: keiner der beiden Kanaele darf den Aufrufer abbrechen.
+    Rueckgabe bezieht sich auf Telegram, solange das der Hauptkanal ist.
+    """
+    # Web-Push zuerst — inhaltslos, weil message Kunden-PII enthalten kann.
+    try:
+        from core.integrations.push_notifier import send_push_to_tenant
+        await send_push_to_tenant(
+            tenant_id,
+            title="Hinweis zu deinem Betrieb",
+            body="In der App ansehen.",
+            url="/app#aktuelles", tag="tenant-alert",
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"_send_alert push failed: {e}")
+
+    from core.integrations.notify import telegram_active
+    if not telegram_active():
+        return False
+
     try:
         # Lazy-Import damit keine Plugin-Loading-Zirkel.
         # resolve_employee_push_target liefert (bot_token, chat_id, prefix);

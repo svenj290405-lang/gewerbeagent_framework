@@ -344,38 +344,44 @@ async def _notify_move(
     tenant: Tenant, sick_emp: Employee, new_emp: Employee,
     event: dict, start_dt: dt.datetime,
 ) -> None:
-    """Push an sick_emp und new_emp ueber die Umverteilung.
+    """Benachrichtigt sick_emp und new_emp ueber die Umverteilung.
 
-    Silent-fail: Telegram-Fehler werden geloggt aber nicht weitergereicht
+    Silent-fail: Versandfehler werden geloggt aber nicht weitergereicht
     (Umverteilung selbst soll nicht an Push-Problemen scheitern).
     """
     from html import escape as _h
-    from plugins.telegram_notify.handler import TelegramNotifier
+    from core.integrations.notify import notify_employee
     when = start_dt.strftime("%a %d.%m. %H:%M")
     subject = (event.get("subject") or "(Termin)")[:80]
     try:
-        await TelegramNotifier.send_for_employee(
-            tenant.id,
-            (
+        await notify_employee(
+            tenant.id, sick_emp.id,
+            title="Termin umgehängt",
+            body=f"{when} — ein Kollege übernimmt. Details in der App.",
+            url="/app#termine", tag="umverteilung",
+            telegram_text=(
                 f"🔄 <b>Dein Termin wurde umgehaengt</b>\n"
                 f"<b>Wann:</b> {when}\n"
                 f"<b>Was:</b> {_h(subject)}\n"
                 f"<b>Uebernimmt:</b> {_h(new_emp.name)}"
             ),
-            employee_id=sick_emp.id, employee_label=sick_emp.name,
+            employee_label=sick_emp.name,
         )
     except Exception as e:  # noqa: BLE001
         logger.warning(f"_notify_move sick push failed: {e}")
     try:
-        await TelegramNotifier.send_for_employee(
-            tenant.id,
-            (
+        await notify_employee(
+            tenant.id, new_emp.id,
+            title="Du übernimmst einen Termin",
+            body=f"{when} — Details in der App.",
+            url="/app#termine", tag="umverteilung",
+            telegram_text=(
                 f"📥 <b>Du uebernimmst einen Termin</b>\n"
                 f"<b>Wann:</b> {when}\n"
                 f"<b>Was:</b> {_h(subject)}\n"
                 f"<b>Von:</b> {_h(sick_emp.name)} (krank)"
             ),
-            employee_id=new_emp.id, employee_label=new_emp.name,
+            employee_label=new_emp.name,
         )
     except Exception as e:  # noqa: BLE001
         logger.warning(f"_notify_move new push failed: {e}")
@@ -455,18 +461,28 @@ async def redistribute_for_employee(
 
 
 async def _send_report_to_inhaber(tenant: Tenant, report: RedistributionReport):
-    """Schickt die Zusammenfassung an den Default-Employee per Telegram."""
+    """Schickt die Zusammenfassung an den Default-Employee (Push + Telegram).
+
+    Bewusst NICHT auf telegram_chat_id gegated — sonst bekaeme ein Inhaber
+    ohne Telegram auch keinen Web-Push. Welcher Kanal tatsaechlich greift,
+    entscheidet notify_tenant.
+    """
     try:
-        from plugins.telegram_notify.handler import TelegramNotifier
+        from core.integrations.notify import notify_tenant
         default = await get_default_employee(tenant.id)
-        if default is None or not default.telegram_chat_id:
+        if default is None:
             logger.info(
-                f"_send_report_to_inhaber: kein Default-Chat fuer "
+                f"_send_report_to_inhaber: kein Default-Employee fuer "
                 f"tenant={tenant.slug} — skip"
             )
             return
-        await TelegramNotifier.send_for_tenant(
-            tenant.id, report.telegram_summary(), employee_id=default.id,
+        await notify_tenant(
+            tenant.id,
+            title="Umverteilung abgeschlossen",
+            body="Zusammenfassung in der App ansehen.",
+            url="/app#termine", tag="umverteilung-report",
+            telegram_text=report.telegram_summary(),
+            employee_id=default.id,
         )
     except Exception as e:  # noqa: BLE001
         logger.warning(
