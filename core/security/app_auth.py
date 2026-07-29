@@ -56,8 +56,44 @@ COOKIE_SECURE = settings.is_production
 LOGIN_RATE_WINDOW = dt.timedelta(minutes=15)
 LOGIN_RATE_MAX = 5
 
+# Passwort-Login-Brute-Force-Schutz: fehlgeschlagene Versuche pro IP.
+# Bewusst prozessintern (kein DB-Marker) — die App laeuft als EIN uvicorn-
+# Prozess ohne --workers, darum ist der In-Memory-Zaehler vollstaendig wirksam
+# und ueberlebt bewusst keinen Neustart (dann ist die Sperre eh hinfaellig).
+# Anders als beim Magic-Link koennen wir hier keinen AppLoginToken-Marker
+# anlegen: dessen employee_id/tenant_id sind NOT NULL, bei unbekannter Mail
+# gibt es aber keinen Employee.
+FAILED_LOGIN_WINDOW = dt.timedelta(minutes=15)
+FAILED_LOGIN_MAX = 10
+_failed_logins: dict[str, list[dt.datetime]] = {}
+
 # Sliding-Window: Session-Activity nur alle 5 Min in die DB schreiben.
 _ACTIVITY_BUMP_SECONDS = 300
+
+
+def _prune_failed_logins(ip: str, now: dt.datetime) -> list[dt.datetime]:
+    cutoff = now - FAILED_LOGIN_WINDOW
+    kept = [t for t in _failed_logins.get(ip, ()) if t >= cutoff]
+    if kept:
+        _failed_logins[ip] = kept
+    else:
+        _failed_logins.pop(ip, None)
+    return kept
+
+
+def password_login_locked(ip: str) -> bool:
+    """True wenn diese IP zu viele Passwort-Fehlversuche im Fenster hatte."""
+    now = dt.datetime.now(dt.timezone.utc)
+    return len(_prune_failed_logins(ip, now)) >= FAILED_LOGIN_MAX
+
+
+def record_failed_password_login(ip: str) -> None:
+    """Vermerkt einen fehlgeschlagenen Passwort-Login fuer die IP-Sperre."""
+    now = dt.datetime.now(dt.timezone.utc)
+    kept = _prune_failed_logins(ip, now)
+    # Speicher-Deckel: der Zaehler zaehlt bis MAX, mehr braucht die Sperre nicht.
+    if len(kept) <= FAILED_LOGIN_MAX * 2:
+        _failed_logins.setdefault(ip, []).append(now)
 
 
 # =====================================================================

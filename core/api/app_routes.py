@@ -170,18 +170,22 @@ async def app_login_password(
     email: str = Form(...),
     password: str = Form(...),
 ):
-    """Klassisches E-Mail+Passwort-Login. Rate-limited per IP (gleiches
-    Fenster wie Magic-Link)."""
-    from core.security.app_auth import _client_ip
+    """Klassisches E-Mail+Passwort-Login. Brute-Force-gebremst per IP
+    (eigener In-Memory-Zaehler, siehe app_auth.password_login_locked)."""
+    from core.security.app_auth import (
+        _client_ip,
+        password_login_locked,
+        record_failed_password_login,
+    )
 
     ip = _client_ip(request)
+    if password_login_locked(ip):
+        return RedirectResponse("/app/login?fehler=rate", status_code=303)
     async with get_session() as s:
-        if not await check_login_rate_limit(ip, session=s):
-            return RedirectResponse("/app/login?fehler=rate", status_code=303)
         emp = await verify_app_login(email, password, session=s)
         if emp is None:
-            # Fehlversuch als Rate-Limit-Zaehler vermerken (Login-Token-Tabelle
-            # dient als IP-Zaehler — wir legen einen kurzlebigen Marker an).
+            # Fehlversuch zaehlen, damit Passwort-Raten in die IP-Sperre laeuft.
+            record_failed_password_login(ip)
             return RedirectResponse("/app/login?fehler=login", status_code=303)
         sess = await create_app_session(employee=emp, request=request, session=s)
         token_val = sess.token
@@ -276,7 +280,7 @@ async def app_activate_set(
 
     token = (token or "").strip()
     email = (email or "").strip().lower()
-    if "@" not in email or len(password) < 6:
+    if "@" not in email or len(password) < 8:
         return RedirectResponse(f"/app/activate?token={token}&fehler=eingabe", status_code=303)
 
     consumed = await consume_activation_token(token)
@@ -327,6 +331,23 @@ async def app_shell_root(_emp=Depends(require_app_user)) -> FileResponse:
     return FileResponse(str(STATIC_DIR / "index.html"))
 
 
+@router.get("/beta")
+async def app_shell_beta(_emp=Depends(require_app_user)) -> FileResponse:
+    """Design-Vorschau: dieselbe App (gleiches app.js, gleiche API, gleiche
+    Session) mit dem Beta-Stylesheet. Reiner Reskin — /app bleibt unberuehrt,
+    beide Versionen laufen parallel auf denselben Daten.
+
+    Bewusst ohne Manifest: die Beta soll sich nicht als zweite App auf dem
+    Homescreen installieren lassen. Den Service-Worker registriert app.js
+    trotzdem (gleicher /app-Scope) — unkritisch, weil er network-first
+    arbeitet und beta.html per no-store ohnehin immer frisch kommt.
+    """
+    return FileResponse(
+        str(STATIC_DIR / "beta.html"),
+        headers={"Cache-Control": "no-store"},
+    )
+
+
 # =====================================================================
 # JSON-API: Session-Kontext + Push-Subscriptions
 # =====================================================================
@@ -345,6 +366,11 @@ async def app_api_me(request: Request, _emp=Depends(require_app_user)) -> JSONRe
         "tenant": {
             "slug": tenant.slug,
             "company_name": tenant.company_name,
+            "brand_color": tenant.brand_color or None,
+            # Branding fuer die Kopfzeile. has_logo statt der Bytes — das Bild
+            # holt der Client bei Bedarf von /app/api/branding/logo.
+            "website_url": tenant.website_url or None,
+            "has_logo": bool(tenant.logo_data),
         },
         "features": features,
         "onboarding_done": emp.app_onboarding_completed_at is not None,
