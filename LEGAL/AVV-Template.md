@@ -97,7 +97,7 @@ durchgefuehrt; eine Bestaetigung erfolgt schriftlich oder per Mail.
 
 Der Verantwortliche stimmt der Einschaltung der in
 **LEGAL/Subprozessoren-Liste.md** aufgefuehrten Sub-Auftragsverarbeiter
-zu (Stand 11.05.2026: 9 Anbieter, siehe separate Liste).
+zu (Stand 25.05.2026: 9 Anbieter, siehe separate Liste).
 
 Aenderungen werden mindestens **14 Tage vor Wirksamwerden** per Mail
 mitgeteilt. Der Verantwortliche kann widersprechen; im Streitfall steht
@@ -139,10 +139,21 @@ Datengeheimnis (Art. 28 Abs. 3 lit. b DSGVO) verpflichtet.
 
 ## 9. Kontrollrechte
 
-Der Verantwortliche hat das Recht, im Benehmen mit dem
-Auftragsverarbeiter Audits durchzufuehren — entweder selbst oder
-durch eine beauftragte Stelle. Kosten fuer Audits, die haeufiger als
-einmal pro Jahr stattfinden, traegt der Verantwortliche.
+(1) Der Verantwortliche hat das Recht, die Einhaltung der in diesem
+Vertrag getroffenen Massnahmen zu ueberpruefen. Die Ueberpruefung
+erfolgt vorrangig dadurch, dass der Auftragsverarbeiter geeignete
+Nachweise vorlegt (z.B. die TOM-Uebersicht aus Ziffer 3, die
+Subprozessoren-Liste und eine Sicherheits-Selbstauskunft).
+
+(2) Reicht dies im Einzelfall nicht aus, kann der Verantwortliche ein
+Audit — im Benehmen mit dem Auftragsverarbeiter, mit angemessener
+Vorankuendigung (mind. 14 Tage), zu den ueblichen Geschaeftszeiten und
+ohne Stoerung des Betriebsablaufs — selbst oder durch eine zur
+Verschwiegenheit verpflichtete Stelle durchfuehren.
+
+(3) Die Kosten eines Audits traegt der Verantwortliche; dies umfasst
+auch den angemessenen Aufwand des Auftragsverarbeiters fuer die
+Unterstuetzung des Audits.
 
 ## 10. Beendigung des Vertrages
 

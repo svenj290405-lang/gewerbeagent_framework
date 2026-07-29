@@ -1,4 +1,4 @@
-# Subprozessoren-Liste (Stand: 11.05.2026)
+# Subprozessoren-Liste (Stand: 25.05.2026)
 
 Diese Liste nennt alle Dienste, an die personenbezogene Daten beim
 Betrieb des Gewerbeagent-Frameworks weitergegeben werden, und ist
@@ -22,7 +22,7 @@ hinterlegte Kontakt-Adresse) und kann Aenderungen innerhalb von
 | 4 | **Sendinblue SAS (Brevo)** | Transaktionale Mails (Rechnungen, Visualisierungen) | Paris, FR | EU | Empfaenger-Mail-Adresse, Mail-Inhalt, Anhaenge | EU-intern, kein Drittlandstransfer |
 | 5 | **Telegram Messenger Inc.** | Tenant-Bot (Telegram-Push) | London, UK | UK / Singapore | Telegram-User-ID, Bot-Nachrichten | UK GDPR Adequacy + Telegram-AGB |
 | 6 | **Sipgate GmbH** | Voice-Telefon-Nummer + Anruf-Routing | Duesseldorf, DE | EU (DE) | Anrufer-Nummer, Anruf-Zeitstempel | Telekommunikations-Anbieter (TKG), DSGVO |
-| 7 | **ElevenLabs Inc.** | Voice-AI (Telefon-Annahme-Agent) | San Francisco, USA | USA (mit SCC) | Anrufer-Audio, Transkripte | Standardvertragsklauseln (SCC), keine Trainings-Verwendung vertraglich ausgeschlossen |
+| 7 | **ElevenLabs Inc.** | Voice-AI (Telefon-Annahme-Agent) | San Francisco, USA | USA (mit SCC) | Anrufer-Audio, Transkripte | Standardvertragsklauseln (SCC); Modell-Training via Zero-Retention-Mode/Opt-out deaktiviert |
 | 8 | **Deepgram Inc.** | Speech-to-Text (Voice-Transkription) | San Francisco, USA | USA (mit SCC) | Audio-Snippets, Transkripte | Standardvertragsklauseln (SCC) |
 | 9 | **Lexware (Haufe-Lexware GmbH & Co. KG)** | Buchhaltung (Rechnungen, Bezahl-Status) | Freiburg, DE | EU (DE) | Kunden-Stammdaten, Rechnungsbetraege, Lexware-API-Key | Auftragsverarbeitung (Lexware AVV) |
 
@@ -51,8 +51,13 @@ hinterlegte Kontakt-Adresse) und kann Aenderungen innerhalb von
 - **USA-Transfers (ElevenLabs, Deepgram):** abgedeckt durch
   Standardvertragsklauseln gemaess Art. 46 DSGVO. ElevenLabs- und
   Deepgram-Calls erfolgen nur bei aktivem Voice-Feature.
-- **Training-Use-Schutz:** ElevenLabs und Deepgram haben vertraglich
-  zugesichert, Kunden-Audio nicht fuer Modell-Training zu verwenden.
+- **Training-Use-Schutz:** Anruf-Audio wird nicht fuer das Modell-
+  Training der Anbieter verwendet. Bei **ElevenLabs** ist hierfuer der
+  Zero-Retention-Mode bzw. der Opt-out der Daten-Nutzung aktiviert
+  (ohne diese Einstellung nutzt ElevenLabs Voice-Data standardmaessig
+  zur Modellverbesserung). **Deepgram** trainiert standardmaessig nicht
+  auf Kundendaten; das Opt-in-Programm (Model Improvement Partnership)
+  ist nicht aktiviert.
 - **Loeschfristen:** Mail-Konversationen werden nach
   `tenant.data_retention_days` (Default 90 Tage) automatisch geloescht
   (DSGVO-Cleanup-Cron). Backups werden 90 Tage off-site aufbewahrt,
@@ -63,3 +68,5 @@ hinterlegte Kontakt-Adresse) und kann Aenderungen innerhalb von
 ## Aenderungshistorie
 
 - 2026-05-11: Erstfassung fuer Pilot-Phase.
+- 2026-05-25: Training-Use-Schutz praezisiert (ElevenLabs: Zero-
+  Retention-Mode/Opt-out aktiv; Deepgram: kein MIP-Opt-in).
