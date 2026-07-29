@@ -311,6 +311,9 @@ __all__ = [
     "STATE_ARCHIV_AWAIT_CHOICE",
     "STATE_ARCHIV_AWAIT_NEW_CONFIRM",
     "TenantKundeDrive",
+    "Kunde",
+    "KundeExternalRef",
+    "REF_SYSTEM_LEXWARE",
     "Rueckruf",
     "RUECKRUF_STATUS_OFFEN",
     "RUECKRUF_STATUS_ERLEDIGT",
@@ -395,6 +398,8 @@ from core.models.tenant_material import (
     BESTELL_ART_MANUAL,
 )
 from core.models.tenant_kunde_drive import TenantKundeDrive
+from core.models.kunde import Kunde
+from core.models.kunde_external_ref import KundeExternalRef, REF_SYSTEM_LEXWARE
 from core.models.app_account import (
     AppSession,
     AppLoginToken,

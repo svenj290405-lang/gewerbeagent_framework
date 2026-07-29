@@ -14,7 +14,7 @@ import uuid
 from enum import Enum
 from typing import TYPE_CHECKING
 
-from sqlalchemy import BigInteger, DateTime, Integer, Numeric, String
+from sqlalchemy import BigInteger, DateTime, Integer, LargeBinary, Numeric, String
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -124,6 +124,21 @@ class Tenant(Base):
     data_retention_days: Mapped[int] = mapped_column(
         Integer, nullable=False, server_default="90", default=90,
     )
+
+    # Primärfarbe der WebApp (CSS --primary). Hex-Wert wie "#0066cc".
+    # NULL = Standard-Blau (#0066cc).
+    brand_color: Mapped[str | None] = mapped_column(String(7), nullable=True)
+
+    # Firmen-Website. Wird in der App-Kopfzeile hinter dem Logo verlinkt.
+    # Immer mit Schema ("https://..."), damit der Link nicht relativ wird.
+    website_url: Mapped[str | None] = mapped_column(String(300), nullable=True)
+
+    # Firmenlogo direkt als BYTEA in der DB — gleiches Muster wie die
+    # Visualisierungs-Bilder: atomar, faellt mit dem Tenant-Delete weg, kein
+    # zweiter Speicherort der aus dem Takt geraten kann. Ein Logo ist klein
+    # (Limit 512 KB), das rechtfertigt keinen Drive-/S3-Umweg.
+    logo_data: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
+    logo_mime: Mapped[str | None] = mapped_column(String(50), nullable=True)
 
     # --- Relationships ---
 

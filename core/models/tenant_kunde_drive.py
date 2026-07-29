@@ -53,6 +53,14 @@ class TenantKundeDrive(Base):
     # zur Nachvollziehbarkeit + um bei Bedarf umzuschluesseln.
     kunde_email: Mapped[str | None] = mapped_column(String(200), nullable=True)
     kunde_telefon: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    # Verweis auf den Kundenstamm (kunden.id), nullable waehrend der
+    # Umstellung — siehe Kundendatenbank_Umsetzungsplan.md. Loest den
+    # kunde_key perspektivisch (Phase 7) als Identitaet ab.
+    kunde_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("kunden.id", ondelete="SET NULL"),
+        nullable=True,
+    )
 
     # Drive-Folder
     drive_folder_id: Mapped[str] = mapped_column(String(100), nullable=False)

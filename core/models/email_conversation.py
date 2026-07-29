@@ -77,6 +77,13 @@ class EmailConversation(Base):
     # Routing-Key: Mail des Kunden (NIE die Tenant-Reply-Adresse)
     kunde_email: Mapped[str] = mapped_column(String(255), nullable=False)
     kunde_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # Verweis auf den Kundenstamm (kunden.id), nullable waehrend der
+    # Umstellung — siehe Kundendatenbank_Umsetzungsplan.md.
+    kunde_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("kunden.id", ondelete="SET NULL"),
+        nullable=True,
+    )
 
     # Aktueller Termin (falls schon eingetragen)
     gcal_event_id: Mapped[str | None] = mapped_column(String(255), nullable=True)

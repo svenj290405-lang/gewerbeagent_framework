@@ -75,6 +75,13 @@ class AnfrageToken(Base):
     # Index (tenant_id, kunde_telefon) WHERE NOT NULL — siehe Migration
     # a9k2m4n6p8q1.
     kunde_telefon: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    # Verweis auf den Kundenstamm (kunden.id), nullable waehrend der
+    # Umstellung — siehe Kundendatenbank_Umsetzungsplan.md.
+    kunde_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("kunden.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     anfrage_typ: Mapped[str] = mapped_column(String(50), nullable=False, default=ANFRAGE_TYP_ALLGEMEIN)
     original_subject: Mapped[str | None] = mapped_column(String(500), nullable=True)
     original_message_id: Mapped[str | None] = mapped_column(String(500), nullable=True)

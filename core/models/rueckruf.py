@@ -61,6 +61,13 @@ class Rueckruf(Base):
     kunde_telefon: Mapped[str] = mapped_column(String(50), nullable=False)
     anliegen: Mapped[str] = mapped_column(Text, nullable=False)
     kunde_email: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # Verweis auf den Kundenstamm (kunden.id), nullable waehrend der
+    # Umstellung — siehe Kundendatenbank_Umsetzungsplan.md.
+    kunde_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("kunden.id", ondelete="SET NULL"),
+        nullable=True,
+    )
 
     # Bearbeitungs-Status. server_default damit Bestands-/Roh-Inserts
     # ohne explizites Setzen sauber 'offen' sind.

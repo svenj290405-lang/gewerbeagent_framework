@@ -74,6 +74,15 @@ class Angebot(Base):
     kunde_strasse: Mapped[str | None] = mapped_column(String(300), nullable=True)
     kunde_plz: Mapped[str | None] = mapped_column(String(20), nullable=True)
     kunde_ort: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    # Verweis auf den Kundenstamm (kunden.id) — nullable waehrend der
+    # Umstellung; Backfill + Schreibpfade setzen ihn (Umsetzungsplan
+    # Phase 2/3), die Namensfelder bleiben parallel befuellt.
+    # Partial-Index in der Migration (WHERE kunde_id IS NOT NULL).
+    kunde_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("kunden.id", ondelete="SET NULL"),
+        nullable=True,
+    )
 
     # Gesamtbetrag (errechnet aus Positionen, gespeichert fuer Stats)
     gesamtbetrag_brutto_eur: Mapped[Decimal | None] = mapped_column(

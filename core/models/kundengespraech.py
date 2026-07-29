@@ -43,8 +43,18 @@ class Kundengespraech(Base):
 
     # Kundendaten
     kunde_name: Mapped[str] = mapped_column(String(300), nullable=False)
+    # Totes Feld aus einem frueheren Anlauf — nirgends beschrieben oder
+    # gelesen, bleibt additive-only stehen. NICHT wiederverwenden; der
+    # Kundenstamm-Verweis ist kunde_id (wie in allen Tabellen).
     kunde_kontakt_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), nullable=True
+    )
+    # Verweis auf den Kundenstamm (kunden.id), nullable waehrend der
+    # Umstellung — siehe Kundendatenbank_Umsetzungsplan.md.
+    kunde_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("kunden.id", ondelete="SET NULL"),
+        nullable=True,
     )
 
     # Audio-Metadaten

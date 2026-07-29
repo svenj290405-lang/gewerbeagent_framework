@@ -92,6 +92,13 @@ class Rechnung(Base):
     kunde_email: Mapped[str | None] = mapped_column(
         String(255), nullable=True
     )
+    # Verweis auf den Kundenstamm (kunden.id), nullable waehrend der
+    # Umstellung — siehe Kundendatenbank_Umsetzungsplan.md.
+    kunde_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("kunden.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     leistung_titel: Mapped[str | None] = mapped_column(
         String(500), nullable=True
     )
