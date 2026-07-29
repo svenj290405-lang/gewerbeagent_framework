@@ -21,9 +21,10 @@ from core.api import app_screens
 
 
 class _FakeProfSession:
-    """execute() liefert nacheinander die Werte aus seq. Listen werden ueber
-    scalars().all() abgefragt (Gespraeche/Angebote/Rechnungen), das
-    Drive-Objekt ueber scalar_one_or_none()."""
+    """execute() liefert nacheinander die Werte aus seq. Reihenfolge seit
+    Phase 5: [kunden, gespraeche, angebote, rechnungen, drive]. Listen
+    werden ueber scalars().all() abgefragt, der Drive-Ordner ueber
+    scalars().first()."""
     def __init__(self, seq):
         self.seq = list(seq)
         self.i = 0
@@ -37,8 +38,17 @@ class _FakeProfSession:
     async def execute(self, stmt):
         val = self.seq[self.i]
         self.i += 1
+
+        def _first(v=val):
+            if isinstance(v, list):
+                return v[0] if v else None
+            return v
+
         return SimpleNamespace(
-            scalars=lambda v=val: SimpleNamespace(all=lambda: v if isinstance(v, list) else []),
+            scalars=lambda v=val: SimpleNamespace(
+                all=lambda: v if isinstance(v, list) else [],
+                first=_first,
+            ),
             scalar_one_or_none=lambda v=val: (None if isinstance(v, list) else v),
         )
 
@@ -70,7 +80,8 @@ async def test_profil_happy_path_aggregates(monkeypatch):
     drive = SimpleNamespace(drive_folder_url="https://drive.example/x",
                             upload_count=3, last_upload_at=None)
     monkeypatch.setattr(app_screens, "get_session",
-                        lambda: _FakeProfSession([gespraeche, angebote, rechnungen, drive]))
+                        lambda: _FakeProfSession(
+                            [[], gespraeche, angebote, rechnungen, drive]))
 
     resp = await app_screens.api_kunde_profil(request=_req(), name="Mueller", _e=None)
     assert resp.status_code == 200
@@ -78,6 +89,7 @@ async def test_profil_happy_path_aggregates(monkeypatch):
     assert j["ok"] is True
     assert j["name"] == "Mueller"
     assert j["email"] == "kunde@example.de"
+    assert j["kunde_id"] is None  # kein Kundenstamm-Treffer im Fake
     assert len(j["gespraeche"]) == 1 and j["gespraeche"][0]["briefing"] == "Bad sanieren"
     assert j["angebote"][0]["status"]      # gemapptes Label, nicht leer
     assert j["drive"]["url"] == "https://drive.example/x"
@@ -87,7 +99,7 @@ async def test_profil_happy_path_aggregates(monkeypatch):
 @pytest.mark.asyncio
 async def test_profil_without_drive(monkeypatch):
     monkeypatch.setattr(app_screens, "get_session",
-                        lambda: _FakeProfSession([[], [], [], None]))
+                        lambda: _FakeProfSession([[], [], [], [], None]))
     resp = await app_screens.api_kunde_profil(request=_req(), name="Unbekannt", _e=None)
     assert resp.status_code == 200
     j = _json(resp)

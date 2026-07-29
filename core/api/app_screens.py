@@ -16,7 +16,7 @@ import logging
 import uuid
 
 from fastapi import APIRouter, Depends, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from sqlalchemy import func, select
 
 from core.database.connection import get_session
@@ -1126,12 +1126,16 @@ async def _save_diktat_gespraech(
     kunde_name: str,
     dauer: int | None,
     extracted: dict,
-) -> uuid.UUID:
+) -> tuple[uuid.UUID, list[dict]]:
     """Speichert ein Kundengespraech aus der Diktat-Extraktion.
 
     Spiegelt exakt das Mapping aus dem Telegram-Flow
     (_handle_aufnahme_audio_received); zusaetzlich wird der diktierende
     Mitarbeiter als created_by/assigned vermerkt.
+
+    Returns: (gespraech_id, kunde_frage) — kunde_frage ist die Liste
+    namensgleicher Bestandskunden (Phase 6), wenn die Zuordnung offen
+    blieb; leer wenn eindeutig.
     """
     g = Kundengespraech(
         tenant_id=tenant_id,
@@ -1150,8 +1154,21 @@ async def _save_diktat_gespraech(
     )
     async with get_session() as s:
         s.add(g)
+        # Phase 6: Nur-Name-Anlage raet nie — bei namensgleichen
+        # Bestandskunden bleibt kunde_id offen, die PWA fragt nach.
+        from core.services.kunde_identity import (
+            kunde_anzeige_merkmal, resolve_kunde_name_only)
+        kandidaten = []
+        try:
+            g.kunde_id, kandidaten = await resolve_kunde_name_only(
+                s, tenant_id, kunde_name)
+        except Exception:
+            logger.exception(
+                "Kundenaufloesung fehlgeschlagen — kunde_id bleibt NULL")
+        frage = [{"id": str(k.id), "name": k.name,
+                  "merkmal": kunde_anzeige_merkmal(k)} for k in kandidaten]
         await s.commit()
-        return g.id
+        return g.id, frage
 
 
 @router.post("/aufnahmen/diktat")
@@ -1209,7 +1226,8 @@ async def api_aufnahme_diktat(
             status_code=422,
         )
 
-    g_id = await _save_diktat_gespraech(tid, emp.id, kunde_name, dauer, extracted)
+    g_id, kunde_frage = await _save_diktat_gespraech(
+        tid, emp.id, kunde_name, dauer, extracted)
     from core.models.app_usage_event import record_app_usage, USAGE_DIKTAT
     await record_app_usage(tid, emp.id, USAGE_DIKTAT)
     logger.info(
@@ -1223,6 +1241,9 @@ async def api_aufnahme_diktat(
         "briefing": (extracted.get("briefing_kurz") or "")[:300],
         "todos": list(extracted.get("todos") or []),
         "confidence": extracted.get("extraction_confidence"),
+        # Phase 6: namensgleiche Bestandskunden -> die UI fragt
+        # „derselbe oder ein neuer?" (leer = eindeutig zugeordnet)
+        "kunde_frage": kunde_frage,
     })
 
 
@@ -1392,31 +1413,84 @@ async def api_visualisierung_erstellen(
 async def api_kunden(
     request: Request, q: str = "", _e=Depends(require_app_user),
 ) -> JSONResponse:
+    """Kunden-Suche. Leere Query liefert alle bekannten Kunden.
+
+    Durchsucht Gespraeche, Angebote, Rechnungen UND TenantKundeDrive
+    (Kunden die nur per Archiv-Upload existieren werden sonst nicht gefunden)."""
+    from core.models.tenant_kunde_drive import TenantKundeDrive
+    from core.models import Kunde
     tid = current_tenant_id(request)
     query = (q or "").strip()
-    if len(query) < 2:
-        return JSONResponse({"q": query, "gespraeche": [], "angebote": [],
-                             "rechnungen": [], "hint": "Mind. 2 Zeichen eingeben."})
-    like = f"%{query}%"
+    like = f"%{query}%" if query else "%"
     async with get_session() as s:
+        # Kundenstamm zuerst (Phase 5): Treffer per Name ODER Mail —
+        # so findet eine Mail-Suche auch Gespraeche der Person, deren
+        # Zeilen selbst keine Mail tragen.
+        kunden_rows = (await s.execute(
+            select(Kunde).where(
+                Kunde.tenant_id == tid,
+                Kunde.merged_into_id.is_(None),
+                (Kunde.name.ilike(like) | Kunde.email.ilike(like)),
+            ).order_by(Kunde.name.asc()).limit(100)
+        )).scalars().all()
+        kunden_ids = [k.id for k in kunden_rows]
+
+        def _treffer(model):
+            # kunde_id-Treffer ODER Namens-ilike. Der Namens-Zweig
+            # traegt Zeilen ohne kunde_id durch die Uebergangsphase
+            # und faellt in Phase 7 weg.
+            cond = model.kunde_name.ilike(like)
+            if kunden_ids:
+                cond = cond | model.kunde_id.in_(kunden_ids)
+            return cond
+
         g = (await s.execute(
             select(Kundengespraech)
             .where(Kundengespraech.tenant_id == tid)
-            .where(Kundengespraech.kunde_name.ilike(like))
+            .where(_treffer(Kundengespraech))
             .order_by(Kundengespraech.gespraech_datum.desc()).limit(25)
         )).scalars().all()
         a = (await s.execute(
             select(Angebot).where(Angebot.tenant_id == tid)
-            .where(Angebot.kunde_name.ilike(like))
+            .where(_treffer(Angebot))
             .order_by(Angebot.created_at.desc()).limit(25)
         )).scalars().all()
         r = (await s.execute(
             select(Rechnung).where(Rechnung.tenant_id == tid)
-            .where(Rechnung.kunde_name.ilike(like))
+            .where(_treffer(Rechnung))
             .order_by(Rechnung.created_at.desc()).limit(25)
         )).scalars().all()
+        drv = (await s.execute(
+            select(TenantKundeDrive)
+            .where(TenantKundeDrive.tenant_id == tid)
+            # Nur Alt-Zeilen OHNE Kundenstamm-Verweis: Zeilen mit kunde_id
+            # sind schon durch ihren Kunden-Eintrag vertreten. Ohne diesen
+            # Filter taucht nach einem Merge der alte Name der Quelle
+            # (kunde_name der umgehaengten Drive-Zeile) als zweiter
+            # Kunde in der Liste auf.
+            .where(TenantKundeDrive.kunde_id.is_(None))
+            .where(_treffer(TenantKundeDrive))
+            .order_by(TenantKundeDrive.kunde_name.asc()).limit(50)
+        )).scalars().all()
+    # Anzeigeregel (Phase 6): normal nur der Name; kollidieren Namen im
+    # Ergebnis, bekommt jeder Kunde sein kleinstes unterscheidendes
+    # Merkmal (Mail > letzte 4 Tel-Ziffern > Erstkontakt-Datum).
+    from core.services.kunde_identity import kunde_anzeige_merkmal
+    name_haeufigkeit: dict[str, int] = {}
+    for k in kunden_rows:
+        n = (k.name or "").strip().lower()
+        name_haeufigkeit[n] = name_haeufigkeit.get(n, 0) + 1
+    kunden_liste = [{
+        "id": str(k.id),
+        "name": k.name,
+        "merkmal": (kunde_anzeige_merkmal(k)
+                    if name_haeufigkeit[(k.name or "").strip().lower()] > 1
+                    else None),
+    } for k in kunden_rows]
+
     return JSONResponse({
         "q": query,
+        "kunden": kunden_liste,
         "gespraeche": [{"id": str(x.id), "kunde": x.kunde_name,
                         "briefing": (x.briefing_kurz or "")[:140],
                         "zeit": _fmt_dt(x.gespraech_datum)} for x in g],
@@ -1425,43 +1499,169 @@ async def api_kunden(
         "rechnungen": [{"kunde": x.kunde_name or "—", "betrag": _fmt_eur(x.betrag_brutto_eur),
                         "nummer": x.lexware_voucher_number or "",
                         "zeit": _fmt_dt(x.created_at)} for x in r],
+        "drive_kunden": [{"name": d.kunde_name} for d in drv],
     })
+
+
+@router.post("/gespraeche/{gespraech_id}/kunde")
+async def api_gespraech_kunde_zuordnen(
+    gespraech_id: str,
+    request: Request,
+    _e=Depends(require_app_user),
+    _c=Depends(require_app_csrf),
+) -> JSONResponse:
+    """Phase 6: beantwortet die Kunden-Rueckfrage nach einem Diktat —
+    ordnet ein nur-Name-Gespraech einem bestehenden Kunden zu
+    (body: {"kunde_id": "..."}) oder legt bewusst einen neuen an
+    (body: {"neu": true}). Tenant-gescoped, CSRF."""
+    from core.models import Kunde
+    from core.services.kunde_identity import (
+        create_kunde_explizit_neu, kunde_anzeige_merkmal)
+    tid = current_tenant_id(request)
+    try:
+        gid = uuid.UUID(gespraech_id)
+    except (ValueError, TypeError):
+        return JSONResponse({"ok": False, "error": "ungueltige id"}, status_code=400)
+    body = await request.json()
+    kid_raw = (body.get("kunde_id") or "").strip()
+    neu = bool(body.get("neu"))
+    if not kid_raw and not neu:
+        return JSONResponse(
+            {"ok": False, "error": "kunde_id oder neu erwartet"},
+            status_code=400)
+    async with get_session() as s:
+        g = (await s.execute(
+            select(Kundengespraech).where(
+                Kundengespraech.id == gid, Kundengespraech.tenant_id == tid)
+        )).scalar_one_or_none()
+        if g is None:
+            return JSONResponse(
+                {"ok": False, "error": "Gespraech nicht gefunden."},
+                status_code=404)
+        if g.kunde_id is not None:
+            return JSONResponse(
+                {"ok": False, "error": "Schon zugeordnet."}, status_code=409)
+        if neu:
+            kunde = await create_kunde_explizit_neu(s, tid, g.kunde_name)
+        else:
+            try:
+                kunde = await s.get(Kunde, uuid.UUID(kid_raw))
+            except (ValueError, TypeError):
+                kunde = None
+            if kunde is None or kunde.tenant_id != tid:
+                return JSONResponse(
+                    {"ok": False, "error": "Kunde nicht gefunden."},
+                    status_code=404)
+        g.kunde_id = kunde.id
+        antwort = {"ok": True, "kunde_id": str(kunde.id),
+                   "name": kunde.name,
+                   "merkmal": kunde_anzeige_merkmal(kunde)}
+        await s.commit()
+    logger.info("PWA-Kundenzuordnung: gespraech=%s -> kunde=%s tenant=%s",
+                gid, antwort["kunde_id"], tid)
+    return JSONResponse(antwort)
 
 
 @router.get("/kunden/profil")
 async def api_kunde_profil(
-    request: Request, name: str = "", _e=Depends(require_app_user),
+    request: Request, name: str = "", kunde_id: str = "",
+    _e=Depends(require_app_user),
 ) -> JSONResponse:
-    """Gebuendeltes Kundenprofil zu einem (exakten) Namen: Gespraeche,
-    Angebote, Rechnungen + Drive-Ordner. Read-only, tenant-gescoped."""
+    """Gebuendeltes Kundenprofil: Gespraeche, Angebote, Rechnungen +
+    Drive-Ordner. Read-only, tenant-gescoped.
+
+    Aufloesung (Phase 5): mit `kunde_id` praezise ueber den
+    Kundenstamm; sonst ueber den (exakten) Namen — dann laufen die
+    Abfragen ueber kunde_id ALLER namensgleichen Kunden plus
+    Namens-ilike als Uebergangs-Fallback fuer Zeilen ohne kunde_id
+    (faellt in Phase 7 weg).
+    """
+    from sqlalchemy import or_
+    from core.models import Kunde
     from core.models.tenant_kunde_drive import TenantKundeDrive
+    from core.services.kunde_identity import (
+        find_kunden_by_name, kunde_anzeige_merkmal)
     tid = current_tenant_id(request)
     nm = (name or "").strip()
-    if len(nm) < 2:
+    kid_raw = (kunde_id or "").strip()
+    if not kid_raw and len(nm) < 2:
         return JSONResponse({"ok": False, "error": "Name fehlt."}, status_code=400)
     async with get_session() as s:
+        kunde = None
+        kunden_ids: list = []
+        name_fallback = True
+        if kid_raw:
+            try:
+                kid = uuid.UUID(kid_raw)
+            except ValueError:
+                return JSONResponse(
+                    {"ok": False, "error": "kunde_id ungueltig."},
+                    status_code=400)
+            kunde = await s.get(Kunde, kid)
+            if kunde is None or kunde.tenant_id != tid:
+                return JSONResponse(
+                    {"ok": False, "error": "Kunde nicht gefunden."},
+                    status_code=404)
+            nm = kunde.name
+            kunden_ids = [kunde.id]
+            # Praeziser Modus: kein Namens-Fallback, sonst wuerden
+            # Zeilen eines namensgleichen ANDEREN Kunden einsickern.
+            name_fallback = False
+        else:
+            treffer = await find_kunden_by_name(s, tid, nm)
+            kunden_ids = [k.id for k in treffer]
+            if len(treffer) == 1:
+                kunde = treffer[0]
+
+        # Zusammenfuehren-Karte: weitere Kunden mit exakt diesem Namen,
+        # je mit Unterscheidungsmerkmal. Nur wenn das Profil eindeutig
+        # aufgeloest ist — sonst gaebe es keine klare Merge-Richtung.
+        dubletten = []
+        if kunde is not None:
+            alle = await find_kunden_by_name(s, tid, kunde.name)
+            # Kontaktdaten je Dublette mitgeben: der Merge-Dialog laesst
+            # bei abweichenden Werten pro Feld die Hauptdaten waehlen.
+            dubletten = [
+                {"id": str(k.id), "merkmal": kunde_anzeige_merkmal(k),
+                 "email": k.email, "telefon": k.telefon,
+                 "adresse": k.adresse}
+                for k in alle if k.id != kunde.id
+            ]
+
+        def _cond(model):
+            conds = [model.kunde_name.ilike(nm)] if name_fallback else []
+            if kunden_ids:
+                conds.append(model.kunde_id.in_(kunden_ids))
+            return or_(*conds)
+
         g = (await s.execute(
             select(Kundengespraech)
-            .where(Kundengespraech.tenant_id == tid, Kundengespraech.kunde_name.ilike(nm))
+            .where(Kundengespraech.tenant_id == tid, _cond(Kundengespraech))
             .order_by(Kundengespraech.gespraech_datum.desc()).limit(25)
         )).scalars().all()
         a = (await s.execute(
             select(Angebot)
-            .where(Angebot.tenant_id == tid, Angebot.kunde_name.ilike(nm))
+            .where(Angebot.tenant_id == tid, _cond(Angebot))
             .order_by(Angebot.created_at.desc()).limit(25)
         )).scalars().all()
         r = (await s.execute(
             select(Rechnung)
-            .where(Rechnung.tenant_id == tid, Rechnung.kunde_name.ilike(nm))
+            .where(Rechnung.tenant_id == tid, _cond(Rechnung))
             .order_by(Rechnung.created_at.desc()).limit(25)
         )).scalars().all()
         drv = (await s.execute(
             select(TenantKundeDrive)
-            .where(TenantKundeDrive.tenant_id == tid, TenantKundeDrive.kunde_name.ilike(nm))
+            .where(TenantKundeDrive.tenant_id == tid, _cond(TenantKundeDrive))
+            # non-null kunde_id zuerst — der praezise Treffer gewinnt.
+            # Haengen nach einem Merge mehrere Ordner am Kunden, gewinnt
+            # der meistgenutzte (die Dateiliste aggregiert ohnehin alle).
+            .order_by(TenantKundeDrive.kunde_id.is_(None),
+                      TenantKundeDrive.upload_count.desc())
             .limit(1)
-        )).scalar_one_or_none()
+        )).scalars().first()
 
-    email = next((x.kunde_email for x in a if getattr(x, "kunde_email", None)), "") or ""
+    email = (kunde.email if kunde and kunde.email else "") or next(
+        (x.kunde_email for x in a if getattr(x, "kunde_email", None)), "") or ""
     drive = None
     if drv:
         drive = {
@@ -1473,6 +1673,19 @@ async def api_kunde_profil(
         "ok": True,
         "name": nm,
         "email": email,
+        # Phase 5: Kundenstamm-Infos (additiv; None wenn der Name
+        # mehrdeutig ist oder kein Kunde existiert)
+        "kunde_id": str(kunde.id) if kunde else None,
+        "telefon": (kunde.telefon if kunde else None) or None,
+        "adresse": (kunde.adresse if kunde else None) or None,
+        "merkmal": kunde_anzeige_merkmal(kunde) if kunde else None,
+        # Reiner Stammdaten-Wert fuer den Merge-Dialog: "email" oben
+        # kann ein Angebots-Fallback sein und taugt nicht als
+        # Vergleichsbasis dafuer, was am Kunden wirklich steht.
+        "email_stamm": (kunde.email if kunde else None) or None,
+        "namensgleiche_kunden": len(kunden_ids),
+        # Zusammenfuehren-Karte (Inhaber-Aktion, POST /kunden/merge)
+        "dubletten": dubletten,
         "gespraeche": [{"id": str(x.id), "briefing": (x.briefing_kurz or "")[:160],
                         "zeit": _fmt_dt(x.gespraech_datum)} for x in g],
         "angebote": [{"betrag": _fmt_eur(x.gesamtbetrag_brutto_eur),
@@ -1486,6 +1699,83 @@ async def api_kunde_profil(
                         "zeit": _fmt_dt(x.created_at)} for x in r],
         "drive": drive,
     })
+
+
+@router.post("/kunden/merge")
+async def api_kunden_merge(
+    request: Request,
+    _e=Depends(require_app_inhaber),
+    _c=Depends(require_app_csrf),
+) -> JSONResponse:
+    """Zusammenfuehren-Karte im Kundenprofil: die Quelle geht im Ziel
+    auf (body: {"quelle_id": "...", "ziel_id": "..."}). Kernlogik in
+    core/services/kunde_merge.py — dieselben Regeln wie das CLI-Skript
+    scripts/merge_kunden.py (additive-only, Ref-Konflikte brechen ab).
+
+    Inhaber-only: das Zusammenfuehren ist praktisch nicht rueckgaengig
+    zu machen und gehoert nicht in die Monteur-Sicht.
+    """
+    from core.models import Kunde
+    from core.services.kunde_identity import (
+        find_kunden_by_name, kunde_anzeige_merkmal)
+    from core.services.kunde_merge import MergeAbbruch, merge_kunden
+    tid = current_tenant_id(request)
+    body = await request.json()
+    try:
+        quelle_id = uuid.UUID((body.get("quelle_id") or "").strip())
+        ziel_id = uuid.UUID((body.get("ziel_id") or "").strip())
+    except (ValueError, TypeError, AttributeError):
+        return JSONResponse(
+            {"ok": False, "error": "quelle_id/ziel_id ungueltig."},
+            status_code=400)
+    # Hauptdaten-Wahl aus dem Dialog: pro Feld "ziel" (Default) oder
+    # "quelle". Unbekannte Felder/Werte werden ignoriert — dann greift
+    # die Default-Regel (Ziel gewinnt, Luecken fuellen).
+    feld_wahl: dict[str, str] = {}
+    felder_raw = body.get("felder")
+    if isinstance(felder_raw, dict):
+        for feld, wahl in felder_raw.items():
+            if feld in ("name", "email", "telefon", "adresse") \
+                    and wahl in ("quelle", "ziel"):
+                feld_wahl[feld] = wahl
+    async with get_session() as s:
+        # Tenant-Gate VOR dem Service: der prueft nur, dass Quelle und
+        # Ziel im selben Tenant liegen — nicht, dass es UNSERER ist.
+        for kid in (quelle_id, ziel_id):
+            k = await s.get(Kunde, kid)
+            if k is None or k.tenant_id != tid:
+                return JSONResponse(
+                    {"ok": False, "error": "Kunde nicht gefunden."},
+                    status_code=404)
+        try:
+            e = await merge_kunden(
+                s, quelle_id, ziel_id, feld_wahl=feld_wahl)
+        except MergeAbbruch as exc:
+            return JSONResponse(
+                {"ok": False, "error": str(exc)}, status_code=409)
+        ziel = e.ziel
+        # Der Mensch hat die Dublette gerade aufgeloest: bleibt kein
+        # weiterer namensgleicher Kunde uebrig, ist auch das
+        # Review-Flag am Ziel erledigt. Bei weiteren Dubletten bleibt
+        # es stehen (dieselbe Zurueckhaltung wie --clear-review im CLI).
+        if ziel.needs_review:
+            verbliebene = await find_kunden_by_name(s, tid, ziel.name)
+            if len(verbliebene) <= 1:
+                ziel.needs_review = False
+        antwort = {
+            "ok": True,
+            "kunde_id": str(ziel.id),
+            "name": ziel.name,
+            "merkmal": kunde_anzeige_merkmal(ziel),
+            "umgehaengt": e.umgehaengt,
+            "schon_gemergt": e.schon_gemergt,
+            # >1 Drive-Ordner am Ziel: Dateien liegen jetzt verteilt
+            "drive_hinweis": len(e.drive_keys) > 1,
+        }
+        await s.commit()
+    logger.info("PWA-Kunden-Merge: quelle=%s -> ziel=%s tenant=%s",
+                quelle_id, antwort["kunde_id"], tid)
+    return JSONResponse(antwort)
 
 
 # =====================================================================
@@ -1643,6 +1933,88 @@ async def api_archiv_notiz(
         "folder_url": result.get("kunde_folder_url"),
         "upload_count": result.get("upload_count"),
     })
+
+
+# =====================================================================
+# Kunden-Archiv: Dateien aus Drive lesen + Proxy
+# =====================================================================
+
+_DRIVE_FILE_ID_RE = __import__("re").compile(r"^[A-Za-z0-9_\-]{10,200}$")
+
+
+@router.get("/archiv/dateien")
+async def api_archiv_dateien(
+    request: Request,
+    _e=Depends(require_app_user),
+    kunde_name: str = "",
+) -> JSONResponse:
+    """Listet Dateien im Drive-Ordner eines Kunden (neueste zuerst).
+
+    Query: ?kunde_name=
+    Gibt leere Liste zurueck wenn kein Ordner existiert oder Drive nicht
+    verbunden — nie ein Fehler der das Profil kaputt machen koennte."""
+    from core.integrations.google_drive import list_files_in_kunde_folder
+    tid = current_tenant_id(request)
+    if not await _archiv_feature_ok(tid):
+        return JSONResponse({"ok": True, "dateien": []})
+    nm = (kunde_name or "").strip()[:200]
+    if len(nm) < 2:
+        return JSONResponse({"ok": False, "error": "Kunde fehlt."}, status_code=400)
+    dateien = await list_files_in_kunde_folder(tid, nm)
+    return JSONResponse({"ok": True, "dateien": dateien})
+
+
+@router.get("/archiv/datei/{file_id}")
+async def api_archiv_datei_proxy(
+    file_id: str,
+    request: Request,
+    _e=Depends(require_app_user),
+    thumb: int = 0,
+) -> Response:
+    """Proxy-Endpunkt: Datei-Bytes aus Drive durchreichen (max 10 MB).
+
+    Mit ``?thumb=1`` liefert Drive statt des Originals sein Vorschaubild
+    (~50 KB statt bis zu 10 MB) — das nutzt die Archiv-Galerie fuer ihre
+    Kacheln. Hat Drive kein Thumbnail, faellt es aufs Original zurueck.
+
+    Authentifizierung via Session (require_app_user) — kein direkter
+    Drive-Link im Browser noetig. Cache-Control: private, 1h."""
+    from core.integrations.google_drive import get_file_bytes, get_thumbnail_bytes
+    tid = current_tenant_id(request)
+    if not await _archiv_feature_ok(tid):
+        return JSONResponse({"ok": False}, status_code=403)
+    if not _DRIVE_FILE_ID_RE.match(file_id):
+        return JSONResponse({"ok": False}, status_code=400)
+    try:
+        data = mime = None
+        if thumb:
+            got = await get_thumbnail_bytes(tid, file_id)
+            if got:
+                data, mime = got
+        if data is None:
+            data, mime = await get_file_bytes(tid, file_id)
+    except ValueError:
+        return JSONResponse(
+            {"ok": False, "error": "Drive nicht verbunden."},
+            status_code=409,
+        )
+    except RuntimeError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=413)
+    except Exception:
+        logger.exception("Archiv-Datei-Proxy fehlgeschlagen: file_id=%s tenant=%s", file_id, tid)
+        return JSONResponse(
+            {"ok": False, "error": "Datei konnte nicht geladen werden."},
+            status_code=502,
+        )
+    # Thumbnails aendern sich nie (Drive-Datei ist immutable) -> lange
+    # cachen, damit ein zweiter Besuch der Galerie gar nicht erst zu Drive
+    # muss. Originale bleiben bei 1h.
+    max_age = 86400 if thumb else 3600
+    return Response(
+        content=data,
+        media_type=mime,
+        headers={"Cache-Control": f"private, max-age={max_age}"},
+    )
 
 
 # =====================================================================
@@ -2642,6 +3014,9 @@ async def api_einstellungen_get(
             "heimat_ort": tenant.heimat_ort or "",
             "fahrtzeit_puffer_min": tenant.fahrtzeit_puffer_min,
             "adresse_join": adresse_join,
+            "brand_color": tenant.brand_color or "",
+            "website_url": tenant.website_url or "",
+            "has_logo": bool(tenant.logo_data),
         },
         "features": list(getattr(tenant, "features", []) or []),
         "package_tier": tenant.package_tier or "",
@@ -2667,19 +3042,163 @@ async def api_einstellungen_set(
     body = await request.json()
     allowed = {
         "company_name", "contact_name", "contact_email", "contact_phone",
-        "heimat_strasse", "heimat_plz", "heimat_ort", "branche",
+        "heimat_strasse", "heimat_plz", "heimat_ort", "branche", "brand_color",
+        "website_url",
     }
+    import re as _re
+    _HEX_COLOR = _re.compile(r"^#[0-9a-fA-F]{6}$")
     from core.models.tenant import Tenant
     async with get_session() as s:
         t = (await s.execute(select(Tenant).where(Tenant.id == tid))).scalar_one_or_none()
         if t is None:
             return JSONResponse({"ok": False, "error": "Tenant nicht gefunden."}, status_code=404)
         for k, v in (body or {}).items():
-            if k in allowed:
-                val = (v or "").strip() if isinstance(v, str) else v
-                setattr(t, k, val or None)
+            if k not in allowed:
+                continue
+            val = (v or "").strip() if isinstance(v, str) else v
+            if k == "brand_color":
+                if val and not _HEX_COLOR.match(val):
+                    return JSONResponse({"ok": False, "error": "Ungültige Farbe."}, status_code=400)
+            if k == "website_url" and val:
+                val = _normalize_website_url(val)
+                if val is None:
+                    return JSONResponse(
+                        {"ok": False, "error": "Website muss mit http:// oder https:// beginnen."},
+                        status_code=400,
+                    )
+            setattr(t, k, val or None)
         await s.commit()
     return JSONResponse({"ok": True})
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Branding: Firmenlogo + Website-Link fuer die App-Kopfzeile
+# ─────────────────────────────────────────────────────────────────────
+
+# SVG ist bewusst NICHT erlaubt: eine SVG-Datei kann Skripte enthalten, und
+# wir liefern das Logo von der eigenen Domain aus — das waere ein XSS-Vektor,
+# den ein Tenant selbst hochladen koennte.
+_LOGO_MIMES = {"image/png", "image/jpeg", "image/webp"}
+_LOGO_MAX_BYTES = 512 * 1024
+
+# Erste Bytes der erlaubten Formate. Wir glauben dem Content-Type des Clients
+# nicht — sonst laedt jemand eine HTML-Datei als "image/png" hoch und wir
+# liefern sie als solche wieder aus.
+_LOGO_MAGIC = (
+    (b"\x89PNG\r\n\x1a\n", "image/png"),
+    (b"\xff\xd8\xff", "image/jpeg"),
+)
+
+
+def _sniff_logo_mime(data: bytes) -> str | None:
+    """Erkennt das Bildformat an den Magic Bytes. None = nicht erlaubt."""
+    for magic, mime in _LOGO_MAGIC:
+        if data.startswith(magic):
+            return mime
+    # WEBP: "RIFF" .... "WEBP"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
+def _normalize_website_url(raw: str) -> str | None:
+    """Erzwingt http/https und eine plausible Laenge. None = ungueltig.
+
+    Ohne Schema-Zwang wuerde aus "jantos.de" im href ein relativer Link
+    (/app/jantos.de), und ein "javascript:"-Schema waere ein XSS-Vektor.
+    """
+    url = (raw or "").strip()
+    if not url:
+        return None
+    if not url.lower().startswith(("http://", "https://")):
+        # Bequemlichkeit: reine Domain-Eingabe ("jantos.de") ergaenzen.
+        if "://" in url or url.startswith(("javascript:", "data:")):
+            return None
+        url = "https://" + url
+    if len(url) > 300 or " " in url:
+        return None
+    return url
+
+
+@router.post("/branding/logo")
+async def api_branding_logo_upload(
+    request: Request,
+    _e=Depends(require_app_inhaber),
+    _c=Depends(require_app_csrf),
+) -> JSONResponse:
+    """Firmenlogo hochladen. Roh-Bytes im Body, Format wird an den Magic
+    Bytes geprueft (nicht am Content-Type). Max 512 KB, PNG/JPEG/WEBP.
+    Inhaber-only."""
+    from core.models.tenant import Tenant
+
+    data = await request.body()
+    if not data:
+        return JSONResponse({"ok": False, "error": "Keine Datei erhalten."}, status_code=400)
+    if len(data) > _LOGO_MAX_BYTES:
+        return JSONResponse(
+            {"ok": False, "error": f"Logo zu groß ({len(data) // 1024} KB, max 512 KB)."},
+            status_code=413,
+        )
+    mime = _sniff_logo_mime(data)
+    if mime not in _LOGO_MIMES:
+        return JSONResponse(
+            {"ok": False, "error": "Nur PNG, JPEG oder WEBP."}, status_code=415,
+        )
+
+    tid = current_tenant_id(request)
+    async with get_session() as s:
+        t = (await s.execute(select(Tenant).where(Tenant.id == tid))).scalar_one_or_none()
+        if t is None:
+            return JSONResponse({"ok": False, "error": "Tenant nicht gefunden."}, status_code=404)
+        t.logo_data = data
+        t.logo_mime = mime
+        await s.commit()
+    logger.info("Logo gesetzt: tenant=%s mime=%s bytes=%s", tid, mime, len(data))
+    return JSONResponse({"ok": True, "mime": mime, "bytes": len(data)})
+
+
+@router.delete("/branding/logo")
+async def api_branding_logo_delete(
+    request: Request,
+    _e=Depends(require_app_inhaber),
+    _c=Depends(require_app_csrf),
+) -> JSONResponse:
+    """Logo entfernen. Inhaber-only."""
+    from core.models.tenant import Tenant
+
+    tid = current_tenant_id(request)
+    async with get_session() as s:
+        t = (await s.execute(select(Tenant).where(Tenant.id == tid))).scalar_one_or_none()
+        if t is None:
+            return JSONResponse({"ok": False, "error": "Tenant nicht gefunden."}, status_code=404)
+        t.logo_data = None
+        t.logo_mime = None
+        await s.commit()
+    return JSONResponse({"ok": True})
+
+
+@router.get("/branding/logo")
+async def api_branding_logo(
+    request: Request, _e=Depends(require_app_user),
+) -> Response:
+    """Liefert das Logo des eigenen Tenants. Jeder Mitarbeiter darf es sehen
+    (es steht in seiner Kopfzeile), aber nur das des eigenen Betriebs —
+    die Tenant-Id kommt aus der Session, nicht aus der URL."""
+    from core.models.tenant import Tenant
+
+    tid = current_tenant_id(request)
+    async with get_session() as s:
+        t = (await s.execute(select(Tenant).where(Tenant.id == tid))).scalar_one_or_none()
+    if t is None or not t.logo_data:
+        return JSONResponse({"ok": False, "error": "Kein Logo."}, status_code=404)
+    return Response(
+        content=t.logo_data,
+        media_type=t.logo_mime or "image/png",
+        headers={
+            "Cache-Control": "private, max-age=300",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -3000,12 +3519,18 @@ async def api_formular_get(
     from core.integrations.anfrage_forms import get_schema_for_tenant, RESERVED_FIELD_NAMES
     from core.models.anfrage import ANFRAGE_TYP_TISCHLER, ANFRAGE_TYP_ALLGEMEIN
     from core.features.check import is_feature_enabled
+    from config.settings import settings
     tid = current_tenant_id(request)
     if anfrage_typ not in (ANFRAGE_TYP_TISCHLER, ANFRAGE_TYP_ALLGEMEIN):
         return JSONResponse({"ok": False, "error": "Unbekannter Formular-Typ."}, status_code=400)
     if not await is_feature_enabled(tid, _ANFRAGE_FORMULAR_FEATURE):
         return JSONResponse({"ok": False, "error": "Die Anfrage-Formular-Funktion ist nicht aktiv."}, status_code=403)
     schema = await get_schema_for_tenant(tid, anfrage_typ)
+    tenant = request.state.app_tenant
+    preview_url = (
+        f"{settings.public_url.rstrip('/')}"
+        f"/anfrage/preview/{tenant.slug}/{anfrage_typ}"
+    )
     return JSONResponse({
         "ok": True,
         "anfrage_typ": anfrage_typ,
@@ -3016,6 +3541,7 @@ async def api_formular_get(
         "option_types": sorted(_OPTION_FIELD_TYPES),
         "anfrage_typen": _ANFRAGE_TYP_CHOICES,
         "reserved_names": sorted(RESERVED_FIELD_NAMES),
+        "preview_url": preview_url,
     })
 
 
@@ -3075,6 +3601,81 @@ async def api_formular_reset(
         "title": schema.get("title") or "",
         "subtitle": schema.get("subtitle") or "",
         "fields": schema.get("fields") or [],
+    })
+
+
+@router.post("/formulare/{anfrage_typ}/link")
+async def api_formular_link_generieren(
+    anfrage_typ: str,
+    request: Request,
+    _e=Depends(require_app_user),
+    _c=Depends(require_app_csrf),
+) -> JSONResponse:
+    """Generiert einen ausfuellbaren Formular-Link fuer einen konkreten Kunden.
+
+    Nützlich wenn der Handwerker gerade mit einem Kunden telefoniert hat
+    und ihm direkt einen Token-Link per WhatsApp/SMS schicken will, ohne
+    den Mail-Pipeline-Weg abzuwarten. Der Link ist 7 Tage gültig und
+    verhält sich identisch zu den Mail-generierten Links.
+
+    Body: { kunde_name, kunde_email?, kunde_telefon?, valid_days? }
+    Wenn keine E-Mail bekannt: synthetischer Platzhalter (kein
+    Dank-Mail-Versand nach Eingang, weil Adresse nicht real ist).
+    """
+    import secrets
+    from core.integrations.anfrage_forms import (
+        create_anfrage_token, build_anfrage_url,
+    )
+    from core.models.anfrage import ANFRAGE_TYP_TISCHLER, ANFRAGE_TYP_ALLGEMEIN
+    from core.features.check import is_feature_enabled
+
+    tid = current_tenant_id(request)
+    if anfrage_typ not in (ANFRAGE_TYP_TISCHLER, ANFRAGE_TYP_ALLGEMEIN):
+        return JSONResponse({"ok": False, "error": "Unbekannter Formular-Typ."}, status_code=400)
+    if not await is_feature_enabled(tid, _ANFRAGE_FORMULAR_FEATURE):
+        return JSONResponse({"ok": False, "error": "Funktion nicht aktiv."}, status_code=403)
+
+    body = await request.json()
+    kunde_name = (body.get("kunde_name") or "").strip()
+    if not kunde_name:
+        return JSONResponse({"ok": False, "error": "Kundenname ist Pflicht."}, status_code=400)
+    kunde_email = (body.get("kunde_email") or "").strip() or None
+    kunde_telefon = (body.get("kunde_telefon") or "").strip() or None
+    try:
+        valid_days = int(body.get("valid_days") or 7)
+    except (TypeError, ValueError):
+        valid_days = 7
+    valid_days = max(1, min(valid_days, 30))
+
+    # Ohne bekannte E-Mail: synthetischer Platzhalter damit das NOT-NULL-
+    # Feld befüllt ist. Dank-Mail nach Eingang schlägt dann still fehl
+    # (kein Brevo-Versand an .intern-Domain) — das ist gewollt.
+    if not kunde_email:
+        kunde_email = f"anonym-{secrets.token_hex(6)}@formular.intern"
+
+    token_obj = await create_anfrage_token(
+        tenant_id=tid,
+        kunde_email=kunde_email,
+        kunde_name=kunde_name,
+        anfrage_typ=anfrage_typ,
+        kunde_telefon=kunde_telefon,
+        valid_days=valid_days,
+    )
+    url = build_anfrage_url(token_obj.token)
+    expires_fmt = (
+        token_obj.expires_at.strftime("%d.%m.%Y")
+        if token_obj.expires_at else ""
+    )
+    logger.info(
+        "PWA-Formular-Link generiert: typ=%s tenant=%s kunde=%r valid_days=%d",
+        anfrage_typ, tid, kunde_name, valid_days,
+    )
+    return JSONResponse({
+        "ok": True,
+        "url": url,
+        "kunde_name": kunde_name,
+        "expires_at": token_obj.expires_at.isoformat() if token_obj.expires_at else None,
+        "expires_fmt": expires_fmt,
     })
 
 
@@ -3197,6 +3798,9 @@ async def api_rueckruf_anlegen(
             assigned_employee_id=getattr(employee, "id", None),
         )
         s.add(r)
+        from core.services.kunde_identity import resolve_kunde_id_safe
+        r.kunde_id = await resolve_kunde_id_safe(
+            s, tid, kunde_name, email=kunde_email, telefon=kunde_telefon)
         await s.commit()
         await s.refresh(r)
 
@@ -3380,8 +3984,20 @@ async def api_assistent(
             if t:
                 history.append({"role": role, "text": t[:1000]})
 
+    # Aktueller Screen-Kontext (welche Ansicht / welcher Kunde ist gerade offen)
+    screen_context: dict | None = None
+    sc_raw = (body or {}).get("screen_context")
+    if isinstance(sc_raw, dict):
+        screen  = (sc_raw.get("screen")   or "").strip()[:100]
+        kunde   = (sc_raw.get("kunde")    or "").strip()[:200]
+        notizen = (sc_raw.get("notizen")  or "").strip()[:2000]
+        briefing = (sc_raw.get("briefing") or "").strip()[:500]
+        if screen:
+            screen_context = {"screen": screen, "kunde": kunde or None,
+                              "notizen": notizen or None, "briefing": briefing or None}
+
     ctx = await _build_command_ctx(request)
-    result = await run_command(text, ctx, history=history)
+    result = await run_command(text, ctx, history=history, screen_context=screen_context)
     from core.models.app_usage_event import record_app_usage, USAGE_ASSISTENT_BEFEHL
     await record_app_usage(ctx.tid, getattr(ctx.employee, "id", None), USAGE_ASSISTENT_BEFEHL)
     return JSONResponse(result)

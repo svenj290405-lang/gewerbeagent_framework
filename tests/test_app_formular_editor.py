@@ -228,3 +228,139 @@ async def test_reset_loescht_und_liefert_default(monkeypatch):
     assert called["typ"] == "allgemein"
     assert b["title"] == "Standard"
     assert b["fields"][0]["name"] == "anliegen"
+
+
+# --------------------------------------------------------------------------
+# GET /formulare/{typ} — preview_url im Response
+# --------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_get_liefert_preview_url(monkeypatch):
+    _feature(monkeypatch, True)
+
+    async def fake_schema(tid, typ):
+        return {"title": "T", "subtitle": "", "fields": []}
+
+    monkeypatch.setattr("core.integrations.anfrage_forms.get_schema_for_tenant", fake_schema)
+
+    res = await app_screens.api_formular_get("allgemein", _req(), _e=None)
+    assert res.status_code == 200
+    b = _body(res)
+    assert "preview_url" in b
+    # Tenant-Slug "pilot" + Typ "allgemein" muessen im Pfad vorkommen
+    assert "/anfrage/preview/pilot/allgemein" in b["preview_url"]
+
+
+# --------------------------------------------------------------------------
+# POST /formulare/{typ}/link
+# --------------------------------------------------------------------------
+
+import datetime as _dt
+
+
+def _token_obj(name="Max Muster", email="max@example.com"):
+    return SimpleNamespace(
+        token="abc123",
+        expires_at=_dt.datetime(2026, 7, 1, tzinfo=_dt.timezone.utc),
+    )
+
+
+@pytest.mark.asyncio
+async def test_link_feature_aus_403(monkeypatch):
+    _feature(monkeypatch, False)
+    res = await app_screens.api_formular_link_generieren(
+        "allgemein", _req({"kunde_name": "Max"}), _e=None, _c=None
+    )
+    assert res.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_link_unbekannter_typ_400(monkeypatch):
+    _feature(monkeypatch, True)
+    res = await app_screens.api_formular_link_generieren(
+        "zauberei", _req({"kunde_name": "Max"}), _e=None, _c=None
+    )
+    assert res.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_link_fehlender_name_400(monkeypatch):
+    _feature(monkeypatch, True)
+    res = await app_screens.api_formular_link_generieren(
+        "allgemein", _req({}), _e=None, _c=None
+    )
+    assert res.status_code == 400
+    assert "Pflicht" in _body(res)["error"]
+
+
+@pytest.mark.asyncio
+async def test_link_happy_path_mit_email(monkeypatch):
+    _feature(monkeypatch, True)
+    seen = {}
+
+    async def fake_create(tenant_id, kunde_email, kunde_name, anfrage_typ,
+                          kunde_telefon=None, valid_days=7, **kw):
+        seen["email"] = kunde_email
+        seen["name"] = kunde_name
+        seen["typ"] = anfrage_typ
+        seen["days"] = valid_days
+        return _token_obj()
+
+    def fake_url(token):
+        return f"https://example.com/anfrage/{token}"
+
+    monkeypatch.setattr("core.integrations.anfrage_forms.create_anfrage_token", fake_create)
+    monkeypatch.setattr("core.integrations.anfrage_forms.build_anfrage_url", fake_url)
+
+    body = {"kunde_name": "Max Muster", "kunde_email": "max@test.de", "valid_days": 14}
+    res = await app_screens.api_formular_link_generieren("allgemein", _req(body), _e=None, _c=None)
+    assert res.status_code == 200
+    b = _body(res)
+    assert b["ok"] is True
+    assert b["url"] == "https://example.com/anfrage/abc123"
+    assert b["kunde_name"] == "Max Muster"
+    assert b["expires_fmt"] == "01.07.2026"
+    assert seen["email"] == "max@test.de"
+    assert seen["days"] == 14
+
+
+@pytest.mark.asyncio
+async def test_link_ohne_email_nutzt_platzhalter(monkeypatch):
+    _feature(monkeypatch, True)
+    seen = {}
+
+    async def fake_create(tenant_id, kunde_email, kunde_name, anfrage_typ,
+                          kunde_telefon=None, valid_days=7, **kw):
+        seen["email"] = kunde_email
+        return _token_obj()
+
+    monkeypatch.setattr("core.integrations.anfrage_forms.create_anfrage_token", fake_create)
+    monkeypatch.setattr("core.integrations.anfrage_forms.build_anfrage_url", lambda t: f"https://x/{t}")
+
+    res = await app_screens.api_formular_link_generieren(
+        "tischler", _req({"kunde_name": "Müller"}), _e=None, _c=None
+    )
+    assert res.status_code == 200
+    # Platzhalter-Email enthält @formular.intern
+    assert "@formular.intern" in seen["email"]
+
+
+@pytest.mark.asyncio
+async def test_link_valid_days_wird_geclampt(monkeypatch):
+    _feature(monkeypatch, True)
+    seen = {}
+
+    async def fake_create(tenant_id, kunde_email, kunde_name, anfrage_typ,
+                          kunde_telefon=None, valid_days=7, **kw):
+        seen["days"] = valid_days
+        return _token_obj()
+
+    monkeypatch.setattr("core.integrations.anfrage_forms.create_anfrage_token", fake_create)
+    monkeypatch.setattr("core.integrations.anfrage_forms.build_anfrage_url", lambda t: "https://x")
+
+    # 999 Tage -> wird auf 30 geclampt
+    res = await app_screens.api_formular_link_generieren(
+        "allgemein", _req({"kunde_name": "X", "valid_days": 999}), _e=None, _c=None
+    )
+    assert res.status_code == 200
+    assert seen["days"] == 30

@@ -1,0 +1,343 @@
+/* =====================================================================
+   Beta-Design — ruhiger, moderner, mit Dunkelmodus.
+   Wird NUR von /app/beta geladen. Das Original (/app + app.css) bleibt
+   unangetastet; hier wird app.css importiert und gezielt ueberschrieben,
+   damit jede Klasse gestylt bleibt, auch die, die wir nicht anfassen.
+
+   Leitidee: Farbe ist kein Dekor, sondern Signal. Der blaue Balken oben
+   verschwindet — Blau markiert ab jetzt nur noch, was der Handwerker
+   antippen soll (aktiver Tab, Buttons) und was Handlungsbedarf hat.
+   ===================================================================== */
+@import url("/app/static/app.css");
+
+:root {
+  /* Flaechen: eine Spur waermer + mehr Ruhe als das Original */
+  --bg: #f6f7f9;
+  --card: #ffffff;
+  --text: #10151f;
+  --muted: #6a7280;
+  --line: #e7eaef;
+  --radius: 16px;
+
+  /* Die Kopfzeile ist NICHT mehr --primary (der Wert wird pro Tenant zur
+     Laufzeit ueberschrieben, applyBrandColor()). Eigenes Token, damit die
+     Markenfarbe frei fuer Bedienelemente bleibt. */
+  --header-bg: rgba(255, 255, 255, .82);
+  --header-fg: #10151f;
+  --header-line: #e7eaef;
+
+  /* Inline-Styles in app.js greifen auf diese Tokens zu (mit hellen
+     Fallbacks). Ohne Definition waeren Archiv-Modal & Co. im Dunkelmodus
+     weiss auf weiss. */
+  --fg: #10151f;
+  --accent: var(--primary);
+  --err: #d9453f;
+
+  --shadow-s: 0 1px 2px rgba(16, 21, 31, .04);
+  --shadow-m: 0 4px 16px rgba(16, 21, 31, .07);
+  --pill-bg: #eef1f5;
+  --pill-ok-bg: #e3f6ec;
+  --pill-warn-bg: #fdf3da;
+  --pill-danger-bg: #fce6e5;
+  --theme-color-meta: #ffffff;  /* nur zum Auslesen durch beta.js */
+}
+
+/* ---------------------------------------------------------------------
+   Dunkelmodus. Zwei Wege fuehren hierher, darum steht der Token-Block
+   zweimal da (CSS kann Deklarationsbloecke nicht wiederverwenden):
+     1. data-theme="dark"  — der Nutzer hat es in den Einstellungen gewaehlt
+     2. data-theme="auto"  — er folgt dem System, und das steht auf dunkel
+   "light" gewinnt immer, auch wenn das System dunkel ist.
+   beta.js setzt data-theme; ein Inline-Skript im <head> von beta.html macht
+   das schon vor dem ersten Paint, sonst blitzt kurz die helle Version auf.
+   --------------------------------------------------------------------- */
+:root[data-theme="dark"] {
+  --bg: #0f1216;
+  --card: #171b21;
+  --text: #e7eaee;
+  --muted: #98a1ac;
+  --line: #262c34;
+  --header-bg: rgba(18, 21, 26, .82);
+  --header-fg: #e7eaee;
+  --header-line: #262c34;
+  --fg: #e7eaee;
+  --err: #ef6b66;
+  --ok: #35c07d;
+  --warn: #e8b73d;
+  --shadow-s: 0 1px 2px rgba(0, 0, 0, .4);
+  --shadow-m: 0 6px 22px rgba(0, 0, 0, .5);
+  --pill-bg: #222831;
+  --pill-ok-bg: rgba(53, 192, 125, .14);
+  --pill-warn-bg: rgba(232, 183, 61, .14);
+  --pill-danger-bg: rgba(239, 107, 102, .14);
+  --theme-color-meta: #12151a;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root[data-theme="auto"] {
+    --bg: #0f1216;
+    --card: #171b21;
+    --text: #e7eaee;
+    --muted: #98a1ac;
+    --line: #262c34;
+    --header-bg: rgba(18, 21, 26, .82);
+    --header-fg: #e7eaee;
+    --header-line: #262c34;
+    --fg: #e7eaee;
+    --err: #ef6b66;
+    --ok: #35c07d;
+    --warn: #e8b73d;
+    --shadow-s: 0 1px 2px rgba(0, 0, 0, .4);
+    --shadow-m: 0 6px 22px rgba(0, 0, 0, .5);
+    --pill-bg: #222831;
+    --pill-ok-bg: rgba(53, 192, 125, .14);
+    --pill-warn-bg: rgba(232, 183, 61, .14);
+    --pill-danger-bg: rgba(239, 107, 102, .14);
+    --theme-color-meta: #12151a;
+  }
+}
+
+/* ---------- Kopfzeile: abgerundete, schwebende Leiste in der Markenfarbe ----
+   Sie klebt nicht mehr am Bildschirmrand, sondern schwebt als Karte darueber.
+   Die Statusleiste des Handys sieht dadurch den Seitenhintergrund (nicht die
+   Markenfarbe) — genau deshalb bleibt theme-color hell bzw. dunkel.
+   --header-fg wird von beta.js gesetzt: Weiss oder Schwarz, je nachdem wie
+   hell die gewaehlte Markenfarbe ist. Sonst waere die Schrift bei einem
+   gelben Firmen-Ton unlesbar. */
+.app-header {
+  background: var(--primary);
+  color: var(--header-fg, #fff);
+  border-bottom: 0;
+  border-radius: 18px;
+  top: calc(env(safe-area-inset-top, 0px) + 8px);
+  margin: calc(env(safe-area-inset-top, 0px) + 8px) 12px 4px;
+  padding: 13px 14px 13px 16px;
+  font-size: 17px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+  box-shadow: var(--shadow-m);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+/* Knoepfe in der Leiste: leicht abgesetzte Flaeche aus der Schriftfarbe —
+   funktioniert damit auf hellen wie dunklen Markenfarben. */
+.icon-btn {
+  background: rgba(255, 255, 255, .16);
+  background: color-mix(in srgb, var(--header-fg, #fff) 16%, transparent);
+  color: inherit;
+  border-radius: 10px;
+}
+.icon-btn:active {
+  background: color-mix(in srgb, var(--header-fg, #fff) 28%, transparent);
+}
+.hdr-back { color: inherit; font-weight: 500; }
+/* Die Leiste darf nicht dicker werden, wenn Zurueck-Pfeil oder Glocke
+   auftauchen: die Buttons behalten ihre 36px-Trefferflaeche (Daumen!),
+   ragen aber per negativer Margin ins Header-Padding hinein, statt die
+   Zeile in die Hoehe zu druecken. */
+.app-header .icon-btn {
+  height: 36px;
+  margin-top: -8px;
+  margin-bottom: -8px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+/* inline-flex oben schlaegt sonst das hidden-Attribut (dessen
+   display:none kommt nur aus dem Browser-Stylesheet) — der Pfeil
+   stuende dann dauerhaft da, auch auf Home. */
+.app-header .icon-btn[hidden] { display: none; }
+
+/* ---------- Logo + Website in der Kopfzeile ----------
+   Sitzt direkt hinter dem Firmennamen. Klick fuehrt zur Firmen-Website.
+   Der Titel darf schrumpfen (min-width:0 + ellipsis), das Branding nicht —
+   sonst quetscht ein langer Firmenname das Logo weg. */
+.hdr-brand {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+  margin-left: 8px;
+  padding: 3px 8px 3px 4px;
+  border-radius: 999px;
+  text-decoration: none;
+  color: inherit;
+  background: color-mix(in srgb, var(--header-fg, #fff) 14%, transparent);
+}
+a.hdr-brand:active { background: color-mix(in srgb, var(--header-fg, #fff) 26%, transparent); }
+.hdr-logo {
+  width: 22px; height: 22px;
+  border-radius: 6px;
+  object-fit: contain;
+  background: #fff;   /* transparente PNGs bleiben auf jeder Markenfarbe lesbar */
+  display: block;
+}
+.hdr-site {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0;
+  white-space: nowrap;
+  opacity: .9;
+}
+
+/* ---------- Branding-Karte in den Einstellungen ---------- */
+.brand-row { display: flex; align-items: center; gap: 14px; }
+.brand-logo-prev {
+  width: 56px; height: 56px;
+  flex: 0 0 auto;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--pill-bg);
+  display: flex; align-items: center; justify-content: center;
+  overflow: hidden;
+  text-align: center;
+}
+.brand-logo-prev img { width: 100%; height: 100%; object-fit: contain; }
+
+/* ---------- Flaechen ---------- */
+body { background: var(--bg); color: var(--text); }
+
+.card {
+  border: 1px solid var(--line);
+  box-shadow: var(--shadow-s);
+  padding: 16px 18px;
+}
+.card h2 {
+  font-size: 13px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: .05em;
+  color: var(--muted);
+  margin-bottom: 6px;
+}
+.row { padding: 12px 0; }
+.section-title { font-weight: 600; margin: 22px 4px 10px; }
+
+/* ---------- Kacheln: weniger Kasten, mehr Karte ---------- */
+.homescreen-grid { gap: 10px; }
+.home-tile {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-s);
+  background: var(--card);
+  padding: 18px 12px 14px;
+  transition: transform .12s ease, box-shadow .12s ease;
+}
+.home-tile:active { transform: scale(.975); box-shadow: var(--shadow-m); }
+.tile-ico { font-size: 26px; }
+.tile-label { font-weight: 600; font-size: 14px; letter-spacing: -0.01em; }
+.tile-count { color: var(--muted); font-size: 12px; }
+/* Badge = Handlungsbedarf. Bewusst zurueckhaltend: ein Punkt, kein Alarm. */
+.tile-badge {
+  background: var(--primary);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 700;
+  box-shadow: 0 0 0 3px var(--card);
+}
+.tile-badge.warn { background: var(--warn); color: #3d2f00; }
+
+/* ---------- Bedienelemente ---------- */
+button { border-radius: 12px; font-weight: 600; letter-spacing: -0.01em; }
+.btn-sm { border-radius: 10px; }
+.btn-ghost {
+  background: var(--pill-bg);
+  color: var(--text);
+  border: 1px solid var(--line);
+}
+.btn-ghost:active { background: var(--line); }
+
+/* Pill-Farben kommen aus Tokens, damit der Dunkelmodus nicht nochmal
+   dieselben Regeln duplizieren muss. */
+.pill { background: var(--pill-bg); color: var(--muted); font-weight: 600; }
+.pill.ok { background: var(--pill-ok-bg); color: var(--ok); }
+.pill.warn { background: var(--pill-warn-bg); color: var(--warn); }
+.pill.danger { background: var(--pill-danger-bg); color: var(--danger); }
+
+/* ---------- Tab-Leiste: schwebend statt angeklebt ---------- */
+.tabbar {
+  background: var(--header-bg);
+  border-top: 1px solid var(--header-line);
+  backdrop-filter: saturate(180%) blur(14px);
+  -webkit-backdrop-filter: saturate(180%) blur(14px);
+}
+.tabbar button { font-weight: 600; }
+
+/* ---------- Hinweise / Briefing ---------- */
+.banner {
+  background: rgba(224, 168, 0, .10);
+  border: 1px solid rgba(224, 168, 0, .28);
+  color: var(--text);
+  border-radius: 12px;
+}
+.q-briefing {
+  background: var(--card);
+  border: 1px solid var(--line);
+  box-shadow: var(--shadow-s);
+}
+.q-avatar { background: var(--pill-bg); }
+
+/* ---------- Chat ---------- */
+.bubble { box-shadow: var(--shadow-s); }
+.composer, .q-overlay { background: var(--card); }
+.composer .cbtn.ghost { color: var(--muted); }
+.composer .cbtn.ghost:active { background: var(--pill-bg); }
+
+/* ---------- "Mehr": zusammenhaengende Liste statt einzelner Kaesten ----------
+   Die Eintraege liegen bereits IN einer Karte — eine eigene Umrandung pro
+   Zeile macht daraus einen Kasten im Kasten. Stattdessen: durchgehende Liste,
+   Trennlinien ueber die volle Kartenbreite (negative Margins gleichen das
+   Karten-Padding aus), Druck-Feedback auf der ganzen Zeile. */
+.card .menu-item {
+  border: 0;
+  border-bottom: 1px solid var(--line);
+  border-radius: 0;
+  box-shadow: none;
+  margin: 0 -18px;
+  padding: 14px 18px;
+  font-weight: 500;
+  transition: background .12s ease;
+}
+.card .menu-item:last-child { border-bottom: 0; padding-bottom: 2px; }
+.card .menu-item:active { background: var(--pill-bg); }
+.card .menu-item .sub { color: var(--muted); font-size: 17px; line-height: 1; }
+
+/* ---------- Onboarding-Tour erbt die Flaechen ---------- */
+.tut-feat, .tut-conn, .tut-lex-form {
+  border: 1px solid var(--line);
+  box-shadow: var(--shadow-s);
+}
+
+/* ---------- Theme-Umschalter (von beta.js in die Einstellungen gehaengt) ---------- */
+.theme-seg { display: flex; gap: 6px; margin-top: 4px; }
+.theme-seg button {
+  flex: 1;
+  background: var(--pill-bg);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 10px 6px;
+  font-size: 14px;
+  font-weight: 600;
+}
+.theme-seg button.active {
+  background: var(--primary);
+  border-color: var(--primary);
+  color: #fff;
+}
+.tut-overlay, .tut-body { background: var(--bg); }
+.tut-icon { background: var(--pill-bg); }
+
+/* ---------- Formularfelder ---------- */
+input[type=email], input[type=text], input[type=password], input[type=number],
+input[type=date], input[type=time], textarea, select {
+  background: var(--card);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+}
+input::placeholder, textarea::placeholder { color: var(--muted); }
+
+/* Das BETA-Schildchen in der Kopfzeile ist seit der Uebernahme als
+   Standard-Design (2026-07-17) entfernt — dieses Stylesheet laeuft jetzt
+   auf /app UND /app/beta. */

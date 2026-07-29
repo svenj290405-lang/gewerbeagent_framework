@@ -14,6 +14,13 @@ const App = {
   lastScreen: null,
 };
 
+// ---------- Brand-Color ----------
+function applyBrandColor(color) {
+  const c = (color && /^#[0-9a-fA-F]{6}$/.test(color)) ? color : "#0066cc";
+  document.documentElement.style.setProperty("--primary", c);
+  document.querySelector('meta[name="theme-color"]').setAttribute("content", c);
+}
+
 // ---------- Helpers ----------
 async function api(path, opts = {}) {
   const headers = opts.headers || {};
@@ -28,8 +35,13 @@ async function api(path, opts = {}) {
 }
 
 function esc(s) {
+  // Maskiert auch " und ' — esc() wird an vielen Stellen im Attribut-Kontext
+  // (attr="${esc(x)}") mit Fremddaten (Kundenname, Merkmal, Mail ...) benutzt;
+  // ohne Quote-Maskierung liesse sich aus dem Attribut ausbrechen (Stored XSS,
+  // da die CSP script-src 'unsafe-inline' erlaubt).
   return String(s == null ? "" : s)
-    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 }
 // Wandelt http(s)-URLs in bereits ge-esc()-tem Text in klickbare Links um
 // (öffnet in neuem Tab). Muss NACH esc() laufen — die URL kann dann &amp;
@@ -53,8 +65,9 @@ function notifGranted() { return notifSupported() && Notification.permission ===
 // per Q-Chat ("zeig mir die Rechnungen") erreichbar.
 const TABS = [
   { key: "assistent",   label: "Assistent", ico: "🤖" },
-  { key: "aktuelles",   label: "Aktionen", ico: "📋" },
-  { key: "mehr",        label: "Mehr",     ico: "⋯" },
+  { key: "aktuelles",   label: "Aktionen",  ico: "📋" },
+  { key: "_qoverlay",   label: "Q",         ico: `<canvas id="q-tab-sphere-canvas" width="22" height="22"></canvas>`, overlay: true },
+  { key: "mehr",        label: "Mehr",      ico: "⋯" },
 ];
 
 function buildTabbar() {
@@ -63,12 +76,47 @@ function buildTabbar() {
   const feats = new Set(App.me.features || []);
   TABS.filter((t) => !t.feature || feats.has(t.feature)).forEach((t) => {
     const b = el(`<button data-tab="${t.key}"><span class="ico">${t.ico}</span>${t.label}</button>`);
-    b.addEventListener("click", () => navigate(t.key));
+    if (t.overlay) {
+      b.addEventListener("click", () => toggleQOverlay());
+    } else {
+      b.addEventListener("click", () => navigate(t.key));
+    }
     bar.appendChild(b);
   });
 }
 
-function navigate(key) {
+// ---------- Routing ----------
+// Die App tauscht Screens per innerHTML aus; ohne History-Eintraege beendet
+// die Android-Zurueck-Taste in der installierten PWA die ganze App, statt
+// einen Screen zurueckzugehen. navigate() schreibt darum jeden Screen als
+// Hash in die History, popstate rendert ihn wieder.
+//
+// Aliase: was in einer Push-URL steht (z.B. "/app#anfragen", siehe
+// microsoft_inbox.py) oder was ein alter Link enthaelt, ist nicht immer der
+// interne Screen-Name. Unbekannte Hashes fallen still auf den Start-Screen.
+const ROUTE_ALIAS = {
+  rueckrufe: "rueckrufe_page",
+  rechnungen: "rechnungen_page",
+  angebote: "angebote_page",
+  auftraege: "auftraege_page",
+  anrufe: "aufnahmen",  // frueherer Name des Screens
+};
+
+function screenFromHash() {
+  const raw = (location.hash || "").replace(/^#/, "").split("?")[0].trim();
+  if (!raw) return null;
+  const key = ROUTE_ALIAS[raw] || raw;
+  return SCREENS[key] ? key : null;
+}
+
+// Der Assistent ist der Home-Bereich: wer dort landet, soll nicht mehr
+// zurueck koennen — der History-Stack wird beim Ansteuern komplett geleert.
+const HOME_SCREEN = "assistent";
+
+// mode: "push" (normal), "replace" (Weiterleitung — soll keinen eigenen
+// Zurueck-Schritt erzeugen) oder "none" (wir rendern GERADE eine History-
+// Bewegung, die URL stimmt schon).
+function navigate(key, { mode = "push" } = {}) {
   if (App.qSphereStop) { try { App.qSphereStop(); } catch (e) {} App.qSphereStop = null; App.qSphereCanvas = null; }
   if (App._qPasteListener) { document.removeEventListener("paste", App._qPasteListener); App._qPasteListener = null; }
   // Ein angehängtes Bild bleibt absichtlich „kleben" — sonst ginge ein Tab-
@@ -76,15 +124,127 @@ function navigate(key) {
   // landete im Text-Pfad. clearPending() räumt es auf (Aktion/Entfernen).
   App.qIntent = null;
   App.qWorking = false;
+  const known = !!SCREENS[key];
+  if (!known) key = "aktuelles";
+  // Home ansteuern = Stack leeren: statt einen weiteren Eintrag zu stapeln,
+  // gehen wir bis zum Wurzel-Eintrag zurueck (History-API kann Eintraege
+  // nicht loeschen, nur dorthin springen). Der popstate-Handler rendert
+  // dann per _homeReset den Home-Screen und ersetzt den Wurzel-Eintrag.
+  if (key === HOME_SCREEN && mode === "push") {
+    const depth = (history.state && history.state.depth) || 0;
+    if (depth > 0) {
+      App._homeReset = true;
+      history.go(-depth);
+      return;
+    }
+    mode = "replace";  // schon an der Wurzel: Eintrag ersetzen statt stapeln
+  }
   App.current = key;
+  // Assistent-Screen erbt den Kontext der vorherigen Ansicht (z.B. offene
+  // Aufnahme mit Notizen), damit Q weiß, worüber der Nutzer gerade spricht.
+  if (key !== "assistent") {
+    App.screenContext = { screen: key, kunde: null };
+  }
+
+  // History fuehren, BEVOR gerendert wird — ein Screen, der sich selbst
+  // weiterleitet (z.B. rechnungen_page ohne lexware), ueberschreibt den
+  // Eintrag dann sauber per mode:"replace".
+  //
+  // ``depth`` wandert im History-State mit: nur so wissen wir nach einem
+  // popstate, ob es noch etwas gibt, wohin man zurueck kann (history.length
+  // zaehlt auch Vorwaerts-Eintraege und taugt dafuer nicht).
+  if (mode !== "none") {
+    const hash = "#" + key;
+    // Home ist immer die Wurzel (depth 0) — auch wenn z.B. ein Reload auf
+    // einem tieferen History-Eintrag gebootet hat.
+    const cur = key === HOME_SCREEN ? 0 : (history.state && history.state.depth) || 0;
+    if (mode === "replace" || location.hash === hash) {
+      history.replaceState({ screen: key, depth: cur }, "", hash);
+    } else {
+      history.pushState({ screen: key, depth: cur + 1 }, "", hash);
+    }
+  }
+  updateBackButton();
+
   document.querySelectorAll(".tabbar button").forEach((b) =>
     b.classList.toggle("active", b.dataset.tab === key));
-  const fn = SCREENS[key] || SCREENS.aktuelles;
+  const fn = SCREENS[key];
   App.view.innerHTML = `<div class="loading">Lädt …</div>`;
   fn().catch((e) => {
     App.view.innerHTML = `<div class="card"><p class="empty">Konnte nicht laden.</p></div>`;
     console.error(e);
   });
+}
+
+// Zurueck-Taste / Wisch-Geste: den Screen aus dem History-Eintrag rendern,
+// ohne einen neuen Eintrag zu erzeugen.
+window.addEventListener("popstate", (e) => {
+  if (!App.me) return;  // noch im Boot
+  // Ein Home-Tap hat uns per history.go() an die Wurzel springen lassen:
+  // dort den Eintrag durch Home ersetzen — der Stack ist damit leer.
+  if (App._homeReset) {
+    App._homeReset = false;
+    navigate(HOME_SCREEN, { mode: "replace" });
+    return;
+  }
+  // Liegt ein Modal obendrauf, meint "zurueck" das Modal — nicht den Screen
+  // darunter. Wir schliessen es und stellen den History-Eintrag wieder her,
+  // sonst haetten wir den Schritt verbraucht und der Screen waere gewechselt.
+  const modal = document.getElementById("archiv-preview-modal");
+  if (modal) {
+    modal.remove();
+    App._archivPreviewFile = null;
+    const depth = (history.state && history.state.depth) || 0;
+    history.pushState({ screen: App.current, depth: depth + 1 }, "", "#" + App.current);
+    updateBackButton();
+    return;
+  }
+  toggleQOverlay(true);  // offenes Q-Overlay schliessen, sonst liegt es ueber dem Screen
+  const key = (e.state && e.state.screen) || screenFromHash() || HOME_SCREEN;
+  navigate(key, { mode: "none" });
+});
+
+// Die Push-Benachrichtigung navigiert eine bereits offene App per
+// client.navigate("/app#anfragen") (sw.js) — das aendert nur den Hash und
+// laedt nichts neu. Ohne diesen Listener passiert dann schlicht nichts.
+window.addEventListener("hashchange", () => {
+  if (!App.me) return;
+  const key = screenFromHash();
+  if (key && key !== App.current) navigate(key, { mode: "none" });
+});
+
+// Zurueck-Pfeil im Header zeigen, sobald ein Schritt zurueck existiert.
+function updateBackButton() {
+  const btn = document.getElementById("back-btn");
+  if (!btn) return;
+  const depth = (history.state && history.state.depth) || 0;
+  btn.hidden = depth < 1;
+}
+
+// Kanten-Wisch-Geste: iOS liefert installierten PWAs keine eigene, also
+// bauen wir sie nach — vom linken Rand nach rechts ziehen = zurueck.
+// Bewusst eng gefasst (Start am Rand, klar horizontal), damit sie nicht mit
+// Scrollen oder dem Q-Overlay kollidiert.
+const EDGE_START_PX = 28;   // nur ein Zug, der am linken Rand beginnt
+const EDGE_MIN_DX = 70;     // so weit muss gezogen werden
+const EDGE_MAX_DY = 45;     // darueber ist es eine Scroll-Bewegung
+function initEdgeSwipe() {
+  let startX = null, startY = null;
+  document.addEventListener("touchstart", (e) => {
+    if (e.touches.length !== 1) { startX = null; return; }
+    const t = e.touches[0];
+    startX = t.clientX <= EDGE_START_PX ? t.clientX : null;
+    startY = t.clientY;
+  }, { passive: true });
+  document.addEventListener("touchend", (e) => {
+    if (startX === null) return;
+    const t = e.changedTouches[0];
+    const dx = t.clientX - startX;
+    const dy = Math.abs(t.clientY - startY);
+    startX = null;
+    if (dx < EDGE_MIN_DX || dy > EDGE_MAX_DY) return;
+    if ((history.state && history.state.depth) > 0) history.back();
+  }, { passive: true });
 }
 
 // ---------- Screens ----------
@@ -186,8 +346,8 @@ const SCREENS = {
       badge: rueckrufe.length || null, badgeClass: "warn",
     });
     tiles.push({
-      ico: "🎙️", label: "Anrufe", screen: "anrufe",
-      count: aufnahmenCount ? `${aufnahmenCount} Aufnahmen` : "Keine Aufnahmen",
+      ico: "🎙️", label: "Aufnahmen", screen: "aufnahmen",
+      count: aufnahmenCount ? `${aufnahmenCount} Gespräche` : "Keine Gespräche",
       badge: null,
     });
     // Tiles mit Badge (= Handlungsbedarf) nach oben sortieren
@@ -235,7 +395,9 @@ const SCREENS = {
 
   async rechnungen_page() {
     const feats = new Set(App.me.features || []);
-    if (!feats.has("lexware")) { navigate("aktuelles"); return; }
+    // Weiterleitung (z.B. via veraltetem Deep-Link) darf keinen eigenen
+    // Zurueck-Schritt erzeugen, sonst landet man in einer Schleife.
+    if (!feats.has("lexware")) { navigate("aktuelles", { mode: "replace" }); return; }
     const isInhaber = App.me.employee.is_inhaber;
     const res = await api("/app/api/rechnungen");
     const d = res && res.ok ? await res.json() : { rechnungen: [] };
@@ -273,7 +435,9 @@ const SCREENS = {
 
   async angebote_page() {
     const feats = new Set(App.me.features || []);
-    if (!feats.has("lexware")) { navigate("aktuelles"); return; }
+    // Weiterleitung (z.B. via veraltetem Deep-Link) darf keinen eigenen
+    // Zurueck-Schritt erzeugen, sonst landet man in einer Schleife.
+    if (!feats.has("lexware")) { navigate("aktuelles", { mode: "replace" }); return; }
     const isInhaber = App.me.employee.is_inhaber;
     const res = await api("/app/api/angebote");
     const d = res && res.ok ? await res.json() : { angebote: [] };
@@ -336,30 +500,27 @@ const SCREENS = {
     document.getElementById("termin-new-btn").addEventListener("click", showNewTerminForm);
   },
 
-  async anrufe() {
-    const [a, r] = await Promise.all([api("/app/api/aufnahmen"), api("/app/api/rueckrufe")]);
+  // Aufgezeichnete Kundengespraeche (Telegram-/aufnahme + Diktat). Bewusst
+  // OHNE die offenen Rueckrufe: die haben ihre eigene Kachel (rueckrufe_page)
+  // und sind eine To-do-Liste, keine Aufnahme. Der Screen hiess frueher
+  // "Anrufe" — irrefuehrend, hier landet kein einziges Telefonat.
+  async aufnahmen() {
+    const a = await api("/app/api/aufnahmen");
     const ad = a && a.ok ? await a.json() : { aufnahmen: [] };
-    const rd = r && r.ok ? await r.json() : { rueckrufe: [] };
+    const aufnahmen = ad.aufnahmen || [];
     App.view.innerHTML =
+      `<button class="btn-sm btn-ghost" id="back-db" style="margin-bottom:10px">← Übersicht</button>` +
       `<div style="display:flex;align-items:center;justify-content:space-between;margin:4px 4px 14px">
-        <h1 style="font-size:22px;margin:0">Anrufe</h1>
-        <div style="display:flex;gap:6px">
-          <button class="btn-sm" id="diktat-btn" style="padding:8px 12px">🎤 Diktat</button>
-          <button class="btn-sm btn-ghost" id="rueckruf-new-btn" style="padding:8px 12px">+ Rückruf</button>
-        </div>
+        <h1 style="font-size:22px;margin:0">Aufnahmen</h1>
+        <button class="btn-sm" id="diktat-btn" style="padding:8px 14px">🎤 Diktat</button>
       </div>` +
-      `<div class="card"><h2>Offene Rückrufe</h2>${
-        (rd.rueckrufe || []).length ? rd.rueckrufe.map((x) =>
-          rowAction(x.kunde, x.telefon + (x.anliegen ? " · " + esc(x.anliegen) : ""), "", x.id, "rueckruf-done", "Erledigt")).join("")
-        : emptyRow("Keine offenen Rückrufe")
-      }</div>` +
-      `<div class="card"><h2>Letzte Aufnahmen</h2>${
-        (ad.aufnahmen || []).length ? ad.aufnahmen.map((x) => rowTap(x.kunde || "Aufnahme", x.briefing || "", x.zeit, x.id)).join("")
-        : emptyRow("Noch keine Aufnahmen")
+      `<div class="card"><h2>Aufgezeichnete Gespräche</h2>${
+        aufnahmen.length
+          ? aufnahmen.map((x) => rowTap(x.kunde || "Aufnahme", x.briefing || "", x.zeit, x.id)).join("")
+          : emptyRow("Noch keine Gespräche aufgezeichnet")
       }</div>`;
-    bindRueckrufDone();
+    document.getElementById("back-db").addEventListener("click", () => navigate("aktuelles"));
     bindAufnahmen();
-    document.getElementById("rueckruf-new-btn").addEventListener("click", showNewRueckrufForm);
     document.getElementById("diktat-btn").addEventListener("click", showDiktatForm);
   },
 
@@ -491,39 +652,51 @@ const SCREENS = {
   async kunden() {
     App.view.innerHTML =
       `<button class="btn-sm btn-ghost" id="back-mehr" style="margin-bottom:10px">← Zurück</button>` +
-      `<div class="card"><input id="kunde-q" type="text" placeholder="Kundenname suchen …" autocomplete="off" /></div>` +
-      `<div id="kunde-res"><p class="empty">Mind. 2 Zeichen eingeben.</p></div>`;
+      `<div class="card"><input id="kunde-q" type="text" placeholder="Kundenname filtern …" autocomplete="off" /></div>` +
+      `<div id="kunde-res"><div class="loading">Lädt …</div></div>`;
     document.getElementById("back-mehr").addEventListener("click", () => navigate("mehr"));
     const input = document.getElementById("kunde-q");
     const res = document.getElementById("kunde-res");
     let timer = null;
+
+    async function runSearch(q) {
+      res.innerHTML = `<div class="loading">Suche …</div>`;
+      const r = await api("/app/api/kunden?q=" + encodeURIComponent(q));
+      const d = r && r.ok ? await r.json() : {};
+      const blocks = [];
+      // Kundenstamm (Phase 6): echte Kunden-Einträge mit id; bei
+      // namensgleichen Kunden liefert die API ein unterscheidendes
+      // Merkmal (Mail > Tel-Endziffern > Erstkontakt) mit.
+      const eintraege = (d.kunden || []).map((k) => ({
+        name: (k.name || "").trim(), id: k.id || null, merkmal: k.merkmal || null,
+      })).filter((k) => k.name);
+      const seen = new Set(eintraege.map((k) => k.name.toLowerCase()));
+      // Fallback für Alt-Zeilen ohne Kundenstamm-Eintrag (Phase 7 weg)
+      [...(d.drive_kunden || [])].forEach((x) => {
+        const n = (x.name || "").trim();
+        if (n && !seen.has(n.toLowerCase())) { seen.add(n.toLowerCase()); eintraege.push({ name: n, id: null, merkmal: null }); }
+      });
+      [...(d.gespraeche || []), ...(d.angebote || []), ...(d.rechnungen || [])].forEach((x) => {
+        const n = (x.kunde || "").trim();
+        if (n && n !== "—" && !seen.has(n.toLowerCase())) { seen.add(n.toLowerCase()); eintraege.push({ name: n, id: null, merkmal: null }); }
+      });
+      eintraege.sort((a, b) => a.name.localeCompare(b.name, "de"));
+      if (eintraege.length) blocks.push(`<div class="card"><h2>Kunden</h2>${eintraege.map((k) =>
+        `<button class="row menu-item" data-kunde="${esc(k.name)}"${k.id ? ` data-kunde-id="${esc(k.id)}"` : ""}><span>👤 ${esc(k.name)}${k.merkmal ? ` <span class="sub">(${esc(k.merkmal)})</span>` : ""}</span><span class="sub">Profil ›</span></button>`).join("")}</div>`);
+      if ((d.gespraeche || []).length && q) blocks.push(`<div class="card"><h2>Gespräche</h2>${d.gespraeche.map((x) => rowTap(x.kunde, x.briefing, x.zeit, x.id)).join("")}</div>`);
+      if ((d.angebote || []).length && q) blocks.push(`<div class="card"><h2>Angebote</h2>${d.angebote.map((x) => row(x.kunde, x.betrag, x.zeit)).join("")}</div>`);
+      if ((d.rechnungen || []).length && q) blocks.push(`<div class="card"><h2>Rechnungen</h2>${d.rechnungen.map((x) => row(x.kunde + (x.nummer ? " · " + esc(x.nummer) : ""), x.betrag, x.zeit)).join("")}</div>`);
+      res.innerHTML = blocks.length ? blocks.join("") : `<p class="empty">${q ? `Nichts gefunden für „${esc(q)}".` : "Keine Kunden vorhanden."}</p>`;
+      res.querySelectorAll("[data-kunde]").forEach((b) =>
+        b.addEventListener("click", () => showKundenProfil(b.dataset.kunde, b.dataset.kundeId)));
+      bindAufnahmen();
+    }
+
+    runSearch("");
     input.focus();
     input.addEventListener("input", () => {
       clearTimeout(timer);
-      const q = input.value.trim();
-      if (q.length < 2) { res.innerHTML = `<p class="empty">Mind. 2 Zeichen eingeben.</p>`; return; }
-      timer = setTimeout(async () => {
-        res.innerHTML = `<div class="loading">Suche …</div>`;
-        const r = await api("/app/api/kunden?q=" + encodeURIComponent(q));
-        const d = r && r.ok ? await r.json() : {};
-        const blocks = [];
-        // Eindeutige Kundennamen → tappbar zum Profil
-        const namen = [];
-        const seen = new Set();
-        [...(d.gespraeche || []), ...(d.angebote || []), ...(d.rechnungen || [])].forEach((x) => {
-          const n = (x.kunde || "").trim();
-          if (n && n !== "—" && !seen.has(n.toLowerCase())) { seen.add(n.toLowerCase()); namen.push(n); }
-        });
-        if (namen.length) blocks.push(`<div class="card"><h2>Kunden</h2>${namen.map((n) =>
-          `<button class="row menu-item" data-kunde="${esc(n)}"><span>👤 ${esc(n)}</span><span class="sub">Profil ›</span></button>`).join("")}</div>`);
-        if ((d.gespraeche || []).length) blocks.push(`<div class="card"><h2>Gespräche</h2>${d.gespraeche.map((x) => rowTap(x.kunde, x.briefing, x.zeit, x.id)).join("")}</div>`);
-        if ((d.angebote || []).length) blocks.push(`<div class="card"><h2>Angebote</h2>${d.angebote.map((x) => row(x.kunde, x.betrag, x.zeit)).join("")}</div>`);
-        if ((d.rechnungen || []).length) blocks.push(`<div class="card"><h2>Rechnungen</h2>${d.rechnungen.map((x) => row(x.kunde + (x.nummer ? " · " + esc(x.nummer) : ""), x.betrag, x.zeit)).join("")}</div>`);
-        res.innerHTML = blocks.length ? blocks.join("") : `<p class="empty">Nichts gefunden für „${esc(q)}".</p>`;
-        res.querySelectorAll("[data-kunde]").forEach((b) =>
-          b.addEventListener("click", () => showKundenProfil(b.dataset.kunde)));
-        bindAufnahmen();
-      }, 300);
+      timer = setTimeout(() => runSearch(input.value.trim()), 300);
     });
   },
 
@@ -680,7 +853,7 @@ const SCREENS = {
       `<p class="muted" style="margin:0 4px 14px">Foto eines Raums/Objekts hochladen und beschreiben, was verändert werden soll — die KI rendert eine fotorealistische Vorschau.</p>` +
       `<div class="card">
          <label class="sub">Foto (JPEG/PNG, max 15 MB)</label>
-         <input type="file" id="viz-file" accept="image/jpeg,image/png" style="${inputStyle}" />
+         <input type="file" id="viz-file" accept="image/jpeg,image/png" capture="environment" style="${inputStyle}" />
          <label class="sub">Was soll verändert werden?</label>
          <textarea id="viz-prompt" rows="3" placeholder="z.B. Wände in warmem Grau streichen, Eichenparkett verlegen" style="${inputStyle};font-family:inherit"></textarea>
          <button class="btn-sm" id="viz-go" style="width:100%;margin-top:4px" disabled>Visualisierung erstellen</button>
@@ -752,15 +925,97 @@ const SCREENS = {
   },
 
   async einstellungen() {
+    // Übersicht: die Einstellungen sind thematisch auf Unterseiten
+    // verteilt (App / Betrieb / Verbindungen / System) statt auf einer
+    // langen Sammelseite zu liegen.
+    const isInhaber = !!(App.me && App.me.employee && App.me.employee.is_inhaber);
+    const item = (go, ico, label, sub) =>
+      `<button class="row menu-item" data-go="${go}"><span>${ico} ${esc(label)}<span class="sub" style="display:block">${esc(sub)}</span></span><span class="sub">›</span></button>`;
+    App.view.innerHTML =
+      `<button class="btn-sm btn-ghost" id="back-mehr" style="margin-bottom:10px">← Zurück</button>` +
+      `<h1 style="font-size:22px;margin:4px 4px 14px">Einstellungen</h1>` +
+      `<div class="card">` +
+        item("einstellungen_app", "📱", "App-Einstellungen", "Farbe & Darstellung") +
+        item("einstellungen_betrieb", "🏢", "Betrieb",
+          isInhaber ? "Firmendaten, Adresse, Logo & Website" : "Firmendaten & Adresse") +
+        (isInhaber ? item("einstellungen_verbindungen", "🔌", "Verbindungen", "Google, Outlook, Lexware") : "") +
+        item("einstellungen_system", "ℹ️", "System", "Paket, Funktionen, Daten-Speicherung") +
+      `</div>`;
+    document.getElementById("back-mehr").addEventListener("click", () => navigate("mehr"));
+    App.view.querySelectorAll("[data-go]").forEach((b) =>
+      b.addEventListener("click", () => navigate(b.dataset.go)));
+  },
+
+  async einstellungen_app() {
+    // App-Farbe (Tenant-weit, nur Inhaber änderbar). Die Darstellung-Karte
+    // (hell/dunkel, pro Gerät) hängt beta.js nach dem Rendern an.
     const res = await api("/app/api/einstellungen");
-    const d = res && res.ok ? await res.json() : { stammdaten: {}, features: [] };
+    const d = res && res.ok ? await res.json() : { stammdaten: {} };
     const st = d.stammdaten || {};
     const isInhaber = !!d.is_inhaber;
+    const brandColorVal = st.brand_color || "#0066cc";
+    const colorField = isInhaber
+      ? `<label class="sub">App-Farbe</label>
+         <div style="display:flex;align-items:center;gap:10px;margin:4px 0 10px">
+           <input type="color" id="set-brand_color-picker" value="${esc(brandColorVal)}"
+             style="width:48px;height:40px;border:1px solid var(--line);border-radius:8px;padding:2px;cursor:pointer;background:none" />
+           <input type="text" id="set-brand_color" value="${esc(brandColorVal)}" maxlength="7"
+             style="flex:1;padding:12px;border:1px solid var(--line);border-radius:10px;font-size:15px" placeholder="#0066cc" />
+         </div>
+         <p class="muted" style="font-size:12px;margin:0 0 8px">Färbt Buttons und Bedienelemente — gilt für alle im Betrieb.</p>
+         <button class="btn-sm" id="set-save-color" style="width:100%">Speichern</button>`
+      : `<div class="row"><span>App-Farbe</span><span class="sub" style="display:flex;align-items:center;gap:6px"><span style="display:inline-block;width:14px;height:14px;border-radius:3px;background:${esc(brandColorVal)};border:1px solid var(--line)"></span>${esc(brandColorVal)}</span></div>
+         <p class="muted" style="font-size:12px;margin:8px 0 0">Die Farbe legt der Inhaber fest. Hell/Dunkel wählst du unten — das gilt nur für dein Gerät.</p>`;
+    App.view.innerHTML =
+      `<button class="btn-sm btn-ghost" id="back-einst" style="margin-bottom:10px">← Einstellungen</button>` +
+      `<h1 style="font-size:22px;margin:4px 4px 14px">App-Einstellungen</h1>` +
+      `<div class="card"><h2>App-Farbe</h2>${colorField}</div>`;
+    document.getElementById("back-einst").addEventListener("click", () => navigate("einstellungen"));
+    if (!isInhaber) return;
+    const picker = document.getElementById("set-brand_color-picker");
+    const hex = document.getElementById("set-brand_color");
+    picker.addEventListener("input", () => {
+      hex.value = picker.value;
+      applyBrandColor(picker.value);
+    });
+    hex.addEventListener("input", () => {
+      if (/^#[0-9a-fA-F]{6}$/.test(hex.value)) {
+        picker.value = hex.value;
+        applyBrandColor(hex.value);
+      }
+    });
+    const saveBtn = document.getElementById("set-save-color");
+    saveBtn.addEventListener("click", async () => {
+      const colorHex = (hex.value || "").trim();
+      if (!/^#[0-9a-fA-F]{6}$/.test(colorHex)) {
+        alert("Bitte eine Farbe im Format #rrggbb angeben.");
+        return;
+      }
+      saveBtn.disabled = true; saveBtn.textContent = "Speichere …";
+      const r = await api("/app/api/einstellungen",
+        { method: "POST", body: JSON.stringify({ brand_color: colorHex }) });
+      const j = r && r.ok ? await r.json().catch(() => null) : null;
+      if (j && j.ok) {
+        applyBrandColor(colorHex);
+        if (App.me && App.me.tenant) App.me.tenant.brand_color = colorHex;
+        saveBtn.textContent = "✓ Gespeichert";
+        setTimeout(() => { saveBtn.textContent = "Speichern"; saveBtn.disabled = false; }, 1500);
+        return;
+      }
+      alert("Konnte nicht speichern: " + ((j && j.error) || "unbekannt"));
+      saveBtn.disabled = false; saveBtn.textContent = "Speichern";
+    });
+  },
 
-    // Read-Only-View fuer Mitarbeiter, Editierbar fuer Inhaber. Felder die
-    // OAuth/Voice betreffen sind hier nicht editierbar — der Setup-Wizard
-    // bzw. Admin-UI bleibt zustaendig (Microsoft-Login, Drive-Anbindung,
-    // Sipgate-Nummer-Routing).
+  async einstellungen_betrieb() {
+    // Firmendaten + Werkstatt-Adresse (Inhaber editierbar, sonst
+    // read-only). Die Logo-&-Website-Karte hängt beta.js an (Inhaber).
+    const res = await api("/app/api/einstellungen");
+    const d = res && res.ok ? await res.json() : { stammdaten: {} };
+    const st = d.stammdaten || {};
+    const isInhaber = !!d.is_inhaber;
+    // OAuth/Voice-Felder sind hier bewusst nicht editierbar — der
+    // Setup-Wizard bzw. Admin-UI bleibt dafür zuständig.
     const fld = (label, key, type = "text", hint = "") => {
       const val = st[key] || "";
       if (!isInhaber) {
@@ -771,18 +1026,9 @@ const SCREENS = {
         hint ? `<p class="muted" style="margin:-6px 0 8px;font-size:12px">${esc(hint)}</p>` : ""
       }`;
     };
-
-    const readOnlyBlock = `<div class="card"><h2>Verbundene Dienste</h2>
-      <div class="row"><span>Funktionen aktiv</span><span class="sub">${(d.features || []).length}</span></div>
-      ${(d.features || []).length ? `<div class="sub" style="margin-top:6px">${(d.features || []).map(esc).join(", ")}</div>` : ""}
-      <div class="row"><span>Paket</span><span class="sub">${esc(d.package_tier || "—")}</span></div>
-      <div class="row"><span>Daten-Retention</span><span class="sub">${esc(String(d.data_retention_days || ""))} Tage</span></div>
-      <p class="muted" style="margin-top:8px">Microsoft, Google, Lexware und die Telefonnummer (Sipgate) verwalte über den Setup-Bereich auf gewerbeagent.de.</p>
-    </div>`;
-
     App.view.innerHTML =
-      `<button class="btn-sm btn-ghost" id="back-mehr" style="margin-bottom:10px">← Zurück</button>` +
-      `<h1 style="font-size:22px;margin:4px 4px 14px">Einstellungen</h1>` +
+      `<button class="btn-sm btn-ghost" id="back-einst" style="margin-bottom:10px">← Einstellungen</button>` +
+      `<h1 style="font-size:22px;margin:4px 4px 14px">Betrieb</h1>` +
       `<div class="card"><h2>Firma & Kontakt</h2>` +
         fld("Firmenname", "company_name") +
         fld("Branche", "branche", "text", "z.B. Heizungsbau, Elektro, Sanitär") +
@@ -796,11 +1042,8 @@ const SCREENS = {
         fld("PLZ", "heimat_plz") +
         fld("Ort", "heimat_ort") +
       `</div>` +
-      (isInhaber ? `<div id="verbindungen-mount"></div>` : "") +
-      readOnlyBlock +
       (isInhaber ? `<button class="btn-sm" id="set-save" style="width:100%;margin-top:8px">Speichern</button>` : "");
-
-    document.getElementById("back-mehr").addEventListener("click", () => navigate("mehr"));
+    document.getElementById("back-einst").addEventListener("click", () => navigate("einstellungen"));
     const saveBtn = document.getElementById("set-save");
     if (saveBtn) {
       saveBtn.addEventListener("click", async () => {
@@ -811,28 +1054,55 @@ const SCREENS = {
         saveBtn.disabled = true; saveBtn.textContent = "Speichere …";
         const r = await api("/app/api/einstellungen",
           { method: "POST", body: JSON.stringify(body) });
-        if (r && r.ok) {
-          const j = await r.json();
-          if (j.ok) {
-            saveBtn.textContent = "✓ Gespeichert";
-            setTimeout(() => { saveBtn.textContent = "Speichern"; saveBtn.disabled = false; }, 1500);
-            return;
-          }
-          alert("Konnte nicht speichern: " + (j.error || "unbekannt"));
-        } else {
-          alert("Konnte nicht speichern.");
+        const j = r && r.ok ? await r.json().catch(() => null) : null;
+        if (j && j.ok) {
+          saveBtn.textContent = "✓ Gespeichert";
+          setTimeout(() => { saveBtn.textContent = "Speichern"; saveBtn.disabled = false; }, 1500);
+          return;
         }
+        alert("Konnte nicht speichern: " + ((j && j.error) || "unbekannt"));
         saveBtn.disabled = false; saveBtn.textContent = "Speichern";
       });
     }
+  },
 
-    // ── Verbindungen (OAuth + Lexware) — nur Inhaber ───────────────────
+  async einstellungen_system() {
+    // Read-only: Paket, aktive Funktionen, Daten-Retention.
+    const res = await api("/app/api/einstellungen");
+    const d = res && res.ok ? await res.json() : { features: [] };
+    App.view.innerHTML =
+      `<button class="btn-sm btn-ghost" id="back-einst" style="margin-bottom:10px">← Einstellungen</button>` +
+      `<h1 style="font-size:22px;margin:4px 4px 14px">System</h1>` +
+      `<div class="card"><h2>Verbundene Dienste</h2>
+        <div class="row"><span>Funktionen aktiv</span><span class="sub">${(d.features || []).length}</span></div>
+        ${(d.features || []).length ? `<div class="sub" style="margin-top:6px">${(d.features || []).map(esc).join(", ")}</div>` : ""}
+        <div class="row"><span>Paket</span><span class="sub">${esc(d.package_tier || "—")}</span></div>
+        <div class="row"><span>Daten-Retention</span><span class="sub">${esc(String(d.data_retention_days || ""))} Tage</span></div>
+        <p class="muted" style="margin-top:8px">Microsoft, Google, Lexware und die Telefonnummer (Sipgate) verwalte über den Setup-Bereich auf gewerbeagent.de.</p>
+      </div>`;
+    document.getElementById("back-einst").addEventListener("click", () => navigate("einstellungen"));
+  },
+
+  async einstellungen_verbindungen() {
+    // OAuth + Lexware (nur Inhaber) — Logik unverändert von der alten
+    // Sammelseite hierher verschoben.
+    const isInhaber = !!(App.me && App.me.employee && App.me.employee.is_inhaber);
+    App.view.innerHTML =
+      `<button class="btn-sm btn-ghost" id="back-einst" style="margin-bottom:10px">← Einstellungen</button>` +
+      `<h1 style="font-size:22px;margin:4px 4px 14px">Verbindungen</h1>` +
+      (isInhaber ? `<div id="verbindungen-mount"></div>`
+        : `<div class="card"><p class="empty">Verbindungen verwaltet der Inhaber.</p></div>`);
+    document.getElementById("back-einst").addEventListener("click", () => navigate("einstellungen"));
     if (!isInhaber) return;
 
+    // Gestapelt statt nebeneinander: bis zu drei Buttons pro Dienst sind auf
+    // Handy-Breite breiter als die Zeile — als flex-shrink:0-Nachbar quetschten
+    // sie den Titel auf Null Breite (Buchstaben brachen einzeln um).
     const row = (title, sub, btns) =>
-      `<div class="row" style="align-items:flex-start;gap:8px">
-         <div style="min-width:0"><div>${title}</div><div class="sub" style="word-break:break-word">${sub}</div></div>
-         <div style="display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end;flex-shrink:0">${btns}</div>
+      `<div class="row" style="display:block">
+         <div>${title}</div>
+         <div class="sub" style="word-break:break-word">${sub}</div>
+         ${btns ? `<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px">${btns}</div>` : ""}
        </div>`;
 
     const startOAuth = (provider) => {
@@ -976,6 +1246,7 @@ const SCREENS = {
       typ: (App.formular && App.formular.typ) || "allgemein",
       title: "", subtitle: "", fields: [],
       fieldTypes: [], optionTypes: [], typen: [], dirty: false,
+      previewUrl: "",
     };
     App.formular = state;
 
@@ -1110,7 +1381,18 @@ const SCREENS = {
         `<button class="btn-sm btn-ghost" id="f-add" style="width:100%;margin:6px 0 14px">+ Feld hinzufügen</button>` +
         `<button class="btn-sm" id="f-save" style="width:100%">Speichern</button>` +
         `<button class="btn-sm btn-ghost" id="f-reset" style="width:100%;margin-top:8px">Auf Standard zurücksetzen</button>` +
-        `<p class="muted" id="f-msg" style="text-align:center;margin-top:10px;font-size:13px"></p>`;
+        `<p class="muted" id="f-msg" style="text-align:center;margin-top:10px;font-size:13px"></p>` +
+        `<div class="card" style="margin-top:14px">
+           <h2 style="margin-top:0">Formular teilen</h2>
+           <p class="sub" style="margin:0 0 8px">Vorschau-Link — zeigt das Formular, ohne dass etwas abgeschickt wird:</p>
+           <div style="display:flex;gap:6px;align-items:center;margin-bottom:12px">
+             <input id="f-preview-url" readonly value="${esc(state.previewUrl)}"
+               style="flex:1;padding:9px 10px;border:1px solid var(--line);border-radius:10px;font-size:14px;background:var(--bg2,#f8f8f8);color:var(--text)">
+             <button class="btn-sm btn-ghost" id="f-copy-preview" style="white-space:nowrap">Kopieren</button>
+           </div>
+           <button class="btn-sm btn-ghost" id="f-gen-link" style="width:100%">Kunden-Link generieren …</button>
+           <p class="muted" style="font-size:12px;margin:8px 0 0">Generiert einen persönlichen Ausfüll-Link mit Ablaufdatum für einen bestimmten Kunden.</p>
+         </div>`;
       document.getElementById("back-mehr").addEventListener("click", () => {
         if (state.dirty && !confirm("Ungespeicherte Änderungen verwerfen?")) return;
         navigate("mehr");
@@ -1121,6 +1403,15 @@ const SCREENS = {
       document.getElementById("f-add").addEventListener("click", addField);
       document.getElementById("f-save").addEventListener("click", save);
       document.getElementById("f-reset").addEventListener("click", reset);
+      document.getElementById("f-copy-preview").addEventListener("click", () => {
+        const inp = document.getElementById("f-preview-url");
+        if (!inp || !inp.value) return;
+        navigator.clipboard.writeText(inp.value).then(() => {
+          const btn = document.getElementById("f-copy-preview");
+          if (btn) { btn.textContent = "Kopiert!"; setTimeout(() => { btn.textContent = "Kopieren"; }, 2000); }
+        });
+      });
+      document.getElementById("f-gen-link").addEventListener("click", () => showFormularLinkModal(state.typ));
       renderFields();
     };
 
@@ -1138,7 +1429,8 @@ const SCREENS = {
       state.title = j.title || ""; state.subtitle = j.subtitle || "";
       state.fields = (j.fields || []).map(normField);
       state.fieldTypes = j.field_types || []; state.optionTypes = j.option_types || [];
-      state.typen = j.anfrage_typen || []; state.typ = j.anfrage_typ || state.typ; state.dirty = false;
+      state.typen = j.anfrage_typen || []; state.typ = j.anfrage_typ || state.typ;
+      state.previewUrl = j.preview_url || ""; state.dirty = false;
       shell();
     };
 
@@ -1304,10 +1596,20 @@ const SCREENS = {
     const IC = {
       spark: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l1.7 4.8L18.5 9.5l-4.8 1.7L12 16l-1.7-4.8L5.5 9.5l4.8-1.7L12 3z"/><path d="M19 14.5l.6 1.9 1.9.6-1.9.6-.6 1.9-.6-1.9-1.9-.6 1.9-.6.6-1.9z"/></svg>`,
       clip: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>`,
+      cam: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>`,
       mic: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="2" width="6" height="11" rx="3"/><path d="M5 10v1a7 7 0 0 0 14 0v-1"/><line x1="12" y1="19" x2="12" y2="22"/></svg>`,
       stop: `<svg viewBox="0 0 24 24" fill="currentColor" stroke="none"><rect x="6" y="6" width="12" height="12" rx="3"/></svg>`,
       send: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="20" x2="12" y2="5"/><polyline points="6 11 12 5 18 11"/></svg>`,
     };
+    const _miniSphereHtml =
+      `<button class="cbtn q-composer-mic" id="q-mini-sphere" title="Halten zum Sprechen" hidden aria-label="Sprechen">
+        <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="9" y="2" width="6" height="11" rx="3"/>
+          <path d="M5 10a7 7 0 0 0 14 0"/>
+          <line x1="12" y1="19" x2="12" y2="22"/>
+          <line x1="8" y1="22" x2="16" y2="22"/>
+        </svg>
+      </button>`;
     App.view.innerHTML =
       `<div class="chat" id="q-chat"></div>
        <div class="composer">
@@ -1315,18 +1617,23 @@ const SCREENS = {
          <div class="composer-preview" id="composer-preview" hidden></div>
          <div class="composer-inner">
            <button class="cbtn ghost" id="q-actions" title="Funktionen" aria-label="Funktionen">${IC.spark}</button>
-           <button class="cbtn ghost" id="q-attach" title="Foto oder Datei anhängen" aria-label="Anhängen">${IC.clip}</button>
-           <textarea id="q-input" rows="1" placeholder="Schreib Q … (Bilder einfügen mit Strg+V)"></textarea>
+           <button class="cbtn ghost" id="q-attach" title="Datei anhängen" aria-label="Anhängen">${IC.clip}</button>
+           <button class="cbtn ghost" id="q-camera" title="Foto machen" aria-label="Foto machen">${IC.cam}</button>
+           <textarea id="q-input" rows="1" placeholder="Schreib Q …"></textarea>
+           ${_miniSphereHtml}
            <button class="cbtn" id="q-send" title="Senden" aria-label="Senden">${IC.send}</button>
          </div>
        </div>
-       <input type="file" id="q-file" accept="image/jpeg,image/png,image/webp,application/pdf" style="display:none">`;
+       <input type="file" id="q-file" accept="image/jpeg,image/png,image/webp,application/pdf" style="display:none">
+       <input type="file" id="q-camera-file" accept="image/*" capture="environment" style="display:none">`;
 
     const chatEl = document.getElementById("q-chat");
     const input = document.getElementById("q-input");
     const sendBtn = document.getElementById("q-send");
     const attachBtn = document.getElementById("q-attach");
     const fileEl = document.getElementById("q-file");
+    const cameraBtn = document.getElementById("q-camera");
+    const cameraFileEl = document.getElementById("q-camera-file");
 
     function scrollDown() { requestAnimationFrame(() => window.scrollTo(0, document.body.scrollHeight)); }
     function auto() { input.style.height = "auto"; input.style.height = Math.min(input.scrollHeight, 120) + "px"; }
@@ -1401,17 +1708,21 @@ const SCREENS = {
       }
       if (!hasMsgs) {
         App.qWorking = false;
+        const miniSphHide = document.getElementById("q-mini-sphere");
+        if (miniSphHide) miniSphHide.hidden = true;
         chatEl.innerHTML = `<div class="q-hero">${sphereWrap}<p class="q-sphere-hint" id="q-sphere-hint">Halten zum Sprechen</p></div>`;
         mountQSphere();
         return;
       }
       if (App.qSphereStop) { try { App.qSphereStop(); } catch (e) {} App.qSphereStop = null; App.qSphereCanvas = null; }
+      const miniSph = document.getElementById("q-mini-sphere");
+      if (miniSph) miniSph.hidden = false;
       chatEl.innerHTML = App.qchat.map((m, i) => {
         if (m.role === "me") {
           const imgTag = m.previewUrl ? `<img class="msg-img" src="${m.previewUrl}" alt="${esc(m.fileName || "Bild")}">` : "";
           return `<div class="bubble me">${imgTag}${m.text ? esc(m.text) : ""}</div>`;
         }
-        if (m.role === "typing") return `<div class="bubble q typing"><span></span><span></span><span></span></div>`;
+        if (m.role === "typing") return `<div class="q-typing-row"><div class="q-thinking-orb" id="q-typing-orb"><canvas id="q-mini-sphere-canvas"></canvas></div><div class="q-typing-ring-wrap"><div class="bubble q typing"><span></span><span></span><span></span></div></div></div>`;
         if (m.role === "err") return `<div class="bubble q err">${esc(m.text)}</div>`;
         if (m.role === "onb") {
           const OB_TITLE = { google: "Google verbinden", microsoft: "Microsoft / Outlook verbinden",
@@ -1569,6 +1880,7 @@ const SCREENS = {
         b.addEventListener("click", () => obPush(parseInt(b.dataset.obPush, 10))));
       chatEl.querySelectorAll("[data-ob-skip]").forEach((b) =>
         b.addEventListener("click", () => obSkip(parseInt(b.dataset.obSkip, 10))));
+      _mountMiniSphere("q-typing-orb", "q-mini-sphere-canvas", "qMiniSphereStop");
       scrollDown();
     }
 
@@ -1681,7 +1993,7 @@ const SCREENS = {
       if (j.type === "message") push({ role: "q", text: j.text });
       else if (j.type === "error") push({ role: "err", text: j.text });
       else if (j.type === "confirm") push({ role: "confirm", tool: j.tool, args: j.args, summary: j.summary, frage: j.frage, resolved: false });
-      else if (j.type === "navigate") { if (j.text) push({ role: "q", text: j.text }); handleNavigate(j.bereich); }
+      else if (j.type === "navigate") { if (j.text) push({ role: "q", text: j.text }); handleNavigate(j.bereich, j.kunde, j.kategorie); }
     }
 
     // Q-Antwort als Modell-Turn in den Verlauf übernehmen, damit die nächste
@@ -1719,7 +2031,7 @@ const SCREENS = {
       else if (j.type === "message") push({ role: "q", text: j.text });
       else if (j.type === "error") push({ role: "err", text: j.text });
       else if (j.type === "confirm") push({ role: "confirm", tool: j.tool, args: j.args, summary: j.summary, frage: j.frage, resolved: false });
-      else if (j.type === "navigate") { if (j.text) push({ role: "q", text: j.text }); handleNavigate(j.bereich); }
+      else if (j.type === "navigate") { if (j.text) push({ role: "q", text: j.text }); handleNavigate(j.bereich, j.kunde, j.kategorie); }
       input.focus();
     }
 
@@ -1845,6 +2157,8 @@ const SCREENS = {
     input.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } });
     attachBtn.addEventListener("click", () => fileEl.click());
     fileEl.addEventListener("change", () => { if (fileEl.files && fileEl.files[0]) onFilePicked(fileEl.files[0]); fileEl.value = ""; });
+    cameraBtn.addEventListener("click", () => cameraFileEl.click());
+    cameraFileEl.addEventListener("change", () => { if (cameraFileEl.files && cameraFileEl.files[0]) onFilePicked(cameraFileEl.files[0]); cameraFileEl.value = ""; });
 
     // Paste-Handler: Bilder aus Zwischenablage (Strg+V / Cmd+V) direkt anhängen
     function onPaste(e) {
@@ -1964,6 +2278,61 @@ const SCREENS = {
     });
 
     chatEl.addEventListener("pointercancel", () => _sphereRelease(false));
+
+    // Mini-Sphere im Composer: gleiche Hold-to-Speak-Logik wie der große Globus.
+    // Erscheint wenn Chat-Nachrichten vorhanden sind.
+    {
+      const miniBtn = document.getElementById("q-mini-sphere");
+      let _miniTimer = null, _miniDown = false;
+
+      async function _miniRelease(shouldUpload) {
+        clearTimeout(_miniTimer); _miniTimer = null;
+        if (!_miniDown) return;
+        _miniDown = false;
+        miniBtn.classList.remove("recording");
+        if (!shouldUpload || !Diktat.recording) { _diktatTeardown(); return; }
+        const out = _diktatFinish();
+        if (out.durationSec < 1 || out.blob.size < 2000) {
+          push({ role: "err", text: "Aufnahme war zu kurz — bitte länger halten." }); return;
+        }
+        push({ role: "typing" });
+        const fd = new FormData();
+        fd.append("audio", out.blob, "aufnahme.wav");
+        let res, j = null;
+        try {
+          res = await fetch("/app/api/diktat", { method: "POST",
+            headers: { "X-CSRF-Token": App.me.csrf }, body: fd });
+        } catch (_) { popTyping(); push({ role: "err", text: "Netzwerkfehler." }); return; }
+        try { j = await res.json(); } catch (_) {}
+        popTyping();
+        if (res.ok && j && j.ok && j.text) { input.value = j.text; send(); }
+        else push({ role: "err", text: "Nichts verstanden — bitte erneut halten." });
+      }
+
+      if (miniBtn) {
+        miniBtn.addEventListener("pointerdown", (e) => {
+          e.preventDefault();
+          if (!App.micReady) { _primeMic(); return; }
+          miniBtn.setPointerCapture(e.pointerId);
+          _miniTimer = setTimeout(async () => {
+            _miniDown = true;
+            miniBtn.classList.add("recording");
+            if (App.qSphereActive) App.qSphereActive(false);
+            try {
+              await _diktatStartRecording();
+              Diktat.autostop = setTimeout(() => { if (Diktat.recording) _miniRelease(true); }, 60 * 1000);
+            } catch (er) {
+              _miniDown = false; miniBtn.classList.remove("recording");
+              push({ role: "err", text: er && er.name === "NotAllowedError"
+                ? "Mikrofon-Zugriff abgelehnt. Bitte im Browser erlauben."
+                : "Mikrofon nicht verfügbar." });
+            }
+          }, 200);
+        });
+        miniBtn.addEventListener("pointerup", () => { if (_miniDown || _miniTimer) _miniRelease(true); });
+        miniBtn.addEventListener("pointercancel", () => _miniRelease(false));
+      }
+    }
 
     // ---- Funktions-Dropdown (Quick-Aktionen) ----
     // Damit der Handwerker nicht alles per Hand in eigenen Fenstern anlegt:
@@ -2182,6 +2551,11 @@ const SCREENS = {
     if (App.qPendingFile) showPendingPreview();
     // Q-Onboarding beim ersten Start (oder „Mehr → Einrichtung starten").
     if (App.startOnboarding) { App.startOnboarding = false; runOnboarding(); }
+    // Visualisierung direkt aus dem Bild-Archiv-Preview gestartet.
+    else if (App._autoVizPrompt && App.qPendingFile) {
+      const p = App._autoVizPrompt; App._autoVizPrompt = null;
+      doVisualisieren(App.qPendingFile, p);
+    }
     // Vorbefüllung aus einem Quick-Aktion/„Angebot erstellen"-Tap.
     else if (App.qSeed) { input.value = App.qSeed; App.qSeed = null; auto(); input.focus(); input.setSelectionRange(input.value.length, input.value.length); }
     // Im leeren Chat NICHT fokussieren: sonst poppt die Tastatur und verdeckt
@@ -2208,17 +2582,35 @@ async function loadBriefing(refresh) {
 // Q hat im Chat eine Ansicht angefordert ("zeig mir die Rechnungen") → die
 // passende Stelle öffnen. Anzeigen leben in "Aktuelles" (dorthin + zum
 // Abschnitt scrollen); Kleinkram (Kunden/Wissen/…) als eigener Screen.
-function handleNavigate(bereich) {
+function handleNavigate(bereich, kunde, kategorie) {
   const b = (bereich || "aktuelles").toLowerCase();
+  if (b === "kunden_profil" && kunde) { showKundenProfil(kunde); return; }
+  if (b === "kunden_archiv" && kunde) { openArchivKategorie(kunde, kategorie || "bilder"); return; }
   const mehr = { kunden: 1, wissen: 1, material: 1, team: 1, einstellungen: 1, formulare: 1 };
   const subscreen = {
     auftraege: "auftraege_page", rechnungen: "rechnungen_page",
     angebote: "angebote_page", rueckrufe: "rueckrufe_page",
-    anfragen: "anfragen", termine: "termine",
+    anfragen: "anfragen", termine: "termine", aufnahmen: "aufnahmen",
   };
   if (mehr[b]) { navigate(b); return; }
   if (subscreen[b]) { navigate(subscreen[b]); return; }
   navigate("aktuelles");
+}
+
+// Lädt Dateien für einen Kunden und öffnet direkt eine Archiv-Kategorie-Unterseite.
+async function openArchivKategorie(kundeName, kategorieKey) {
+  App.view.innerHTML = `<div class="loading">Lädt …</div>`;
+  const res = await api("/app/api/archiv/dateien?kunde_name=" + encodeURIComponent(kundeName));
+  const j = res ? await res.json().catch(() => null) : null;
+  const all = (j && j.ok && j.dateien) ? j.dateien : [];
+  const fileMap = Object.fromEntries(all.map((f) => [f.id, f]));
+  const defs = [
+    { key: "bilder",  label: "Bilder",  ico: "📷", files: all.filter((f) => f.is_image) },
+    { key: "pdfs",    label: "PDFs",    ico: "📄", files: all.filter((f) => !f.is_image && f.mime_type === "application/pdf") },
+    { key: "notizen", label: "Notizen", ico: "📝", files: all.filter((f) => !f.is_image && f.mime_type === "text/plain") },
+  ];
+  const group = defs.find((g) => g.key === kategorieKey) || defs[0];
+  showArchivKategorie(kundeName, group, fileMap);
 }
 
 function row(a, b, c) {
@@ -2614,6 +3006,81 @@ async function showNewMaterialForm() {
   });
 }
 
+function showFormularLinkModal(typ) {
+  const inpStyle = "width:100%;padding:12px;border:1px solid var(--line);border-radius:10px;margin:4px 0 10px;font-size:16px";
+  const html =
+    `<div id="flink-modal" style="position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;z-index:1000;padding:16px">
+       <div class="card" style="max-width:440px;width:100%;margin:0">
+         <h2 style="margin-top:0">Kunden-Link generieren</h2>
+         <div id="flink-form">
+           <label class="sub">Kundenname *</label>
+           <input type="text" id="flink-name" placeholder="z.B. Max Muster" style="${inpStyle}">
+           <label class="sub">E-Mail des Kunden (optional)</label>
+           <input type="email" id="flink-email" placeholder="kunde@beispiel.de" style="${inpStyle}">
+           <label class="sub">Telefon (optional)</label>
+           <input type="tel" id="flink-tel" placeholder="+49 …" style="${inpStyle}">
+           <label class="sub">Gültig für</label>
+           <select id="flink-days" style="${inpStyle}">
+             <option value="3">3 Tage</option>
+             <option value="7" selected>7 Tage</option>
+             <option value="14">14 Tage</option>
+             <option value="30">30 Tage</option>
+           </select>
+           <p id="flink-err" style="color:var(--err,#b42318);font-size:13px;margin:0 0 8px;display:none"></p>
+           <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:4px">
+             <button class="btn-sm btn-ghost" id="flink-cancel">Abbrechen</button>
+             <button class="btn-sm" id="flink-save">Link erstellen</button>
+           </div>
+         </div>
+         <div id="flink-result" style="display:none">
+           <p class="sub" style="margin:0 0 6px">Link für <strong id="flink-res-name"></strong> (gültig bis <span id="flink-res-exp"></span>):</p>
+           <div style="display:flex;gap:6px;align-items:center;margin-bottom:14px">
+             <input type="text" id="flink-res-url" readonly style="flex:1;padding:9px 10px;border:1px solid var(--line);border-radius:10px;font-size:14px;background:var(--bg2,#f8f8f8)">
+             <button class="btn-sm btn-ghost" id="flink-res-copy" style="white-space:nowrap">Kopieren</button>
+           </div>
+           <button class="btn-sm btn-ghost" id="flink-close" style="width:100%">Schließen</button>
+         </div>
+       </div>
+     </div>`;
+  document.body.insertAdjacentHTML("beforeend", html);
+  const modal = () => document.getElementById("flink-modal");
+  const close = () => modal()?.remove();
+  document.getElementById("flink-cancel").addEventListener("click", close);
+  document.getElementById("flink-save").addEventListener("click", async () => {
+    const name = (document.getElementById("flink-name").value || "").trim();
+    const email = (document.getElementById("flink-email").value || "").trim() || null;
+    const tel = (document.getElementById("flink-tel").value || "").trim() || null;
+    const days = parseInt(document.getElementById("flink-days").value, 10) || 7;
+    const errEl = document.getElementById("flink-err");
+    if (!name) { errEl.textContent = "Kundenname ist Pflicht."; errEl.style.display = ""; return; }
+    errEl.style.display = "none";
+    const btn = document.getElementById("flink-save");
+    btn.disabled = true; btn.textContent = "Erstelle …";
+    const res = await api(`/app/api/formulare/${encodeURIComponent(typ)}/link`,
+      { method: "POST", body: JSON.stringify({ kunde_name: name, kunde_email: email, kunde_telefon: tel, valid_days: days }) });
+    const j = res ? await res.json().catch(() => null) : null;
+    btn.disabled = false; btn.textContent = "Link erstellen";
+    if (!j || !j.ok) {
+      errEl.textContent = (j && j.error) || "Konnte Link nicht erstellen.";
+      errEl.style.display = "";
+      return;
+    }
+    document.getElementById("flink-form").style.display = "none";
+    const result = document.getElementById("flink-result");
+    result.style.display = "";
+    document.getElementById("flink-res-name").textContent = j.kunde_name || name;
+    document.getElementById("flink-res-exp").textContent = j.expires_fmt || "";
+    document.getElementById("flink-res-url").value = j.url || "";
+    document.getElementById("flink-res-copy").addEventListener("click", () => {
+      navigator.clipboard.writeText(j.url || "").then(() => {
+        const b = document.getElementById("flink-res-copy");
+        if (b) { b.textContent = "Kopiert!"; setTimeout(() => { b.textContent = "Kopieren"; }, 2000); }
+      });
+    });
+    document.getElementById("flink-close").addEventListener("click", close);
+  });
+}
+
 function showAbsenceDialog(slug, name, typ) {
   // Mini-Modal als Overlay — vermeidet Navigation away aus dem Team-Screen.
   const todayIso = new Date().toISOString().slice(0, 10);
@@ -2890,12 +3357,31 @@ async function showDiktatForm() {
       statusEl.textContent = "";
       const todos = (j.todos || []).length
         ? `<div class="card"><h2>To-dos</h2>${j.todos.map((t) => `<div class="row"><div>☐ ${esc(t)}</div></div>`).join("")}</div>` : "";
+      // Phase 6: namensgleiche Bestandskunden -> Rückfrage statt raten
+      const frage = (j.kunde_frage || []).length
+        ? `<div class="card" id="dk-kunde-frage"><h2>⚠️ Kunde zuordnen</h2>
+           <p class="muted" style="font-size:13px;margin:4px 0 8px">Es gibt bereits ${j.kunde_frage.length} Kunden namens „${esc(j.kunde)}". Derselbe oder ein neuer?</p>
+           ${j.kunde_frage.map((k) => `<button class="row menu-item" data-zuord="${esc(k.id)}"><span>👤 Derselbe (${esc(k.merkmal)})</span></button>`).join("")}
+           <button class="row menu-item" data-zuord="neu"><span>🆕 Neuer Kunde</span></button></div>` : "";
       resultEl.innerHTML =
         `<div class="card"><h2>✓ Gespeichert: ${esc(j.kunde)}</h2>` +
         (j.briefing ? `<p style="margin:6px 0 0">${esc(j.briefing)}</p>` : `<p class="muted" style="margin:6px 0 0">Kein Briefing erkannt.</p>`) +
-        `</div>` + todos +
+        `</div>` + frage + todos +
         `<button class="btn-sm" id="dk-open" style="width:100%;margin-top:4px">Zur Aufnahme</button>` +
         `<button class="btn-sm btn-ghost" id="dk-again" style="width:100%;margin-top:8px">Weiteres Gespräch diktieren</button>`;
+      resultEl.querySelectorAll("[data-zuord]").forEach((b) =>
+        b.addEventListener("click", async () => {
+          const wahl = b.dataset.zuord;
+          const r = await api("/app/api/gespraeche/" + j.id + "/kunde", {
+            method: "POST",
+            body: JSON.stringify(wahl === "neu" ? { neu: true } : { kunde_id: wahl }),
+          });
+          const jr = r && r.ok ? await r.json() : null;
+          const card = document.getElementById("dk-kunde-frage");
+          if (card) card.innerHTML = (jr && jr.ok)
+            ? `<h2>✓ Zugeordnet</h2><p class="muted" style="margin:4px 0 0">${esc(jr.name)} (${esc(jr.merkmal)})</p>`
+            : `<h2>⚠️ Zuordnung fehlgeschlagen</h2><p class="muted" style="margin:4px 0 0">${esc((jr && jr.error) || "Bitte später im Profil zuordnen.")}</p>`;
+        }));
       const open = document.getElementById("dk-open");
       if (open) open.addEventListener("click", () => showAufnahme(j.id));
       document.getElementById("dk-again").addEventListener("click", showDiktatForm);
@@ -2933,9 +3419,14 @@ async function showDiktatForm() {
 }
 
 // ---------- Kunden-Profil (gebündelte Historie) ----------
-async function showKundenProfil(name) {
+async function showKundenProfil(name, kundeId) {
+  App.screenContext = { screen: "kunden_profil", kunde: name };
   App.view.innerHTML = `<div class="loading">Lädt …</div>`;
-  const res = await api("/app/api/kunden/profil?name=" + encodeURIComponent(name));
+  // Mit kunde_id ist das Profil präzise (namensgleiche Kunden bleiben
+  // getrennt, Phase 6); ohne fällt es auf den Namen zurück.
+  const res = await api("/app/api/kunden/profil?" + (kundeId
+    ? "kunde_id=" + encodeURIComponent(kundeId)
+    : "name=" + encodeURIComponent(name)));
   const d = res && res.ok ? await res.json() : null;
   if (!d || !d.ok) {
     App.view.innerHTML = `<button class="btn-sm btn-ghost" id="back-kunden" style="margin-bottom:10px">← Zurück</button><div class="card"><p class="empty">Konnte Profil nicht laden.</p></div>`;
@@ -2943,20 +3434,41 @@ async function showKundenProfil(name) {
     return;
   }
   const parts = [`<button class="btn-sm btn-ghost" id="back-kunden" style="margin-bottom:10px">← Zurück</button>`];
-  parts.push(`<div class="card"><h2>👤 ${esc(d.name)}</h2>${d.email ? `<div class="row"><span>E-Mail</span><span class="sub">${esc(d.email)}</span></div>` : ""}</div>`);
-  if (d.drive) {
-    parts.push(`<div class="card"><h2>Ablage (Drive)</h2>
-      <a class="row" href="${esc(d.drive.url)}" target="_blank" rel="noopener" style="text-decoration:none;color:inherit"><div><div>Ordner öffnen</div><div class="sub">${esc(String(d.drive.anzahl || 0))} Datei(en)${d.drive.letzter ? " · zuletzt " + esc(d.drive.letzter) : ""}</div></div><span class="sub">›</span></a>
+  parts.push(`<div class="card"><h2>👤 ${esc(d.name)}</h2>`
+    + (d.email ? `<div class="row"><span>E-Mail</span><span class="sub">${esc(d.email)}</span></div>` : "")
+    + (d.telefon ? `<div class="row"><span>Telefon</span><span class="sub">${esc(d.telefon)}</span></div>` : "")
+    + (d.adresse ? `<div class="row"><span>Adresse</span><span class="sub">${esc(d.adresse)}</span></div>` : "")
+    + ((d.namensgleiche_kunden || 0) > 1 && !kundeId
+      ? `<p class="muted" style="font-size:12px;margin:8px 0 0">⚠️ ${d.namensgleiche_kunden} Kunden tragen diesen Namen — Ansicht zeigt alle zusammen. Über die Kundensuche lassen sie sich getrennt öffnen.</p>` : "")
+    + `</div>`);
+  // Zusammenführen-Karte (Inhaber-only, wie der Server-Endpoint): weitere
+  // Kunden mit exakt diesem Namen. Dieses Profil ist das ZIEL (bleibt),
+  // die gewählte Dublette die Quelle — Regeln wie scripts/merge_kunden.py.
+  // Nur im präzisen Modus (kunde_id): sonst gäbe es keine klare Richtung.
+  const istInhaber = !!(App.me && App.me.employee && App.me.employee.is_inhaber);
+  if (istInhaber && d.kunde_id && (d.dubletten || []).length) {
+    const n = d.dubletten.length;
+    parts.push(`<div class="card" id="merge-card"><h2>⚠️ Doppelte Kunden?</h2>
+      <p class="muted" style="font-size:13px;margin-top:0">Es gibt ${n === 1 ? "einen weiteren Eintrag" : n + " weitere Einträge"} namens „${esc(d.name)}“. Falls das dieselbe Person ist, kannst du sie in dieses Profil${d.merkmal ? " (" + esc(d.merkmal) + ")" : ""} übernehmen — Gespräche, Angebote und Rechnungen wandern mit.</p>
+      ${d.dubletten.map((k) => `<div class="row"><span>👤 ${esc(d.name)} <span class="sub">(${esc(k.merkmal)})</span></span><button class="btn-sm" data-merge="${esc(k.id)}" data-merkmal="${esc(k.merkmal)}">Zusammenführen</button></div>`).join("")}
+      <p class="muted" id="merge-msg" style="font-size:13px;margin:8px 0 0"></p>
     </div>`);
   }
-  if ((App.me.features || []).includes("drive_archiv")) {
-    parts.push(`<div class="card"><h2>📎 Zum Archiv hinzufügen</h2>
-      <p class="muted" style="font-size:12px;margin-top:0">Foto, PDF oder Notiz landet im Google-Drive-Ordner von ${esc(d.name)}.</p>
-      <input type="file" id="arch-file" accept="image/jpeg,image/png,image/webp,application/pdf" capture="environment" style="display:none">
-      <button class="btn-sm" id="arch-file-btn" style="width:100%;margin-bottom:8px">📷 Foto / PDF hochladen</button>
-      <textarea id="arch-note" rows="2" placeholder="Notiz (optional, wird beim Hochladen mitgespeichert) …" style="width:100%;padding:10px;border:1px solid var(--line);border-radius:10px;font-size:15px;margin-bottom:8px"></textarea>
-      <button class="btn-sm btn-ghost" id="arch-note-btn" style="width:100%">📝 Nur Notiz speichern</button>
-      <p class="muted" id="arch-msg" style="font-size:13px;margin-top:8px;text-align:center"></p>
+  // Ablage-Karte: das Hochladen wohnt nicht mehr in einer eigenen Karte,
+  // sondern hinter dem + im Kopf (oeffnet zeigeArchivUploadDialog). Die Karte
+  // erscheint darum auch OHNE vorhandenen Drive-Ordner, sobald das Feature da
+  // ist — sonst haette der erste Upload keinen Einstiegspunkt.
+  const hasDriveArchiv = (App.me.features || []).includes("drive_archiv");
+  if (d.drive || hasDriveArchiv) {
+    parts.push(`<div class="card" id="archiv-card">
+      <div style="display:flex;align-items:center;gap:12px;margin-bottom:2px">
+        <h2 style="flex:1;margin:0">Ablage</h2>
+        ${d.drive ? `<a href="${esc(d.drive.url)}" target="_blank" rel="noopener"
+          style="font-size:13px;color:var(--accent,#0066cc);text-decoration:none">Drive ↗</a>` : ""}
+        ${hasDriveArchiv ? `<button class="btn-sm" id="archiv-add-btn" title="Zum Archiv hinzufügen" aria-label="Zum Archiv hinzufügen"
+          style="width:30px;height:30px;padding:0;border-radius:50%;font-size:19px;line-height:1;display:flex;align-items:center;justify-content:center">+</button>` : ""}
+      </div>
+      ${hasDriveArchiv ? `<div id="archiv-dateien-list" style="min-height:90px"><p class="muted" style="font-size:13px;text-align:center;margin:10px 0">Lädt …</p></div>` : ""}
     </div>`);
   }
   parts.push(`<div class="card"><h2>Gespräche (${(d.gespraeche || []).length})</h2>${
@@ -2968,25 +3480,336 @@ async function showKundenProfil(name) {
   parts.push(`<div class="card"><h2>Rechnungen (${(d.rechnungen || []).length})</h2>${
     (d.rechnungen || []).length ? d.rechnungen.map((x) => rowPill(x.betrag + (x.nummer ? " · " + esc(x.nummer) : ""), x.zeit, x.status, x.pill)).join("") : emptyRow("Keine Rechnungen")
   }</div>`);
+  // Manueller Merge (Inhaber): findet die Fälle, die die Dubletten-Karte
+  // nicht sieht — derselbe Kunde unter ANDEREM Namen (z. B. nach Heirat).
+  // Immer genau zwei auf einmal: gewählter Eintrag -> dieses Profil.
+  if (istInhaber && d.kunde_id) {
+    parts.push(`<div class="card" id="merge-pick-card"><h2>🔗 Kunden zusammenführen</h2>
+      <p class="muted" style="font-size:12px;margin-top:0">Existiert ${esc(d.name)} noch unter anderem Namen (z. B. nach Heirat)? Eintrag suchen und in dieses Profil übernehmen.</p>
+      <input type="text" id="merge-pick-q" placeholder="Namen oder E-Mail suchen …" autocomplete="off" style="width:100%">
+      <div id="merge-pick-list"></div>
+    </div>`);
+  }
   App.view.innerHTML = parts.join("");
   document.getElementById("back-kunden").addEventListener("click", () => navigate("kunden"));
-  if ((App.me.features || []).includes("drive_archiv")) bindArchivUpload(d);
+  document.querySelectorAll("[data-merge]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const dub = (d.dubletten || []).find((k) => k.id === btn.dataset.merge);
+      if (dub) zeigeMergeDialog(d, dub);
+    });
+  });
+  const pickQ = document.getElementById("merge-pick-q");
+  if (pickQ) {
+    let pickTimer = null;
+    pickQ.addEventListener("input", () => {
+      clearTimeout(pickTimer);
+      pickTimer = setTimeout(async () => {
+        const list = document.getElementById("merge-pick-list");
+        if (!list) return;
+        const q = pickQ.value.trim();
+        if (q.length < 2) { list.innerHTML = ""; return; }
+        const res = await api("/app/api/kunden?q=" + encodeURIComponent(q));
+        const j = res ? await res.json().catch(() => null) : null;
+        // Das eigene Profil ist als Ziel gesetzt und fliegt raus —
+        // so bleiben es immer genau zwei Kunden pro Merge.
+        const treffer = ((j && j.kunden) || [])
+          .filter((k) => k.id !== d.kunde_id).slice(0, 8);
+        list.innerHTML = treffer.length
+          ? treffer.map((k) => `<button class="row menu-item" data-pick="${esc(k.id)}"><span>👤 ${esc(k.name)}${k.merkmal ? ` <span class="sub">(${esc(k.merkmal)})</span>` : ""}</span></button>`).join("")
+          : `<p class="muted" style="font-size:13px;margin:8px 0 0">Kein anderer Kunde gefunden.</p>`;
+        list.querySelectorAll("[data-pick]").forEach((b) => {
+          b.addEventListener("click", async () => {
+            // Kontaktdaten des Kandidaten fürs Hauptdaten-Wählen holen
+            // (email_stamm/telefon/adresse liefert das Profil präzise).
+            const pres = await api("/app/api/kunden/profil?kunde_id="
+              + encodeURIComponent(b.dataset.pick));
+            const p = pres ? await pres.json().catch(() => null) : null;
+            if (!p || !p.ok) return;
+            zeigeMergeDialog(d, {
+              id: p.kunde_id, name: p.name, merkmal: p.merkmal || "",
+              email: p.email_stamm, telefon: p.telefon, adresse: p.adresse,
+            }, document.getElementById("merge-pick-card"));
+          });
+        });
+      }, 300);
+    });
+  }
+  if (hasDriveArchiv) {
+    // Auch ohne Drive-Ordner laden: der Endpoint liefert dann eine leere
+    // Liste und die drei Kacheln stehen einheitlich mit 0 da.
+    loadArchivDateien(d.name);
+    document.getElementById("archiv-add-btn")
+      .addEventListener("click", () => zeigeArchivUploadDialog(d));
+  }
   bindAufnahmen();
 }
 
-// Archiv-Upload im Kunden-Profil: Foto/PDF (roher fetch mit Datei-MIME, wie
-// Beleg-Upload) + optionale/eigenständige Notiz. Nach Erfolg lädt das Profil
-// neu (Datei-Zähler/Ordner-Link aktualisieren).
-function bindArchivUpload(d) {
+// Merge-Dialog in der Dubletten-Karte: bei abweichenden Kontaktdaten
+// entscheidet der Inhaber pro Feld, welcher Wert die Hauptdaten stellt
+// (Default: dieses Profil = Ziel, wie im CLI-Skript). Der nicht gewählte
+// Wert wird verworfen — das sagt der Dialog auch dazu. Felder, die nur
+// der andere Eintrag hat, werden ohne Nachfrage ergänzt.
+function zeigeMergeDialog(d, dub, cardEl) {
+  const card = cardEl || document.getElementById("merge-card");
+  if (!card) return;
+  // email_stamm statt d.email: d.email kann ein Angebots-Fallback sein
+  // und stünde dann fälschlich als "vorhandener" Ziel-Wert zur Wahl.
+  // name läuft mit: beim Merge über Namensgrenzen (Heirat) ist der
+  // Name selbst eine Hauptdaten-Entscheidung.
+  const stamm = { name: d.name, email: d.email_stamm, telefon: d.telefon, adresse: d.adresse };
+  const LABELS = { name: "Name", email: "E-Mail", telefon: "Telefon", adresse: "Adresse" };
+  const quellName = dub.name || d.name;
+  const wahlFelder = [];
+  const ergaenzt = [];
+  for (const feld of ["name", "email", "telefon", "adresse"]) {
+    const z = (stamm[feld] || "").trim();
+    const q = (dub[feld] || "").trim();
+    if (z && q && z !== q) wahlFelder.push(feld);
+    else if (q && !z) ergaenzt.push(feld);
+  }
+  card.innerHTML = `<h2>Zusammenführen</h2>
+    <p class="muted" style="font-size:13px;margin-top:0">„${esc(quellName)}${dub.merkmal ? " (" + esc(dub.merkmal) + ")" : ""}“ geht in dieses Profil auf — Gespräche, Angebote und Rechnungen wandern mit.${wahlFelder.length ? " Bei abweichenden Daten wählst du, welcher Wert künftig gilt; der andere wird verworfen." : ""}</p>
+    ${wahlFelder.map((f) => `
+      <div style="margin:10px 0">
+        <div class="muted" style="font-size:12px;margin-bottom:4px">${LABELS[f]}</div>
+        <label class="row" style="gap:8px"><input type="radio" name="mf-${f}" value="ziel" checked><span style="flex:1">${esc(stamm[f])} <span class="sub">(dieses Profil)</span></span></label>
+        <label class="row" style="gap:8px"><input type="radio" name="mf-${f}" value="quelle"><span style="flex:1">${esc(dub[f])} <span class="sub">(anderer Eintrag)</span></span></label>
+      </div>`).join("")}
+    ${ergaenzt.length ? `<p class="muted" style="font-size:12px">Wird ergänzt (hier bisher leer): ${ergaenzt.map((f) => `${LABELS[f]} ${esc(dub[f])}`).join(", ")}</p>` : ""}
+    <p class="muted" style="font-size:12px">Nicht per Klick rückgängig zu machen.</p>
+    <button class="btn-sm" id="merge-go" style="width:100%;margin-top:4px">Jetzt zusammenführen</button>
+    <button class="btn-sm btn-ghost" id="merge-cancel" style="width:100%;margin-top:8px">Abbrechen</button>
+    <p class="muted" id="merge-msg" style="font-size:13px;margin:8px 0 0"></p>`;
+  document.getElementById("merge-cancel").addEventListener("click",
+    () => showKundenProfil(d.name, d.kunde_id));
+  document.getElementById("merge-go").addEventListener("click", async () => {
+    const felder = {};
+    for (const f of wahlFelder) {
+      const sel = card.querySelector(`input[name="mf-${f}"]:checked`);
+      if (sel) felder[f] = sel.value;
+    }
+    const goBtn = document.getElementById("merge-go");
+    goBtn.disabled = true;
+    document.getElementById("merge-msg").textContent = "Führt zusammen …";
+    const res = await api("/app/api/kunden/merge", {
+      method: "POST",
+      body: JSON.stringify({ quelle_id: dub.id, ziel_id: d.kunde_id, felder }),
+    });
+    const j = res ? await res.json().catch(() => null) : null;
+    if (j && j.ok) {
+      // Profil neu laden — Karte verschwindet, übernommene Einträge
+      // tauchen in den Listen auf.
+      showKundenProfil(d.name, d.kunde_id);
+    } else {
+      goBtn.disabled = false;
+      document.getElementById("merge-msg").textContent =
+        (j && j.error) || "Zusammenführen fehlgeschlagen.";
+    }
+  });
+}
+
+// Lädt Dateiliste aus Drive und rendert drei Kacheln (Bilder / PDFs / Notizen)
+// im home-tile-Stil nebeneinander. Kacheln mit 0 Dateien sind ausgegraut.
+async function loadArchivDateien(kundeName) {
+  const container = document.getElementById("archiv-dateien-list");
+  if (!container) return;
+  const res = await api("/app/api/archiv/dateien?kunde_name=" + encodeURIComponent(kundeName));
+  const j = res ? await res.json().catch(() => null) : null;
+  const all = (j && j.ok && j.dateien) ? j.dateien : [];
+  const fileMap = Object.fromEntries(all.map((f) => [f.id, f]));
+
+  const groups = [
+    { key: "bilder",  label: "Bilder",  ico: "📷", files: all.filter((f) => f.is_image) },
+    { key: "pdfs",    label: "PDFs",    ico: "📄", files: all.filter((f) => !f.is_image && f.mime_type === "application/pdf") },
+    { key: "notizen", label: "Notizen", ico: "📝", files: all.filter((f) => !f.is_image && f.mime_type === "text/plain") },
+  ];
+
+  let html = `<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:4px">`;
+  for (const g of groups) {
+    const empty = g.files.length === 0;
+    html += `<button class="home-tile" data-archivgroup="${esc(g.key)}"
+      ${empty ? 'disabled style="opacity:.35;cursor:default"' : ""}>
+      <span class="tile-ico">${g.ico}</span>
+      <span class="tile-label">${g.label}</span>
+      <span class="tile-count">${g.files.length}</span>
+    </button>`;
+  }
+  html += `</div>`;
+  container.innerHTML = html;
+
+  container.querySelectorAll("[data-archivgroup]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const g = groups.find((x) => x.key === btn.dataset.archivgroup);
+      if (g && g.files.length) showArchivKategorie(kundeName, g, fileMap);
+    });
+  });
+}
+
+// Zeigt eine Kategorie (Bilder / PDFs / Notizen) als eigene Unterseite.
+// Bilder erscheinen als zusammenhängendes Album-Grid, alles andere als Liste.
+function showArchivKategorie(kundeName, group, fileMap) {
+  let contentHtml;
+  if (group.key === "bilder") {
+    contentHtml = `<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:2px;margin-top:12px;border-radius:12px;overflow:hidden">`;
+    for (const f of group.files) {
+      contentHtml += `<button data-archivfid="${esc(f.id)}" title="${esc(f.name)}"
+        style="display:block;aspect-ratio:1;overflow:hidden;background:var(--line,#eee);border:none;padding:0;cursor:pointer">
+        <img src="/app/api/archiv/datei/${esc(f.id)}?thumb=1" alt="${esc(f.name)}" loading="lazy"
+          style="width:100%;height:100%;object-fit:cover;pointer-events:none">
+      </button>`;
+    }
+    contentHtml += `</div>`;
+  } else {
+    contentHtml = `<div class="card" style="margin-top:12px">`;
+    for (const f of group.files) {
+      contentHtml += `<button data-archivfid="${esc(f.id)}" class="row"
+        style="background:transparent;border:none;cursor:pointer;width:100%;text-align:left;color:inherit">
+        <div><div>${group.ico} ${esc(f.name)}</div></div>
+        <span class="sub">›</span>
+      </button>`;
+    }
+    contentHtml += `</div>`;
+  }
+
+  App.view.innerHTML =
+    `<button class="btn-sm btn-ghost" id="back-archiv-kat" style="margin-bottom:10px">← Zurück</button>
+     <div class="card"><h2>${group.ico} ${group.label} · ${esc(kundeName)}</h2></div>
+     ${contentHtml}`;
+
+  document.getElementById("back-archiv-kat").addEventListener("click", () => showKundenProfil(kundeName));
+  App.view.querySelectorAll("[data-archivfid]").forEach((btn) =>
+    btn.addEventListener("click", () => showArchivPreview(fileMap[btn.dataset.archivfid]))
+  );
+}
+
+// Zeigt eine Datei aus dem Kunden-Archiv direkt in der App an (Bild, PDF oder Notiz-Text).
+function showArchivPreview(f) {
+  if (!f) return;
+  document.getElementById("archiv-preview-modal")?.remove();
+
+  const proxyUrl = `/app/api/archiv/datei/${encodeURIComponent(f.id)}`;
+  let contentHtml;
+  if (f.is_image) {
+    contentHtml = `<img src="${esc(proxyUrl)}" alt="${esc(f.name)}"
+      style="max-width:100%;max-height:65vh;object-fit:contain;border-radius:8px;display:block;margin:auto">`;
+  } else if (f.mime_type === "application/pdf") {
+    contentHtml = `<iframe src="${esc(proxyUrl)}"
+      style="width:100%;height:65vh;border:none;border-radius:8px;display:block"></iframe>`;
+  } else {
+    contentHtml = `<pre id="archiv-note-text"
+      style="margin:0;white-space:pre-wrap;font-size:14px;line-height:1.6;font-family:inherit;color:var(--fg,#111)">Lädt …</pre>`;
+  }
+
+  const hasViz = f.is_image && (App.me.features || []).includes("visualisierung");
+  const actionsHtml = f.is_image && hasViz
+    ? `<div id="archiv-modal-actions" style="border-top:1px solid var(--line,#eee);padding:10px 16px;display:flex;gap:8px;flex-shrink:0">
+         <button id="archiv-modal-viz-btn" class="btn-sm" style="flex:1">🎨 Visualisieren</button>
+       </div>`
+    : "";
+
+  const modal = document.createElement("div");
+  modal.id = "archiv-preview-modal";
+  modal.style.cssText = "position:fixed;inset:0;z-index:9;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;padding:16px 16px calc(60px + env(safe-area-inset-bottom)) 16px";
+  modal.innerHTML = `
+    <div style="background:var(--bg,#fff);border-radius:16px;width:100%;max-width:720px;max-height:92vh;overflow:hidden;display:flex;flex-direction:column;box-shadow:0 8px 40px rgba(0,0,0,.3)">
+      <div style="display:flex;align-items:center;gap:10px;padding:14px 16px;border-bottom:1px solid var(--line,#eee);flex-shrink:0">
+        <span style="flex:1;font-weight:600;font-size:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(f.name)}</span>
+        <a href="${esc(f.web_link)}" target="_blank" rel="noopener"
+          style="font-size:13px;color:var(--accent,#0066cc);white-space:nowrap;text-decoration:none;flex-shrink:0">Drive ↗</a>
+        <button id="archiv-modal-close" aria-label="Schließen"
+          style="border:none;background:transparent;font-size:22px;line-height:1;cursor:pointer;padding:0 2px;color:var(--fg,#111);flex-shrink:0">✕</button>
+      </div>
+      <div style="flex:1;overflow:auto;padding:16px">${contentHtml}</div>
+      ${actionsHtml}
+    </div>`;
+
+  if (f.is_image) App._archivPreviewFile = { proxyUrl, name: f.name };
+
+  function closeModal() { App._archivPreviewFile = null; modal.remove(); }
+
+  document.body.appendChild(modal);
+  modal.addEventListener("click", (e) => { if (e.target === modal) closeModal(); });
+  modal.querySelector("#archiv-modal-close").addEventListener("click", closeModal);
+
+  modal.querySelector("#archiv-modal-viz-btn")?.addEventListener("click", () => {
+    const actionsDiv = document.getElementById("archiv-modal-actions");
+    if (!actionsDiv) return;
+    actionsDiv.innerHTML =
+      `<input id="archiv-viz-input" type="text" placeholder="Was soll verändert werden?" autocomplete="off"
+         style="flex:1;padding:10px 12px;border:1px solid var(--line,#eee);border-radius:10px;font-size:15px;font-family:inherit" />
+       <button id="archiv-viz-go" class="btn-sm" style="flex-shrink:0">Los</button>`;
+    actionsDiv.style.alignItems = "center";
+    const vizInput = document.getElementById("archiv-viz-input");
+    const vizGo = document.getElementById("archiv-viz-go");
+    vizInput.focus();
+
+    async function startViz() {
+      const prompt = (vizInput.value || "").trim();
+      if (!prompt) { vizInput.focus(); return; }
+      vizInput.disabled = true; vizGo.disabled = true; vizGo.textContent = "Lädt …";
+      let blob;
+      try { const r = await fetch(proxyUrl); blob = await r.blob(); } catch (_) {
+        vizInput.disabled = false; vizGo.disabled = false; vizGo.textContent = "Los"; return;
+      }
+      const file = new File([blob], f.name, { type: blob.type || "image/jpeg" });
+      App.qPendingFile = file;
+      App.qPendingPreviewUrl = proxyUrl;
+      App._autoVizPrompt = prompt;
+      closeModal();
+      navigate("assistent");
+    }
+
+    vizGo.addEventListener("click", startViz);
+    vizInput.addEventListener("keydown", (e) => { if (e.key === "Enter") startViz(); });
+  });
+
+  if (!f.is_image && f.mime_type !== "application/pdf") {
+    fetch(proxyUrl)
+      .then((r) => r.text())
+      .then((txt) => { const el = document.getElementById("archiv-note-text"); if (el) el.textContent = txt; })
+      .catch(() => { const el = document.getElementById("archiv-note-text"); if (el) el.textContent = "Fehler beim Laden."; });
+  }
+}
+
+// Archiv-Upload im Kunden-Profil: oeffnet als Dialog ueber das + in der
+// Ablage-Karte. Foto/PDF (roher fetch mit Datei-MIME, wie Beleg-Upload)
+// + optionale/eigenständige Notiz. Nach Erfolg schliesst der Dialog und das
+// Profil lädt neu (Datei-Zähler/Ordner-Link aktualisieren).
+function zeigeArchivUploadDialog(d) {
+  document.getElementById("archiv-upload-modal")?.remove();
+  const modal = document.createElement("div");
+  modal.id = "archiv-upload-modal";
+  // Gleiche Optik wie das Archiv-Vorschau-Modal (z-index 9: unter der Tabbar,
+  // das Padding unten haelt den Inhalt oberhalb der Leiste).
+  modal.style.cssText = "position:fixed;inset:0;z-index:9;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;padding:16px 16px calc(60px + env(safe-area-inset-bottom)) 16px";
+  modal.innerHTML = `
+    <div style="background:var(--bg,#fff);border-radius:16px;width:100%;max-width:480px;max-height:92vh;overflow:hidden;display:flex;flex-direction:column;box-shadow:0 8px 40px rgba(0,0,0,.3)">
+      <div style="display:flex;align-items:center;gap:10px;padding:14px 16px;border-bottom:1px solid var(--line,#eee);flex-shrink:0">
+        <span style="flex:1;font-weight:600;font-size:14px">📎 Zum Archiv hinzufügen</span>
+        <button id="archiv-upload-close" aria-label="Schließen"
+          style="border:none;background:transparent;font-size:22px;line-height:1;cursor:pointer;padding:0 2px;color:var(--fg,#111);flex-shrink:0">✕</button>
+      </div>
+      <div style="flex:1;overflow:auto;padding:16px">
+        <p class="muted" style="font-size:12px;margin-top:0">Foto, PDF oder Notiz landet im Google-Drive-Ordner von ${esc(d.name)}.</p>
+        <input type="file" id="arch-file" accept="image/jpeg,image/png,image/webp,application/pdf" capture="environment" style="display:none">
+        <button class="btn-sm" id="arch-file-btn" style="width:100%;margin-bottom:8px">📷 Foto / PDF hochladen</button>
+        <textarea id="arch-note" rows="2" placeholder="Notiz (optional, wird beim Hochladen mitgespeichert) …" style="width:100%;padding:10px;border:1px solid var(--line);border-radius:10px;font-size:15px;margin-bottom:8px"></textarea>
+        <button class="btn-sm btn-ghost" id="arch-note-btn" style="width:100%">📝 Nur Notiz speichern</button>
+        <p class="muted" id="arch-msg" style="font-size:13px;margin-top:8px;text-align:center"></p>
+      </div>
+    </div>`;
+  document.body.appendChild(modal);
+  modal.addEventListener("click", (e) => { if (e.target === modal) modal.remove(); });
+  modal.querySelector("#archiv-upload-close").addEventListener("click", () => modal.remove());
+
   const fileBtn = document.getElementById("arch-file-btn");
   const fileEl = document.getElementById("arch-file");
   const noteBtn = document.getElementById("arch-note-btn");
   const noteEl = document.getElementById("arch-note");
   const msg = document.getElementById("arch-msg");
-  if (!fileBtn || !fileEl || !noteBtn || !noteEl) return;
   const setM = (t, ok) => { msg.textContent = t; msg.style.color = ok ? "var(--ok,#1a7f37)" : "var(--err,#b42318)"; };
   const q = (k, v) => (v ? `&${k}=${encodeURIComponent(v)}` : "");
-  const reload = () => setTimeout(() => showKundenProfil(d.name), 700);
+  const reload = () => setTimeout(() => { modal.remove(); showKundenProfil(d.name, d.kunde_id); }, 700);
 
   fileBtn.addEventListener("click", () => fileEl.click());
   fileEl.addEventListener("change", async () => {
@@ -3141,7 +3964,7 @@ async function showBelegUpload() {
     `<p class="muted" style="margin:0 4px 14px">Foto einer Quittung/Rechnung machen oder ein PDF wählen. Der Beleg landet unverbucht in Lexware — dort prüfst und buchst du ihn.</p>` +
     `<div class="card">
        <label class="sub">Beleg (JPEG, PNG oder PDF, max 10 MB)</label>
-       <input type="file" id="bl-file" accept="image/jpeg,image/png,application/pdf" style="${inputStyle}" />
+       <input type="file" id="bl-file" accept="image/jpeg,image/png,application/pdf" capture="environment" style="${inputStyle}" />
        <label class="sub">Notiz (optional)</label>
        <input type="text" id="bl-caption" placeholder="z.B. Bauhaus Schrauben" style="${inputStyle}" />
        <button class="btn-sm" id="bl-upload" style="width:100%;margin-top:8px" disabled>Beleg hochladen</button>
@@ -3523,6 +4346,12 @@ async function showAufnahme(id) {
   const r = await api("/app/api/aufnahmen/" + encodeURIComponent(id));
   if (!r || !r.ok) { App.view.innerHTML = `<div class="card"><p class="empty">Konnte nicht laden.</p></div>`; return; }
   const d = await r.json();
+  App.screenContext = {
+    screen: "kunden_profil",
+    kunde: d.kunde || "",
+    notizen: (d.notizen || "").slice(0, 2000),
+    briefing: (d.briefing || "").slice(0, 500),
+  };
   const todos = (d.todos || []).length
     ? `<div class="card"><h2>To-dos</h2>${d.todos.map((t) => `<div class="row"><div>☐ ${esc(t)}</div></div>`).join("")}</div>` : "";
   const termin = d.termin ? `<div class="row"><span>Termin</span><span class="sub">${esc(d.termin)}${d.termin_ort ? " · " + esc(d.termin_ort) : ""}</span></div>` : "";
@@ -3534,7 +4363,7 @@ async function showAufnahme(id) {
     (d.notizen ? `<div class="card"><h2>Notizen</h2><div>${esc(d.notizen)}</div></div>` : "") +
     todos +
     (d.transkript ? `<div class="card"><h2>Transkript</h2><div class="sub" style="white-space:pre-wrap">${esc(d.transkript)}</div></div>` : "");
-  document.getElementById("back-anrufe").addEventListener("click", () => navigate(App.current || "anrufe"));
+  document.getElementById("back-anrufe").addEventListener("click", () => navigate(App.current || "aufnahmen"));
 }
 
 function bindStorno() {
@@ -3612,6 +4441,40 @@ function loadThree() {
     document.head.appendChild(s);
   });
   return App._threeP;
+}
+
+// Mountet eine kleine Kopie der Q-Sphere in den Thinking-Orb neben der Typing-Bubble.
+async function _mountMiniSphere(orbId, canvasId, storeKey) {
+  if (App[storeKey]) { try { App[storeKey](); } catch (e) {} App[storeKey] = null; }
+  const orb = document.getElementById(orbId);
+  const canvas = document.getElementById(canvasId);
+  if (!orb || !canvas || !sphereSupported()) return;
+  try {
+    await loadThree();
+    if (!document.body.contains(canvas)) return; // Typing-Bubble bereits weg
+    const wasWorking = App.qWorking;
+    App.qWorking = true;                          // Sphere dreht sich immer schnell während Denken
+    App[storeKey] = buildQSphere(orb, canvas);
+    App.qWorking = wasWorking;
+    App.qSphereActive = null;                     // Mini-Sphere läuft autark, kein externer Stop
+  } catch (e) {}
+}
+
+// Mountet die Sphere als Tab-Icon (läuft immer langsam im Hintergrund).
+async function _mountTabSphere() {
+  if (App.qTabSphereStop) { try { App.qTabSphereStop(); } catch (e) {} App.qTabSphereStop = null; }
+  const canvas = document.getElementById("q-tab-sphere-canvas");
+  if (!canvas || !sphereSupported()) return;
+  const ico = canvas.parentElement; // .ico span
+  try {
+    await loadThree();
+    if (!document.body.contains(canvas)) return;
+    const prevWorking = App.qWorking;
+    App.qWorking = false; // Tab-Sphere dreht sich immer langsam/ruhig
+    App.qTabSphereStop = buildQSphere(ico, canvas);
+    App.qWorking = prevWorking;
+    // App.qSphereActive bleibt für die Haupt-Sphere reserviert
+  } catch (e) {}
 }
 
 // Baut die Sphere in wrap/canvas und gibt eine stop()-Funktion zum Aufräumen zurück.
@@ -3821,6 +4684,202 @@ function mountQSphere() {
   }).catch(() => fallback());
 }
 
+// ---------- Q-Overlay ----------
+
+function toggleQOverlay(forceClose) {
+  const overlay = document.getElementById("q-overlay");
+  if (!overlay) return;
+  // Ist der Assistent-Chat gerade wirklich zu sehen, ist Q direkt erreichbar —
+  // Overlay bleibt zu. App.current reicht als Kriterium nicht: showKundenProfil()
+  // rendert z.B. das Profil in die View, ohne App.current zu aendern, und dann
+  // muss Q per Overlay erreichbar sein.
+  if (!forceClose && document.getElementById("q-chat")) return;
+  // Archiv-Bild offen: Bild in den Assistent laden statt Overlay öffnen,
+  // damit Q mit vollem Bildkontext antworten kann.
+  if (!forceClose && App._archivPreviewFile) {
+    const { proxyUrl, name } = App._archivPreviewFile;
+    document.getElementById("archiv-preview-modal")?.remove();
+    App._archivPreviewFile = null;
+    fetch(proxyUrl).then((r) => r.blob()).then((blob) => {
+      App.qPendingFile = new File([blob], name, { type: blob.type || "image/jpeg" });
+      App.qPendingPreviewUrl = proxyUrl;
+      navigate("assistent");
+    }).catch(() => navigate("assistent"));
+    return;
+  }
+  const opening = forceClose ? false : !overlay.classList.contains("open");
+  overlay.classList.toggle("open", opening);
+  document.querySelectorAll(".tabbar button[data-tab='_qoverlay']").forEach((b) =>
+    b.classList.toggle("active", opening));
+  if (opening) {
+    _qOverlayRender();
+    const inp = document.getElementById("q-overlay-input");
+    if (inp) setTimeout(() => inp.focus(), 280);
+  }
+}
+
+// Hilfsfunktion: letzten Text-Inhalt einer Rolle aus App.qchat lesen
+function _qLastMsg(role) {
+  for (let i = (App.qchat || []).length - 1; i >= 0; i--) {
+    if (App.qchat[i].role === role && App.qchat[i].text) return App.qchat[i].text;
+  }
+  return null;
+}
+
+function _qOverlayRender() {
+  const msgsEl = document.getElementById("q-overlay-msgs");
+  if (!msgsEl) return;
+  const chat = App.qchat || [];
+
+  let html = "";
+  const isTyping = chat.some((m) => m.role === "typing");
+  if (isTyping) {
+    // Letzte User-Nachricht + Typing-Indikator
+    const lastMe = [...chat].reverse().find((m) => m.role === "me");
+    if (lastMe) html += `<div class="q-ov-bbl me">${esc(lastMe.text || "")}</div>`;
+    html += `<div class="q-typing-row"><div class="q-thinking-orb" id="q-typing-orb-ov"><canvas id="q-mini-sphere-canvas-ov"></canvas></div><div class="q-typing-ring-wrap"><div class="q-ov-bbl q typing"><span></span><span></span><span></span></div></div></div>`;
+  } else {
+    // Letzten Q-Response (q / err / confirm) + die dazugehörige User-Frage suchen
+    let lastQIdx = -1;
+    let lastQMsg = null;
+    for (let i = chat.length - 1; i >= 0; i--) {
+      const r = chat[i].role;
+      if (r === "q" || r === "err" || r === "confirm") { lastQIdx = i; lastQMsg = chat[i]; break; }
+    }
+    if (lastQMsg) {
+      const lastMe = chat.slice(0, lastQIdx).reverse().find((m) => m.role === "me");
+      if (lastMe) html += `<div class="q-ov-bbl me">${esc(lastMe.text || "")}</div>`;
+      if (lastQMsg.role === "q")      html += `<div class="q-ov-bbl q">${lastQMsg.html ? lastQMsg.text : esc(lastQMsg.text || "")}</div>`;
+      else if (lastQMsg.role === "err")  html += `<div class="q-ov-bbl err">${esc(lastQMsg.text || "")}</div>`;
+      else if (lastQMsg.role === "confirm") html += `<div class="q-ov-bbl q">⚡ ${esc(lastQMsg.summary || "Aktion")} — <a href="#" id="q-ov-confirm-link">Im Assistenten bestätigen ›</a></div>`;
+    } else {
+      html = `<p class="q-ov-hint">Stell mir eine Frage — ich bin auch hier.</p>`;
+    }
+  }
+
+  msgsEl.innerHTML = html;
+  const cl = msgsEl.querySelector("#q-ov-confirm-link");
+  if (cl) cl.addEventListener("click", (e) => { e.preventDefault(); toggleQOverlay(true); navigate("assistent"); });
+  _mountMiniSphere("q-typing-orb-ov", "q-mini-sphere-canvas-ov", "qMiniSphereOvStop");
+  msgsEl.scrollTop = msgsEl.scrollHeight;
+}
+
+async function _qOverlaySend(text) {
+  if (!text.trim()) return;
+  App.qchat = App.qchat || [];
+  App.qhistory = App.qhistory || [];
+  const QHIST_MAX = 8;
+  const history = App.qhistory.slice(-QHIST_MAX);
+  App.qhistory.push({ role: "user", text });
+  App.qchat.push({ role: "me", text });
+  App.qchat.push({ role: "typing" });
+  _qOverlayRender();
+
+  let res, j = null;
+  try {
+    res = await fetch("/app/api/assistent", { method: "POST",
+      headers: { "X-CSRF-Token": App.me.csrf, "Content-Type": "application/json" },
+      body: JSON.stringify({ text, history, screen_context: App.screenContext || null }) });
+  } catch (_) {
+    App.qchat.splice(App.qchat.findIndex((m) => m.role === "typing"), 1);
+    App.qchat.push({ role: "err", text: "Netzwerkfehler." });
+    _qOverlayRender(); return;
+  }
+
+  const typIdx = App.qchat.findIndex((m) => m.role === "typing");
+  if (typIdx >= 0) App.qchat.splice(typIdx, 1);
+
+  try { j = await res.json(); } catch (_) {}
+  if (!j || !j.type) { App.qchat.push({ role: "err", text: "Fehler." }); _qOverlayRender(); return; }
+
+  if (j.type === "message") {
+    App.qchat.push({ role: "q", text: j.text });
+    App.qhistory.push({ role: "model", text: j.text });
+  } else if (j.type === "navigate") {
+    if (j.text) { App.qchat.push({ role: "q", text: j.text }); App.qhistory.push({ role: "model", text: j.text }); }
+    _qOverlayRender();
+    setTimeout(() => { toggleQOverlay(true); handleNavigate(j.bereich, j.kunde, j.kategorie); }, 600);
+    return;
+  } else if (j.type === "confirm") {
+    const say = j.frage || j.summary;
+    if (say) App.qhistory.push({ role: "model", text: say });
+    App.qchat.push({ role: "confirm", tool: j.tool, args: j.args, summary: j.summary, frage: j.frage, resolved: false });
+  } else if (j.type === "error") {
+    App.qchat.push({ role: "err", text: j.text });
+  }
+  _qOverlayRender();
+}
+
+function initQOverlay() {
+  const overlay  = document.getElementById("q-overlay");
+  const inp      = document.getElementById("q-overlay-input");
+  const sendBtn  = document.getElementById("q-overlay-send");
+  const closeBtn = document.getElementById("q-overlay-close");
+  const micBtn   = document.getElementById("q-overlay-mic");
+  if (!overlay || !inp || !sendBtn) return;
+
+  // Schließen per X-Button oder Außerhalb-Klick
+  if (closeBtn) closeBtn.addEventListener("click", () => toggleQOverlay(true));
+  document.addEventListener("pointerdown", (e) => {
+    if (overlay.classList.contains("open") &&
+        !overlay.contains(e.target) &&
+        !e.target.closest("[data-tab='_qoverlay']")) {
+      toggleQOverlay(true);
+    }
+  }, { passive: true });
+
+  // Senden
+  async function send() {
+    const text = inp.value.trim();
+    if (!text) return;
+    inp.value = "";
+    await _qOverlaySend(text);
+  }
+  sendBtn.addEventListener("click", send);
+  inp.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } });
+
+  // Hold-to-Speak im Overlay
+  if (micBtn) {
+    let _ot = null, _od = false;
+    async function _oRelease(upload) {
+      clearTimeout(_ot); _ot = null;
+      if (!_od) return;
+      _od = false;
+      micBtn.classList.remove("recording");
+      if (!upload || !Diktat.recording) { _diktatTeardown(); return; }
+      const out = _diktatFinish();
+      if (out.durationSec < 1 || out.blob.size < 2000) return;
+      const fd = new FormData();
+      fd.append("audio", out.blob, "aufnahme.wav");
+      try {
+        const r = await fetch("/app/api/diktat", { method: "POST",
+          headers: { "X-CSRF-Token": App.me.csrf }, body: fd });
+        const j = r.ok ? await r.json().catch(() => null) : null;
+        if (j && j.ok && j.text) await _qOverlaySend(j.text);
+      } catch (_) {}
+    }
+    micBtn.addEventListener("pointerdown", (e) => {
+      e.preventDefault();
+      if (!App.micReady) {
+        navigator.mediaDevices.getUserMedia({ audio: true })
+          .then((s) => { s.getTracks().forEach((t) => t.stop()); App.micReady = true; })
+          .catch(() => {});
+        return;
+      }
+      micBtn.setPointerCapture(e.pointerId);
+      _ot = setTimeout(async () => {
+        _od = true; micBtn.classList.add("recording");
+        try {
+          await _diktatStartRecording();
+          Diktat.autostop = setTimeout(() => { if (Diktat.recording) _oRelease(true); }, 60000);
+        } catch (_) { _od = false; micBtn.classList.remove("recording"); _diktatTeardown(); }
+      }, 200);
+    });
+    micBtn.addEventListener("pointerup", () => { if (_od || _ot) _oRelease(true); });
+    micBtn.addEventListener("pointercancel", () => _oRelease(false));
+  }
+}
+
 // ---------- Boot ----------
 async function boot() {
   if ("serviceWorker" in navigator) {
@@ -3842,14 +4901,23 @@ async function boot() {
   const res = await api("/app/api/me");
   if (!res) return;
   App.me = await res.json();
+  applyBrandColor(App.me.tenant.brand_color);
   document.getElementById("hdr-title").textContent = App.me.tenant.company_name || "Gewerbeagent";
   const nb = document.getElementById("notif-btn");
   if (notifSupported() && !notifGranted()) { nb.hidden = false; nb.addEventListener("click", enablePush); }
+  document.getElementById("back-btn").addEventListener("click", () => history.back());
+  initEdgeSwipe();
   buildTabbar();
+  initQOverlay();
+  requestAnimationFrame(() => requestAnimationFrame(_mountTabSphere));
   // Neue Nutzer: Q führt durch die Ersteinrichtung (Flag wird im
   // Assistent-Screen ausgewertet, der den Onboarding-Chat startet).
   if (!App.me.onboarding_done) App.startOnboarding = true;
-  navigate("assistent");
+  // Kam die App aus einer Push-Benachrichtigung ("/app#anfragen"), direkt
+  // dorthin. Sonst der normale Start-Screen. mode:"replace", damit der erste
+  // Zurueck-Druck die App verlaesst statt auf einen leeren Eintrag zu fallen.
+  const start = (App.startOnboarding ? null : screenFromHash()) || "assistent";
+  navigate(start, { mode: "replace" });
 }
 
 boot();

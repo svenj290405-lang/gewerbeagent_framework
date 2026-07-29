@@ -22,12 +22,12 @@
       <label for="email">Deine E-Mail</label>
       <input id="email" name="email" type="email" autocomplete="username"
              required placeholder="du@betrieb.de" />
-      <label for="password">Passwort wählen (mind. 6 Zeichen)</label>
+      <label for="password">Passwort wählen (mind. 8 Zeichen)</label>
       <input id="password" name="password" type="password"
-             autocomplete="new-password" required minlength="6" placeholder="••••••••" />
+             autocomplete="new-password" required minlength="8" placeholder="••••••••" />
       <label for="password2">Passwort wiederholen</label>
       <input id="password2" type="password" autocomplete="new-password"
-             required minlength="6" placeholder="••••••••" />
+             required minlength="8" placeholder="••••••••" />
       <button type="submit" id="submit-btn">Loslegen</button>
     </form>
 
@@ -43,7 +43,7 @@
     const form = document.getElementById("act-form");
     const back = document.getElementById("back");
     const fehler = params.get("fehler");
-    if (fehler === "eingabe") msg.textContent = "Bitte gültige E-Mail und Passwort (mind. 6 Zeichen) eingeben.";
+    if (fehler === "eingabe") msg.textContent = "Bitte gültige E-Mail und Passwort (mind. 8 Zeichen) eingeben.";
     else if (fehler === "link") msg.textContent = "Der Einladungs-Link ist abgelaufen oder schon benutzt.";
 
     async function init() {

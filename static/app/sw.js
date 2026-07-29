@@ -93,11 +93,35 @@
 // Text-Pfad und Gemini lehnte mangels Bild/Tool ab). Vorschau wird beim
 // Wiederbetreten des Assistenten wiederhergestellt; Bild-Router macht 1 Retry
 // bei 429 (Vertex-Kontingent-Burst).
-const CACHE = "ga-app-v54";
+// v55: Beta-Design ist jetzt das Standard-Design auf /app — Shell laedt
+// app-beta.css + beta.js statt app.css (index.html entsprechend umgestellt;
+// /app/beta bleibt als identische Vorschau bestehen).
+// v56: Assistent ist Home/Wurzel (Zurueck-Stack wird dort geleert);
+// Kopfzeile zeigt nur noch das Logo, die Website-URL liegt unsichtbar
+// dahinter (Domain-Text nur noch als Fallback ohne Logo).
+// v57: Q-Overlay gleitet hinter der Tabbar hervor statt vor den Reitern
+// hoch; Drag-Handle durch Kopfzeile mit X ersetzt; Q-Tab funktioniert
+// jetzt auch auf Sub-Ansichten wie dem Kundenprofil (DOM-Check statt
+// App.current).
+// v58: Kundenprofil: "Zum Archiv hinzufügen" ist keine eigene Karte mehr,
+// sondern ein Dialog hinter dem + im Kopf der Ablage-Karte.
+// v59: Ablage-Karte zeigt die drei Kacheln (Bilder/PDFs/Notizen) auch ohne
+// Drive-Ordner einheitlich mit 0 statt eines Hinweistexts.
+// v60: Einstellungen > Verbindungen: Dienste gestapelt (Titel, Status,
+// Buttons untereinander) — vorher quetschten die Buttons auf Handy-Breite
+// den Titel auf Null und die Buchstaben brachen einzeln um.
+// v61: Kopfzeile bleibt gleich hoch, wenn Zurueck-Pfeil/Glocke erscheinen
+// (Buttons ragen ins Header-Padding statt die Zeile zu strecken).
+// v62: Fix zu v61 — hidden-Attribut der Header-Buttons griff nicht mehr
+// (display:inline-flex schlug es), der Pfeil stand dauerhaft da.
+// v63: Security — esc() maskiert jetzt auch " und ' (Attribut-Kontext-XSS
+// ueber Fremddaten wie Kundennamen geschlossen).
+const CACHE = "ga-app-v63";
 const SHELL = [
   "/app",
-  "/app/static/app.css",
+  "/app/static/app-beta.css",
   "/app/static/app.js",
+  "/app/static/beta.js",
   "/app/static/icon.svg",
   "/app/static/icon-192.png",
   "/app/static/icon-512.png",

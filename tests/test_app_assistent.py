@@ -122,6 +122,34 @@ def test_feature_gate_filters_mail_and_lexware_tools():
     assert "rueckruf_erledigt" in names
 
 
+def test_drive_tools_gated_by_drive_archiv():
+    # Ohne das Feature darf Q gar nicht erst anbieten, in Drive zu schreiben.
+    ohne = _ctx(features=())
+    names = {s.name for s in cc._available_tools(ohne)}
+    assert "drive_ordner_anlegen" not in names
+    assert "drive_notiz_anlegen" not in names
+
+    # Mit drive_archiv sind beide da — auch fuer den Monteur: einen Kunden-
+    # ordner anlegen oder eine Notiz ablegen ist Alltag auf der Baustelle,
+    # kein Inhaber-Vorbehalt (anders als Angebot/Rechnung).
+    monteur = _ctx(features=("drive_archiv",), is_inhaber=False)
+    names2 = {s.name for s in cc._available_tools(monteur)}
+    assert "drive_ordner_anlegen" in names2
+    assert "drive_notiz_anlegen" in names2
+    assert "archiv_suchen" in names2
+
+
+def test_drive_tools_sind_write_tools():
+    # Beide schreiben nach Drive -> muessen ueber den confirm-Pfad laufen und
+    # duerfen nicht als Read-Tool stillschweigend ausgefuehrt werden.
+    for name in ("drive_ordner_anlegen", "drive_notiz_anlegen"):
+        spec = cc._spec_by_name(name)
+        assert spec is not None, f"{name} fehlt in der Registry"
+        assert spec.kind == "write"
+        assert spec.feature == "drive_archiv"
+        assert spec.summarize is not None, f"{name} braucht eine confirm-Zusammenfassung"
+
+
 def test_archiv_and_lexware_tools_appear_with_features():
     mit = _ctx(features=("drive_archiv", "lexware", "anfrage_formular"))
     names = {s.name for s in cc._available_tools(mit)}
@@ -161,8 +189,30 @@ def test_beleg_fluss_tools_gating():
     assert "anfrage_beantworten" in names3
 
 
+# Soll-Bestand der Registry. Bewusst eine Namensmenge statt einer Anzahl:
+# ein Zaehler bricht bei jedem neuen Tool, ohne zu sagen welches fehlt, und
+# haelt ein versehentlich geloeschtes Tool nicht auf, solange nur die Summe
+# stimmt. Wer ein Tool ergaenzt, traegt es hier bewusst nach.
+_ERWARTETE_TOOLS = {
+    # read
+    "freie_termine_finden", "kunde_suchen", "material_liste", "offene_rueckrufe",
+    "anzeige_oeffnen", "anstehende_termine", "team_status", "offene_anfragen",
+    "wissen_suchen", "archiv_suchen", "rechnungen_pruefen", "formulare_status",
+    # write
+    "termin_anlegen", "termin_stornieren", "termin_verschieben", "rueckruf_anlegen",
+    "rueckruf_erledigt", "material_bestellen", "material_anlegen",
+    "abwesenheit_melden", "mitarbeiter_zurueck", "wissen_merken", "wissen_loeschen",
+    "auftrag_status", "angebot_erstellen", "angebot_senden", "rechnung_erstellen",
+    "rechnung_abrechnen", "anfrage_beantworten",
+    "drive_ordner_anlegen", "drive_notiz_anlegen",
+}
+
+
 def test_registry_has_all_tools():
-    assert len(cc._REGISTRY) == 27
+    namen = {s.name for s in cc._REGISTRY}
+    assert namen == _ERWARTETE_TOOLS
+    # Namen muessen eindeutig sein — _find_tool() nimmt sonst still das erste.
+    assert len(cc._REGISTRY) == len(namen)
 
 
 # --------------------------------------------------------------------------

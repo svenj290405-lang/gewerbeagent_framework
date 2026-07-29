@@ -31,7 +31,7 @@ html, body {
 .login-card h1 { margin: 12px 0 4px; font-size: 24px; }
 .login-card form { display: flex; flex-direction: column; gap: 8px; margin-top: 20px; text-align: left; }
 .login-card label { font-size: 13px; color: var(--muted); }
-input[type=email], input[type=text] {
+input[type=email], input[type=text], input[type=password] {
   padding: 14px; border: 1px solid var(--line); border-radius: 10px; font-size: 16px;
 }
 button {
@@ -50,6 +50,14 @@ button:disabled { opacity: .6; }
   background: var(--primary); color: #fff; font-weight: 700; font-size: 18px;
 }
 .icon-btn { background: rgba(255,255,255,.18); padding: 6px 10px; font-size: 16px; }
+/* Zurueck-Pfeil im Header. Grosszuegige Trefferflaeche (Daumen, Handschuh) —
+   auf dem iPhone ist das die einzige Zurueck-Moeglichkeit, die Geste fehlt
+   in installierten PWAs. */
+.hdr-back {
+  font-size: 24px; line-height: 1; font-weight: 700;
+  padding: 2px 14px; min-height: 36px; margin-right: 10px;
+}
+#hdr-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .view { padding: 16px; padding-bottom: 88px; max-width: 720px; margin: 0 auto; }
 .loading { color: var(--muted); text-align: center; padding: 40px 0; }
 
@@ -83,7 +91,7 @@ button:disabled { opacity: .6; }
   padding: 8px 0 10px; font-size: 11px; font-weight: 500;
   display: flex; flex-direction: column; align-items: center; gap: 3px; cursor: pointer;
 }
-.tabbar button .ico { font-size: 20px; }
+.tabbar button .ico { font-size: 20px; line-height: 1; display: flex; align-items: center; justify-content: center; }
 .tabbar button.active { color: var(--primary); }
 
 .banner { background: #fff7e0; border: 1px solid #f0dca0; color: #7a5c00;
@@ -198,6 +206,50 @@ button:disabled { opacity: .6; }
 .bubble.typing span:nth-child(2) { animation-delay: .2s; }
 .bubble.typing span:nth-child(3) { animation-delay: .4s; }
 @keyframes typingdot { 0%,60%,100% { opacity: .3; transform: translateY(0); } 30% { opacity: 1; transform: translateY(-3px); } }
+
+/* Q denkt: Sphere + rotierender Glührand */
+.q-typing-row {
+  display: flex; align-items: flex-end; gap: 8px;
+  align-self: flex-start; max-width: 84%;
+  animation: bubblein .14s ease-out;
+}
+/* Sphere neben der Bubble — WebGL-Kugel wie der große Q-Globus, nur 30×30 */
+.q-thinking-orb {
+  width: 30px; height: 30px; flex-shrink: 0; border-radius: 50%;
+  background: radial-gradient(circle at 37% 30%, #d0e8ff 0%, #0066cc 50%, #001a4d 100%);
+  position: relative; overflow: hidden; /* clips canvas zur Kreisform */
+  animation: orb-breathe 2s ease-in-out infinite;
+}
+.q-thinking-orb canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+@keyframes orb-breathe {
+  0%,100% { box-shadow: 0 0 8px rgba(0,130,255,.35); }
+  50% { box-shadow: 0 0 20px rgba(0,210,255,.7); }
+}
+/* Rotierender Glührand um die Bubble */
+.q-typing-ring-wrap {
+  position: relative; overflow: hidden;
+  padding: 2.5px;
+  border-radius: 20px 20px 20px 7px;
+}
+.q-typing-ring-wrap::before {
+  content: '';
+  position: absolute;
+  top: 50%; left: 50%;
+  width: 300%; height: 300%;
+  background: conic-gradient(from 0deg,
+    #00e5ff 0%, #ffffff 20%, rgba(200,240,255,.08) 45%,
+    transparent 55%, #00e5ff 80%);
+  animation: typing-ring-spin 1.8s linear infinite;
+}
+@keyframes typing-ring-spin {
+  from { transform: translate(-50%,-50%) rotate(0deg); }
+  to   { transform: translate(-50%,-50%) rotate(360deg); }
+}
+.q-typing-ring-wrap .bubble,
+.q-typing-ring-wrap .q-ov-bbl {
+  position: relative; z-index: 1;
+  border: none !important; animation: none; max-width: none; margin: 0;
+}
 
 /* Eingabeleiste */
 .composer { position: fixed; left: 0; right: 0; z-index: 9;
@@ -345,3 +397,70 @@ button:disabled { opacity: .6; }
 }
 .tile-badge.warn { background: var(--warn); color: #7a5c00; }
 .tile-badge.ok { background: var(--ok); color: #fff; }
+
+/* Mikrofon-Button im Composer (erscheint wenn Chat-Nachrichten vorhanden) */
+.q-composer-mic { background: #e8f0fe !important; color: var(--primary) !important; }
+.q-composer-mic:hover { background: #d2e3fc !important; }
+.q-composer-mic:active { background: #c6d8fb !important; }
+.q-composer-mic.recording { background: var(--danger) !important; color: #fff !important; animation: recpulse 1s infinite; }
+
+/* Q-Overlay: Slide-up Panel über der Tabbar */
+/* Oberhalb der Tabbar verankert und mit z-index UNTER ihr (9 < 10): das Panel
+   gleitet beim Oeffnen hinter der Leiste hervor statt vor den Reitern hoch. */
+.q-overlay { position: fixed; left: 0; right: 0; z-index: 9;
+  bottom: calc(56px + env(safe-area-inset-bottom,0px));
+  background: var(--card); border-top: 2px solid var(--line);
+  border-radius: 18px 18px 0 0; box-shadow: 0 -6px 28px rgba(0,0,0,.13);
+  transform: translateY(calc(100% + 56px + env(safe-area-inset-bottom,0px)));
+  transition: transform .28s cubic-bezier(.4,0,.2,1);
+  max-height: 55vh; display: flex; flex-direction: column;
+  pointer-events: none; }
+.q-overlay.open {
+  transform: translateY(0);
+  pointer-events: auto; }
+/* Kopfzeile mit X statt Drag-Handle: der Balken sah nach Verschieben aus,
+   war aber nur ein Klick-Ziel. */
+.q-overlay-head { display: flex; align-items: center; justify-content: space-between;
+  padding: 10px 10px 4px 16px; flex-shrink: 0; }
+.q-overlay-title { font-size: 12px; font-weight: 700; letter-spacing: .05em;
+  text-transform: uppercase; color: var(--muted); }
+.q-overlay-close { width: 28px; height: 28px; border-radius: 50%; border: 0; padding: 0;
+  background: var(--bg); color: var(--muted); cursor: pointer;
+  display: flex; align-items: center; justify-content: center; }
+.q-overlay-close:active { background: var(--line); }
+.q-overlay-msgs { flex: 1; overflow-y: auto; padding: 4px 12px 6px;
+  display: flex; flex-direction: column; gap: 6px; min-height: 0; }
+.q-ov-bbl { font-size: 15px; line-height: 1.45; padding: 9px 13px; border-radius: 16px; max-width: 88%; word-break: break-word; }
+.q-ov-bbl.me { background: var(--primary); color: #fff; align-self: flex-end; border-bottom-right-radius: 4px; }
+.q-ov-bbl.q  { background: var(--bg); border: 1px solid var(--line); align-self: flex-start; border-bottom-left-radius: 4px; }
+.q-ov-bbl.err { background: #fff0ef; border: 1px solid #f5c6c4; color: var(--danger); align-self: flex-start; border-radius: 12px; }
+.q-ov-bbl.typing span { display: inline-block; width: 6px; height: 6px; border-radius: 50%;
+  background: var(--muted); margin: 0 2px; animation: typingdot .9s ease-in-out infinite; }
+.q-ov-bbl.typing span:nth-child(2) { animation-delay: .15s; }
+.q-ov-bbl.typing span:nth-child(3) { animation-delay: .3s; }
+/* Kein safe-area-Padding mehr noetig: die Leiste sitzt jetzt ueber der
+   Tabbar, die den unteren Geraeterand bereits abdeckt. */
+.q-overlay-bar { display: flex; align-items: center; gap: 8px;
+  padding: 8px 10px;
+  border-top: 1px solid var(--line); flex-shrink: 0; }
+.q-overlay-bar input { flex: 1; padding: 10px 14px; border: 1px solid var(--line);
+  border-radius: 21px; font-size: 16px; font-family: inherit;
+  background: var(--bg); outline: none; }
+.q-overlay-bar input:focus { border-color: var(--primary); background: var(--card); }
+.q-overlay-bar .cbtn { flex: 0 0 auto; width: 40px; height: 40px; border-radius: 50%; padding: 0;
+  background: var(--primary); color: #fff; border: none; cursor: pointer;
+  display: flex; align-items: center; justify-content: center; }
+.q-overlay-bar .cbtn svg { width: 20px; height: 20px; display: block; }
+.q-overlay-bar .cbtn.ghost { background: transparent; color: var(--muted); }
+.q-overlay-bar .cbtn.ghost:hover { background: #eef2f7; color: var(--primary); }
+.q-overlay-bar .cbtn.ghost:active { background: #e3e9f1; }
+.q-overlay-bar .cbtn.rec { background: var(--danger); color: #fff; animation: recpulse 1s infinite; }
+/* Mikrofon-Button: klar erkennbar mit Hintergrund und Akzentfarbe */
+.q-overlay-mic-btn { background: #e8f0fe !important; color: var(--primary) !important; }
+.q-overlay-mic-btn:hover { background: #d2e3fc !important; }
+.q-overlay-mic-btn:active { background: #c6d8fb !important; }
+.q-overlay-mic-btn.recording { background: var(--danger) !important; color: #fff !important; animation: recpulse 1s infinite; }
+.q-ov-hint { font-size: 14px; color: var(--muted); text-align: center; margin: auto; padding: 12px 0; }
+/* WebGL-Sphere-Canvas im Q-Tab */
+#q-tab-sphere-canvas { display: block; width: 22px; height: 22px; border-radius: 50%; }
+.tabbar button.active #q-tab-sphere-canvas { filter: drop-shadow(0 0 4px rgba(0,102,204,.55)); }

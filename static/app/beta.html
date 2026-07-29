@@ -5,15 +5,15 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <!-- Muss dableiben: applyBrandColor() in app.js greift ungeprueft auf
        meta[name=theme-color] zu und wuerde ohne dieses Tag beim Start
-       crashen. Den Wert zieht beta.js dann auf hell/dunkel passend nach. -->
+       crashen. Den Wert setzt es dann sowieso auf die Tenant-Markenfarbe. -->
   <meta name="theme-color" content="#ffffff" />
-  <title>Gewerbeagent</title>
+  <title>Gewerbeagent (Beta)</title>
   <link rel="icon" type="image/svg+xml" href="/app/static/icon.svg" />
   <link rel="icon" type="image/png" sizes="192x192" href="/app/static/icon-192.png" />
   <link rel="apple-touch-icon" href="/app/static/apple-touch-icon.png" />
-  <!-- Anders als beta.html: das Manifest bleibt — /app ist die installierbare
-       Haupt-App auf dem Homescreen. -->
-  <link rel="manifest" href="/app/manifest.webmanifest" />
+  <!-- KEIN Manifest: die Beta soll sich nicht als zweite App auf dem
+       Homescreen installieren lassen. (Den Service-Worker registriert app.js
+       trotzdem — unkritisch, er arbeitet network-first.) -->
   <link rel="stylesheet" href="/app/static/app-beta.css" />
   <script>
     // Muss VOR dem ersten Paint laufen (darum inline, nicht in beta.js):
@@ -70,9 +70,11 @@
     </div>
   </div>
 
-  <!-- Seit 2026-07-17 ist das Beta-Design das Standard-Design: gleiches
-       app.js, dazu app-beta.css + beta.js (Theme-Umschalter, theme-color,
-       Kopfzeilen-Branding). Das alte Design liegt weiter in app.css. -->
+  <!-- Exakt dasselbe app.js wie das Original — die Beta ist ein reiner
+       Reskin. Alles, was hier funktioniert, funktioniert auch in /app.
+       applyBrandColor() setzt --primary (Markenfarbe) und theme-color; im
+       Beta-Design faerbt --primary nur noch Bedienelemente, nicht mehr die
+       ganze Kopfzeile. -->
   <script src="/app/static/app.js" defer></script>
   <!-- Muss NACH app.js laufen: wickelt applyBrandColor() ein und haengt den
        Hell/Dunkel-Umschalter in die Einstellungen. defer haelt die Reihenfolge. -->

@@ -3,11 +3,21 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-  <meta name="theme-color" content="#0066cc" />
+  <meta name="theme-color" content="#ffffff" />
   <title>Gewerbeagent — Anmelden</title>
   <link rel="icon" href="/app/static/icon.svg" />
   <link rel="manifest" href="/app/manifest.webmanifest" />
-  <link rel="stylesheet" href="/app/static/app.css" />
+  <link rel="stylesheet" href="/app/static/app-beta.css" />
+  <script>
+    // Muss VOR dem ersten Paint laufen (gleiches Muster wie index.html):
+    // sonst blitzt bei gewaehltem Dunkelmodus kurz die helle Version auf.
+    (function () {
+      var t = null;
+      try { t = localStorage.getItem("ga-theme"); } catch (e) { /* Privatmodus */ }
+      document.documentElement.setAttribute(
+        "data-theme", (t === "light" || t === "dark") ? t : "auto");
+    })();
+  </script>
 </head>
 <body class="login-body">
   <main class="login-card">
@@ -45,6 +55,22 @@
   </main>
 
   <script>
+    // Browserleiste an hell/dunkel anpassen. beta.js laeuft hier nicht
+    // (das ist App-Shell-Code: Einstellungs-Karten, Branding-Fetch) —
+    // darum die Mini-Variante: Wert aus dem Stylesheet lesen, bei
+    // Systemwechsel nachziehen.
+    function syncThemeColor() {
+      var meta = document.querySelector('meta[name="theme-color"]');
+      if (!meta) return;
+      var v = getComputedStyle(document.documentElement)
+        .getPropertyValue("--theme-color-meta").trim();
+      if (v) meta.setAttribute("content", v);
+    }
+    syncThemeColor();
+    var mq = window.matchMedia("(prefers-color-scheme: dark)");
+    if (mq.addEventListener) mq.addEventListener("change", syncThemeColor);
+    else if (mq.addListener) mq.addListener(syncThemeColor);
+
     const params = new URLSearchParams(location.search);
     const msg = document.getElementById("msg");
     const fehler = params.get("fehler");
