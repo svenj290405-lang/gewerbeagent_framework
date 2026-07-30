@@ -72,13 +72,22 @@ def _json_body(resp):
 # GET /auftraege
 # =====================================================================
 
+def _ang(**kw):
+    """Angebot-Attrappe mit allen Feldern, die _auftrag_zeile liest."""
+    basis = dict(
+        id=uuid.uuid4(), kunde_name="Mueller", gesamtbetrag_brutto_eur=1000,
+        status="accepted", created_at=None, arbeit_fortschritt=0,
+        abgeschlossen_am=None, archiv_drive_folder_url=None,
+    )
+    basis.update(kw)
+    return SimpleNamespace(**basis)
+
+
 @pytest.mark.asyncio
 async def test_auftraege_list_maps_lifecycle(monkeypatch):
     rows = [
-        SimpleNamespace(id=uuid.uuid4(), kunde_name="Mueller",
-                        gesamtbetrag_brutto_eur=1000, status="accepted", created_at=None),
-        SimpleNamespace(id=uuid.uuid4(), kunde_name="Schmidt",
-                        gesamtbetrag_brutto_eur=None, status="abgebrochen", created_at=None),
+        _ang(kunde_name="Mueller", status="accepted"),
+        _ang(kunde_name="Schmidt", gesamtbetrag_brutto_eur=None, status="abgebrochen"),
     ]
     monkeypatch.setattr(app_screens, "get_session", lambda: _FakeListSession(rows))
     resp = await app_screens.api_auftraege(request=_req(), _e=None)
@@ -90,6 +99,47 @@ async def test_auftraege_list_maps_lifecycle(monkeypatch):
     assert a0["abgebrochen"] is False
     assert a1["abgebrochen"] is True
     assert a1["schritt"] is None         # abgebrochen ist nicht im Lifecycle
+
+
+@pytest.mark.asyncio
+async def test_laufende_liste_zeigt_regler_nur_bei_arbeit_laeuft(monkeypatch):
+    """Der Fortschritts-Regler gehoert an genau EINEN Schritt: 'Arbeit
+    laeuft'. Die Liste reicht das per in_arbeit-Flag durch."""
+    rows = [
+        _ang(kunde_name="Arbeitet", status="arbeit_laeuft", arbeit_fortschritt=60),
+        _ang(kunde_name="Wartet", status="accepted"),
+    ]
+    monkeypatch.setattr(app_screens, "get_session", lambda: _FakeListSession(rows))
+    j = _json_body(await app_screens.api_auftraege(request=_req(), _e=None))
+    arbeitet, wartet = j["auftraege"]
+    assert arbeitet["in_arbeit"] is True and arbeitet["fortschritt"] == 60
+    assert wartet["in_arbeit"] is False
+
+
+@pytest.mark.asyncio
+async def test_abgeschlossene_liste_liefert_archiv_link(monkeypatch):
+    rows = [_ang(
+        kunde_name="Fertig", status="rechnung_gesendet",
+        archiv_drive_folder_url="https://drive.google.com/drive/folders/abc",
+    )]
+    monkeypatch.setattr(app_screens, "get_session", lambda: _FakeListSession(rows))
+    j = _json_body(await app_screens.api_auftraege_abgeschlossen(request=_req(), _e=None))
+    assert len(j["auftraege"]) == 1
+    assert j["auftraege"][0]["archiv_url"].endswith("/abc")
+
+
+def test_laufende_liste_schliesst_abgeschlossene_aus():
+    """Abgeschlossene Auftraege haben ihre eigene Liste — sonst waechst die
+    Arbeitsliste ewig. Der Status-Filter der laufenden Liste darf
+    rechnung_gesendet daher nicht enthalten."""
+    from core.models.angebot import (
+        ANGEBOT_STATUS_ABGEBROCHEN, ANGEBOT_STATUS_RECHNUNG_GESENDET,
+        AUFTRAG_LIFECYCLE,
+    )
+    laufend = (set(AUFTRAG_LIFECYCLE) | {ANGEBOT_STATUS_ABGEBROCHEN}) - {
+        ANGEBOT_STATUS_RECHNUNG_GESENDET}
+    assert ANGEBOT_STATUS_RECHNUNG_GESENDET not in laufend
+    assert "arbeit_laeuft" in laufend
 
 
 # =====================================================================

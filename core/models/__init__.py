@@ -345,6 +345,12 @@ from core.models.angebot import (
     ANGEBOT_STATUS_RECHNUNG_ERSTELLT,
 )
 from core.models.angebot_position import AngebotPosition
+from core.models.auftrag_prozess import (
+    AuftragProzessSchritt,
+    AuftragSchrittStatus,
+    MAX_EIGENE_SCHRITTE,
+    MAX_SCHRITT_LABEL,
+)
 from core.models.kundengespraech import Kundengespraech
 from core.models.anfrage import (
     AnfrageToken,

@@ -298,10 +298,14 @@ _AUFTRAG_SETTABLE = {
 async def api_auftraege(
     request: Request, _e=Depends(require_app_user),
 ) -> JSONResponse:
-    """Laufende Auftraege = Angebote, deren Status im Lifecycle liegt
-    (inkl. abgebrochen). Tenant-gescoped."""
+    """LAUFENDE Auftraege = Angebote im Lifecycle (inkl. abgebrochen), aber
+    ohne die abgeschlossenen — die haben ihre eigene Liste
+    (``/auftraege/abgeschlossen``), sonst waechst die Arbeitsliste ewig.
+    Tenant-gescoped."""
     tid = current_tenant_id(request)
-    relevante = set(AUFTRAG_LIFECYCLE) | {ANGEBOT_STATUS_ABGEBROCHEN}
+    relevante = (
+        set(AUFTRAG_LIFECYCLE) | {ANGEBOT_STATUS_ABGEBROCHEN}
+    ) - {ANGEBOT_STATUS_RECHNUNG_GESENDET}
     async with get_session() as s:
         rows = (await s.execute(
             select(Angebot)
@@ -309,20 +313,51 @@ async def api_auftraege(
             .order_by(Angebot.created_at.desc())
             .limit(50)
         )).scalars().all()
-    out = []
-    for a in rows:
-        out.append({
-            "id": str(a.id),
-            "kunde": a.kunde_name,
-            "betrag": _fmt_eur(a.gesamtbetrag_brutto_eur),
-            "status": a.status,
-            "status_label": AUFTRAG_LIFECYCLE_LABELS.get(a.status, a.status),
-            "schritt": AUFTRAG_LIFECYCLE.index(a.status) if a.status in AUFTRAG_LIFECYCLE else None,
-            "schritte_gesamt": len(AUFTRAG_LIFECYCLE),
-            "abgebrochen": a.status == ANGEBOT_STATUS_ABGEBROCHEN,
-            "zeit": _fmt_dt(a.created_at),
-        })
-    return JSONResponse({"auftraege": out})
+    return JSONResponse({"auftraege": [_auftrag_zeile(a) for a in rows]})
+
+
+def _auftrag_zeile(a: Angebot) -> dict:
+    """Listen-Repraesentation eines Auftrags (laufend wie abgeschlossen)."""
+    return {
+        "id": str(a.id),
+        "kunde": a.kunde_name,
+        "betrag": _fmt_eur(a.gesamtbetrag_brutto_eur),
+        "status": a.status,
+        "status_label": AUFTRAG_LIFECYCLE_LABELS.get(a.status, a.status),
+        "schritt": AUFTRAG_LIFECYCLE.index(a.status) if a.status in AUFTRAG_LIFECYCLE else None,
+        "schritte_gesamt": len(AUFTRAG_LIFECYCLE),
+        "abgebrochen": a.status == ANGEBOT_STATUS_ABGEBROCHEN,
+        "in_arbeit": a.status == ANGEBOT_STATUS_WORK_IN_PROGRESS,
+        "fertig": a.status == ANGEBOT_STATUS_WORK_DONE,
+        "fortschritt": int(a.arbeit_fortschritt or 0),
+        "zeit": _fmt_dt(a.created_at),
+        "abgeschlossen_am": _fmt_dt(a.abgeschlossen_am) if a.abgeschlossen_am else "",
+        "archiv_url": a.archiv_drive_folder_url or "",
+    }
+
+
+@router.get("/auftraege/abgeschlossen")
+async def api_auftraege_abgeschlossen(
+    request: Request, _e=Depends(require_app_user),
+) -> JSONResponse:
+    """Abgeschlossene Auftraege = Rechnung ist raus (rechnung_gesendet).
+
+    Sortiert nach Abschluss-Zeitpunkt, neueste zuerst. Altbestand ohne
+    ``abgeschlossen_am`` (vor Einfuehrung des Archivs versendet) faellt auf
+    ``created_at`` zurueck, damit die Liste vollstaendig bleibt."""
+    tid = current_tenant_id(request)
+    async with get_session() as s:
+        rows = (await s.execute(
+            select(Angebot)
+            .where(Angebot.tenant_id == tid)
+            .where(Angebot.status == ANGEBOT_STATUS_RECHNUNG_GESENDET)
+            .order_by(
+                Angebot.abgeschlossen_am.desc().nullslast(),
+                Angebot.created_at.desc(),
+            )
+            .limit(100)
+        )).scalars().all()
+    return JSONResponse({"auftraege": [_auftrag_zeile(a) for a in rows]})
 
 
 @router.post("/auftraege/{angebot_id}/status")
@@ -647,6 +682,126 @@ async def api_auftrag_fortschritt(
     return JSONResponse({
         "ok": True, "fortschritt": pct, "fertig": fertig, "status": neuer_status,
     })
+
+
+# =====================================================================
+# Auftrags-Detailansicht + konfigurierbarer Auftragsprozess
+# =====================================================================
+
+@router.get("/auftraege/{angebot_id}/detail")
+async def api_auftrag_detail(
+    angebot_id: str, request: Request, _e=Depends(require_app_user),
+) -> JSONResponse:
+    """Alle Infos zu EINEM Auftrag: Kunde, Positionen, Betraege, Termine,
+    Drive-Archiv und die volle Fortschrittszeile (Kern-Schritte +
+    eigene Schritte mit Erledigt-Zustand)."""
+    from core.models.angebot_position import AngebotPosition
+    from core.services.auftrag_prozess import lade_auftrag_schritte
+
+    tid = current_tenant_id(request)
+    try:
+        aid = uuid.UUID(angebot_id)
+    except (ValueError, TypeError):
+        return JSONResponse({"ok": False, "error": "ungueltige id"}, status_code=400)
+
+    async with get_session() as s:
+        a = (await s.execute(
+            select(Angebot).where(Angebot.id == aid, Angebot.tenant_id == tid)
+        )).scalar_one_or_none()
+        if a is None:
+            return JSONResponse({"ok": False, "error": "Auftrag nicht gefunden."},
+                                status_code=404)
+        positionen = (await s.execute(
+            select(AngebotPosition)
+            .where(AngebotPosition.angebot_id == aid)
+            .order_by(AngebotPosition.position_nr)
+        )).scalars().all()
+        pos_out = [{
+            "name": p.name or "",
+            "beschreibung": p.beschreibung or "",
+            "menge": f"{float(p.menge):g} {p.einheit or ''}".strip(),
+            "preis": _fmt_eur(p.preis_brutto_eur),
+        } for p in positionen]
+        s.expunge(a)
+
+    adresse = " ".join(x for x in [
+        a.kunde_strasse,
+        " ".join(y for y in [a.kunde_plz, a.kunde_ort] if y),
+    ] if x).strip()
+
+    return JSONResponse({
+        "ok": True,
+        **_auftrag_zeile(a),
+        "adresse": adresse,
+        "email": a.kunde_email or "",
+        "angebot_nr": a.lexware_voucher_number or "",
+        "angebot_versendet": _fmt_dt(a.mail_sent_at) if a.mail_sent_at else "",
+        "angenommen_am": _fmt_dt(a.accepted_at) if a.accepted_at else "",
+        "positionen": pos_out,
+        "schritte": await lade_auftrag_schritte(tid, a),
+    })
+
+
+@router.post("/auftraege/{angebot_id}/schritt")
+async def api_auftrag_schritt(
+    angebot_id: str,
+    request: Request,
+    e=Depends(require_app_user),
+    _c=Depends(require_app_csrf),
+) -> JSONResponse:
+    """Hakt einen EIGENEN Prozess-Schritt fuer diesen Auftrag ab (oder nimmt
+    den Haken weg). Kern-Schritte sind hier nicht setzbar — die haengen am
+    Auftrags-Status und laufen ueber ``/auftraege/{id}/status``."""
+    from core.services.auftrag_prozess import setze_schritt_erledigt
+
+    tid = current_tenant_id(request)
+    body = await request.json()
+    try:
+        aid = uuid.UUID(angebot_id)
+        sid = uuid.UUID(str((body or {}).get("schritt_id")))
+    except (ValueError, TypeError):
+        return JSONResponse({"ok": False, "error": "ungueltige id"}, status_code=400)
+    erledigt = bool((body or {}).get("erledigt"))
+
+    ok = await setze_schritt_erledigt(
+        tid, aid, sid, erledigt=erledigt, employee_id=getattr(e, "id", None))
+    if not ok:
+        return JSONResponse({"ok": False, "error": "Schritt nicht gefunden."},
+                            status_code=404)
+    return JSONResponse({"ok": True, "erledigt": erledigt})
+
+
+@router.get("/auftragsprozess")
+async def api_auftragsprozess(
+    request: Request, _e=Depends(require_app_user),
+) -> JSONResponse:
+    """Die Prozess-Definition des Betriebs als geordnete Schritt-Liste
+    (Kern-Schritte gesperrt, eigene Schritte frei)."""
+    from core.services.auftrag_prozess import lade_prozess
+
+    tid = current_tenant_id(request)
+    return JSONResponse({"ok": True, "schritte": await lade_prozess(tid)})
+
+
+@router.post("/auftragsprozess")
+async def api_auftragsprozess_speichern(
+    request: Request,
+    _e=Depends(require_app_inhaber),
+    _c=Depends(require_app_csrf),
+) -> JSONResponse:
+    """Speichert die eigenen Zwischenschritte. Inhaber-only — der Prozess
+    gilt fuer den ganzen Betrieb."""
+    from core.services.auftrag_prozess import ProzessFehler, speichere_prozess
+
+    tid = current_tenant_id(request)
+    body = await request.json()
+    try:
+        schritte = await speichere_prozess(tid, (body or {}).get("schritte") or [])
+    except ProzessFehler as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+    logger.info("PWA-Auftragsprozess gespeichert: tenant=%s schritte=%d",
+                tid, len(schritte))
+    return JSONResponse({"ok": True, "schritte": schritte})
 
 
 # =====================================================================

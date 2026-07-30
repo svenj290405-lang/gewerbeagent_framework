@@ -146,6 +146,22 @@ class Angebot(Base):
         Integer, nullable=False, server_default="0"
     )
 
+    # Abschluss + Drive-Archiv. Ein Auftrag gilt als abgeschlossen, sobald
+    # die Rechnung raus ist (Status rechnung_gesendet). Dann wird er im
+    # Drive unter "Abgeschlossene Auftraege/<Datum> <Kunde>" archiviert;
+    # die Ordner-ID/-URL landet hier, damit die App direkt verlinken kann.
+    # Die Archivierung ist best-effort: schlaegt sie fehl, bleiben die
+    # Felder leer und der Auftrag ist trotzdem abgeschlossen.
+    abgeschlossen_am: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    archiv_drive_folder_id: Mapped[str | None] = mapped_column(
+        String(100), nullable=True
+    )
+    archiv_drive_folder_url: Mapped[str | None] = mapped_column(
+        String(500), nullable=True
+    )
+
     # Erstellung (fuer Listings/Sortierung)
     created_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False

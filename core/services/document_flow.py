@@ -451,10 +451,19 @@ async def finalize_and_send_invoice(
         mail_result = {"success": False, "error": str(exc)}
 
     if mail_result.get("success"):
+        import datetime as _dt
+
         async with get_session() as s:
             a = (await s.execute(select(Angebot).where(Angebot.id == angebot_id))).scalar_one()
             a.status = ANGEBOT_STATUS_RECHNUNG_GESENDET
+            a.abgeschlossen_am = _dt.datetime.now(_dt.timezone.utc)
             await s.commit()
+        # Rechnung raus = Auftrag abgeschlossen -> Drive-Archiv. Bewusst als
+        # Hintergrund-Task: der Handwerker soll nicht auf ein Dutzend Drive-
+        # Requests warten, und ein Drive-Problem darf einen erfolgreichen
+        # Rechnungsversand nicht als Fehler aussehen lassen.
+        from core.services.auftrag_archiv import archiviere_im_hintergrund
+        archiviere_im_hintergrund(tid, angebot_id)
         return {**base, "mail_sent": True, "status": ANGEBOT_STATUS_RECHNUNG_GESENDET}
     return {**base, "mail_sent": False,
             "mail_error": mail_result.get("error", "unbekannt"),

@@ -471,3 +471,93 @@ button:disabled { opacity: .6; }
 /* WebGL-Sphere-Canvas im Q-Tab */
 #q-tab-sphere-canvas { display: block; width: 22px; height: 22px; border-radius: 50%; }
 .tabbar button.active #q-tab-sphere-canvas { filter: drop-shadow(0 0 4px rgba(0,102,204,.55)); }
+
+/* ---------- Auftrags-Fortschrittszeile (Detailansicht) ---------- */
+/* Waagerechte, scrollbare Schrittkette. Auf dem Handy passen nie alle
+   Schritte nebeneinander — darum horizontal scrollbar statt umbrechend,
+   so bleibt die Reihenfolge als eine Linie lesbar. */
+.stepper { display: flex; gap: 0; overflow-x: auto; padding: 4px 2px 10px;
+  -webkit-overflow-scrolling: touch; scrollbar-width: none; }
+.stepper::-webkit-scrollbar { display: none; }
+.step { flex: 0 0 auto; width: 96px; background: none; border: 0; padding: 0;
+  display: flex; flex-direction: column; align-items: center; gap: 6px;
+  cursor: pointer; color: var(--muted); font-family: inherit; position: relative; }
+/* Verbindungslinie zum vorherigen Schritt — als Pseudo-Element, damit sie
+   exakt auf Höhe der Punkt-Mitte sitzt und mitscrollt. */
+.step + .step::before { content: ""; position: absolute; left: -50%; top: 13px;
+  width: 100%; height: 2px; background: var(--line); }
+.step.erledigt + .step::before, .step.erledigt::before { background: var(--ok); }
+.step-dot { width: 28px; height: 28px; border-radius: 50%; background: var(--card);
+  border: 2px solid var(--line); display: flex; align-items: center;
+  justify-content: center; font-size: 13px; font-weight: 700; z-index: 1;
+  color: var(--muted); }
+.step-label { font-size: 11px; line-height: 1.25; text-align: center;
+  padding: 0 4px; word-break: break-word; }
+.step.erledigt .step-dot { background: var(--ok); border-color: var(--ok); color: #fff; }
+.step.erledigt .step-label { color: var(--text); }
+.step.aktiv .step-dot { border-color: var(--primary); color: var(--primary);
+  box-shadow: 0 0 0 4px rgba(0,102,204,.14); }
+.step.aktiv .step-label { color: var(--primary); font-weight: 700; }
+.step.eigen .step-dot { border-style: dashed; }
+.step.sel .step-label { text-decoration: underline; }
+.step-info { background: var(--bg); border-radius: 10px; padding: 10px 12px;
+  font-size: 14px; }
+.step-info .sub { color: var(--muted); font-size: 13px; }
+
+/* Fortschritts-Regler (Schritt „Arbeit läuft") */
+.fortschritt { margin-top: 10px; }
+.fortschritt-head { display: flex; justify-content: space-between;
+  font-size: 13px; color: var(--muted); margin-bottom: 2px; }
+.fortschritt-head b { color: var(--primary); font-size: 15px; }
+.fortschritt input[type="range"] { width: 100%; accent-color: var(--primary);
+  height: 28px; }
+
+/* ---------- Auftragsprozess-Editor (Aktivitätsdiagramm) ---------- */
+.proc-overlay { position: fixed; inset: 0; z-index: 60; background: var(--bg);
+  display: flex; flex-direction: column; }
+.proc-head { display: flex; align-items: center; gap: 10px; padding: 12px 16px;
+  background: var(--primary); color: #fff; font-weight: 700; }
+.proc-head .btn-sm { background: rgba(255,255,255,.2); color: #fff; }
+.proc-head .titel { flex: 1; font-size: 16px; }
+.proc-canvas { flex: 1; overflow-y: auto; padding: 18px 16px 8px;
+  display: flex; flex-direction: column; align-items: center; }
+.proc-foot { border-top: 1px solid var(--line); background: var(--card);
+  padding: 12px 16px calc(12px + env(safe-area-inset-bottom)); }
+.proc-foot .zeile { display: flex; gap: 8px; }
+.proc-foot input { flex: 1; padding: 12px; border: 1px solid var(--line);
+  border-radius: 10px; font-size: 16px; font-family: inherit; }
+/* Box + Pfeil. Die Pfeilspitze ist ein CSS-Dreieck — kein Bild, kein SVG. */
+.proc-box { width: 100%; max-width: 340px; background: var(--card);
+  border: 2px solid var(--line); border-radius: 12px; padding: 12px 14px;
+  display: flex; align-items: center; gap: 10px; font-size: 15px;
+  box-shadow: 0 1px 3px rgba(16,24,40,.06); }
+/* Kern-Schritt: getönt in der Markenfarbe. Als fester Wert für alte
+   Browser, darüber theme-abhängig gemischt — sonst stünde im Dunkelmodus
+   heller Text auf hellblauem Grund (app-beta.css kippt --card/--text). */
+.proc-box.kern { background: #eef4fc; border-color: #cfe0f5; font-weight: 700; }
+@supports (background: color-mix(in srgb, red 10%, white)) {
+  .proc-box.kern {
+    background: color-mix(in srgb, var(--primary) 10%, var(--card));
+    border-color: color-mix(in srgb, var(--primary) 32%, var(--card)); }
+}
+.proc-box .lbl { flex: 1; word-break: break-word; }
+/* touch-action NUR am Griff: sonst ließe sich die Liste auf dem Handy
+   nicht mehr scrollen, weil jede Wischgeste über einer Box geschluckt wird. */
+.proc-box .griff { color: var(--muted); font-size: 20px; cursor: grab;
+  padding: 2px 6px; line-height: 1; touch-action: none;
+  -webkit-user-select: none; user-select: none; }
+.proc-box .schloss { color: var(--muted); font-size: 13px; }
+.proc-box .weg { background: none; border: 0; color: var(--danger);
+  font-size: 17px; padding: 0 4px; cursor: pointer; line-height: 1; }
+.proc-box.zieht { opacity: .45; }
+.proc-pfeil { width: 2px; height: 20px; background: var(--line); position: relative; }
+.proc-pfeil::after { content: ""; position: absolute; left: -4px; bottom: -1px;
+  border-left: 5px solid transparent; border-right: 5px solid transparent;
+  border-top: 7px solid var(--line); }
+/* Einfüge-Marker beim Ziehen */
+.proc-marke { width: 100%; max-width: 340px; height: 4px; border-radius: 2px;
+  background: var(--primary); box-shadow: 0 0 0 3px rgba(0,102,204,.18); }
+/* Die mitgezogene Box klebt am Finger */
+.proc-geist { position: fixed; z-index: 70; pointer-events: none; opacity: .92;
+  max-width: 340px; transform: translateY(-50%);
+  box-shadow: 0 8px 24px rgba(16,24,40,.22); }

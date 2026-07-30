@@ -118,7 +118,11 @@
 // ueber Fremddaten wie Kundennamen geschlossen).
 // v64: Q kann E-Mails schreiben — Entwurfs-Karte im Chat (Empfaenger,
 // Betreff, Text, Anhaenge) mit Freigabe vor dem Versand.
-const CACHE = "ga-app-v64";
+// v65: Auftraege ueberarbeitet — Fortschritts-Regler zurueck am Schritt
+// "Arbeit laeuft", Auftrag antippbar mit voller Detailansicht + abhakbarer
+// Fortschrittszeile, Liste "Abgeschlossene Auftraege" (Drive-Archiv je
+// Auftrag) und Prozess-Editor als Aktivitaetsdiagramm mit Drag & Drop.
+const CACHE = "ga-app-v65";
 const SHELL = [
   "/app",
   "/app/static/app-beta.css",

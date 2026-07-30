@@ -395,12 +395,52 @@ const SCREENS = {
     const d = res && res.ok ? await res.json() : { auftraege: [] };
     const isInhaber = App.me.employee.is_inhaber;
     const list = (d.auftraege || []).map((a) => auftragCard(a, isInhaber)).join("");
+    // Unten die beiden Sammel-Funktionen: links das Archiv der fertigen
+    // Aufträge, rechts der Editor für den Ablauf selbst.
+    const fuss =
+      `<div style="display:flex;gap:8px;margin-top:18px">
+         <button class="btn-sm btn-ghost" id="auf-fertig" style="flex:1;padding:14px 10px;text-align:center">✅ Abgeschlossene Aufträge</button>
+         ${isInhaber ? `<button class="btn-sm btn-ghost" id="auf-prozess" style="flex:1;padding:14px 10px;text-align:center">⚙️ Auftragsprozess bearbeiten</button>` : ""}
+       </div>`;
     App.view.innerHTML =
       `<button class="btn-sm btn-ghost" id="back-db" style="margin-bottom:10px">← Übersicht</button>` +
       `<h1 style="font-size:22px;margin:4px 4px 14px">Aufträge</h1>` +
-      (list || `<div class="card">${emptyRow("Keine laufenden Aufträge")}</div>`);
+      (list || `<div class="card">${emptyRow("Keine laufenden Aufträge")}</div>`) +
+      fuss;
     document.getElementById("back-db").addEventListener("click", () => navigate("aktuelles"));
-    if (isInhaber) bindAuftragActions();
+    document.getElementById("auf-fertig").addEventListener("click",
+      () => navigate("auftraege_fertig"));
+    const proz = document.getElementById("auf-prozess");
+    if (proz) proz.addEventListener("click", () => showProzessEditor("auftraege_page"));
+    bindAuftragOeffnen("auftraege_page");
+    bindFortschrittsRegler();
+    if (isInhaber) bindAuftragActions(() => navigate("auftraege_page", { mode: "none" }));
+  },
+
+  async auftraege_fertig() {
+    App.view.innerHTML = `<div class="loading">Lädt …</div>`;
+    const res = await api("/app/api/auftraege/abgeschlossen");
+    const d = res && res.ok ? await res.json() : { auftraege: [] };
+    const liste = (d.auftraege || []).map((a) => {
+      const archiv = a.archiv_url
+        ? `<a href="${esc(a.archiv_url)}" target="_blank" rel="noopener" class="sub" style="white-space:nowrap">📁 Drive ›</a>`
+        : `<span class="sub" style="white-space:nowrap">—</span>`;
+      return `<div class="card" style="cursor:pointer">
+        <div class="row">
+          <div data-auftrag-open="${esc(a.id)}" style="flex:1">
+            <div><b>${esc(a.kunde)}</b></div>
+            <div class="sub">${esc(a.betrag)}${a.abgeschlossen_am ? " · abgeschlossen " + esc(a.abgeschlossen_am) : ""}</div>
+          </div>
+          ${archiv}
+        </div></div>`;
+    }).join("");
+    App.view.innerHTML =
+      `<button class="btn-sm btn-ghost" id="back-auf" style="margin-bottom:10px">← Aufträge</button>` +
+      `<h1 style="font-size:22px;margin:4px 4px 6px">Abgeschlossene Aufträge</h1>` +
+      `<p class="muted" style="margin:0 4px 14px">Fertig abgerechnet. Jeder Auftrag liegt zusätzlich als eigener Ordner im Drive.</p>` +
+      (liste || `<div class="card">${emptyRow("Noch keine abgeschlossenen Aufträge")}</div>`);
+    document.getElementById("back-auf").addEventListener("click", () => navigate("auftraege_page"));
+    bindAuftragOeffnen("auftraege_fertig");
   },
 
   async rechnungen_page() {
@@ -571,7 +611,10 @@ const SCREENS = {
     const aBtn = document.getElementById("angebot-new-btn");
     const rBtn = document.getElementById("rechnung-new-btn");
     document.getElementById("beleg-new-btn").addEventListener("click", showBelegUpload);
-    document.getElementById("auftraege-btn").addEventListener("click", showAuftraege);
+    // Eine einzige Aufträge-Ansicht (auftraege_page) — sie trägt auch das
+    // Archiv und den Prozess-Editor; ein zweiter Zwilling würde driften.
+    document.getElementById("auftraege-btn").addEventListener("click",
+      () => navigate("auftraege_page"));
     if (aBtn) aBtn.addEventListener("click", () => showAngebotForm());
     if (rBtn) rBtn.addEventListener("click", () => showRechnungForm());
     const pBtn = document.getElementById("rechnung-pruefen-btn");
@@ -4022,6 +4065,43 @@ const AUFTRAG_NEXT = {
   arbeit_laeuft: { status: "arbeit_fertig", label: "🏁 Fertig" },
 };
 
+// Der Fortschritts-Regler gehört an den Schritt, der die Arbeit
+// symbolisiert („🔨 Arbeit läuft"). Er ist der einzige Schritt, der einen
+// Zwischenstand hat — alle anderen sind an/aus. Bei 100 % meldet der
+// Server den Auftrag fertig und wir leiten in den Rechnungs-Flow.
+function fortschrittsRegler(a) {
+  if (!a.in_arbeit) return "";
+  const pct = Math.max(0, Math.min(100, a.fortschritt || 0));
+  return `<div class="fortschritt">
+    <div class="fortschritt-head"><span>Fortschritt</span>
+      <b data-slider-val="${esc(a.id)}">${pct}%</b></div>
+    <input type="range" min="0" max="100" step="5" value="${pct}"
+      data-slider="${esc(a.id)}" aria-label="Arbeits-Fortschritt in Prozent">
+  </div>`;
+}
+
+// Bindet alle Regler im aktuellen Screen. onFertig() läuft, wenn der
+// Handwerker auf 100 % zieht (Auftrag ist damit fertiggemeldet).
+function bindFortschrittsRegler(onFertig) {
+  document.querySelectorAll("[data-slider]").forEach((sl) => {
+    const id = sl.dataset.slider;
+    const val = document.querySelector(`[data-slider-val="${CSS.escape(id)}"]`);
+    sl.addEventListener("click", (ev) => ev.stopPropagation());
+    sl.addEventListener("input", () => { if (val) val.textContent = sl.value + "%"; });
+    sl.addEventListener("change", async () => {
+      sl.disabled = true;
+      const res = await api(`/app/api/auftraege/${encodeURIComponent(id)}/fortschritt`,
+        { method: "POST", body: JSON.stringify({ fortschritt: parseInt(sl.value, 10) }) });
+      if (!res) return;                       // api() hat schon umgeleitet
+      let j = null;
+      try { j = await res.json(); } catch (e) {}
+      if (j && j.ok && j.fertig) { (onFertig || openRechnungInQ)(id); return; }
+      if (!j || !j.ok) alert((j && j.error) || "Speichern fehlgeschlagen.");
+      sl.disabled = false;
+    });
+  });
+}
+
 function auftragCard(a, isInhaber) {
   const pill = a.abgebrochen ? "danger" : (a.status === "rechnung_gesendet" ? "ok" : "warn");
   const progress = (a.schritt != null) ? ` · Schritt ${a.schritt + 1}/${a.schritte_gesamt}` : "";
@@ -4032,21 +4112,28 @@ function auftragCard(a, isInhaber) {
     if (next) {
       btns.push(`<button class="btn-sm" data-auftrag="${esc(a.id)}" data-status="${next.status}" style="padding:6px 10px">${next.label}</button>`);
     } else if (a.status === "arbeit_fertig") {
-      btns.push(`<span class="sub">Rechnung über „Rechnungen" senden</span>`);
+      btns.push(`<button class="btn-sm" data-rechnung="${esc(a.id)}" style="padding:6px 10px">🧾 Rechnung stellen</button>`);
     }
     btns.push(`<button class="btn-sm btn-ghost" data-auftrag="${esc(a.id)}" data-status="abgebrochen" style="padding:6px 10px">Abbrechen</button>`);
     actions = `<div style="margin-top:8px;display:flex;gap:6px;flex-wrap:wrap;align-items:center">${btns.join("")}</div>`;
   }
-  return `<div class="card">
+  // Die ganze Karte öffnet die Detailansicht; die Buttons darin stoppen
+  // die Weitergabe, damit ein Klick auf „Abbrechen" nicht zusätzlich das
+  // Detail aufblättert.
+  return `<div class="card" data-auftrag-open="${esc(a.id)}" style="cursor:pointer">
     <div class="row"><div><div><b>${esc(a.kunde)}</b></div><div class="sub">${esc(a.betrag)}${esc(progress)} · ${esc(a.zeit)}</div></div>
-    <span class="pill ${pill}">${esc(a.status_label)}</span></div>
+    <span class="pill ${pill}">${esc(a.status_label)} ›</span></div>
+    ${fortschrittsRegler(a)}
     ${actions}
   </div>`;
 }
 
-function bindAuftragActions() {
+// refresh(): womit der Screen nach einer Status-Änderung neu gezeichnet wird.
+function bindAuftragActions(refresh) {
+  const neuLaden = refresh || (() => navigate(App.current || "auftraege_page"));
   document.querySelectorAll("[data-auftrag]").forEach((b) =>
-    b.addEventListener("click", async () => {
+    b.addEventListener("click", async (ev) => {
+      ev.stopPropagation();
       const status = b.dataset.status;
       if (status === "abgebrochen" && !confirm("Auftrag wirklich abbrechen?")) return;
       b.disabled = true;
@@ -4054,27 +4141,305 @@ function bindAuftragActions() {
         { method: "POST", body: JSON.stringify({ status }) });
       if (res && res.ok) {
         const j = await res.json();
-        if (j.ok) { showAuftraege(); return; }
+        if (j.ok) { neuLaden(); return; }
         alert(j.error || "Konnte Status nicht setzen.");
       } else {
         alert("Konnte Status nicht setzen.");
       }
       b.disabled = false;
     }));
+  document.querySelectorAll("[data-rechnung]").forEach((b) =>
+    b.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      openRechnungInQ(b.dataset.rechnung);
+    }));
 }
 
-async function showAuftraege() {
+// Karten-Klick -> Detailansicht. Getrennt gebunden, weil die Karten in
+// mehreren Screens (laufend, abgeschlossen, Büro) auftauchen.
+function bindAuftragOeffnen(zurueck) {
+  document.querySelectorAll("[data-auftrag-open]").forEach((c) =>
+    c.addEventListener("click", () => showAuftragDetail(c.dataset.auftragOpen, zurueck)));
+}
+
+// ---------- Auftragsprozess-Editor (Aktivitätsdiagramm) ----------
+// Vollbild-Overlay: der Ablauf eines Auftrags als Boxen mit Pfeilen. Die
+// fünf Kern-Schritte sind gesperrt (an ihnen hängen Rechnungsversand und
+// Fortschritts-Regler), dazwischen legt der Betrieb eigene Aktivitäten an,
+// zieht sie an die richtige Stelle und löscht sie wieder.
+//
+// Drag & Drop läuft über Pointer-Events statt der HTML5-Drag-API: die
+// funktioniert auf Touch-Geräten nicht — und die App ist eine PWA.
+
+async function showProzessEditor(zurueck) {
+  const res = await api("/app/api/auftragsprozess");
+  if (!res || !res.ok) { alert("Konnte den Prozess nicht laden."); return; }
+  const d = await res.json();
+  let entwurf = (d.schritte || []).map((s) => ({ ...s }));
+  let schmutzig = false;
+
+  const ov = el(`<div class="proc-overlay">
+    <div class="proc-head">
+      <button class="btn-sm" id="pz-zu">← Zurück</button>
+      <span class="titel">Auftragsprozess</span>
+      <button class="btn-sm" id="pz-save">Speichern</button>
+    </div>
+    <div class="proc-canvas" id="pz-canvas"></div>
+    <div class="proc-foot">
+      <div class="zeile">
+        <input type="text" id="pz-neu" maxlength="60" placeholder="Neue Aktivität, z.B. Aufmaß nehmen">
+        <button class="btn-sm" id="pz-add">+ Hinzufügen</button>
+      </div>
+      <p class="muted" style="margin:8px 0 0;font-size:12px">Am Griff ⠿ ziehen, um eine Aktivität zwischen andere zu schieben. Die blauen Schritte sind fest.</p>
+    </div>
+  </div>`);
+  document.body.appendChild(ov);
+  const canvas = ov.querySelector("#pz-canvas");
+
+  const zeichnen = () => {
+    canvas.innerHTML = "";
+    entwurf.forEach((s, i) => {
+      if (i > 0) canvas.appendChild(el(`<div class="proc-pfeil"></div>`));
+      const box = el(`<div class="proc-box ${s.typ === "kern" ? "kern" : ""}" data-idx="${i}">
+        ${s.typ === "kern" ? `<span class="schloss">🔒</span>` : `<span class="griff">⠿</span>`}
+        <span class="lbl">${esc(s.label)}</span>
+        ${s.typ === "kern" ? "" : `<button class="weg" title="Aktivität löschen">✕</button>`}
+      </div>`);
+      const weg = box.querySelector(".weg");
+      if (weg) weg.addEventListener("click", () => {
+        if (!confirm(`„${s.label}" aus dem Prozess entfernen?`)) return;
+        entwurf.splice(i, 1); schmutzig = true; zeichnen();
+      });
+      const griff = box.querySelector(".griff");
+      if (griff) griff.addEventListener("pointerdown", (ev) => zieheStart(ev, i, box));
+      canvas.appendChild(box);
+    });
+  };
+
+  // --- Ziehen ---
+  let zug = null;
+  function zieheStart(ev, idx, box) {
+    ev.preventDefault();
+    const rest = entwurf.filter((_, i) => i !== idx);
+    const geist = box.cloneNode(true);
+    geist.classList.add("proc-geist");
+    geist.style.width = box.offsetWidth + "px";
+    document.body.appendChild(geist);
+    box.classList.add("zieht");
+    const marke = el(`<div class="proc-marke"></div>`);
+    zug = { idx, rest, geist, marke, ziel: null };
+    ev.target.setPointerCapture(ev.pointerId);
+    ev.target.addEventListener("pointermove", zieheBewegen);
+    ev.target.addEventListener("pointerup", zieheEnde);
+    ev.target.addEventListener("pointercancel", zieheEnde);
+    zieheBewegen(ev);
+  }
+
+  function zieheBewegen(ev) {
+    if (!zug) return;
+    zug.geist.style.left = "16px";
+    zug.geist.style.top = ev.clientY + "px";
+
+    // Nahe am Rand mitscrollen, damit auch lange Prozesse erreichbar sind.
+    const cr = canvas.getBoundingClientRect();
+    if (ev.clientY < cr.top + 60) canvas.scrollTop -= 12;
+    else if (ev.clientY > cr.bottom - 60) canvas.scrollTop += 12;
+
+    // Einfügestelle = vor der ersten Box, deren Mitte unter dem Finger liegt.
+    const boxen = [...canvas.querySelectorAll(".proc-box:not(.zieht)")];
+    let ziel = boxen.length;
+    for (let i = 0; i < boxen.length; i++) {
+      const r = boxen[i].getBoundingClientRect();
+      if (ev.clientY < r.top + r.height / 2) { ziel = i; break; }
+    }
+    if (ziel === zug.ziel) return;
+    zug.ziel = ziel;
+    if (ziel < boxen.length) canvas.insertBefore(zug.marke, boxen[ziel]);
+    else canvas.appendChild(zug.marke);
+  }
+
+  function zieheEnde(ev) {
+    if (!zug) return;
+    const { idx, rest, ziel } = zug;
+    try { ev.target.releasePointerCapture(ev.pointerId); } catch (e) {}
+    ev.target.removeEventListener("pointermove", zieheBewegen);
+    ev.target.removeEventListener("pointerup", zieheEnde);
+    ev.target.removeEventListener("pointercancel", zieheEnde);
+    zug.geist.remove();
+    zug.marke.remove();
+    zug = null;
+    if (ziel != null) {
+      const bewegt = entwurf[idx];
+      rest.splice(ziel, 0, bewegt);
+      entwurf = rest;
+      schmutzig = true;
+    }
+    zeichnen();
+  }
+
+  // --- Hinzufügen / Speichern / Schließen ---
+  const hinzu = () => {
+    const feld = ov.querySelector("#pz-neu");
+    const name = feld.value.trim();
+    if (!name) { feld.focus(); return; }
+    entwurf.push({ id: "neu-" + Date.now(), typ: "eigen", label: name, kern_status: null });
+    feld.value = "";
+    schmutzig = true;
+    zeichnen();
+    canvas.scrollTop = canvas.scrollHeight;
+  };
+  ov.querySelector("#pz-add").addEventListener("click", hinzu);
+  ov.querySelector("#pz-neu").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { e.preventDefault(); hinzu(); }
+  });
+
+  const schliessen = () => {
+    ov.remove();
+    if (zurueck) navigate(zurueck, { mode: "none" });
+  };
+  ov.querySelector("#pz-zu").addEventListener("click", () => {
+    if (schmutzig && !confirm("Änderungen verwerfen?")) return;
+    schliessen();
+  });
+  ov.querySelector("#pz-save").addEventListener("click", async (e) => {
+    const btn = e.currentTarget;
+    btn.disabled = true;
+    const r = await api("/app/api/auftragsprozess",
+      { method: "POST", body: JSON.stringify({ schritte: entwurf }) });
+    if (!r) return;
+    let j = null;
+    try { j = await r.json(); } catch (err) {}
+    if (j && j.ok) { schmutzig = false; schliessen(); return; }
+    btn.disabled = false;
+    alert((j && j.error) || "Speichern fehlgeschlagen.");
+  });
+
+  zeichnen();
+}
+
+// ---------- Auftrags-Detailansicht ----------
+// Ein Auftrag mit allem, was zu ihm gehört, plus die Fortschrittszeile
+// oben: jeder Schritt des Prozesses als Punkt, erledigte abgehakt.
+// Jeder Punkt ist antippbar und zeigt darunter seine Infos.
+
+function stepperHtml(schritte) {
+  return `<div class="stepper">` + schritte.map((s, i) => {
+    const zeichen = s.zustand === "erledigt" ? "✓" : String(i + 1);
+    const cls = ["step", s.zustand, s.typ === "eigen" ? "eigen" : ""].join(" ");
+    return `<button class="${cls}" data-step="${esc(s.id)}">
+      <span class="step-dot">${zeichen}</span>
+      <span class="step-label">${esc(s.label)}</span>
+    </button>`;
+  }).join("") + `</div><div class="step-info" id="step-info"></div>`;
+}
+
+const _ZUSTAND_TEXT = {
+  erledigt: "✅ Erledigt", aktiv: "🔵 Läuft gerade", offen: "○ Steht noch aus",
+};
+
+async function showAuftragDetail(id, zurueck) {
   App.view.innerHTML = `<div class="loading">Lädt …</div>`;
-  const res = await api("/app/api/auftraege");
-  const d = res && res.ok ? await res.json() : { auftraege: [] };
+  const res = await api("/app/api/auftraege/" + encodeURIComponent(id) + "/detail");
+  if (!res || !res.ok) {
+    App.view.innerHTML = `<div class="card"><p class="empty">Konnte den Auftrag nicht laden.</p></div>`;
+    return;
+  }
+  const d = await res.json();
   const isInhaber = App.me.employee.is_inhaber;
-  const list = (d.auftraege || []).map((a) => auftragCard(a, isInhaber)).join("");
+  // Q darf mitreden können, worüber der Nutzer gerade schaut.
+  App.screenContext = { screen: "auftrag_detail", kunde: d.kunde || "" };
+
+  const zeile = (label, wert) => wert
+    ? `<div class="row"><span>${esc(label)}</span><span class="sub">${esc(wert)}</span></div>` : "";
+  const positionen = (d.positionen || []).length
+    ? `<div class="card"><h2>Positionen</h2>` + d.positionen.map((p) =>
+        `<div class="row"><div><div>${esc(p.name)}</div>${
+          p.beschreibung ? `<div class="sub">${esc(p.beschreibung)}</div>` : ""
+        }<div class="sub">${esc(p.menge)}</div></div><span class="sub">${esc(p.preis)}</span></div>`
+      ).join("") + `</div>`
+    : "";
+  const archiv = d.archiv_url
+    ? `<div class="card"><a href="${esc(d.archiv_url)}" target="_blank" rel="noopener">📁 Auftragsordner im Drive öffnen</a></div>`
+    : "";
+
+  let aktionen = "";
+  if (isInhaber && !d.abgebrochen && d.status !== "rechnung_gesendet") {
+    const next = AUFTRAG_NEXT[d.status];
+    const btns = [];
+    if (next) btns.push(`<button class="btn-sm" data-auftrag="${esc(d.id)}" data-status="${next.status}">${next.label}</button>`);
+    else if (d.status === "arbeit_fertig") btns.push(`<button class="btn-sm" data-rechnung="${esc(d.id)}">🧾 Rechnung stellen</button>`);
+    btns.push(`<button class="btn-sm btn-ghost" data-auftrag="${esc(d.id)}" data-status="abgebrochen">Abbrechen</button>`);
+    aktionen = `<div class="card"><h2>Nächster Schritt</h2><div style="display:flex;gap:8px;flex-wrap:wrap">${btns.join("")}</div></div>`;
+  }
+
   App.view.innerHTML =
-    `<button class="btn-sm btn-ghost" id="back-buchhaltung" style="margin-bottom:10px">← Zurück</button>` +
-    `<h1 style="font-size:22px;margin:4px 4px 14px">Aufträge</h1>` +
-    (list || `<div class="card">${emptyRow("Keine laufenden Aufträge")}</div>`);
-  document.getElementById("back-buchhaltung").addEventListener("click", () => navigate("buchhaltung"));
-  if (isInhaber) bindAuftragActions();
+    `<button class="btn-sm btn-ghost" id="back-auftrag" style="margin-bottom:10px">← Zurück</button>` +
+    `<h1 style="font-size:22px;margin:4px 4px 2px">${esc(d.kunde)}</h1>` +
+    `<p class="muted" style="margin:0 4px 14px">${esc(d.status_label)}${d.betrag ? " · " + esc(d.betrag) : ""}</p>` +
+    `<div class="card"><h2>Fortschritt</h2>${stepperHtml(d.schritte || [])}
+       ${fortschrittsRegler(d)}</div>` +
+    `<div class="card"><h2>Auftrag</h2>` +
+      zeile("Kunde", d.kunde) + zeile("Anschrift", d.adresse) + zeile("E-Mail", d.email) +
+      zeile("Betrag (brutto)", d.betrag) + zeile("Angebotsnummer", d.angebot_nr) +
+      zeile("Angelegt", d.zeit) + zeile("Angebot versendet", d.angebot_versendet) +
+      zeile("Angenommen", d.angenommen_am) + zeile("Abgeschlossen", d.abgeschlossen_am) +
+    `</div>` +
+    positionen + archiv + aktionen;
+
+  document.getElementById("back-auftrag").addEventListener("click",
+    () => navigate(zurueck || "auftraege_page"));
+  bindFortschrittsRegler(() => openRechnungInQ(d.id));
+  if (isInhaber) bindAuftragActions(() => showAuftragDetail(id, zurueck));
+  bindStepper(d, id, zurueck);
+}
+
+// Antippen eines Schritts blendet darunter seine Infos ein. Eigene
+// Schritte lassen sich dort auch ab-/anhaken — Kern-Schritte nicht, die
+// hängen am Auftrags-Status (und am Rechnungsversand).
+function bindStepper(d, id, zurueck) {
+  const info = document.getElementById("step-info");
+  if (!info) return;
+  const schritte = d.schritte || [];
+
+  const zeigen = (sid) => {
+    document.querySelectorAll(".step").forEach((b) =>
+      b.classList.toggle("sel", b.dataset.step === sid));
+    const s = schritte.find((x) => x.id === sid);
+    if (!s) return;
+    const wann = s.erledigt_am
+      ? ` · ${new Date(s.erledigt_am).toLocaleDateString("de-DE")}` : "";
+    const knopf = s.typ === "eigen"
+      ? `<button class="btn-sm ${s.zustand === "erledigt" ? "btn-ghost" : ""}"
+           id="step-toggle" style="margin-top:10px">${
+             s.zustand === "erledigt" ? "Haken entfernen" : "✓ Erledigt"
+           }</button>`
+      : `<div class="sub" style="margin-top:6px">Fester Schritt — ändert sich mit dem Auftrags-Status.</div>`;
+    info.innerHTML =
+      `<div><b>${esc(s.label)}</b></div>` +
+      `<div class="sub">${esc(_ZUSTAND_TEXT[s.zustand] || s.zustand)}${esc(wann)}</div>` +
+      knopf;
+    const t = document.getElementById("step-toggle");
+    if (t) t.addEventListener("click", async () => {
+      t.disabled = true;
+      const r = await api("/app/api/auftraege/" + encodeURIComponent(id) + "/schritt",
+        { method: "POST", body: JSON.stringify({
+          schritt_id: s.id, erledigt: s.zustand !== "erledigt" }) });
+      if (r && r.ok) { showAuftragDetail(id, zurueck); return; }
+      t.disabled = false;
+      alert("Konnte den Schritt nicht setzen.");
+    });
+  };
+
+  document.querySelectorAll(".step").forEach((b) =>
+    b.addEventListener("click", () => zeigen(b.dataset.step)));
+  // Startbelegung: der Schritt, an dem der Auftrag gerade steht.
+  const start = schritte.find((s) => s.zustand === "aktiv")
+    || schritte.find((s) => s.zustand === "offen") || schritte[0];
+  if (start) {
+    zeigen(start.id);
+    const btn = document.querySelector(`.step[data-step="${CSS.escape(start.id)}"]`);
+    if (btn) btn.scrollIntoView({ block: "nearest", inline: "center" });
+  }
 }
 
 // ---------- Belege (Foto/PDF → Lexware-Voucher) ----------
@@ -4428,29 +4793,15 @@ function bindAktuelles() {
   document.querySelectorAll("[data-lead-nein]").forEach((b) =>
     b.addEventListener("click", () => beratungEntscheidung(b.dataset.leadNein, "ablehnen")));
 
-  // Fortschritts-Regler
-  document.querySelectorAll("[data-slider]").forEach((sl) => {
-    const id = sl.dataset.slider;
-    const val = document.querySelector(`[data-slider-val="${id}"]`);
-    sl.addEventListener("input", () => { if (val) val.textContent = sl.value + "%"; });
-    sl.addEventListener("change", async () => {
-      sl.disabled = true;
-      let res, j = null;
-      try {
-        res = await fetch(`/app/api/auftraege/${encodeURIComponent(id)}/fortschritt`, {
-          method: "POST", headers: { "X-CSRF-Token": App.me.csrf, "Content-Type": "application/json" },
-          body: JSON.stringify({ fortschritt: parseInt(sl.value, 10) }) });
-      } catch (e) { sl.disabled = false; alert("Speichern fehlgeschlagen."); return; }
-      if (res.status === 303 || res.status === 401 || res.redirected) { location.href = "/app/login"; return; }
-      try { j = await res.json(); } catch (e) {}
-      if (j && j.ok && j.fertig) { openRechnungInQ(id); return; }
-      sl.disabled = false;
-    });
-  });
+  // Fortschritts-Regler (gemeinsame Implementierung, siehe auftragCard)
+  bindFortschrittsRegler();
 
   // Fertiger Auftrag -> Rechnung in Q vorbereiten
   document.querySelectorAll("[data-rechnung]").forEach((b) =>
-    b.addEventListener("click", () => openRechnungInQ(b.dataset.rechnung)));
+    b.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      openRechnungInQ(b.dataset.rechnung);
+    }));
 
   // Angenommener Lead -> Angebot über Q erstellen
   document.querySelectorAll("[data-angebot-neu]").forEach((b) =>
