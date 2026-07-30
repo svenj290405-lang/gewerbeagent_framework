@@ -10,7 +10,7 @@ import datetime as dt
 import secrets
 import sys
 
-from core.plugins import discover_plugins
+from core.plugin_system import discover_plugins
 from core.database.connection import get_session
 from config.settings import settings
 from sqlalchemy import select
