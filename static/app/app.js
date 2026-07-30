@@ -109,7 +109,8 @@ const ROUTE_ALIAS = {
   rechnungen: "rechnungen_page",
   angebote: "angebote_page",
   auftraege: "auftraege_page",
-  anrufe: "aufnahmen",  // frueherer Name des Screens
+  anrufe: "gespraeche",     // frueherer Name des Screens
+  aufnahmen: "gespraeche",  // ebenso — jetzt "Kundengespräche"
 };
 
 function screenFromHash() {
@@ -291,7 +292,7 @@ const SCREENS = {
       `<div style="display:flex;align-items:center;justify-content:space-between;margin:4px 4px 14px">
          <h1 style="font-size:22px;margin:0">Aktionen</h1>
          <div style="display:flex;gap:6px">
-           <button class="btn-sm" id="ak-diktat" style="padding:8px 12px">🎤 Diktat</button>
+           <button class="btn-sm" id="ak-diktat" style="padding:8px 12px">🎤 Gespräch</button>
            <button class="btn-sm btn-ghost" id="ak-rueckruf" style="padding:8px 12px">+ Rückruf</button>
          </div>
        </div>`);
@@ -356,7 +357,7 @@ const SCREENS = {
       badge: rueckrufe.length || null, badgeClass: "warn",
     });
     tiles.push({
-      ico: "🎙️", label: "Aufnahmen", screen: "aufnahmen",
+      ico: "🎙️", label: "Kundengespräche", screen: "gespraeche",
       count: aufnahmenCount ? `${aufnahmenCount} Gespräche` : "Keine Gespräche",
       badge: null,
     });
@@ -379,7 +380,7 @@ const SCREENS = {
     App.view.innerHTML = parts.join("");
     const inline = document.getElementById("enable-notif-inline");
     if (inline) inline.addEventListener("click", enablePush);
-    document.getElementById("ak-diktat").addEventListener("click", showDiktatForm);
+    document.getElementById("ak-diktat").addEventListener("click", () => navigate("gespraech_neu"));
     document.getElementById("ak-rueckruf").addEventListener("click", showNewRueckrufForm);
     const briefRefresh = document.getElementById("ak-briefing-refresh");
     if (briefRefresh) briefRefresh.addEventListener("click", () => loadBriefing(true));
@@ -616,28 +617,75 @@ const SCREENS = {
     document.getElementById("termin-new-btn").addEventListener("click", showNewTerminForm);
   },
 
-  // Aufgezeichnete Kundengespraeche (Telegram-/aufnahme + Diktat). Bewusst
-  // OHNE die offenen Rueckrufe: die haben ihre eigene Kachel (rueckrufe_page)
-  // und sind eine To-do-Liste, keine Aufnahme. Der Screen hiess frueher
-  // "Anrufe" — irrefuehrend, hier landet kein einziges Telefonat.
-  async aufnahmen() {
-    const a = await api("/app/api/aufnahmen");
-    const ad = a && a.ok ? await a.json() : { aufnahmen: [] };
-    const aufnahmen = ad.aufnahmen || [];
+  // Kundengespräche. Bewusst OHNE die offenen Rueckrufe: die haben ihre
+  // eigene Kachel (rueckrufe_page) und sind eine To-do-Liste, kein Gespräch.
+  // Der Screen hiess frueher "Anrufe", dann "Aufnahmen" — beides zu eng: hier
+  // haengt inzwischen alles vom Kundentermin (Diktat, Notiz, Fotos, Bilder).
+  async gespraeche() {
+    const a = await api("/app/api/gespraeche");
+    const ad = a && a.ok ? await a.json() : { gespraeche: [] };
+    const liste = ad.gespraeche || [];
     App.view.innerHTML =
       `<button class="btn-sm btn-ghost" id="back-db" style="margin-bottom:10px">← Übersicht</button>` +
-      `<div style="display:flex;align-items:center;justify-content:space-between;margin:4px 4px 14px">
-        <h1 style="font-size:22px;margin:0">Aufnahmen</h1>
-        <button class="btn-sm" id="diktat-btn" style="padding:8px 14px">🎤 Diktat</button>
-      </div>` +
-      `<div class="card"><h2>Aufgezeichnete Gespräche</h2>${
-        aufnahmen.length
-          ? aufnahmen.map((x) => rowTap(x.kunde || "Aufnahme", x.briefing || "", x.zeit, x.id)).join("")
-          : emptyRow("Noch keine Gespräche aufgezeichnet")
+      `<h1 style="font-size:22px;margin:4px 4px 14px">Kundengespräche</h1>` +
+      `<button class="btn-sm" id="gespr-neu" style="width:100%;margin-bottom:12px;padding:14px 10px">➕ Neues Kundengespräch</button>` +
+      `<div class="card"><h2>Bisherige Gespräche</h2>${
+        liste.length
+          ? liste.map((x) => rowTap(x.kunde || "Gespräch", x.briefing || "", x.zeit, x.id)).join("")
+          : emptyRow("Noch kein Gespräch erfasst")
       }</div>`;
     document.getElementById("back-db").addEventListener("click", () => navigate("aktuelles"));
+    document.getElementById("gespr-neu").addEventListener("click", () => navigate("gespraech_neu"));
     bindAufnahmen();
-    document.getElementById("diktat-btn").addEventListener("click", showDiktatForm);
+  },
+
+  // Alter Screen-Name — Q („zeig mir die Aufnahmen") und alte Links zeigen
+  // weiter hierher, landen aber im neuen Bereich.
+  async aufnahmen() { await SCREENS.gespraeche(); },
+
+  // Einstieg: erst der Kunde, dann alles andere. Nur so kann die App im
+  // Gespräch seine Daten zeigen, statt sie hinterher aus dem Diktat zu raten.
+  async gespraech_neu() {
+    App.view.innerHTML = `<div class="loading">Lädt …</div>`;
+    const r = await api("/app/api/kunden");
+    const d = r && r.ok ? await r.json() : { kunden: [] };
+    const alle = (d.kunden || []).map((k) => (typeof k === "string" ? { name: k } : k));
+    const inp = "width:100%;padding:12px;border:1px solid var(--line);border-radius:10px;font-size:16px";
+    App.view.innerHTML =
+      `<button class="btn-sm btn-ghost" id="gn-back" style="margin-bottom:10px">← Gespräche</button>` +
+      `<h1 style="font-size:22px;margin:4px 4px 6px">Neues Kundengespräch</h1>` +
+      `<p class="muted" style="margin:0 4px 14px">Mit wem sprichst du?</p>` +
+      `<div class="card">
+         <input type="text" id="gn-suche" placeholder="Kunde suchen oder neuen Namen eingeben" style="${inp}" autocomplete="off" />
+         <div id="gn-treffer" style="margin-top:10px"></div>
+       </div>`;
+    document.getElementById("gn-back").addEventListener("click", () => navigate("gespraeche"));
+
+    const feld = document.getElementById("gn-suche");
+    const trefferEl = document.getElementById("gn-treffer");
+    const zeichnen = () => {
+      const q = feld.value.trim().toLowerCase();
+      const treffer = (q ? alle.filter((k) => (k.name || "").toLowerCase().includes(q)) : alle).slice(0, 12);
+      trefferEl.innerHTML =
+        treffer.map((k) => `<button class="row menu-item" data-kid="${esc(k.id || "")}" data-kname="${esc(k.name || "")}">
+            <span>👤 ${esc(k.name || "")}</span><span class="sub">›</span></button>`).join("") +
+        (q.length >= 2 && !treffer.some((k) => (k.name || "").toLowerCase() === q)
+          ? `<button class="row menu-item" data-kid="" data-kname="${esc(feld.value.trim())}">
+               <span>🆕 „${esc(feld.value.trim())}" als neuen Kunden</span><span class="sub">›</span></button>`
+          : "") +
+        (!treffer.length && q.length < 2 ? emptyRow("Noch keine Kunden — Namen eintippen") : "");
+      trefferEl.querySelectorAll("[data-kname]").forEach((b) =>
+        b.addEventListener("click", () => starten(b.dataset.kid, b.dataset.kname)));
+    };
+    const starten = async (kid, kname) => {
+      const res = await api("/app/api/gespraeche", { method: "POST",
+        body: JSON.stringify(kid ? { kunde_id: kid } : { kunde_name: kname }) });
+      const j = res ? await res.json().catch(() => null) : null;
+      if (j && j.ok) { showGespraech(j.id); return; }
+      alert((j && j.error) || "Konnte das Gespräch nicht anlegen.");
+    };
+    feld.addEventListener("input", zeichnen);
+    zeichnen();
   },
 
   async buchhaltung() {
@@ -2370,9 +2418,14 @@ const SCREENS = {
     async function doVisualisieren(file, prompt) {
       push({ role: "me", text: "🖼️ " + file.name + " — „" + prompt + "“" });
       push({ role: "typing" });
+      // Aus einem Kundengespräch heraus gestartet? Dann hängt das Ergebnis
+      // sich dort wieder an (App.vizGespraech setzt showGespraech).
+      const g = App.vizGespraech;
+      const ziel = "/app/api/visualisierungen?prompt=" + encodeURIComponent(prompt) +
+        (g && g.id ? "&gespraech_id=" + encodeURIComponent(g.id) : "");
       let res, j = null;
       try {
-        res = await fetch("/app/api/visualisierungen?prompt=" + encodeURIComponent(prompt),
+        res = await fetch(ziel,
           { method: "POST", headers: { "X-CSRF-Token": App.me.csrf, "Content-Type": file.type }, body: file });
       } catch (e) { popTyping(); push({ role: "err", text: "Netzwerkfehler beim Rendern." }); return; }
       if (res.status === 303 || res.status === 401 || res.redirected) { location.href = "/app/login"; return; }
@@ -2383,6 +2436,17 @@ const SCREENS = {
         push({ role: "q", html: true, text:
           `🖼️ Fertig! <a href="${url}" target="_blank" rel="noopener noreferrer">in voller Größe öffnen ↗</a>`
           + `<img src="${url}" alt="Visualisierung" style="width:100%;border-radius:10px;margin-top:8px">` });
+        if (j.gespraech_id) {
+          // Der Weg zurück ins Gespräch — dort liegt das Bild jetzt auch.
+          const zurueck = String(j.gespraech_id);
+          App.vizGespraech = null;
+          push({ role: "q", html: true, text:
+            `Das Bild hängt jetzt am Kundengespräch. <a href="#" id="q-viz-back">Zurück zum Gespräch ›</a>` });
+          setTimeout(() => {
+            const a = document.getElementById("q-viz-back");
+            if (a) a.addEventListener("click", (ev) => { ev.preventDefault(); showGespraech(zurueck); });
+          }, 0);
+        }
       } else {
         push({ role: "err", text: (j && j.error) || "Konnte kein Bild erzeugen — bitte anderes Foto/Beschreibung versuchen." });
       }
@@ -2843,7 +2907,8 @@ function handleNavigate(bereich, kunde, kategorie) {
   const subscreen = {
     auftraege: "auftraege_page", rechnungen: "rechnungen_page",
     angebote: "angebote_page", rueckrufe: "rueckrufe_page",
-    anfragen: "anfragen", termine: "termine", aufnahmen: "aufnahmen",
+    anfragen: "anfragen", termine: "termine", aufnahmen: "gespraeche",
+    gespraeche: "gespraeche",
   };
   if (mehr[b]) { navigate(b); return; }
   if (subscreen[b]) { navigate(subscreen[b]); return; }
@@ -3582,126 +3647,6 @@ function _diktatFinish() {
   const resampled = _diktatResample(raw, Diktat.inRate, DIKTAT_TARGET_RATE);
   _diktatTeardown();
   return { blob: _diktatEncodeWav(resampled, DIKTAT_TARGET_RATE), durationSec };
-}
-
-async function showDiktatForm() {
-  App.view.innerHTML =
-    `<button class="btn-sm btn-ghost" id="back-anrufe" style="margin-bottom:10px">← Zurück</button>` +
-    `<h1 style="font-size:22px;margin:4px 4px 6px">Gespräch diktieren</h1>` +
-    `<p class="muted" style="margin:0 4px 14px">Sprich das Gespräch ein — Kundenname, was zu tun ist, Preise, Termin. Die KI erstellt daraus automatisch ein Briefing.</p>` +
-    `<div class="card" style="text-align:center;padding:24px 16px">
-       <div id="dk-timer" style="font-size:32px;font-variant-numeric:tabular-nums;margin-bottom:14px">0:00</div>
-       <button class="btn-sm" id="dk-toggle" style="padding:14px 24px;font-size:17px">🎤 Aufnahme starten</button>
-       <p class="muted" id="dk-status" style="margin-top:14px;min-height:20px"></p>
-     </div>
-     <div id="dk-result"></div>`;
-  document.getElementById("back-anrufe").addEventListener("click", () => {
-    if (Diktat.recording) _diktatTeardown();
-    navigate("aktuelles");
-  });
-
-  const toggle = document.getElementById("dk-toggle");
-  const timerEl = document.getElementById("dk-timer");
-  const statusEl = document.getElementById("dk-status");
-  const resultEl = document.getElementById("dk-result");
-
-  const fmtT = (s) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
-
-  async function stopAndUpload() {
-    if (!Diktat.recording) return;
-    const { blob, durationSec } = _diktatFinish();
-    toggle.disabled = true;
-    toggle.textContent = "🎤 Aufnahme starten";
-    statusEl.textContent = "Analysiere das Gespräch … (kann 30–60 Sek dauern)";
-    if (durationSec < 1 || blob.size < 2000) {
-      statusEl.textContent = "Aufnahme war zu kurz. Bitte erneut versuchen.";
-      toggle.disabled = false;
-      return;
-    }
-    let res;
-    try {
-      res = await fetch("/app/api/aufnahmen/diktat", {
-        method: "POST",
-        headers: {
-          "X-CSRF-Token": App.me.csrf,
-          "Content-Type": "audio/wav",
-          "X-Audio-Duration": String(durationSec),
-        },
-        body: blob,
-      });
-    } catch (e) {
-      statusEl.textContent = "Netzwerkfehler. Bitte erneut versuchen.";
-      toggle.disabled = false;
-      return;
-    }
-    if (res.status === 303 || res.status === 401 || res.redirected) {
-      location.href = "/app/login"; return;
-    }
-    let j = null;
-    try { j = await res.json(); } catch (e) {}
-    if (res.ok && j && j.ok) {
-      statusEl.textContent = "";
-      const todos = (j.todos || []).length
-        ? `<div class="card"><h2>To-dos</h2>${j.todos.map((t) => `<div class="row"><div>☐ ${esc(t)}</div></div>`).join("")}</div>` : "";
-      // Phase 6: namensgleiche Bestandskunden -> Rückfrage statt raten
-      const frage = (j.kunde_frage || []).length
-        ? `<div class="card" id="dk-kunde-frage"><h2>⚠️ Kunde zuordnen</h2>
-           <p class="muted" style="font-size:13px;margin:4px 0 8px">Es gibt bereits ${j.kunde_frage.length} Kunden namens „${esc(j.kunde)}". Derselbe oder ein neuer?</p>
-           ${j.kunde_frage.map((k) => `<button class="row menu-item" data-zuord="${esc(k.id)}"><span>👤 Derselbe (${esc(k.merkmal)})</span></button>`).join("")}
-           <button class="row menu-item" data-zuord="neu"><span>🆕 Neuer Kunde</span></button></div>` : "";
-      resultEl.innerHTML =
-        `<div class="card"><h2>✓ Gespeichert: ${esc(j.kunde)}</h2>` +
-        (j.briefing ? `<p style="margin:6px 0 0">${esc(j.briefing)}</p>` : `<p class="muted" style="margin:6px 0 0">Kein Briefing erkannt.</p>`) +
-        `</div>` + frage + todos +
-        `<button class="btn-sm" id="dk-open" style="width:100%;margin-top:4px">Zur Aufnahme</button>` +
-        `<button class="btn-sm btn-ghost" id="dk-again" style="width:100%;margin-top:8px">Weiteres Gespräch diktieren</button>`;
-      resultEl.querySelectorAll("[data-zuord]").forEach((b) =>
-        b.addEventListener("click", async () => {
-          const wahl = b.dataset.zuord;
-          const r = await api("/app/api/gespraeche/" + j.id + "/kunde", {
-            method: "POST",
-            body: JSON.stringify(wahl === "neu" ? { neu: true } : { kunde_id: wahl }),
-          });
-          const jr = r && r.ok ? await r.json() : null;
-          const card = document.getElementById("dk-kunde-frage");
-          if (card) card.innerHTML = (jr && jr.ok)
-            ? `<h2>✓ Zugeordnet</h2><p class="muted" style="margin:4px 0 0">${esc(jr.name)} (${esc(jr.merkmal)})</p>`
-            : `<h2>⚠️ Zuordnung fehlgeschlagen</h2><p class="muted" style="margin:4px 0 0">${esc((jr && jr.error) || "Bitte später im Profil zuordnen.")}</p>`;
-        }));
-      const open = document.getElementById("dk-open");
-      if (open) open.addEventListener("click", () => showAufnahme(j.id));
-      document.getElementById("dk-again").addEventListener("click", showDiktatForm);
-      toggle.style.display = "none";
-      timerEl.textContent = "0:00";
-    } else {
-      statusEl.textContent = (j && j.error) || "Konnte nicht verarbeiten. Bitte erneut versuchen.";
-      toggle.disabled = false;
-    }
-  }
-
-  toggle.addEventListener("click", async () => {
-    if (Diktat.recording) { await stopAndUpload(); return; }
-    resultEl.innerHTML = "";
-    statusEl.textContent = "";
-    try {
-      await _diktatStartRecording();
-    } catch (e) {
-      statusEl.textContent = (e && e.name === "NotAllowedError")
-        ? "Mikrofon-Zugriff wurde abgelehnt. Bitte in den Browser-Einstellungen erlauben."
-        : "Mikrofon nicht verfügbar.";
-      _diktatTeardown();
-      return;
-    }
-    toggle.textContent = "⏹ Stoppen & analysieren";
-    timerEl.textContent = "0:00";
-    Diktat.tick = setInterval(() => {
-      const s = Math.round((Date.now() - Diktat.startTs) / 1000);
-      timerEl.textContent = fmtT(s);
-    }, 500);
-    Diktat.autostop = setTimeout(() => {
-      if (Diktat.recording) stopAndUpload();
-    }, DIKTAT_MAX_SECONDS * 1000);
-  });
 }
 
 // ---------- Kunden-Profil (gebündelte Historie) ----------
@@ -4935,30 +4880,218 @@ async function openRechnungInQ(angebotId) {
   navigate("assistent");
 }
 
-async function showAufnahme(id) {
+// ---------- Kundengespräch: der Arbeitsbereich vor Ort ----------
+// Oben der Kunde mit allem, was der Handwerker im Gespräch wissen will;
+// darunter die vier Werkzeuge (Diktat, Notiz, Foto, Visualisierung) und
+// alles, was schon zusammengekommen ist. Ganz unten die Kundenmail.
+
+function _gespraechKopf(k) {
+  const zeile = (label, wert) => wert
+    ? `<div class="row"><span>${esc(label)}</span><span class="sub">${esc(wert)}</span></div>` : "";
+  const offen = [];
+  if (k.auftraege_laufend) offen.push(`${k.auftraege_laufend} laufende(r) Auftrag/Aufträge`);
+  if (k.rechnungen_offen) offen.push(`${k.rechnungen_offen} offene Rechnung(en)`);
+  if (k.gespraeche_frueher) offen.push(`${k.gespraeche_frueher} frühere(s) Gespräch(e)`);
+  return `<div class="card">
+    <h2>${esc(k.name || "Kunde")}</h2>
+    ${zeile("Adresse", k.adresse)}
+    ${zeile("Telefon", k.telefon)}
+    ${zeile("E-Mail", k.email)}
+    ${offen.length ? `<div class="row"><span>Beim Kunden offen</span><span class="sub">${esc(offen.join(" · "))}</span></div>` : ""}
+    ${k.drive_url ? `<a class="row" href="${esc(k.drive_url)}" target="_blank" rel="noopener" style="text-decoration:none;color:inherit"><span>Kundenordner</span><span class="sub">📁 Drive ›</span></a>` : ""}
+    ${k.kunde_id ? `<button class="row menu-item" id="gs-profil"><span>Ganzes Kundenprofil</span><span class="sub">›</span></button>` : ""}
+  </div>`;
+}
+
+async function showGespraech(id) {
   App.view.innerHTML = `<div class="loading">Lädt …</div>`;
-  const r = await api("/app/api/aufnahmen/" + encodeURIComponent(id));
-  if (!r || !r.ok) { App.view.innerHTML = `<div class="card"><p class="empty">Konnte nicht laden.</p></div>`; return; }
+  const r = await api("/app/api/gespraeche/" + encodeURIComponent(id));
+  if (!r || !r.ok) { App.view.innerHTML = `<div class="card"><p class="empty">Konnte das Gespräch nicht laden.</p></div>`; return; }
   const d = await r.json();
+  const k = d.kunde || {};
+  // Q soll mitreden können, ohne dass der Handwerker den Kunden nochmal nennt.
   App.screenContext = {
-    screen: "kunden_profil",
-    kunde: d.kunde || "",
+    screen: "kundengespraech",
+    kunde: k.name || "",
     notizen: (d.notizen || "").slice(0, 2000),
     briefing: (d.briefing || "").slice(0, 500),
   };
+
+  const bilder = d.bilder || [];
+  const galerie = bilder.length
+    ? `<div class="card"><h2>Bilder</h2>
+         <p class="muted" style="margin:0 0 10px;font-size:13px">Angehakte Bilder gehen mit in die Kundenmail.</p>
+         <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(96px,1fr));gap:8px">
+           ${bilder.map((b) => `<label style="position:relative;display:block;cursor:pointer">
+              <img src="${esc(b.url)}" alt="${esc(b.name)}" loading="lazy"
+                   style="width:100%;aspect-ratio:1;object-fit:cover;border-radius:10px;border:1px solid var(--line)" />
+              <input type="checkbox" data-bild="${esc(b.id)}" checked
+                     style="position:absolute;top:6px;left:6px;width:20px;height:20px" />
+              ${b.typ === "visualisierung" ? `<span class="pill ok" style="position:absolute;bottom:6px;right:6px">🎨</span>` : ""}
+            </label>`).join("")}
+         </div>
+       </div>`
+    : "";
+
   const todos = (d.todos || []).length
     ? `<div class="card"><h2>To-dos</h2>${d.todos.map((t) => `<div class="row"><div>☐ ${esc(t)}</div></div>`).join("")}</div>` : "";
-  const termin = d.termin ? `<div class="row"><span>Termin</span><span class="sub">${esc(d.termin)}${d.termin_ort ? " · " + esc(d.termin_ort) : ""}</span></div>` : "";
+  const termin = d.termin
+    ? `<div class="card"><h2>Termin</h2><div class="row"><span>${esc(d.termin)}</span><span class="sub">${esc(d.termin_ort || "")}</span></div></div>` : "";
+
   App.view.innerHTML =
-    `<button class="btn-sm btn-ghost" id="back-anrufe" style="margin-bottom:10px">← Zurück</button>` +
-    `<div class="card"><h2>${esc(d.kunde || "Aufnahme")}</h2>
-       <div class="row"><span>Zeitpunkt</span><span class="sub">${esc(d.zeit)}${d.dauer ? " · " + esc(d.dauer) : ""}</span></div>${termin}</div>` +
-    (d.briefing ? `<div class="card"><h2>Briefing</h2><div>${esc(d.briefing)}</div></div>` : "") +
-    (d.notizen ? `<div class="card"><h2>Notizen</h2><div>${esc(d.notizen)}</div></div>` : "") +
-    todos +
+    `<button class="btn-sm btn-ghost" id="gs-back" style="margin-bottom:10px">← Gespräche</button>` +
+    _gespraechKopf(k) +
+    `<div class="card">
+       <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
+         <button class="btn-sm btn-ghost" id="gs-diktat" style="padding:14px 8px">🎤 Diktat</button>
+         <button class="btn-sm btn-ghost" id="gs-foto" style="padding:14px 8px">📷 Foto</button>
+         <button class="btn-sm btn-ghost" id="gs-viz" style="padding:14px 8px">🎨 Visualisieren</button>
+         <button class="btn-sm btn-ghost" id="gs-mail" style="padding:14px 8px">✉️ Kundenmail</button>
+       </div>
+       <div id="gs-rec" style="margin-top:10px"></div>
+       <input type="file" id="gs-fotofile" accept="image/jpeg,image/png,image/webp" capture="environment" style="display:none" />
+       <p class="muted" id="gs-status" style="margin:10px 0 0;min-height:18px"></p>
+     </div>` +
+    (d.briefing ? `<div class="card"><h2>Zusammenfassung</h2><div style="white-space:pre-wrap">${esc(d.briefing)}</div></div>` : "") +
+    (d.notizen ? `<div class="card"><h2>Notizen aus dem Diktat</h2><div style="white-space:pre-wrap">${esc(d.notizen)}</div></div>` : "") +
+    todos + termin + galerie +
+    `<div class="card"><h2>Eigene Notiz</h2>
+       <p class="muted" style="margin:0 0 8px;font-size:13px">Nur für dich — geht nie an den Kunden.</p>
+       <textarea id="gs-notiz" rows="4" placeholder="z.B. Zufahrt eng, Material selbst mitbringen"
+         style="width:100%;padding:12px;border:1px solid var(--line);border-radius:10px;font-family:inherit;font-size:16px">${esc(d.handnotiz || "")}</textarea>
+       <button class="btn-sm btn-ghost" id="gs-notiz-save" style="margin-top:8px;width:100%">Notiz speichern</button>
+     </div>` +
     (d.transkript ? `<div class="card"><h2>Transkript</h2><div class="sub" style="white-space:pre-wrap">${esc(d.transkript)}</div></div>` : "");
-  document.getElementById("back-anrufe").addEventListener("click", () => navigate(App.current || "aufnahmen"));
+
+  document.getElementById("gs-back").addEventListener("click", () => navigate("gespraeche"));
+  const profilBtn = document.getElementById("gs-profil");
+  if (profilBtn) profilBtn.addEventListener("click", () => showKundenProfil(k.name, k.kunde_id));
+
+  const statusEl = document.getElementById("gs-status");
+  const gewaehlteBilder = () =>
+    [...document.querySelectorAll("[data-bild]")].filter((c) => c.checked).map((c) => c.dataset.bild);
+
+  // --- Notiz ---
+  document.getElementById("gs-notiz-save").addEventListener("click", async (e) => {
+    const btn = e.currentTarget;
+    btn.disabled = true;
+    const res = await api("/app/api/gespraeche/" + encodeURIComponent(id) + "/notiz", {
+      method: "POST", body: JSON.stringify({ text: document.getElementById("gs-notiz").value }) });
+    btn.disabled = false;
+    statusEl.textContent = (res && res.ok) ? "Notiz gespeichert." : "Notiz konnte nicht gespeichert werden.";
+  });
+
+  // --- Foto ---
+  const fileEl = document.getElementById("gs-fotofile");
+  document.getElementById("gs-foto").addEventListener("click", () => fileEl.click());
+  fileEl.addEventListener("change", async () => {
+    const f = fileEl.files && fileEl.files[0];
+    if (!f) return;
+    statusEl.textContent = "Lade Foto hoch …";
+    let res;
+    try {
+      res = await fetch("/app/api/gespraeche/" + encodeURIComponent(id) + "/foto", {
+        method: "POST", headers: { "X-CSRF-Token": App.me.csrf, "Content-Type": f.type }, body: f });
+    } catch (err) { statusEl.textContent = "Netzwerkfehler beim Hochladen."; return; }
+    if (res.status === 303 || res.status === 401 || res.redirected) { location.href = "/app/login"; return; }
+    const j = await res.json().catch(() => null);
+    fileEl.value = "";
+    if (j && j.ok) { showGespraech(id); return; }
+    statusEl.textContent = (j && j.error) || "Foto konnte nicht abgelegt werden.";
+  });
+
+  // --- Visualisierung: gerendert wird im Q-Chat, das Ergebnis kommt hierher ---
+  document.getElementById("gs-viz").addEventListener("click", () => {
+    App.vizGespraech = { id, kunde: k.name || "" };
+    App.qchat = App.qchat || [];
+    App.qchat.push({ role: "q", text: `Visualisierung für ${k.name || "den Kunden"}: häng unten ein Foto an (📎) und beschreib, was daraus werden soll. Das fertige Bild landet automatisch wieder im Gespräch.` });
+    navigate("assistent");
+  });
+
+  // --- Kundenmail ---
+  document.getElementById("gs-mail").addEventListener("click", async (e) => {
+    const btn = e.currentTarget;
+    btn.disabled = true;
+    statusEl.textContent = "Schreibe den Entwurf …";
+    const res = await api("/app/api/gespraeche/" + encodeURIComponent(id) + "/mail", {
+      method: "POST", body: JSON.stringify({ bild_ids: gewaehlteBilder() }) });
+    const j = res ? await res.json().catch(() => null) : null;
+    btn.disabled = false;
+    if (j && j.ok && j.entwurf) {
+      statusEl.textContent = "";
+      App.qchat = App.qchat || [];
+      App.qchat.push({ role: "q", text: `Entwurf für ${k.name || "den Kunden"} — prüf ihn und schick ihn ab. Transkript, To-dos und deine Notiz bleiben hier.` });
+      App.qchat.push(mailDraftMsg(j.entwurf));
+      navigate("assistent");
+      return;
+    }
+    statusEl.textContent = (j && j.error) || "Konnte keinen Entwurf bauen.";
+  });
+
+  // --- Diktat direkt im Gespräch ---
+  document.getElementById("gs-diktat").addEventListener("click", () => {
+    const recEl = document.getElementById("gs-rec");
+    if (Diktat.recording) { _gespraechDiktatStop(id, recEl, statusEl); return; }
+    _gespraechDiktatStart(id, recEl, statusEl);
+  });
 }
+
+async function _gespraechDiktatStart(id, recEl, statusEl) {
+  try {
+    await _diktatStartRecording();
+  } catch (e) {
+    statusEl.textContent = (e && e.name === "NotAllowedError")
+      ? "Mikrofon-Zugriff wurde abgelehnt. Bitte in den Browser-Einstellungen erlauben."
+      : "Mikrofon nicht verfügbar.";
+    _diktatTeardown();
+    return;
+  }
+  recEl.innerHTML = `<div style="text-align:center">
+      <div id="gs-timer" style="font-size:28px;font-variant-numeric:tabular-nums">0:00</div>
+      <button class="btn-sm" id="gs-stop" style="margin-top:8px;width:100%">⏹ Stoppen & analysieren</button>
+    </div>`;
+  statusEl.textContent = "Aufnahme läuft …";
+  const timerEl = document.getElementById("gs-timer");
+  Diktat.tick = setInterval(() => {
+    const s = Math.round((Date.now() - Diktat.startTs) / 1000);
+    timerEl.textContent = `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+  }, 500);
+  Diktat.autostop = setTimeout(() => {
+    if (Diktat.recording) _gespraechDiktatStop(id, recEl, statusEl);
+  }, DIKTAT_MAX_SECONDS * 1000);
+  document.getElementById("gs-stop").addEventListener("click",
+    () => _gespraechDiktatStop(id, recEl, statusEl));
+}
+
+async function _gespraechDiktatStop(id, recEl, statusEl) {
+  if (!Diktat.recording) return;
+  const { blob, durationSec } = _diktatFinish();
+  recEl.innerHTML = "";
+  if (durationSec < 1 || blob.size < 2000) {
+    statusEl.textContent = "Aufnahme war zu kurz. Bitte erneut versuchen.";
+    return;
+  }
+  statusEl.textContent = "Analysiere das Gespräch … (kann 30–60 Sek dauern)";
+  let res;
+  try {
+    res = await fetch("/app/api/gespraeche/" + encodeURIComponent(id) + "/diktat", {
+      method: "POST",
+      headers: {
+        "X-CSRF-Token": App.me.csrf,
+        "Content-Type": "audio/wav",
+        "X-Audio-Duration": String(durationSec),
+      },
+      body: blob,
+    });
+  } catch (e) { statusEl.textContent = "Netzwerkfehler. Bitte erneut versuchen."; return; }
+  if (res.status === 303 || res.status === 401 || res.redirected) { location.href = "/app/login"; return; }
+  const j = await res.json().catch(() => null);
+  if (j && j.ok) { showGespraech(id); return; }
+  statusEl.textContent = (j && j.error) || "Konnte nicht verarbeiten. Bitte erneut versuchen.";
+}
+
+// Alter Einstiegspunkt (Listen-Zeilen, Q-Links) — führt in den neuen Bereich.
+async function showAufnahme(id) { await showGespraech(id); }
 
 function bindStorno() {
   document.querySelectorAll('[data-action="storno"]').forEach((b) =>

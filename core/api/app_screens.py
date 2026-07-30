@@ -1381,7 +1381,13 @@ async def api_aufnahme_diktat(
     emp: Employee = Depends(require_app_user),
     _c=Depends(require_app_csrf),
 ) -> JSONResponse:
-    """Sprach-Diktat aus dem Browser → Gemini-Analyse → Kundengespraech.
+    """Sprach-Diktat ohne vorher gewaehlten Kunden → Gemini-Analyse →
+    neues Kundengespraech (die KI zieht den Namen aus dem Gesprochenen).
+
+    Der Hauptweg der App laeuft inzwischen ueber den Gespraechs-Bereich:
+    dort steht der Kunde vorher fest und das Diktat geht an
+    ``/gespraeche/{id}/diktat``. Dieser Endpunkt bleibt der Einstieg fuer
+    „Kunde noch unbekannt" und spiegelt weiterhin den Telegram-Flow.
 
     Der Browser nimmt das Gespraech per Web-Audio auf, kodiert es
     client-seitig zu WAV (16 kHz mono — von Gemini nativ unterstuetzt) und
@@ -1563,10 +1569,24 @@ async def api_visualisierung_erstellen(
         return JSONResponse({"ok": False, "error": "Bitte etwas mehr beschreiben (min. 5 Zeichen)."}, status_code=400)
     prompt = prompt[:500]
 
+    # Aus einem Kundengespräch heraus gestartet? Dann findet das Ergebnis
+    # dorthin zurück — gerendert wird trotzdem hier im Q-Chat.
+    gespraech_id = None
+    roh = (request.query_params.get("gespraech_id") or "").strip()
+    if roh:
+        try:
+            kandidat = uuid.UUID(roh)
+        except (ValueError, TypeError):
+            kandidat = None
+        if kandidat is not None:
+            g, _ = await _gespraech_laden(tid, kandidat)
+            gespraech_id = g.id if g is not None else None
+
     async with get_session() as s:
         viz = Visualisierung(
             tenant_id=tid, original_image_data=image_bytes,
             prompt=prompt, status=VIZ_STATUS_GENERATING,
+            gespraech_id=gespraech_id,
         )
         s.add(viz)
         await s.commit()
@@ -1602,10 +1622,29 @@ async def api_visualisierung_erstellen(
             "Konnte kein Bild erzeugen (evtl. Sicherheits-Block oder unklares "
             "Foto). Bitte mit anderem Foto/Beschreibung erneut versuchen."
         )}, status_code=502)
+
+    if gespraech_id is not None:
+        # Zuordnung ans Gespräch — best-effort: das Bild ist fertig und
+        # bleibt es auch, wenn die Verknüpfung scheitert.
+        try:
+            from core.models.gespraech_datei import (
+                GespraechDatei, GESPRAECH_DATEI_VISUALISIERUNG)
+            async with get_session() as s:
+                s.add(GespraechDatei(
+                    tenant_id=tid, gespraech_id=gespraech_id,
+                    typ=GESPRAECH_DATEI_VISUALISIERUNG,
+                    visualisierung_id=viz_id,
+                    dateiname=f"{prompt[:60]}.png", mime="image/png",
+                ))
+                await s.commit()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Visualisierung nicht ans Gespräch geknüpft: %s", exc)
+
     logger.info("PWA-Visualisierung fertig: id=%s tenant=%s mitarbeiter=%s", viz_id, tid, emp.id)
     return JSONResponse({
         "ok": True, "id": str(viz_id),
         "bild_url": f"/app/api/visualisierungen/{viz_id}/bild",
+        "gespraech_id": str(gespraech_id) if gespraech_id else "",
     })
 
 
@@ -1764,6 +1803,441 @@ async def api_gespraech_kunde_zuordnen(
     logger.info("PWA-Kundenzuordnung: gespraech=%s -> kunde=%s tenant=%s",
                 gid, antwort["kunde_id"], tid)
     return JSONResponse(antwort)
+
+
+# =====================================================================
+# Kundengespräch — der Arbeitsbereich vor Ort
+#
+# Ein Gespräch wird zum Kunden angelegt (nicht mehr nur als Nebenprodukt
+# eines Diktats) und sammelt danach alles ein: Diktat, Handnotiz, Fotos,
+# Visualisierungen. Am Ende steht die Kundenmail — die Grenze, was davon
+# der Kunde sehen darf, zieht core/services/kundengespraech.py.
+# =====================================================================
+
+_GESPRAECH_MAX_NOTIZ = 5000
+_GESPRAECH_MAX_FOTO_BYTES = 15_000_000
+_GESPRAECH_FOTO_MIMES = {
+    "image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp",
+}
+
+
+async def _gespraech_laden(tid: uuid.UUID, gid: uuid.UUID):
+    """Gespräch + angehängte Dateien, tenant-gescoped."""
+    from core.models.gespraech_datei import GespraechDatei
+    async with get_session() as s:
+        g = (await s.execute(
+            select(Kundengespraech).where(
+                Kundengespraech.id == gid, Kundengespraech.tenant_id == tid)
+        )).scalar_one_or_none()
+        if g is None:
+            return None, []
+        dateien = (await s.execute(
+            select(GespraechDatei)
+            .where(GespraechDatei.gespraech_id == gid)
+            .where(GespraechDatei.tenant_id == tid)
+            .order_by(GespraechDatei.created_at.asc())
+        )).scalars().all()
+    return g, list(dateien)
+
+
+def _datei_zeile(d) -> dict:
+    """Ein Bild für die Galerie. Fotos kommen über den Drive-Proxy,
+    Visualisierungen direkt aus der DB."""
+    from core.models.gespraech_datei import GESPRAECH_DATEI_VISUALISIERUNG
+    if d.typ == GESPRAECH_DATEI_VISUALISIERUNG and d.visualisierung_id:
+        url = f"/app/api/visualisierungen/{d.visualisierung_id}/bild"
+    elif d.drive_file_id:
+        url = f"/app/api/archiv/datei/{d.drive_file_id}"
+    else:
+        url = ""
+    return {
+        "id": str(d.id), "typ": d.typ, "url": url,
+        "name": d.dateiname or ("Visualisierung"
+                                if d.typ == GESPRAECH_DATEI_VISUALISIERUNG
+                                else "Foto"),
+        "drive_url": d.drive_url or "",
+    }
+
+
+async def _kunden_kontext(tid: uuid.UUID, g) -> dict:
+    """Die Kundendaten, die der Handwerker im Gespräch sehen will:
+    Kontakt, Adresse, Drive-Ordner und was gerade offen ist."""
+    from core.models import Kunde
+    from core.models.rechnung import RECHNUNG_STATUS_BEZAHLT
+    kunde = None
+    async with get_session() as s:
+        if g.kunde_id:
+            kunde = await s.get(Kunde, g.kunde_id)
+            if kunde is not None and kunde.tenant_id != tid:
+                kunde = None
+        # Zuordnung über den Kundenstamm, wo er gesetzt ist — sonst über
+        # den Namen (Zeilen aus der Übergangsphase haben keine kunde_id).
+        def _gehoert_zum_kunden(modell):
+            if g.kunde_id:
+                return modell.kunde_id == g.kunde_id
+            return modell.kunde_name == g.kunde_name
+
+        laufend = set(AUFTRAG_LIFECYCLE) - {ANGEBOT_STATUS_RECHNUNG_GESENDET}
+        auftraege = (await s.execute(
+            select(func.count(Angebot.id))
+            .where(Angebot.tenant_id == tid)
+            .where(_gehoert_zum_kunden(Angebot))
+            .where(Angebot.status.in_(laufend))
+        )).scalar() or 0
+        offen = (await s.execute(
+            select(func.count(Rechnung.id))
+            .where(Rechnung.tenant_id == tid)
+            .where(_gehoert_zum_kunden(Rechnung))
+            .where(Rechnung.status != RECHNUNG_STATUS_BEZAHLT)
+        )).scalar() or 0
+        frueher = (await s.execute(
+            select(func.count(Kundengespraech.id))
+            .where(Kundengespraech.tenant_id == tid)
+            .where(Kundengespraech.kunde_name == g.kunde_name)
+            .where(Kundengespraech.id != g.id)
+        )).scalar() or 0
+
+    drive_url = ""
+    try:
+        from core.integrations.google_drive import get_kunde_folder_link
+        drive_url = await get_kunde_folder_link(tid, g.kunde_name) or ""
+    except Exception:  # noqa: BLE001
+        # Ohne Drive-Verbindung bleibt der Link leer — das Gespräch
+        # funktioniert trotzdem.
+        drive_url = ""
+
+    return {
+        "kunde_id": str(g.kunde_id) if g.kunde_id else "",
+        "name": g.kunde_name,
+        "email": (kunde.email if kunde else "") or "",
+        "telefon": (kunde.telefon if kunde else "") or "",
+        "adresse": (kunde.adresse if kunde else "") or "",
+        "drive_url": drive_url,
+        "auftraege_laufend": int(auftraege),
+        "rechnungen_offen": int(offen),
+        "gespraeche_frueher": int(frueher),
+    }
+
+
+@router.get("/gespraeche")
+async def api_gespraeche(
+    request: Request, _e=Depends(require_app_user),
+) -> JSONResponse:
+    """Liste der Kundengespräche (dieselben Daten wie /aufnahmen)."""
+    tid = current_tenant_id(request)
+    return JSONResponse({"gespraeche": await _recent_aufnahmen(tid)})
+
+
+@router.post("/gespraeche")
+async def api_gespraech_neu(
+    request: Request,
+    emp: Employee = Depends(require_app_user),
+    _c=Depends(require_app_csrf),
+) -> JSONResponse:
+    """Legt ein leeres Gespräch zu einem Kunden an — der Einstieg vor Ort.
+
+    Body: {kunde_id} für einen Bestandskunden ODER {kunde_name} für einen
+    neuen. Diktat, Notiz und Fotos kommen danach dazu."""
+    from core.models import Kunde
+    tid = current_tenant_id(request)
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": "Ungueltige Daten."}, status_code=400)
+
+    kid_raw = (body.get("kunde_id") or "").strip()
+    name = (body.get("kunde_name") or "").strip()[:300]
+    kunde = None
+    async with get_session() as s:
+        if kid_raw:
+            try:
+                kunde = await s.get(Kunde, uuid.UUID(kid_raw))
+            except (ValueError, TypeError):
+                kunde = None
+            if kunde is None or kunde.tenant_id != tid:
+                return JSONResponse(
+                    {"ok": False, "error": "Kunde nicht gefunden."}, status_code=404)
+            name = kunde.name
+        if len(name) < 2:
+            return JSONResponse(
+                {"ok": False, "error": "Bitte einen Kunden wählen oder eingeben."},
+                status_code=400)
+
+        g = Kundengespraech(
+            tenant_id=tid,
+            kunde_name=name,
+            kunde_id=kunde.id if kunde else None,
+            gespraech_datum=dt.datetime.now(dt.timezone.utc),
+            status=KUNDENGESPRAECH_STATUS_ERFASST,
+            created_by_employee_id=emp.id,
+            assigned_employee_id=emp.id,
+        )
+        s.add(g)
+        await s.flush()
+        gid = g.id
+        await s.commit()
+    logger.info("PWA-Gespräch angelegt: id=%s tenant=%s kunde=%r", gid, tid, name)
+    return JSONResponse({"ok": True, "id": str(gid), "kunde": name})
+
+
+@router.get("/gespraeche/{gespraech_id}")
+async def api_gespraech_detail(
+    gespraech_id: str, request: Request, _e=Depends(require_app_user),
+) -> JSONResponse:
+    """Alles zu einem Gespräch: Kundendaten, Diktat-Ergebnis, Handnotiz,
+    Bilder, Termin."""
+    tid = current_tenant_id(request)
+    try:
+        gid = uuid.UUID(gespraech_id)
+    except (ValueError, TypeError):
+        return JSONResponse({"ok": False, "error": "ungueltige id"}, status_code=400)
+    g, dateien = await _gespraech_laden(tid, gid)
+    if g is None:
+        return JSONResponse({"ok": False, "error": "nicht gefunden"}, status_code=404)
+
+    dauer = ""
+    if g.audio_dauer_sekunden:
+        m, sec = divmod(int(g.audio_dauer_sekunden), 60)
+        dauer = f"{m}:{sec:02d} min"
+    return JSONResponse({
+        "ok": True,
+        "id": str(g.id),
+        "zeit": _fmt_dt(g.gespraech_datum),
+        "dauer": dauer,
+        "kunde": await _kunden_kontext(tid, g),
+        "briefing": g.briefing_kurz or "",
+        "notizen": g.notizen_lang or "",
+        "handnotiz": g.handnotiz or "",
+        "todos": list(g.todos or []),
+        "transkript": g.raw_transcript or "",
+        "termin": _fmt_dt(g.termin_datum) if g.termin_datum else "",
+        "termin_ort": g.termin_ort or "",
+        "bilder": [_datei_zeile(d) for d in dateien],
+    })
+
+
+@router.post("/gespraeche/{gespraech_id}/notiz")
+async def api_gespraech_notiz(
+    gespraech_id: str,
+    request: Request,
+    _e=Depends(require_app_user),
+    _c=Depends(require_app_csrf),
+) -> JSONResponse:
+    """Handnotiz speichern (ersetzt die bisherige). Bleibt INTERN — sie
+    geht nie in eine Kundenmail."""
+    tid = current_tenant_id(request)
+    try:
+        gid = uuid.UUID(gespraech_id)
+    except (ValueError, TypeError):
+        return JSONResponse({"ok": False, "error": "ungueltige id"}, status_code=400)
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": "Ungueltige Daten."}, status_code=400)
+    text = (body.get("text") or "").strip()[:_GESPRAECH_MAX_NOTIZ]
+    async with get_session() as s:
+        g = (await s.execute(
+            select(Kundengespraech).where(
+                Kundengespraech.id == gid, Kundengespraech.tenant_id == tid)
+        )).scalar_one_or_none()
+        if g is None:
+            return JSONResponse({"ok": False, "error": "nicht gefunden"}, status_code=404)
+        g.handnotiz = text or None
+        await s.commit()
+    return JSONResponse({"ok": True})
+
+
+@router.post("/gespraeche/{gespraech_id}/foto")
+async def api_gespraech_foto(
+    gespraech_id: str,
+    request: Request,
+    emp: Employee = Depends(require_app_user),
+    _c=Depends(require_app_csrf),
+) -> JSONResponse:
+    """Foto zum Gespräch: landet im Drive-Kundenordner (wie das übrige
+    Archiv) und wird dem Gespräch zugeordnet. Body = rohe Bild-Bytes."""
+    from core.integrations.google_drive import upload_file_to_kunde_folder
+    from core.models.gespraech_datei import GespraechDatei, GESPRAECH_DATEI_FOTO
+    tid = current_tenant_id(request)
+    try:
+        gid = uuid.UUID(gespraech_id)
+    except (ValueError, TypeError):
+        return JSONResponse({"ok": False, "error": "ungueltige id"}, status_code=400)
+
+    daten = await request.body()
+    if not daten:
+        return JSONResponse({"ok": False, "error": "Kein Foto empfangen."}, status_code=400)
+    if len(daten) > _GESPRAECH_MAX_FOTO_BYTES:
+        mb = len(daten) // 1024 // 1024
+        return JSONResponse(
+            {"ok": False, "error": f"Foto zu gross ({mb} MB, max 15 MB)."},
+            status_code=413)
+    mime = (request.headers.get("content-type") or "").split(";")[0].strip().lower()
+    if mime not in _GESPRAECH_FOTO_MIMES:
+        return JSONResponse(
+            {"ok": False, "error": "Nur JPEG-, PNG- oder WebP-Fotos."}, status_code=415)
+
+    g, _ = await _gespraech_laden(tid, gid)
+    if g is None:
+        return JSONResponse({"ok": False, "error": "nicht gefunden"}, status_code=404)
+
+    ts = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d_%H%M%S")
+    name = f"gespraech_{ts}{_GESPRAECH_FOTO_MIMES[mime]}"
+    try:
+        res = await upload_file_to_kunde_folder(
+            tenant_id=tid, kunde_name=g.kunde_name, file_bytes=daten,
+            filename=name, mime_type=mime, employee_id=emp.id,
+        )
+    except ValueError:
+        return JSONResponse(
+            {"ok": False, "error": "Google Drive ist nicht verbunden. Bitte in den Einstellungen verbinden."},
+            status_code=409)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Gespräch-Foto-Upload fehlgeschlagen: %s", exc)
+        return JSONResponse(
+            {"ok": False, "error": "Upload fehlgeschlagen. Bitte erneut versuchen."},
+            status_code=502)
+
+    async with get_session() as s:
+        d = GespraechDatei(
+            tenant_id=tid, gespraech_id=gid, typ=GESPRAECH_DATEI_FOTO,
+            drive_file_id=res.get("file_id"), drive_url=res.get("web_link"),
+            dateiname=name, mime=mime,
+        )
+        s.add(d)
+        await s.flush()
+        zeile = _datei_zeile(d)
+        await s.commit()
+    logger.info("PWA-Gespräch-Foto: gespraech=%s tenant=%s", gid, tid)
+    return JSONResponse({"ok": True, "bild": zeile})
+
+
+@router.post("/gespraeche/{gespraech_id}/diktat")
+async def api_gespraech_diktat(
+    gespraech_id: str,
+    request: Request,
+    emp: Employee = Depends(require_app_user),
+    _c=Depends(require_app_csrf),
+) -> JSONResponse:
+    """Diktat in ein bestehendes Gespräch. Gleiche Analyse wie
+    ``/aufnahmen/diktat``, aber der Kunde steht schon fest.
+
+    Mehrfaches Diktieren hängt an, statt zu überschreiben — wer auf der
+    Baustelle zweimal spricht, will nichts verlieren. Der Kundenname aus
+    der KI wird bewusst ignoriert: gewählt hat ihn der Handwerker."""
+    from core.ai import analyse_kundengespraech_from_audio
+
+    tid = current_tenant_id(request)
+    try:
+        gid = uuid.UUID(gespraech_id)
+    except (ValueError, TypeError):
+        return JSONResponse({"ok": False, "error": "ungueltige id"}, status_code=400)
+
+    audio_bytes = await request.body()
+    err = _validate_diktat_audio(audio_bytes)
+    if err:
+        return JSONResponse({"ok": False, "error": err[0]}, status_code=err[1])
+    mime = _normalize_diktat_mime(request.headers.get("content-type"))
+    if mime is None:
+        return JSONResponse(
+            {"ok": False, "error": "Audioformat wird nicht unterstuetzt."},
+            status_code=415)
+    dauer = _parse_diktat_duration(request.headers.get("x-audio-duration"))
+
+    g, _ = await _gespraech_laden(tid, gid)
+    if g is None:
+        return JSONResponse({"ok": False, "error": "nicht gefunden"}, status_code=404)
+
+    try:
+        extracted = await analyse_kundengespraech_from_audio(
+            audio_bytes, mime_type=mime, tenant_id=tid)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Gespräch-Diktat: Gemini-Analyse fehlgeschlagen: %s", exc)
+        return JSONResponse(
+            {"ok": False, "error": "Analyse fehlgeschlagen. Bitte erneut versuchen."},
+            status_code=502)
+
+    def _anhaengen(alt: str | None, neu: str | None) -> str | None:
+        alt, neu = (alt or "").strip(), (neu or "").strip()
+        if not neu:
+            return alt or None
+        return f"{alt}\n\n{neu}" if alt else neu
+
+    async with get_session() as s:
+        row = (await s.execute(
+            select(Kundengespraech).where(
+                Kundengespraech.id == gid, Kundengespraech.tenant_id == tid)
+        )).scalar_one_or_none()
+        if row is None:
+            return JSONResponse({"ok": False, "error": "nicht gefunden"}, status_code=404)
+        row.briefing_kurz = _anhaengen(row.briefing_kurz, extracted.get("briefing_kurz"))
+        row.notizen_lang = _anhaengen(row.notizen_lang, extracted.get("notizen_lang"))
+        row.raw_transcript = _anhaengen(row.raw_transcript, extracted.get("transcript"))
+        neue_todos = [t for t in (extracted.get("todos") or []) if str(t).strip()]
+        if neue_todos:
+            row.todos = list(row.todos or []) + neue_todos
+        if dauer:
+            row.audio_dauer_sekunden = (row.audio_dauer_sekunden or 0) + dauer
+        # Termin nur setzen, wenn noch keiner steht — ein zweites Diktat
+        # soll einen bereits vereinbarten Termin nicht still verschieben.
+        if row.termin_datum is None:
+            termin = _parse_diktat_termin(extracted.get("termin_datum"))
+            if termin:
+                row.termin_datum = termin
+                row.termin_ort = extracted.get("termin_ort")
+        if not row.confidence:
+            row.confidence = extracted.get("extraction_confidence")
+        await s.commit()
+
+    from core.models.app_usage_event import record_app_usage, USAGE_DIKTAT
+    await record_app_usage(tid, emp.id, USAGE_DIKTAT)
+    logger.info("PWA-Gespräch-Diktat: gespraech=%s tenant=%s todos=%d",
+                gid, tid, len(extracted.get("todos") or []))
+    return JSONResponse({
+        "ok": True,
+        "briefing": (extracted.get("briefing_kurz") or "")[:300],
+        "todos": list(extracted.get("todos") or []),
+    })
+
+
+@router.post("/gespraeche/{gespraech_id}/mail")
+async def api_gespraech_mail(
+    gespraech_id: str,
+    request: Request,
+    emp: Employee = Depends(require_app_user),
+    _c=Depends(require_app_csrf),
+) -> JSONResponse:
+    """Baut den Kundenmail-Entwurf zum Gespräch.
+
+    Body: {"bild_ids": [...]} — welche Bilder mitgehen sollen. Der Entwurf
+    enthält NUR die Zusammenfassung und die gewählten Bilder; Transkript,
+    Handnotiz und To-dos bleiben im Betrieb (siehe
+    core/services/kundengespraech.py). Antwort ist eine Entwurfs-Karte, die
+    der Handwerker im Assistenten redigiert und freigibt."""
+    from core.services.kundengespraech import baue_kundenmail
+    tid = current_tenant_id(request)
+    try:
+        gid = uuid.UUID(gespraech_id)
+    except (ValueError, TypeError):
+        return JSONResponse({"ok": False, "error": "ungueltige id"}, status_code=400)
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        body = {}
+    gewaehlt = {str(x) for x in (body.get("bild_ids") or [])}
+
+    g, dateien = await _gespraech_laden(tid, gid)
+    if g is None:
+        return JSONResponse({"ok": False, "error": "nicht gefunden"}, status_code=404)
+    bilder = [d for d in dateien if str(d.id) in gewaehlt]
+
+    tenant = getattr(request.state, "app_tenant", None)
+    betrieb = getattr(tenant, "company_name", "") or ""
+    entwurf = await baue_kundenmail(
+        tid, gespraech=g, bilder=bilder, betrieb=betrieb, employee_id=emp.id)
+    logger.info("PWA-Gespräch-Mail-Entwurf: gespraech=%s tenant=%s bilder=%d",
+                gid, tid, len(bilder))
+    return JSONResponse({"ok": True, "entwurf": entwurf})
 
 
 @router.get("/kunden/profil")

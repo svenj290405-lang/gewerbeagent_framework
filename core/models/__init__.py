@@ -281,6 +281,9 @@ __all__ = [
     "STATE_DIALOG",
     "AngebotPosition",
     "Kundengespraech",
+    "GespraechDatei",
+    "GESPRAECH_DATEI_FOTO",
+    "GESPRAECH_DATEI_VISUALISIERUNG",
     "STATE_AUFNAHME_WAITING_AUDIO",
     "STATE_AUFNAHME_PREVIEWING",
     "STATE_ANGEBOT_WAITING_INPUT",
@@ -352,6 +355,11 @@ from core.models.auftrag_prozess import (
     MAX_SCHRITT_LABEL,
 )
 from core.models.kundengespraech import Kundengespraech
+from core.models.gespraech_datei import (
+    GespraechDatei,
+    GESPRAECH_DATEI_FOTO,
+    GESPRAECH_DATEI_VISUALISIERUNG,
+)
 from core.models.anfrage import (
     AnfrageToken,
     AnfrageResponse,

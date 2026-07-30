@@ -64,6 +64,15 @@ class Visualisierung(Base):
         nullable=True,
     )
 
+    # Aus welchem Kundengespraech heraus wurde visualisiert? Der Handwerker
+    # startet im Gespraech, rendert im Q-Chat — ueber diesen Verweis findet
+    # das Ergebnis zurueck in den Gespraechs-Bereich.
+    gespraech_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("kundengespraeche.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+
     # Bilder als BYTEA in DB (atomar, einfach loeschbar mit Tenant)
     original_image_data: Mapped[bytes | None] = mapped_column(
         LargeBinary, nullable=True

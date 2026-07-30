@@ -69,6 +69,11 @@ class Kundengespraech(Base):
     notizen_lang: Mapped[str | None] = mapped_column(Text, nullable=True)
     todos: Mapped[list[str] | None] = mapped_column(ARRAY(Text), nullable=True)
 
+    # Vom Handwerker getippte Notiz — bewusst getrennt von notizen_lang
+    # (das schreibt die KI aus dem Diktat). Sie ist INTERN und geht nie in
+    # eine Kundenmail: hier stehen Dinge wie „zahlt schlecht, Vorkasse".
+    handnotiz: Mapped[str | None] = mapped_column(Text, nullable=True)
+
     # Termin
     termin_datum: Mapped[dt.datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True

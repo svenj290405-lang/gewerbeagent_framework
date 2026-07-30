@@ -124,7 +124,9 @@
 // Auftrag) und Prozess-Editor als Aktivitaetsdiagramm mit Drag & Drop.
 // v66: Auftraege lassen sich von Hand anlegen (Kunde + Positionen +
 // Startschritt) — fuer Arbeit, die nie durch die Angebots-Pipeline lief.
-const CACHE = "ga-app-v66";
+// v67: Aufnahmen sind zum Kundengespraech geworden — Kundendaten oben,
+// Diktat/Notiz/Foto/Visualisierung an einem Ort, am Ende die Kundenmail.
+const CACHE = "ga-app-v67";
 const SHELL = [
   "/app",
   "/app/static/app-beta.css",

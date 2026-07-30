@@ -114,7 +114,7 @@ _SCREEN_LABELS: dict[str, str] = {
     "material":         "Materialien",
     "wissen":           "Wissensbasis",
     "visualisierung":   "Visualisierung",
-    "aufnahmen":        "Aufnahmen (Kundengespräche)",
+    "aufnahmen":        "Kundengespräche (Diktat, Notizen, Fotos)",
     "rueckrufe_page":   "Rückrufe",
 }
 
