@@ -116,7 +116,9 @@
 // (display:inline-flex schlug es), der Pfeil stand dauerhaft da.
 // v63: Security — esc() maskiert jetzt auch " und ' (Attribut-Kontext-XSS
 // ueber Fremddaten wie Kundennamen geschlossen).
-const CACHE = "ga-app-v63";
+// v64: Q kann E-Mails schreiben — Entwurfs-Karte im Chat (Empfaenger,
+// Betreff, Text, Anhaenge) mit Freigabe vor dem Versand.
+const CACHE = "ga-app-v64";
 const SHELL = [
   "/app",
   "/app/static/app-beta.css",

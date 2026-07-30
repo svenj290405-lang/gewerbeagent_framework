@@ -51,6 +51,16 @@ function linkify(escapedHtml) {
     `<a href="${u.replace(/"/g, "%22")}" target="_blank" rel="noopener noreferrer">${u}</a>`);
 }
 function el(html) { const t = document.createElement("template"); t.innerHTML = html.trim(); return t.content.firstChild; }
+// Mail-Entwurf von Q (type: "email_entwurf") in eine Chat-Nachricht giessen.
+// Die Karte im Assistenten redigiert direkt auf .data — abgeschickt wird
+// erst mit dem, was am Ende drinsteht.
+function mailDraftMsg(j) {
+  return { role: "mail", frage: j.frage || "", resolved: false, sent: false, data: {
+    empfaenger: j.empfaenger || "", empfaenger_name: j.empfaenger_name || "",
+    betreff: j.betreff || "", text: j.text || "", kunde_name: j.kunde_name || "",
+    anhaenge: Array.isArray(j.anhaenge) ? j.anhaenge.slice() : [],
+    hinweis: j.hinweis || "" } };
+}
 
 // Notification-API ist nicht überall da (z.B. iOS Safari ohne Home-Screen-
 // Installation) — defensiv prüfen, sonst wirft ein blanker Zugriff und die
@@ -1658,6 +1668,7 @@ const SCREENS = {
       if (tool === "termin_verschieben") return `Termin von ${r.kunde} verschoben${r.alter_termin_entfernt === false ? " (alten Termin bitte im Kalender prüfen)" : ""}.`;
       if (tool === "drive_ordner_anlegen") return `Drive-Ordner für ${r.kunde} bereit${r.link ? ": " + r.link : ""}.`;
       if (tool === "drive_notiz_anlegen") return `Notiz für ${r.kunde} in Drive abgelegt${r.link ? " (" + r.link + ")" : ""}.`;
+      if (tool === "email_schreiben") return `E-Mail an ${r.to_email} gesendet${r.anhaenge ? " (" + r.anhaenge + " Anhang" + (r.anhaenge > 1 ? "e" : "") + ")" : ""}.`;
       return "Erledigt.";
     }
 
@@ -1789,6 +1800,28 @@ const SCREENS = {
              <div class="confirm-actions" style="flex-wrap:wrap">${opts.join("")}</div>
            </div>`;
         }
+        if (m.role === "mail") {
+          const d = m.data || {};
+          if (m.resolved) {
+            return `<div class="bubble q confirm mail"><p class="q-summary">✉️ E-Mail an ${esc(d.empfaenger || d.empfaenger_name || "")}</p><div class="confirm-done">${m.sent ? "✓ Gesendet" : "✕ Abgebrochen"}</div></div>`;
+          }
+          const chips = (d.anhaenge || []).map((a, k) =>
+            `<span class="mail-chip">📎 ${esc(a.name || "Anhang")}<button class="mail-chip-x" data-mdel="${i}:${k}" aria-label="Anhang entfernen">✕</button></span>`).join("");
+          return `<div class="bubble q confirm mail">
+             ${m.frage ? `<p style="margin:0 0 8px">${esc(m.frage)}</p>` : ""}
+             <p class="q-summary">✉️ E-Mail-Entwurf</p>
+             ${d.hinweis ? `<p class="sub" style="margin:0 0 8px">${esc(d.hinweis)}</p>` : ""}
+             <label class="sub">An</label>
+             <input type="email" class="rech-input" data-mmail="${i}" value="${esc(d.empfaenger || "")}" placeholder="kunde@example.de" autocomplete="off" autocapitalize="off" spellcheck="false">
+             <label class="sub">Betreff</label>
+             <input type="text" class="rech-input" data-msubj="${i}" value="${esc(d.betreff || "")}" placeholder="Betreff">
+             <label class="sub">Text</label>
+             <textarea class="rech-input" data-mtext="${i}" rows="9">${esc(d.text || "")}</textarea>
+             <div class="mail-anh">${chips}<button class="btn-sm btn-ghost" data-madd="${i}">📎 Datei anhängen</button></div>
+             <input type="file" data-mfile="${i}" style="display:none">
+             <div class="confirm-actions"><button class="btn-sm" data-msend="${i}">Senden</button><button class="btn-sm btn-ghost" data-mcancel="${i}">Abbrechen</button></div>
+           </div>`;
+        }
         if (m.role === "rechnung") {
           const r = m.data || {};
           if (m.resolved) {
@@ -1832,6 +1865,40 @@ const SCREENS = {
           const m = App.qchat[parseInt(b.dataset.rcancel, 10)];
           m.resolved = true; m.cancelled = true;
           App.qchat.push({ role: "q", text: "Okay, die Rechnung lasse ich erstmal." });
+          render(); scrollDown();
+        }));
+      // Mail-Entwurf: Eingaben in m.data spiegeln (überleben Re-Renders),
+      // Anhänge hinzufügen/entfernen, senden oder verwerfen.
+      chatEl.querySelectorAll("[data-mmail]").forEach((t) =>
+        t.addEventListener("input", () => { App.qchat[parseInt(t.dataset.mmail, 10)].data.empfaenger = t.value; }));
+      chatEl.querySelectorAll("[data-msubj]").forEach((t) =>
+        t.addEventListener("input", () => { App.qchat[parseInt(t.dataset.msubj, 10)].data.betreff = t.value; }));
+      chatEl.querySelectorAll("[data-mtext]").forEach((t) =>
+        t.addEventListener("input", () => { App.qchat[parseInt(t.dataset.mtext, 10)].data.text = t.value; }));
+      chatEl.querySelectorAll("[data-madd]").forEach((b) =>
+        b.addEventListener("click", () => {
+          const f = chatEl.querySelector(`[data-mfile="${b.dataset.madd}"]`);
+          if (f) f.click();
+        }));
+      chatEl.querySelectorAll("[data-mfile]").forEach((f) =>
+        f.addEventListener("change", () => {
+          const file = f.files && f.files[0];
+          f.value = "";
+          if (file) addMailAnhang(parseInt(f.dataset.mfile, 10), file);
+        }));
+      chatEl.querySelectorAll("[data-mdel]").forEach((b) =>
+        b.addEventListener("click", () => {
+          const [mi, ai] = b.dataset.mdel.split(":").map((x) => parseInt(x, 10));
+          const m = App.qchat[mi];
+          if (m && m.data && m.data.anhaenge) { m.data.anhaenge.splice(ai, 1); render(); }
+        }));
+      chatEl.querySelectorAll("[data-msend]").forEach((b) =>
+        b.addEventListener("click", () => doMailSenden(parseInt(b.dataset.msend, 10))));
+      chatEl.querySelectorAll("[data-mcancel]").forEach((b) =>
+        b.addEventListener("click", () => {
+          const m = App.qchat[parseInt(b.dataset.mcancel, 10)];
+          m.resolved = true; m.cancelled = true;
+          App.qchat.push({ role: "q", text: "Okay, die Mail geht nicht raus." });
           render(); scrollDown();
         }));
       // 📎-Upload-Karte: Bild visualisieren, als Beleg ablegen oder im Archiv speichern
@@ -1902,6 +1969,79 @@ const SCREENS = {
       if (j && j.ok && j.mail_sent) { m.sent = true; render(); push({ role: "q", text: `✓ Rechnung an ${esc(j.email_used || r.kunde)} gesendet — Auftrag abgeschlossen.` }); }
       else if (j && j.ok) { m.sent = true; render(); push({ role: "q", text: `Rechnung in Lexware finalisiert${j.mail_error ? " (Mail offen: " + esc(j.mail_error) + ")" : ""}.` }); }
       else { push({ role: "err", text: (j && (j.error || j.mail_error)) || "Rechnung konnte nicht gesendet werden." }); }
+    }
+
+    // Anhang aus dem Dateisystem an einen Mail-Entwurf hängen. Die Bytes
+    // reisen als Base64 im Freigabe-Request mit — Microsoft Graph nimmt
+    // Anhänge bis 3 MB direkt am Entwurf entgegen (darüber bräuchte es eine
+    // Upload-Session), darum dieselbe Grenze schon hier.
+    const MAIL_ANH_MAX = 3 * 1024 * 1024;
+    const MAIL_ANH_COUNT = 5;
+
+    function fileToB64(file) {
+      return new Promise((resolve, reject) => {
+        const r = new FileReader();
+        r.onload = () => { const s = String(r.result || ""); resolve(s.slice(s.indexOf(",") + 1)); };
+        r.onerror = () => reject(new Error("read"));
+        r.readAsDataURL(file);
+      });
+    }
+
+    async function addMailAnhang(idx, file) {
+      const m = App.qchat[idx];
+      if (!m || m.resolved) return;
+      m.data.anhaenge = m.data.anhaenge || [];
+      if (m.data.anhaenge.length >= MAIL_ANH_COUNT) {
+        push({ role: "err", text: `Maximal ${MAIL_ANH_COUNT} Anhänge pro Mail.` }); return;
+      }
+      if (file.size > MAIL_ANH_MAX) {
+        push({ role: "err", text: `„${file.name}" ist zu groß (max 3 MB pro Anhang).` }); return;
+      }
+      let b64;
+      try { b64 = await fileToB64(file); }
+      catch (e) { push({ role: "err", text: "Datei konnte nicht gelesen werden." }); return; }
+      m.data.anhaenge.push({ quelle: "upload", name: file.name,
+                             mime: file.type || "application/octet-stream", b64 });
+      render();
+    }
+
+    async function doMailSenden(idx) {
+      const m = App.qchat[idx];
+      if (!m || m.resolved) return;
+      const d = m.data || {};
+      if (!/^[^@\s]+@[^@\s]+\.[a-zA-Z]{2,}$/.test((d.empfaenger || "").trim())) {
+        push({ role: "err", text: "Bitte eine gültige Empfänger-Adresse eintragen." }); return;
+      }
+      if ((d.betreff || "").trim().length < 2) { push({ role: "err", text: "Bitte einen Betreff eintragen." }); return; }
+      if ((d.text || "").trim().length < 2) { push({ role: "err", text: "Der Mail-Text fehlt." }); return; }
+      m.resolved = true; m.sent = false; render();
+      push({ role: "typing" });
+      const args = {
+        empfaenger: (d.empfaenger || "").trim(),
+        empfaenger_name: d.empfaenger_name || "",
+        betreff: (d.betreff || "").trim(),
+        text: (d.text || "").trim(),
+        kunde_name: d.kunde_name || "",
+        anhaenge: d.anhaenge || [],
+      };
+      let res, j = null;
+      try {
+        res = await fetch("/app/api/assistent/ausfuehren", { method: "POST",
+          headers: { "X-CSRF-Token": App.me.csrf, "Content-Type": "application/json" },
+          body: JSON.stringify({ tool: "email_schreiben", args }) });
+      } catch (e) { popTyping(); m.resolved = false; render(); push({ role: "err", text: "Netzwerkfehler beim Senden." }); return; }
+      if (res.status === 303 || res.status === 401 || res.redirected) { location.href = "/app/login"; return; }
+      try { j = await res.json(); } catch (e) {}
+      popTyping();
+      if (j && j.type === "done" && j.result && j.result.ok) {
+        m.sent = true; render();
+        push({ role: "q", text: "✓ " + resultText("email_schreiben", j.result) });
+      } else {
+        // Entwurf wieder aufmachen — der Nutzer soll Adresse/Text korrigieren
+        // und erneut senden können, statt den Text zu verlieren.
+        m.resolved = false; render();
+        push({ role: "err", text: (j && (j.text || (j.result && j.result.error))) || "Mail konnte nicht gesendet werden." });
+      }
     }
 
     function push(m) { App.qchat.push(m); render(); }
@@ -1993,6 +2133,7 @@ const SCREENS = {
       if (j.type === "message") push({ role: "q", text: j.text });
       else if (j.type === "error") push({ role: "err", text: j.text });
       else if (j.type === "confirm") push({ role: "confirm", tool: j.tool, args: j.args, summary: j.summary, frage: j.frage, resolved: false });
+      else if (j.type === "email_entwurf") push(mailDraftMsg(j));
       else if (j.type === "navigate") { if (j.text) push({ role: "q", text: j.text }); handleNavigate(j.bereich, j.kunde, j.kategorie); }
     }
 
@@ -2003,6 +2144,7 @@ const SCREENS = {
       let say = null;
       if (j.type === "message" || j.type === "navigate") say = j.text;
       else if (j.type === "confirm") say = j.frage || j.summary;
+      else if (j.type === "email_entwurf") say = j.frage || `Mail-Entwurf an ${j.empfaenger || j.empfaenger_name || "den Kunden"}: ${j.betreff || ""}`;
       if (say) App.qhistory.push({ role: "model", text: say });
     }
 
@@ -2031,6 +2173,7 @@ const SCREENS = {
       else if (j.type === "message") push({ role: "q", text: j.text });
       else if (j.type === "error") push({ role: "err", text: j.text });
       else if (j.type === "confirm") push({ role: "confirm", tool: j.tool, args: j.args, summary: j.summary, frage: j.frage, resolved: false });
+      else if (j.type === "email_entwurf") push(mailDraftMsg(j));
       else if (j.type === "navigate") { if (j.text) push({ role: "q", text: j.text }); handleNavigate(j.bereich, j.kunde, j.kategorie); }
       input.focus();
     }
@@ -2354,6 +2497,7 @@ const SCREENS = {
       { ico: "📚", label: "Wissen merken",       intent: "Ich möchte mir etwas in der Wissensdatenbank merken." },
       { ico: "🔍", label: "Kunde nachschlagen",  intent: "Ich möchte einen Kunden nachschlagen." },
       { ico: "✉️", label: "Anfrage beantworten", intent: "Ich möchte eine Kundenanfrage beantworten.",  feature: "mail_intake" },
+      { ico: "📧", label: "E-Mail schreiben",    intent: "Ich möchte eine E-Mail schreiben." },
       { ico: "📄", label: "Angebot erstellen",   intent: "Ich möchte ein Angebot erstellen.",           feature: "lexware", inhaber: true },
       { ico: "🧾", label: "Rechnung erstellen",  intent: "Ich möchte eine Rechnung schreiben.",          feature: "lexware", inhaber: true },
       { ico: "🎨", label: "Visualisierung",      viz: true,                                              feature: "visualisierung" },
@@ -4744,7 +4888,7 @@ function _qOverlayRender() {
     let lastQMsg = null;
     for (let i = chat.length - 1; i >= 0; i--) {
       const r = chat[i].role;
-      if (r === "q" || r === "err" || r === "confirm") { lastQIdx = i; lastQMsg = chat[i]; break; }
+      if (r === "q" || r === "err" || r === "confirm" || r === "mail") { lastQIdx = i; lastQMsg = chat[i]; break; }
     }
     if (lastQMsg) {
       const lastMe = chat.slice(0, lastQIdx).reverse().find((m) => m.role === "me");
@@ -4752,6 +4896,7 @@ function _qOverlayRender() {
       if (lastQMsg.role === "q")      html += `<div class="q-ov-bbl q">${lastQMsg.html ? lastQMsg.text : esc(lastQMsg.text || "")}</div>`;
       else if (lastQMsg.role === "err")  html += `<div class="q-ov-bbl err">${esc(lastQMsg.text || "")}</div>`;
       else if (lastQMsg.role === "confirm") html += `<div class="q-ov-bbl q">⚡ ${esc(lastQMsg.summary || "Aktion")} — <a href="#" id="q-ov-confirm-link">Im Assistenten bestätigen ›</a></div>`;
+      else if (lastQMsg.role === "mail") html += `<div class="q-ov-bbl q">✉️ Mail-Entwurf „${esc((lastQMsg.data || {}).betreff || "")}" — <a href="#" id="q-ov-confirm-link">im Assistenten prüfen ›</a></div>`;
     } else {
       html = `<p class="q-ov-hint">Stell mir eine Frage — ich bin auch hier.</p>`;
     }
@@ -4804,6 +4949,12 @@ async function _qOverlaySend(text) {
     const say = j.frage || j.summary;
     if (say) App.qhistory.push({ role: "model", text: say });
     App.qchat.push({ role: "confirm", tool: j.tool, args: j.args, summary: j.summary, frage: j.frage, resolved: false });
+  } else if (j.type === "email_entwurf") {
+    // Der Entwurf braucht Platz zum Redigieren — im Overlay nur anteasern,
+    // bearbeitet und freigegeben wird er im Assistenten.
+    const say = j.frage || `Mail-Entwurf an ${j.empfaenger || j.empfaenger_name || "den Kunden"}: ${j.betreff || ""}`;
+    App.qhistory.push({ role: "model", text: say });
+    App.qchat.push(mailDraftMsg(j));
   } else if (j.type === "error") {
     App.qchat.push({ role: "err", text: j.text });
   }

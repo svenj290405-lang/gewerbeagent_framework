@@ -3932,6 +3932,10 @@ async def api_anfrage_reply(
 # core/ai/command_center.py). Read-Tools laufen sofort, Write-Tools werden
 # erst nach Bestaetigung ausgefuehrt — daher zwei Endpunkte.
 
+# Obergrenze fuer den Freigabe-Request (Mail-Anhaenge reisen als Base64 mit).
+_ASSISTENT_MAX_BODY_BYTES = 20 * 1024 * 1024
+
+
 async def _build_command_ctx(request: Request):
     """Baut den Ausfuehrungskontext (tenant-isoliert) fuer das command_center."""
     from core.ai.command_center import Ctx
@@ -4013,8 +4017,21 @@ async def api_assistent_ausfuehren(
     NACH ausdruecklicher Bestaetigung des Nutzers.
 
     Body: { "tool": "...", "args": {...} }
+
+    Der Body ist normalerweise winzig; nur der Mail-Entwurf schickt
+    Anhaenge als Base64 mit. Darum eine grosszuegige, aber harte Obergrenze
+    (der Versand selbst begrenzt danach nochmal pro Anhang).
     """
     from core.ai.command_center import execute_confirmed
+
+    try:
+        laenge = int(request.headers.get("content-length") or 0)
+    except ValueError:
+        laenge = 0
+    if laenge > _ASSISTENT_MAX_BODY_BYTES:
+        return JSONResponse(
+            {"type": "error", "text": "Die Anhaenge sind zu gross (max 20 MB)."},
+            status_code=413)
 
     body = await request.json()
     tool = ((body or {}).get("tool") or "").strip()

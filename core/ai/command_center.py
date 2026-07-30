@@ -16,6 +16,10 @@ Architektur — bewusst sicher:
     Gemini schlägt sie vor; ``run_command`` gibt einen ``confirm``-Vorschlag
     zurück. Erst nach ausdrücklicher Bestätigung des Nutzers führt
     ``execute_confirmed`` die Aktion aus (fail-closed).
+  * **E-Mail schreiben** ist derselbe Mechanismus mit reicherer Vorschau:
+    statt einer Bestätigungszeile kommt ein vollständiger Entwurf
+    (Empfänger, Betreff, Text, Anhänge) zurück, den der Nutzer in der App
+    redigiert und dann über denselben Bestätigungsweg freigibt.
 
 Jedes Tool ist tenant-gescoped (alle DB-Zugriffe über ``ctx.tid``),
 feature-gegated (z.B. Kalender-Tools nur bei aktivem ``kalender``-Feature)
@@ -32,6 +36,7 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import logging
+import re
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
@@ -169,6 +174,22 @@ def _system_instruction(ctx: Ctx, screen_context: dict | None = None) -> str:
         "termin_verschieben (nicht stornieren und neu anlegen).\n"
         "- Notizen oder einen Ordner für einen Kunden im Drive-Archiv legst "
         "du mit drive_notiz_anlegen bzw. drive_ordner_anlegen an.\n"
+        "- Soll eine E-Mail geschrieben werden ('schreib X eine Mail', "
+        "'maile dem Kunden, dass...'), rufe SOFORT email_schreiben auf und "
+        "formuliere Betreff und Text KOMPLETT aus — mit Anrede, ganzem Inhalt "
+        "und Grußformel im Namen des Betriebs. Kennst du die Adresse nicht, "
+        "hol sie dir vorher mit kunde_suchen. Soll eine Datei aus dem "
+        "Kundenarchiv mit, hol dir erst mit archiv_dateien die datei_id.\n"
+        "- Bei E-Mails NIEMALS ankündigen, zusammenfassen oder um Erlaubnis "
+        "fragen ('Ich kann ihm schreiben, dass... Ist das so in Ordnung?'). "
+        "Der Nutzer bekommt den fertigen Entwurf zum Lesen, Ändern und "
+        "Freigeben in der App vorgelegt — DAS ist die Rückfrage. Antworte "
+        "also nie mit dem Mail-Inhalt als Text, sondern rufe das Tool auf. "
+        "Fehlt dir nur die Adresse, rufe es trotzdem auf und lass empfaenger "
+        "leer; der Nutzer trägt sie im Entwurf nach.\n"
+        "- Geht es um die Antwort auf eine bestehende offene Anfrage, nimm "
+        "anfrage_beantworten (bleibt im Mail-Thread); für Angebote und "
+        "Rechnungen die dafür vorgesehenen Tools — nicht email_schreiben.\n"
         "- Will der Nutzer eine Ansicht/Liste nur SEHEN ('zeig mir...', "
         "'öffne...', 'geh zu...'), rufe das Tool anzeige_oeffnen mit dem "
         "passenden Bereich auf.\n"
@@ -189,6 +210,38 @@ def _to_plain(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [_to_plain(v) for v in value]
     return value
+
+
+# Ein Mail-Auftrag im Befehl des Nutzers. Bewusst eng: entweder steht "mailen"
+# als Verb da, oder ein Verb des Schreibens/Schickens trifft auf das Substantiv
+# "Mail". Das blosse Wort "schreib" ("schreib das in die Wissensdatenbank")
+# reicht nicht.
+_MAILEN_VERB_RE = re.compile(r"\bmail(e|st|en|t)\b", re.I)
+_SCHREIB_VERB_RE = re.compile(r"\b(schreib\w*|schick\w*|send\w*|verfass\w*)\b", re.I)
+_MAIL_NOMEN_RE = re.compile(r"\b(mails?|e-?mails?)\b", re.I)
+
+
+def _ist_mail_auftrag(text: str) -> bool:
+    """Verlangt der Befehl erkennbar eine E-Mail?"""
+    t = text or ""
+    if _MAILEN_VERB_RE.search(t):
+        return True
+    return bool(_SCHREIB_VERB_RE.search(t)) and bool(_MAIL_NOMEN_RE.search(t))
+
+
+# Geminis "ich hab's im Kopf fertig, darf ich?"-Formulierungen. Bewusst NUR
+# Freigabe-Floskeln: eine echte Rueckfrage ("Was soll drinstehen?", "An wen?")
+# ist berechtigt und darf nicht in einen erfundenen Entwurf umgebogen werden.
+_FREIGABE_FRAGE_RE = re.compile(
+    r"(in ordnung|soll ich|passt (das|es)|einverstanden|so ok|richtig so|"
+    r"so (senden|schicken|verschicken|abschicken)|so belassen)", re.I)
+
+
+def _ist_freigabe_frage(say: str) -> bool:
+    """Hat Gemini den Mail-Inhalt in Prosa angekündigt und fragt nur noch,
+    ob er so passt? Dann fehlt der Entwurf, nicht die Information."""
+    s = say or ""
+    return "?" in s and bool(_FREIGABE_FRAGE_RE.search(s))
 
 
 def _build_genai_tool(specs: list[ToolSpec]):
@@ -219,6 +272,10 @@ async def run_command(text: str, ctx: Ctx, history: list | None = None, screen_c
          "frage": str|None}
             Eine schreibende Aktion ist vorbereitet und wartet auf
             Bestätigung. ``summary`` ist die Klartext-Zeile für die UI.
+      * {"type": "email_entwurf", "tool": "email_schreiben", "empfaenger",
+         "empfaenger_name", "betreff", "text", "kunde_name", "anhaenge",
+         "hinweis", "frage"}
+            Ein Mail-Entwurf wartet auf Redaktion + Freigabe.
       * {"type": "error", "text": str}
     """
     text = (text or "").strip()
@@ -263,6 +320,11 @@ async def run_command(text: str, ctx: Ctx, history: list | None = None, screen_c
             config=config,
         )
 
+    # Fuer die Mail-Nachfass-Regel unten: der Auftrag kann auch ein paar Turns
+    # zurueckliegen ("Schreib ihm eine Mail" → "Worum geht's?" → "dass ...").
+    mail_kontext = " ".join(
+        [text] + [((t or {}).get("text") or "") for t in (history or [])[-4:]])
+    nachgefasst = False  # Mail-Nachfass-Runde nur einmal (siehe unten)
     for _step in range(MAX_STEPS):
         # Bis zu 3 Versuche mit Backoff: ein 429 (RESOURCE_EXHAUSTED) ist meist
         # nur ein kurzer Burst des Vertex-Minutenkontingents (z.B. direkt nach
@@ -300,6 +362,22 @@ async def run_command(text: str, ctx: Ctx, history: list | None = None, screen_c
 
         if fc is None:
             # Kein Tool-Call → Gemini hat geantwortet oder nachgefragt.
+            # Sonderfall Mail: statt zu handeln kündigt Gemini den Inhalt
+            # gern in Prosa an und fragt "Ist das so in Ordnung?". Der Nutzer
+            # soll aber den fertigen Entwurf sehen — also einmal nachfassen
+            # (nur einmal, sonst dreht sich die Schleife).
+            if (not nachgefasst and _ist_mail_auftrag(mail_kontext)
+                    and _ist_freigabe_frage(say)
+                    and any(s.name == "email_schreiben" for s in specs)):
+                nachgefasst = True
+                logger.info("command_center: Mail-Auftrag ohne Tool-Call — fasse nach")
+                contents.append(cand_content)
+                contents.append(types.Content(role="user", parts=[types.Part.from_text(
+                    text="Frag nicht nach und fasse nichts zusammen. Rufe jetzt "
+                         "email_schreiben auf — mit Betreff und vollständig "
+                         "ausformuliertem Text. Der Nutzer sieht den Entwurf und "
+                         "gibt ihn selbst frei.")]))
+                continue
             return {"type": "message",
                     "text": say or "Ich habe dich nicht ganz verstanden — kannst du es anders sagen?"}
 
@@ -318,6 +396,14 @@ async def run_command(text: str, ctx: Ctx, history: list | None = None, screen_c
             kategorie = (args.get("kategorie") or "").strip().lower() or None
             return {"type": "navigate", "bereich": bereich,
                     "kunde": kunde, "kategorie": kategorie, "text": say or None}
+
+        if spec.name == "email_schreiben":
+            # Statt der Einzeiler-Bestätigung den kompletten Entwurf an die
+            # App geben — der Nutzer redigiert Empfänger/Betreff/Text und
+            # gibt erst dann frei (Versand läuft über execute_confirmed).
+            entwurf = await _build_email_entwurf(ctx, args)
+            entwurf["frage"] = say or None
+            return entwurf
 
         if spec.kind == "write":
             # NICHT ausführen — Bestätigung einholen.
@@ -393,6 +479,7 @@ async def _run_freie_slots(ctx: Ctx, args: dict) -> dict:
 
 async def _run_kunde_suchen(ctx: Ctx, args: dict) -> dict:
     from core.database.connection import get_session
+    from core.models.kunde import Kunde
     from core.models.kundengespraech import Kundengespraech
     from core.models.angebot import Angebot
     from core.models.rechnung import Rechnung
@@ -403,6 +490,14 @@ async def _run_kunde_suchen(ctx: Ctx, args: dict) -> dict:
         return {"error": "Bitte mindestens 2 Zeichen für die Suche."}
     like = f"%{name}%"
     async with get_session() as s:
+        # Stammdaten zuerst — daraus zieht Q u.a. die Mail-Adresse, wenn
+        # er eine Mail an den Kunden schreiben soll.
+        k = (await s.execute(
+            select(Kunde).where(Kunde.tenant_id == ctx.tid)
+            .where(Kunde.name.ilike(like))
+            .where(Kunde.merged_into_id.is_(None))
+            .order_by(Kunde.name).limit(5)
+        )).scalars().all()
         g = (await s.execute(
             select(Kundengespraech)
             .where(Kundengespraech.tenant_id == ctx.tid)
@@ -420,6 +515,8 @@ async def _run_kunde_suchen(ctx: Ctx, args: dict) -> dict:
             .order_by(Rechnung.created_at.desc()).limit(10)
         )).scalars().all()
     return {
+        "kunden": [{"name": x.name, "email": x.email, "telefon": x.telefon,
+                    "adresse": x.adresse} for x in k],
         "gespraeche": [{"kunde": x.kunde_name,
                         "briefing": (x.briefing_kurz or "")[:160],
                         "termin": x.termin_datum.isoformat() if x.termin_datum else None}
@@ -999,6 +1096,20 @@ async def _run_archiv_suchen(ctx: Ctx, args: dict) -> dict:
         for f in folders[:15]]}
 
 
+async def _run_archiv_dateien(ctx: Ctx, args: dict) -> dict:
+    """Listet die Dateien im Drive-Archiv-Ordner eines Kunden — mit ID,
+    damit Q eine davon als Mail-Anhang vorschlagen kann."""
+    from core.integrations.google_drive import list_files_in_kunde_folder
+
+    name = (args.get("kunde_name") or "").strip()
+    if len(name) < 2:
+        return {"error": "Bitte den Kundennamen nennen."}
+    dateien = await list_files_in_kunde_folder(ctx.tid, name)
+    return {"anzahl": len(dateien), "dateien": [
+        {"datei_id": f["id"], "name": f["name"], "typ": f["mime_type"]}
+        for f in dateien[:25]]}
+
+
 async def _run_rechnungen_pruefen(ctx: Ctx, args: dict) -> dict:
     """Synchronisiert den Bezahl-Status offener Rechnungen mit Lexware
     (spiegelt /rechnung_pruefen). Kein Versand, nur Abgleich + Markierung."""
@@ -1176,6 +1287,80 @@ def _summary_anfrage_beantworten(ctx: Ctx, args: dict) -> str:
     a = (args.get("antwort_text") or "").strip()
     return (f"Antwort an {(args.get('kunde_name') or '—').strip()} senden: "
             f"„{a[:90]}{'…' if len(a) > 90 else ''}\"?")
+
+
+# ---- WRITE (Freie E-Mail) -------------------------------------------------
+#
+# Sonderfall im Ablauf: statt der einzeiligen Bestaetigung liefert
+# ``run_command`` fuer dieses Tool einen kompletten Entwurf zurueck
+# (Empfaenger, Betreff, Text, Anhaenge). Die App zeigt ihn zum Redigieren
+# an; abgeschickt wird er ueber denselben Bestaetigungs-Endpunkt wie jedes
+# andere Write-Tool — mit den Werten, die der Nutzer am Ende freigibt.
+# Fail-closed bleibt es damit: ohne Freigabe geht keine Mail raus.
+
+async def _build_email_entwurf(ctx: Ctx, args: dict) -> dict:
+    """Baut aus Geminis Vorschlag den Entwurf fuer die Entwurfs-Karte."""
+    from core.services.mail_compose import (
+        EMAIL_RE, MAX_BETREFF, MAX_TEXT, lookup_kunde_email, normalize_anhaenge)
+
+    kunde = (args.get("kunde_name") or "").strip()
+    empfaenger = (args.get("empfaenger") or "").strip()
+    hinweis = None
+    if not empfaenger and kunde:
+        empfaenger = await lookup_kunde_email(ctx.tid, kunde) or ""
+    if not empfaenger:
+        hinweis = "Ich habe keine Adresse gefunden — bitte trag sie ein."
+    elif not EMAIL_RE.match(empfaenger):
+        hinweis = "Die Adresse sieht nicht vollständig aus — bitte prüfen."
+
+    # Von Gemini vorgeschlagene Drive-Anhaenge: Namen nachschlagen, damit
+    # in der Karte nicht nur eine kryptische Datei-ID steht.
+    anhaenge = normalize_anhaenge(args.get("anhang_datei_ids") or args.get("anhaenge"))
+    drive_ids = [a["id"] for a in anhaenge if a.get("quelle") == "drive" and not a.get("name")]
+    if drive_ids and kunde:
+        try:
+            from core.integrations.google_drive import list_files_in_kunde_folder
+            namen = {f["id"]: f["name"]
+                     for f in await list_files_in_kunde_folder(ctx.tid, kunde)}
+            for a in anhaenge:
+                if a.get("quelle") == "drive" and not a.get("name"):
+                    a["name"] = namen.get(a["id"], "Anhang")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("email_entwurf: Anhang-Namen nicht ladbar: %s", exc)
+
+    return {
+        "type": "email_entwurf",
+        "tool": "email_schreiben",
+        "empfaenger": empfaenger,
+        "empfaenger_name": (args.get("empfaenger_name") or "").strip() or kunde,
+        "betreff": (args.get("betreff") or "").strip()[:MAX_BETREFF],
+        "text": (args.get("text") or "").strip()[:MAX_TEXT],
+        "kunde_name": kunde,
+        "anhaenge": [{"quelle": a.get("quelle"), "id": a.get("id"),
+                      "name": a.get("name") or "Anhang"}
+                     for a in anhaenge if a.get("quelle") == "drive"],
+        "hinweis": hinweis,
+    }
+
+
+async def _run_email_senden(ctx: Ctx, args: dict) -> dict:
+    from core.services.mail_compose import normalize_anhaenge, send_freie_mail
+
+    anhaenge = normalize_anhaenge(args.get("anhaenge") or args.get("anhang_datei_ids"))
+    return await send_freie_mail(
+        ctx.tid,
+        to_email=(args.get("empfaenger") or "").strip(),
+        to_name=(args.get("empfaenger_name") or "").strip() or None,
+        betreff=(args.get("betreff") or "").strip(),
+        text=(args.get("text") or "").strip(),
+        anhaenge=anhaenge,
+        employee_id=getattr(ctx.employee, "id", None))
+
+
+def _summary_email(ctx: Ctx, args: dict) -> str:
+    an = (args.get("empfaenger") or args.get("empfaenger_name") or "—").strip()
+    betreff = (args.get("betreff") or "").strip()
+    return f"E-Mail an {an} senden: „{betreff[:70]}{'…' if len(betreff) > 70 else ''}\"?"
 
 
 # ---- WRITE (Drive-Archiv) -------------------------------------------------
@@ -1575,6 +1760,15 @@ _REGISTRY: list[ToolSpec] = [
         parameters={"type": "OBJECT", "properties": {}},
         run=_run_rechnungen_pruefen),
     ToolSpec(
+        name="archiv_dateien", kind="read", feature="drive_archiv",
+        description="Listet die Dateien im Drive-Archiv-Ordner eines Kunden "
+                    "mit ihrer datei_id. Vor dem Anhaengen einer Archiv-Datei "
+                    "an eine E-Mail aufrufen, um die richtige datei_id zu finden.",
+        parameters={"type": "OBJECT", "properties": {
+            "kunde_name": {"type": _S, "description": "Name des Kunden."}},
+            "required": ["kunde_name"]},
+        run=_run_archiv_dateien),
+    ToolSpec(
         name="formulare_status", kind="read", feature="anfrage_formular",
         description="Zeigt den Status der Kunden-Anfrage-Formulare der letzten "
                     "30 Tage (offen / ausgefüllt / abgelaufen).",
@@ -1641,6 +1835,33 @@ _REGISTRY: list[ToolSpec] = [
             "abschliessen": {"type": "BOOLEAN", "description": "Anfrage danach als erledigt schliessen?"}},
             "required": ["kunde_name", "antwort_text"]},
         run=_run_anfrage_beantworten, summarize=_summary_anfrage_beantworten),
+    ToolSpec(
+        name="email_schreiben", kind="write",
+        description="Verfasst eine frei formulierte E-Mail (Empfänger, Betreff, "
+                    "Text, optional Anhänge) und legt sie dem Nutzer als Entwurf "
+                    "zur Freigabe vor. VERSCHICKT NICHTS — der Aufruf öffnet nur "
+                    "den Entwurf, den der Nutzer in der App liest, ändert und "
+                    "freigibt. Darum immer direkt aufrufen und vorher NIE um "
+                    "Erlaubnis fragen oder den Mail-Inhalt als Text ankündigen. "
+                    "Für jede Mail, die keine Antwort auf eine offene Anfrage und "
+                    "kein Angebots-/Rechnungsversand ist. Betreff und Text IMMER "
+                    "vollständig ausformulieren (Anrede, Inhalt, Grußformel) — "
+                    "der Nutzer redigiert nur noch.",
+        parameters={"type": "OBJECT", "properties": {
+            "empfaenger": {"type": _S, "description":
+                "E-Mail-Adresse des Empfängers. Unbekannt? Erst kunde_suchen "
+                "aufrufen; findet sich nichts, das Feld leer lassen."},
+            "empfaenger_name": {"type": _S, "description": "Name des Empfängers."},
+            "betreff": {"type": _S, "description": "Betreffzeile."},
+            "text": {"type": _S, "description":
+                "Der komplette Mail-Text inkl. Anrede und Grußformel."},
+            "kunde_name": {"type": _S, "description":
+                "Kunde, um den es geht (für Adress-Suche und Archiv-Anhänge)."},
+            "anhang_datei_ids": {"type": "ARRAY", "items": {"type": _S},
+                                 "description":
+                "Optionale datei_id-Werte aus archiv_dateien, die angehängt werden sollen."}},
+            "required": ["betreff", "text"]},
+        run=_run_email_senden, summarize=_summary_email),
     ToolSpec(
         name="termin_verschieben", kind="write", feature="kalender",
         description="Verschiebt den anstehenden Termin eines Kunden auf ein "

@@ -197,13 +197,14 @@ _ERWARTETE_TOOLS = {
     # read
     "freie_termine_finden", "kunde_suchen", "material_liste", "offene_rueckrufe",
     "anzeige_oeffnen", "anstehende_termine", "team_status", "offene_anfragen",
-    "wissen_suchen", "archiv_suchen", "rechnungen_pruefen", "formulare_status",
+    "wissen_suchen", "archiv_suchen", "archiv_dateien", "rechnungen_pruefen",
+    "formulare_status",
     # write
     "termin_anlegen", "termin_stornieren", "termin_verschieben", "rueckruf_anlegen",
     "rueckruf_erledigt", "material_bestellen", "material_anlegen",
     "abwesenheit_melden", "mitarbeiter_zurueck", "wissen_merken", "wissen_loeschen",
     "auftrag_status", "angebot_erstellen", "angebot_senden", "rechnung_erstellen",
-    "rechnung_abrechnen", "anfrage_beantworten",
+    "rechnung_abrechnen", "anfrage_beantworten", "email_schreiben",
     "drive_ordner_anlegen", "drive_notiz_anlegen",
 }
 
@@ -322,3 +323,151 @@ async def test_no_function_call_returns_message(monkeypatch):
     res = await cc.run_command("Hallo", _ctx())
     assert res["type"] == "message"
     assert res["text"] == "Wie kann ich helfen?"
+
+
+# --------------------------------------------------------------------------
+# E-Mail schreiben: Entwurf -> Freigabe -> Versand
+# --------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_email_tool_returns_entwurf_without_sending(monkeypatch):
+    gesendet = {"ran": False}
+
+    async def fake_send(ctx, args):
+        gesendet["ran"] = True
+        return {"ok": True}
+
+    _patch_tool(monkeypatch, "email_schreiben", fake_send)
+    _patch_gemini(monkeypatch, [
+        _resp([_part_fc("email_schreiben", {
+            "empfaenger": "meier@example.de", "empfaenger_name": "Frau Meier",
+            "betreff": "Termin Donnerstag",
+            "text": "Hallo Frau Meier,\n\nwir kommen Donnerstag um 10 Uhr.\n\nViele Grüße"})]),
+    ])
+
+    res = await cc.run_command("Schreib Frau Meier wegen Donnerstag", _ctx())
+    assert res["type"] == "email_entwurf"
+    assert res["tool"] == "email_schreiben"
+    assert res["empfaenger"] == "meier@example.de"
+    assert res["betreff"] == "Termin Donnerstag"
+    assert "Donnerstag" in res["text"]
+    assert res["hinweis"] is None
+    assert gesendet["ran"] is False  # ohne Freigabe geht nichts raus
+
+
+@pytest.mark.asyncio
+async def test_email_entwurf_ohne_adresse_setzt_hinweis(monkeypatch):
+    # Kein empfaenger, kein Kunde im Stamm -> Entwurf trotzdem da, aber
+    # mit Hinweis; die Adresse traegt der Nutzer in der Karte nach.
+    async def keine_adresse(tid, kunde_name):
+        return None
+
+    import core.services.mail_compose as mc
+    monkeypatch.setattr(mc, "lookup_kunde_email", keine_adresse)
+    _patch_gemini(monkeypatch, [
+        _resp([_part_fc("email_schreiben", {
+            "kunde_name": "Meier", "betreff": "Rückfrage", "text": "Hallo,\n\nkurze Frage."})]),
+    ])
+    res = await cc.run_command("Schreib Meier eine Mail", _ctx())
+    assert res["type"] == "email_entwurf"
+    assert res["empfaenger"] == ""
+    assert res["hinweis"]
+
+
+@pytest.mark.asyncio
+async def test_email_versand_erst_nach_freigabe(monkeypatch):
+    gesehen = {}
+
+    async def fake_send_freie_mail(tid, **kw):
+        gesehen.update(kw)
+        return {"ok": True, "to_email": kw["to_email"], "betreff": kw["betreff"],
+                "anhaenge": len(kw.get("anhaenge") or [])}
+
+    import core.services.mail_compose as mc
+    monkeypatch.setattr(mc, "send_freie_mail", fake_send_freie_mail)
+
+    res = await cc.execute_confirmed("email_schreiben", {
+        "empfaenger": "meier@example.de", "betreff": "Termin",
+        "text": "Hallo,\n\nbis Donnerstag.",
+        "anhaenge": [{"name": "Aufmass.pdf", "mime": "application/pdf", "b64": "aGk="}],
+    }, _ctx())
+
+    assert res["type"] == "done"
+    assert res["result"]["ok"] is True
+    assert gesehen["to_email"] == "meier@example.de"
+    assert gesehen["anhaenge"][0]["quelle"] == "upload"
+
+
+def test_email_tool_ist_write_und_ungegated():
+    spec = cc._spec_by_name("email_schreiben")
+    assert spec is not None
+    assert spec.kind == "write"          # nie Auto-Execute
+    assert spec.summarize is not None
+    # Mails schreiben darf jeder Mitarbeiter, auch ohne Zusatz-Feature.
+    monteur = _ctx(features=(), is_inhaber=False)
+    assert "email_schreiben" in {s.name for s in cc._available_tools(monteur)}
+
+
+@pytest.mark.parametrize("text,erwartet", [
+    ("Schreib Henrik eine Mail, dass er morgen kommen kann", True),
+    ("Maile dem Kunden die Bestätigung", True),
+    ("Schick Frau Meier eine E-Mail", True),
+    ("Trag Frau Meier morgen 14 Uhr ein", False),
+    ("Zeig mir die offenen Rückrufe", False),
+    ("Schreib das in die Wissensdatenbank", False),   # kein Mail-Wort
+])
+def test_ist_mail_auftrag(text, erwartet):
+    assert cc._ist_mail_auftrag(text) is erwartet
+
+
+@pytest.mark.parametrize("say,erwartet", [
+    ("Ich kann Henrik schreiben, dass er morgen kommt. Ist das so in Ordnung?", True),
+    ("Soll ich ihm das so schicken?", True),
+    ("An welche Adresse soll die Mail gehen?", False),   # echte Rueckfrage
+    ("Was soll in der Mail stehen?", False),
+    ("Alles klar, erledigt.", False),
+])
+def test_ist_freigabe_frage(say, erwartet):
+    assert cc._ist_freigabe_frage(say) is erwartet
+
+
+@pytest.mark.asyncio
+async def test_mail_ankuendigung_wird_zum_entwurf_nachgefasst(monkeypatch):
+    # Gemini kuendigt den Mail-Inhalt als Text an und fragt um Erlaubnis,
+    # statt das Tool zu rufen. Genau das will Henrik nicht sehen — die
+    # Schleife fasst einmal nach und liefert den fertigen Entwurf.
+    models = _patch_gemini(monkeypatch, [
+        _resp([_part_text("Ich kann Henrik eine E-Mail schicken, dass er morgen "
+                          "vorbeikommen kann. Ist das so in Ordnung?")]),
+        _resp([_part_fc("email_schreiben", {
+            "empfaenger": "henrik@example.de", "betreff": "Gespräch morgen",
+            "text": "Hallo Henrik,\n\nmorgen passt.\n\nViele Grüße"})]),
+    ])
+
+    res = await cc.run_command("Schreib Henrik eine Mail wegen morgen", _ctx())
+    assert res["type"] == "email_entwurf"
+    assert res["betreff"] == "Gespräch morgen"
+    assert models.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_echte_rueckfrage_bleibt_rueckfrage(monkeypatch):
+    # Fehlt Q wirklich eine Angabe, darf die Nachfass-Regel NICHT greifen —
+    # sonst erfindet er den Mail-Inhalt.
+    models = _patch_gemini(monkeypatch, [
+        _resp([_part_text("An welche Adresse soll die Mail gehen?")]),
+    ])
+    res = await cc.run_command("Schreib Henrik eine Mail", _ctx())
+    assert res["type"] == "message"
+    assert models.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_nachfassen_passiert_nur_einmal(monkeypatch):
+    models = _patch_gemini(monkeypatch, [
+        _resp([_part_text("Ich schreibe ihm, dass es morgen passt. Ist das so in Ordnung?")]),
+        _resp([_part_text("Soll ich das wirklich so schicken?")]),
+    ])
+    res = await cc.run_command("Schreib Henrik eine Mail wegen morgen", _ctx())
+    assert res["type"] == "message"
+    assert models.calls == 2  # kein Endlos-Nachfassen

@@ -191,13 +191,20 @@ button:disabled { opacity: .6; }
   min-width: 40px; text-align: right; font-variant-numeric: tabular-nums; }
 .card.lead { border-left: 3px solid var(--primary); }
 
-/* Rechnungs-Karte im Q-Chat */
-.bubble.rechnung { max-width: 94%; }
+/* Rechnungs- und Mail-Karte im Q-Chat */
+.bubble.rechnung, .bubble.mail { max-width: 94%; }
 .bubble.rechnung .rech-pos { background: var(--bg); border-radius: 10px; padding: 4px 12px; margin: 0 0 12px; }
-.bubble.rechnung label { display: block; margin-bottom: 2px; }
-.bubble.rechnung .rech-input { width: 100%; margin: 0 0 12px; padding: 10px 12px;
-  border: 1px solid var(--line); border-radius: 10px; font-size: 15px; font-family: inherit; }
-.bubble.rechnung textarea.rech-input { resize: vertical; min-height: 90px; line-height: 1.4; }
+.bubble.rechnung label, .bubble.mail label { display: block; margin-bottom: 2px; }
+.bubble.rechnung .rech-input, .bubble.mail .rech-input { width: 100%; margin: 0 0 12px; padding: 10px 12px;
+  border: 1px solid var(--line); border-radius: 10px; font-size: 15px; font-family: inherit;
+  background: var(--card); color: var(--text); }
+.bubble.rechnung textarea.rech-input, .bubble.mail textarea.rech-input { resize: vertical; min-height: 90px; line-height: 1.4; }
+.bubble.mail .mail-anh { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: 0 0 12px; }
+.bubble.mail .mail-chip { display: inline-flex; align-items: center; gap: 4px; max-width: 100%;
+  background: var(--bg); border: 1px solid var(--line); border-radius: 999px;
+  padding: 5px 6px 5px 10px; font-size: 13px; overflow-wrap: anywhere; }
+.bubble.mail .mail-chip-x { border: 0; background: none; color: var(--muted);
+  font-size: 13px; line-height: 1; padding: 2px 4px; cursor: pointer; }
 
 /* Tipp-Animation (drei Punkte) */
 .bubble.typing { display: flex; gap: 4px; align-items: center; padding: 14px; }
