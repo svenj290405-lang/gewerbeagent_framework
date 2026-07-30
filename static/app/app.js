@@ -2894,6 +2894,10 @@ let _composerPositionen = [];
 let _composerMode = "angebot"; // "angebot" | "rechnung"
 let _rechnungInputMode = "pauschal"; // pauschal | positionen
 
+// min-width:0 an den drei Feldern der Mengenzeile: Flex-Kinder schrumpfen
+// sonst nie unter ihre Eigenbreite, und drei nebeneinanderliegende <input>
+// sind zusammen breiter als ein Handy-Display — die ganze Seite liess sich
+// dadurch waagerecht schieben (auf 390 px: 657 px Inhalt).
 function _composerPositionRow(p, idx) {
   return `<div class="card" style="padding:12px;margin-bottom:8px" data-pos="${idx}">
     <div class="row" style="align-items:flex-start">
@@ -2904,11 +2908,11 @@ function _composerPositionRow(p, idx) {
           style="width:100%;padding:8px;border:1px solid var(--line);border-radius:8px;margin-bottom:6px;font-size:14px" />
         <div style="display:flex;gap:6px">
           <input type="number" data-fld="menge" value="${esc(p.menge || 1)}" step="0.01" min="0.01"
-            style="flex:1;padding:8px;border:1px solid var(--line);border-radius:8px;font-size:14px" placeholder="Menge" />
+            style="flex:1;min-width:0;padding:8px;border:1px solid var(--line);border-radius:8px;font-size:14px" placeholder="Menge" />
           <input type="text" data-fld="einheit" value="${esc(p.einheit || 'Stueck')}"
-            style="flex:1;padding:8px;border:1px solid var(--line);border-radius:8px;font-size:14px" placeholder="Einheit" />
+            style="flex:1;min-width:0;padding:8px;border:1px solid var(--line);border-radius:8px;font-size:14px" placeholder="Einheit" />
           <input type="number" data-fld="preis_brutto_eur" value="${esc(p.preis_brutto_eur || '')}" step="0.01" min="0"
-            style="flex:1.2;padding:8px;border:1px solid var(--line);border-radius:8px;font-size:14px" placeholder="EUR brutto" />
+            style="flex:1.2;min-width:0;padding:8px;border:1px solid var(--line);border-radius:8px;font-size:14px" placeholder="EUR brutto" />
         </div>
       </div>
       <button class="btn-sm btn-ghost" data-del-pos="${idx}" style="padding:4px 8px;margin-left:6px" title="Entfernen">✕</button>
@@ -2959,8 +2963,8 @@ function _composerKundenFields() {
     <label class="sub">Straße + Nr.</label>
     <input type="text" id="c-kunde-str" style="width:100%;padding:12px;border:1px solid var(--line);border-radius:10px;margin:4px 0 10px;font-size:16px" />
     <div style="display:flex;gap:8px">
-      <input type="text" id="c-kunde-plz" placeholder="PLZ" style="flex:0 0 30%;padding:12px;border:1px solid var(--line);border-radius:10px;margin:4px 0 10px;font-size:16px" />
-      <input type="text" id="c-kunde-ort" placeholder="Ort" style="flex:1;padding:12px;border:1px solid var(--line);border-radius:10px;margin:4px 0 10px;font-size:16px" />
+      <input type="text" id="c-kunde-plz" placeholder="PLZ" style="flex:0 0 30%;min-width:0;padding:12px;border:1px solid var(--line);border-radius:10px;margin:4px 0 10px;font-size:16px" />
+      <input type="text" id="c-kunde-ort" placeholder="Ort" style="flex:1;min-width:0;padding:12px;border:1px solid var(--line);border-radius:10px;margin:4px 0 10px;font-size:16px" />
     </div>
   </div>`;
 }

@@ -124,7 +124,7 @@ async def test_auftraege_shows_state_label_prominently(monkeypatch):
     reply = await tn._handle_auftraege_command(chat_id=1)
 
     # State-Labels als Klartext (mit Emoji) sichtbar
-    assert "🔨 Arbeit laeuft" in reply
+    assert "🔨 Arbeit läuft" in reply
     assert "✅ Angenommen" in reply
     # Kunden + Betraege
     assert "Sven Jantos" in reply

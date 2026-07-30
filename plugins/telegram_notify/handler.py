@@ -7060,7 +7060,7 @@ async def _handle_auftrag_show_command(chat_id, id_prefix: str):
         ])
     if ang.status in (ANGEBOT_STATUS_RECHNUNG_ERSTELLT, ANGEBOT_STATUS_ACCEPTED):
         btns.append([
-            {"text": "🔨 Arbeit laeuft",
+            {"text": "🔨 Arbeit läuft",
              "callback_data": f"auftrag:set:{aid}:{ANGEBOT_STATUS_WORK_IN_PROGRESS}"},
         ])
     if ang.status in (

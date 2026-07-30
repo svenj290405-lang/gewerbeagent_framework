@@ -70,7 +70,11 @@ button:disabled { opacity: .6; }
   padding: 10px 0; border-bottom: 1px solid var(--line); }
 .row:last-child { border-bottom: 0; }
 .row .sub { color: var(--muted); font-size: 13px; }
-.pill { font-size: 12px; padding: 3px 9px; border-radius: 999px; background: #eef2f7; color: var(--muted); }
+/* nowrap: der Status ist kurz und soll als EIN Etikett lesbar bleiben —
+   ohne das brach das angehaengte "›" der Auftragskarte allein in eine
+   zweite Zeile um. Der Text links daneben darf stattdessen umbrechen. */
+.pill { font-size: 12px; padding: 3px 9px; border-radius: 999px; background: #eef2f7;
+  color: var(--muted); white-space: nowrap; }
 .pill.ok { background: #e3f6ec; color: var(--ok); }
 .pill.warn { background: #fdf3da; color: var(--warn); }
 .pill.danger { background: #fce6e5; color: var(--danger); }
