@@ -122,7 +122,9 @@
 // "Arbeit laeuft", Auftrag antippbar mit voller Detailansicht + abhakbarer
 // Fortschrittszeile, Liste "Abgeschlossene Auftraege" (Drive-Archiv je
 // Auftrag) und Prozess-Editor als Aktivitaetsdiagramm mit Drag & Drop.
-const CACHE = "ga-app-v65";
+// v66: Auftraege lassen sich von Hand anlegen (Kunde + Positionen +
+// Startschritt) — fuer Arbeit, die nie durch die Angebots-Pipeline lief.
+const CACHE = "ga-app-v66";
 const SHELL = [
   "/app",
   "/app/static/app-beta.css",

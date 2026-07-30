@@ -174,6 +174,120 @@ async def create_angebot(
 
 
 # ---------------------------------------------------------------------------
+# Auftrag von Hand anlegen (nur DB, KEIN Lexware-Draft)
+# ---------------------------------------------------------------------------
+
+# Feldlaengen der angebote-/angebot_positionen-Spalten. Hier gekappt statt
+# der DB einen 300-Zeichen-Namen hinzuwerfen (der knallt sonst als 500).
+_MAX_KUNDE_NAME = 300
+_MAX_EMAIL = 255
+_MAX_STRASSE = 300
+_MAX_PLZ = 20
+_MAX_ORT = 200
+_MAX_POS_NAME = 500
+_MAX_EINHEIT = 50
+
+
+def _kurz(text: str | None, maxlen: int) -> str | None:
+    t = (text or "").strip()
+    return t[:maxlen] or None
+
+
+async def create_auftrag_manuell(
+    tid: uuid.UUID, *, kunde_name: str, positionen: list[dict],
+    status: str | None = None,
+    kunde_strasse: str | None = None, kunde_plz: str | None = None,
+    kunde_ort: str | None = None, kunde_email: str | None = None,
+    quelle: str = "manuell",
+) -> dict:
+    """Legt einen Auftrag direkt in der Auftragsliste an — ohne Angebot und
+    ohne Lexware-Draft. Fuer Arbeit, die am Telefon oder auf der Baustelle
+    vereinbart wurde und nie durch die Angebots-Pipeline gelaufen ist.
+
+    Der Auftrag ist trotzdem vollwertig: die Rechnung am Ende entsteht in
+    ``finalize_and_send_invoice`` aus den Positionen und nicht aus dem
+    Lexware-Angebot. Ein handangelegter Auftrag laeuft also bis zum
+    Rechnungsversand und ins Drive-Archiv wie jeder andere.
+
+    ``status`` ist der Schritt, an dem der Auftrag startet (Default:
+    angenommen — von Hand angelegt heisst in der Praxis "Kunde hat zugesagt").
+    Erlaubt sind die Lifecycle-Schritte AUSSER ``rechnung_gesendet``: der
+    schliesst den Auftrag ab und loest Rechnung + Archiv aus (Geld-Pfad),
+    das darf eine Neuanlage nicht ueberspringen.
+    """
+    from core.database.connection import get_session
+    from core.models.angebot import (
+        Angebot, ANGEBOT_STATUS_ACCEPTED, ANGEBOT_STATUS_RECHNUNG_GESENDET,
+        AUFTRAG_LIFECYCLE)
+    from core.models.angebot_position import AngebotPosition
+
+    kunde_name = (kunde_name or "").strip()
+    if not kunde_name:
+        return {"ok": False, "error": "Kundenname ist Pflicht."}
+
+    status = (status or "").strip() or ANGEBOT_STATUS_ACCEPTED
+    if status == ANGEBOT_STATUS_RECHNUNG_GESENDET or status not in AUFTRAG_LIFECYCLE:
+        return {"ok": False, "error": "Dieser Startschritt ist nicht erlaubt."}
+
+    if not positionen:
+        return {"ok": False, "error": "Mindestens 1 Position."}
+    _items, gesamt, err = _positionen_to_line_items(positionen)
+    if err:
+        return {"ok": False, "error": err}
+    if not _items:
+        return {"ok": False, "error": "Mindestens 1 gueltige Position."}
+
+    async with get_session() as s:
+        ang = Angebot(
+            tenant_id=tid, quelle=quelle, raw_input=None,
+            kunde_name=kunde_name[:_MAX_KUNDE_NAME],
+            kunde_strasse=_kurz(kunde_strasse, _MAX_STRASSE),
+            kunde_plz=_kurz(kunde_plz, _MAX_PLZ),
+            kunde_ort=_kurz(kunde_ort, _MAX_ORT),
+            kunde_email=_kurz(kunde_email, _MAX_EMAIL),
+            status=status,
+            gesamtbetrag_brutto_eur=gesamt,
+        )
+        # Ab "angenommen" gehoert die Zusage des Kunden zur Geschichte des
+        # Auftrags — die Detailansicht zeigt sie als "angenommen am" an.
+        if AUFTRAG_LIFECYCLE.index(status) >= AUFTRAG_LIFECYCLE.index(
+                ANGEBOT_STATUS_ACCEPTED):
+            import datetime as _dt
+            ang.accepted_at = _dt.datetime.now(_dt.timezone.utc)
+        s.add(ang)
+        await s.flush()
+        from core.services.kunde_identity import (
+            compose_adresse, resolve_kunde_id_safe)
+        ang.kunde_id = await resolve_kunde_id_safe(
+            s, tid, kunde_name, email=kunde_email,
+            adresse=compose_adresse(kunde_strasse, kunde_plz, kunde_ort),
+        )
+        for i, p in enumerate(positionen, start=1):
+            name = (p.get("name") or "").strip()
+            if not name:
+                continue
+            try:
+                menge = Decimal(str(p.get("menge") or 1))
+                preis = Decimal(str(p.get("preis_brutto_eur") or 0))
+            except Exception:  # noqa: BLE001
+                continue
+            s.add(AngebotPosition(
+                angebot_id=ang.id, position_nr=i, name=name[:_MAX_POS_NAME],
+                beschreibung=(p.get("beschreibung") or "").strip() or None,
+                menge=menge,
+                einheit=_kurz(p.get("einheit"), _MAX_EINHEIT) or "Stueck",
+                preis_brutto_eur=preis, mwst_prozent=int(p.get("mwst_prozent") or 19),
+            ))
+        await s.commit()
+        ang_id = ang.id
+
+    logger.info("Auftrag von Hand angelegt: id=%s tenant=%s status=%s quelle=%s",
+                ang_id, tid, status, quelle)
+    return {"ok": True, "id": str(ang_id), "kunde": kunde_name,
+            "status": status, "gesamt_brutto_eur": float(gesamt)}
+
+
+# ---------------------------------------------------------------------------
 # Rechnung anlegen (DB + Lexware-Draft)
 # ---------------------------------------------------------------------------
 

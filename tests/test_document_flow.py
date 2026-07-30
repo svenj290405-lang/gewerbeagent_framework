@@ -107,6 +107,120 @@ async def test_create_angebot_requires_positionen():
 
 
 @pytest.mark.asyncio
+async def test_auftrag_manuell_requires_kunde():
+    res = await df.create_auftrag_manuell(
+        TID, kunde_name=" ", positionen=[{"name": "X", "preis_brutto_eur": 5}])
+    assert res["ok"] is False
+
+
+@pytest.mark.asyncio
+async def test_auftrag_manuell_requires_positionen():
+    res = await df.create_auftrag_manuell(TID, kunde_name="Meier", positionen=[])
+    assert res["ok"] is False
+
+
+@pytest.mark.asyncio
+async def test_auftrag_manuell_lehnt_rechnung_gesendet_ab():
+    """Der Abschluss-Schritt loest Rechnungsversand + Archiv aus (Geld-Pfad).
+    Eine Neuanlage darf da nicht hineinspringen."""
+    res = await df.create_auftrag_manuell(
+        TID, kunde_name="Meier", status="rechnung_gesendet",
+        positionen=[{"name": "X", "preis_brutto_eur": 5}])
+    assert res["ok"] is False
+
+
+@pytest.mark.asyncio
+async def test_auftrag_manuell_lehnt_erfundenen_status_ab():
+    res = await df.create_auftrag_manuell(
+        TID, kunde_name="Meier", status="voellig_erfunden",
+        positionen=[{"name": "X", "preis_brutto_eur": 5}])
+    assert res["ok"] is False
+
+
+class _CaptureSession:
+    """Fake-Session, die die angelegten Objekte festhaelt."""
+
+    def __init__(self):
+        self.objekte = []
+
+    def add(self, obj):
+        self.objekte.append(obj)
+
+    async def flush(self):
+        # Spiegelt die DB: die id steht erst nach dem Flush fest.
+        for o in self.objekte:
+            if getattr(o, "id", None) is None:
+                o.id = uuid.uuid4()
+
+    async def commit(self):
+        pass
+
+    async def execute(self, stmt):
+        return SimpleNamespace(scalar_one_or_none=lambda: None)
+
+
+def _patch_capture(monkeypatch):
+    sess = _CaptureSession()
+    import core.database.connection as conn
+    import core.services.kunde_identity as ki
+
+    @asynccontextmanager
+    async def _gs():
+        yield sess
+
+    monkeypatch.setattr(conn, "get_session", _gs)
+
+    async def _resolve(*a, **kw):
+        return None
+    monkeypatch.setattr(ki, "resolve_kunde_id_safe", _resolve)
+    return sess
+
+
+@pytest.mark.asyncio
+async def test_auftrag_manuell_default_ist_angenommen(monkeypatch):
+    sess = _patch_capture(monkeypatch)
+    res = await df.create_auftrag_manuell(
+        TID, kunde_name="Meier",
+        positionen=[{"name": "Bad fliesen", "menge": 2, "preis_brutto_eur": 250}])
+    assert res["ok"] is True
+    assert res["status"] == "accepted"
+    assert res["gesamt_brutto_eur"] == 500.0
+    ang = sess.objekte[0]
+    assert ang.status == "accepted"
+    assert ang.quelle == "manuell"
+    assert ang.gesamtbetrag_brutto_eur == 500
+    # ab "angenommen" gehoert die Zusage zur Geschichte des Auftrags
+    assert ang.accepted_at is not None
+    pos = sess.objekte[1]
+    assert pos.name == "Bad fliesen" and pos.position_nr == 1
+
+
+@pytest.mark.asyncio
+async def test_auftrag_manuell_vor_annahme_ohne_accepted_at(monkeypatch):
+    sess = _patch_capture(monkeypatch)
+    res = await df.create_auftrag_manuell(
+        TID, kunde_name="Meier", status="rechnung_erstellt",
+        positionen=[{"name": "X", "preis_brutto_eur": 5}])
+    assert res["ok"] is True
+    assert sess.objekte[0].accepted_at is None
+
+
+@pytest.mark.asyncio
+async def test_auftrag_manuell_kappt_zu_lange_felder(monkeypatch):
+    """Zu lange Eingaben werden gekappt statt der DB hingeworfen (waere ein 500)."""
+    sess = _patch_capture(monkeypatch)
+    res = await df.create_auftrag_manuell(
+        TID, kunde_name="M" * 400, kunde_ort="O" * 400,
+        positionen=[{"name": "P" * 600, "einheit": "E" * 80, "preis_brutto_eur": 5}])
+    assert res["ok"] is True
+    ang, pos = sess.objekte[0], sess.objekte[1]
+    assert len(ang.kunde_name) == 300
+    assert len(ang.kunde_ort) == 200
+    assert len(pos.name) == 500
+    assert len(pos.einheit) == 50
+
+
+@pytest.mark.asyncio
 async def test_create_rechnung_requires_kunde():
     res = await df.create_rechnung(TID, kunde_name="")
     assert res["ok"] is False

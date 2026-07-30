@@ -213,3 +213,75 @@ async def test_status_progress_does_not_touch_accepted_at(monkeypatch):
     assert resp.status_code == 200
     assert ang.status == "arbeit_laeuft"
     assert ang.accepted_at == existing_ts   # unveraendert
+
+
+# =====================================================================
+# POST /auftraege/neu — Auftrag von Hand
+# =====================================================================
+
+def _fake_create(aufruf: dict):
+    """Ersetzt create_auftrag_manuell und merkt sich die Argumente."""
+    async def _create(tid, **kw):
+        aufruf["tid"] = tid
+        aufruf.update(kw)
+        return {"ok": True, "id": "neue-id", "kunde": kw.get("kunde_name"),
+                "status": kw.get("status") or "accepted"}
+    return _create
+
+
+@pytest.mark.asyncio
+async def test_auftrag_neu_reicht_felder_durch(monkeypatch):
+    aufruf: dict = {}
+    from core.services import document_flow
+    monkeypatch.setattr(document_flow, "create_auftrag_manuell", _fake_create(aufruf))
+    tid = uuid.uuid4()
+    resp = await app_screens.api_auftrag_neu(
+        request=_req({
+            "kunde_name": "Bauer", "kunde_email": "bauer@example.de",
+            "kunde_strasse": "Hauptstr. 3", "kunde_plz": "54497", "kunde_ort": "Horath",
+            "status": "arbeit_laeuft",
+            "positionen": [{"name": "Bad fliesen", "menge": 1, "preis_brutto_eur": 900}],
+        }, tenant_id=tid),
+        _e=None, _c=None,
+    )
+    assert resp.status_code == 200
+    assert _json_body(resp)["id"] == "neue-id"
+    assert aufruf["tid"] == tid
+    assert aufruf["kunde_name"] == "Bauer"
+    assert aufruf["status"] == "arbeit_laeuft"
+    assert aufruf["positionen"][0]["name"] == "Bad fliesen"
+
+
+@pytest.mark.asyncio
+async def test_auftrag_neu_begrenzt_positionen(monkeypatch):
+    """Ein kaputter Client soll ueber das Formular keine tausend Zeilen
+    anlegen koennen."""
+    from core.services import document_flow
+    monkeypatch.setattr(document_flow, "create_auftrag_manuell", _fake_create({}))
+    viele = [{"name": f"P{i}", "preis_brutto_eur": 1} for i in range(51)]
+    resp = await app_screens.api_auftrag_neu(
+        request=_req({"kunde_name": "X", "positionen": viele}), _e=None, _c=None)
+    assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_auftrag_neu_lehnt_kaputte_positionen_ab(monkeypatch):
+    from core.services import document_flow
+    monkeypatch.setattr(document_flow, "create_auftrag_manuell", _fake_create({}))
+    for positionen in ("keine-liste", ["nur ein String"]):
+        resp = await app_screens.api_auftrag_neu(
+            request=_req({"kunde_name": "X", "positionen": positionen}), _e=None, _c=None)
+        assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_auftrag_neu_gibt_fachfehler_als_400_zurueck(monkeypatch):
+    from core.services import document_flow
+
+    async def _create(tid, **kw):
+        return {"ok": False, "error": "Kundenname ist Pflicht."}
+    monkeypatch.setattr(document_flow, "create_auftrag_manuell", _create)
+    resp = await app_screens.api_auftrag_neu(
+        request=_req({"kunde_name": "", "positionen": [{"name": "A"}]}), _e=None, _c=None)
+    assert resp.status_code == 400
+    assert "Pflicht" in _json_body(resp)["error"]

@@ -401,6 +401,55 @@ async def api_auftrag_status(
     })
 
 
+# Mehr Positionen tippt niemand von Hand — die Grenze haelt einen kaputten
+# oder boesartigen Client davon ab, ueber ein Formular tausende Zeilen
+# anzulegen.
+_AUFTRAG_MAX_POSITIONEN = 50
+
+
+@router.post("/auftraege/neu")
+async def api_auftrag_neu(
+    request: Request,
+    _e=Depends(require_app_inhaber),
+    _c=Depends(require_app_csrf),
+) -> JSONResponse:
+    """Legt einen Auftrag von Hand an — fuer Arbeit, die nie durch die
+    Angebots-Pipeline lief (Telefon, Baustelle, Stammkunde).
+
+    Ohne Lexware-Angebot; die Rechnung entsteht am Ende des Flows aus den
+    Positionen. Inhaber-only, CSRF, tenant-gescoped."""
+    tid = current_tenant_id(request)
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": "Ungueltige Daten."}, status_code=400)
+
+    positionen = body.get("positionen") or []
+    if not isinstance(positionen, list):
+        return JSONResponse({"ok": False, "error": "Positionen fehlen."}, status_code=400)
+    if len(positionen) > _AUFTRAG_MAX_POSITIONEN:
+        return JSONResponse(
+            {"ok": False, "error": f"Hoechstens {_AUFTRAG_MAX_POSITIONEN} Positionen."},
+            status_code=400)
+    if not all(isinstance(p, dict) for p in positionen):
+        return JSONResponse({"ok": False, "error": "Positionen fehlerhaft."}, status_code=400)
+
+    from core.services.document_flow import create_auftrag_manuell
+    res = await create_auftrag_manuell(
+        tid,
+        kunde_name=body.get("kunde_name") or "",
+        positionen=positionen,
+        status=body.get("status"),
+        kunde_strasse=body.get("kunde_strasse"),
+        kunde_plz=body.get("kunde_plz"),
+        kunde_ort=body.get("kunde_ort"),
+        kunde_email=body.get("kunde_email"),
+    )
+    if not res.get("ok"):
+        return JSONResponse(res, status_code=400)
+    return JSONResponse(res)
+
+
 # =====================================================================
 # "Aktuelles"-Tab: Rückrufe + Beratungs-Leads + Auftrags-Pipeline
 # =====================================================================

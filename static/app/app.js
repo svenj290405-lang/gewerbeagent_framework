@@ -402,12 +402,20 @@ const SCREENS = {
          <button class="btn-sm btn-ghost" id="auf-fertig" style="flex:1;padding:14px 10px;text-align:center">✅ Abgeschlossene Aufträge</button>
          ${isInhaber ? `<button class="btn-sm btn-ghost" id="auf-prozess" style="flex:1;padding:14px 10px;text-align:center">⚙️ Auftragsprozess bearbeiten</button>` : ""}
        </div>`;
+    // Neu-Button oben: Aufträge von Hand sind der Einstieg für alles, was
+    // ohne Angebot reinkommt — der gehört über die Liste, nicht in den Fuß.
+    const neu = isInhaber
+      ? `<button class="btn-sm btn-ghost" id="auf-neu" style="width:100%;margin-bottom:12px;padding:14px 10px">➕ Auftrag von Hand anlegen</button>`
+      : "";
     App.view.innerHTML =
       `<button class="btn-sm btn-ghost" id="back-db" style="margin-bottom:10px">← Übersicht</button>` +
       `<h1 style="font-size:22px;margin:4px 4px 14px">Aufträge</h1>` +
+      neu +
       (list || `<div class="card">${emptyRow("Keine laufenden Aufträge")}</div>`) +
       fuss;
     document.getElementById("back-db").addEventListener("click", () => navigate("aktuelles"));
+    const neuBtn = document.getElementById("auf-neu");
+    if (neuBtn) neuBtn.addEventListener("click", () => navigate("auftrag_neu"));
     document.getElementById("auf-fertig").addEventListener("click",
       () => navigate("auftraege_fertig"));
     const proz = document.getElementById("auf-prozess");
@@ -441,6 +449,64 @@ const SCREENS = {
       (liste || `<div class="card">${emptyRow("Noch keine abgeschlossenen Aufträge")}</div>`);
     document.getElementById("back-auf").addEventListener("click", () => navigate("auftraege_page"));
     bindAuftragOeffnen("auftraege_fertig");
+  },
+
+  // Auftrag von Hand — für Arbeit, die nie durch die Angebots-Pipeline lief
+  // (am Telefon vereinbart, auf der Baustelle zugerufen, Stammkunde). Teilt
+  // sich Kunden- und Positionen-Felder mit dem Angebots-Composer, damit
+  // beide Formulare gleich zu bedienen sind.
+  async auftrag_neu() {
+    App.view.innerHTML = `<div class="loading">Lädt …</div>`;
+    _composerPositionen = [{ name: "", menge: 1, einheit: "Stueck", preis_brutto_eur: 0 }];
+    // Die Startschritte kommen aus dem Auftragsprozess des Betriebs, damit
+    // sie genauso heißen wie in der Fortschrittszeile. Eigene Schritte sind
+    // keine Status, und „Rechnung raus" schließt den Auftrag ab (Geld-Pfad)
+    // — beides fällt raus.
+    const res = await api("/app/api/auftragsprozess");
+    const d = res && res.ok ? await res.json() : { schritte: [] };
+    const opts = (d.schritte || [])
+      .filter((s) => s.typ === "kern" && s.kern_status !== "rechnung_gesendet")
+      .map((s) => `<option value="${esc(s.kern_status)}"${s.kern_status === "accepted" ? " selected" : ""}>${esc(s.label)}</option>`)
+      .join("");
+    const inp = "width:100%;padding:12px;border:1px solid var(--line);border-radius:10px;margin:4px 0 10px;font-size:16px";
+    App.view.innerHTML =
+      `<button class="btn-sm btn-ghost" id="an-back" style="margin-bottom:10px">← Aufträge</button>` +
+      `<h1 style="font-size:22px;margin:4px 4px 6px">Auftrag von Hand</h1>` +
+      `<p class="muted" style="margin:0 4px 14px">Für Arbeit, die ohne Angebot reingekommen ist. Der Auftrag läuft danach ganz normal weiter — die Rechnung entsteht am Ende aus den Positionen.</p>` +
+      _kiExtractCard("Kunde + Positionen mit Preisen") +
+      _composerKundenFields() +
+      `<div class="card"><h2>Positionen</h2>
+         <div id="pos-list"></div>
+         <button class="btn-sm btn-ghost" id="pos-add" style="margin-top:6px;width:100%">+ Position</button>
+         <div class="row" style="margin-top:12px;padding-top:10px;border-top:1px solid var(--line)">
+           <b>Gesamt brutto</b><b id="pos-summe">0,00 €</b>
+         </div>
+       </div>` +
+      `<div class="card"><h2>Startschritt</h2>
+         <label class="sub">Wo steht der Auftrag gerade?</label>
+         <select id="an-status" style="${inp}">${opts}</select>
+       </div>` +
+      `<button class="btn-sm" id="an-save" style="width:100%;margin-top:8px">Auftrag anlegen</button>`;
+
+    document.getElementById("an-back").addEventListener("click", () => navigate("auftraege_page"));
+    _renderPositionen();
+    document.getElementById("pos-add").addEventListener("click", () => {
+      _composerPositionen.push({ name: "", menge: 1, einheit: "Stueck", preis_brutto_eur: 0 });
+      _renderPositionen();
+    });
+    _bindKiExtract("/app/api/angebote/extrahieren", (ex) => {
+      _applyExtractedToKunde(ex);
+      if (Array.isArray(ex.positionen) && ex.positionen.length) {
+        _composerPositionen = ex.positionen.map((p) => ({
+          name: p.name || "", beschreibung: p.beschreibung || "",
+          menge: p.menge || 1, einheit: p.einheit || "Stueck",
+          preis_brutto_eur: p.preis_brutto_eur || 0,
+          mwst_prozent: p.mwst_prozent || 19,
+        }));
+        _renderPositionen();
+      }
+    });
+    document.getElementById("an-save").addEventListener("click", _submitAuftragNeu);
   },
 
   async rechnungen_page() {
@@ -3008,6 +3074,35 @@ async function _submitAngebot() {
     alert("Konnte nicht anlegen.");
   }
   btn.disabled = false; btn.textContent = "Angebot anlegen";
+}
+
+async function _submitAuftragNeu() {
+  // Leere Positions-Zeilen (die Vorlage beim Öffnen, ein versehentliches
+  // „+ Position") fliegen raus, statt den Nutzer zu maßregeln.
+  const positionen = _composerPositionen.filter((p) => (p.name || "").trim());
+  const body = {
+    kunde_name: document.getElementById("c-kunde-name").value.trim(),
+    kunde_email: document.getElementById("c-kunde-mail").value.trim() || null,
+    kunde_strasse: document.getElementById("c-kunde-str").value.trim() || null,
+    kunde_plz: document.getElementById("c-kunde-plz").value.trim() || null,
+    kunde_ort: document.getElementById("c-kunde-ort").value.trim() || null,
+    status: document.getElementById("an-status").value,
+    positionen,
+  };
+  if (!body.kunde_name) { alert("Kundenname ist Pflicht."); return; }
+  if (!positionen.length) { alert("Mindestens 1 Position mit Bezeichnung."); return; }
+  const btn = document.getElementById("an-save");
+  btn.disabled = true; btn.textContent = "Lege an …";
+  const r = await api("/app/api/auftraege/neu", { method: "POST", body: JSON.stringify(body) });
+  if (r) {
+    let j = null;
+    try { j = await r.json(); } catch (e) {}
+    if (j && j.ok) { showAuftragDetail(j.id, "auftraege_page"); return; }
+    alert((j && j.error) || "Konnte den Auftrag nicht anlegen.");
+  } else {
+    alert("Konnte den Auftrag nicht anlegen.");
+  }
+  btn.disabled = false; btn.textContent = "Auftrag anlegen";
 }
 
 function showRechnungForm() {
