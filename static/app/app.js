@@ -4892,8 +4892,11 @@ function _gespraechKopf(k) {
   if (k.auftraege_laufend) offen.push(`${k.auftraege_laufend} laufende(r) Auftrag/Aufträge`);
   if (k.rechnungen_offen) offen.push(`${k.rechnungen_offen} offene Rechnung(en)`);
   if (k.gespraeche_frueher) offen.push(`${k.gespraeche_frueher} frühere(s) Gespräch(e)`);
+  // Der Name ist die Überschrift des Screens, kein Abschnitts-Label: <h2>
+  // wird in der Karte per CSS zu grauen Großbuchstaben ("KUNDE") — für
+  // einen Eigennamen falsch.
   return `<div class="card">
-    <h2>${esc(k.name || "Kunde")}</h2>
+    <div style="font-size:20px;font-weight:600;margin-bottom:8px">${esc(k.name || "Kunde")}</div>
     ${zeile("Adresse", k.adresse)}
     ${zeile("Telefon", k.telefon)}
     ${zeile("E-Mail", k.email)}
