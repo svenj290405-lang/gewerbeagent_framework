@@ -423,6 +423,7 @@ const SCREENS = {
     if (proz) proz.addEventListener("click", () => showProzessEditor("auftraege_page"));
     bindAuftragOeffnen("auftraege_page");
     bindFortschrittsRegler();
+    bindStundenBuchung();
     if (isInhaber) bindAuftragActions(() => navigate("auftraege_page", { mode: "none" }));
   },
 
@@ -4135,7 +4136,10 @@ const AUFTRAG_NEXT = {
 // symbolisiert („🔨 Arbeit läuft"). Er ist der einzige Schritt, der einen
 // Zwischenstand hat — alle anderen sind an/aus. Bei 100 % meldet der
 // Server den Auftrag fertig und wir leiten in den Rechnungs-Flow.
-function fortschrittsRegler(a) {
+// ohneStunden: in der Detailansicht hat die Stunden-Karte das Eingabefeld.
+// Zweimal dasselbe `data-std-*` im Dokument waere ein echter Fehler — die
+// Buchung liest ihr Feld per Attribut und erwischte sonst das falsche.
+function fortschrittsRegler(a, ohneStunden) {
   if (!a.in_arbeit) return "";
   const pct = Math.max(0, Math.min(100, a.fortschritt || 0));
   return `<div class="fortschritt">
@@ -4143,7 +4147,67 @@ function fortschrittsRegler(a) {
       <b data-slider-val="${esc(a.id)}">${pct}%</b></div>
     <input type="range" min="0" max="100" step="5" value="${pct}"
       data-slider="${esc(a.id)}" aria-label="Arbeits-Fortschritt in Prozent">
+    ${ohneStunden ? "" : stundenFeld(a, false)}
   </div>`;
+}
+
+// Stunden auf den Auftrag buchen — direkt am Regler, weil der Handwerker
+// genau dort steht, wenn er den Tag abschließt. Gebucht wird immer auf den
+// angemeldeten Mitarbeiter; die Zeile darunter zeigt, wer schon wie lange
+// dran war. Das ist Auftragszeit für die Nachkalkulation, keine
+// Anwesenheitserfassung (siehe core/models/auftrag_stunden.py).
+function stundenFeld(a, mitNotiz) {
+  const id = esc(a.id);
+  const feld = "min-width:0;padding:8px;border:1px solid var(--line);border-radius:8px;font-size:15px";
+  return `<div style="margin-top:10px">
+    <div style="display:flex;gap:6px;align-items:center">
+      <input type="text" inputmode="decimal" data-std-input="${id}" placeholder="Std."
+        aria-label="Gearbeitete Stunden" style="width:72px;${feld}">
+      ${mitNotiz ? `<input type="text" data-std-notiz="${id}" placeholder="wofür (optional)"
+        aria-label="Wofür" style="flex:1;${feld}">` : ""}
+      <button class="btn-sm btn-ghost" data-std-add="${id}" style="padding:8px 10px">Buchen</button>
+    </div>
+    <div class="sub" data-std-summe="${id}" style="margin-top:6px">${esc(a.stunden_text || "")}</div>
+  </div>`;
+}
+
+function _stundenSummeText(st) {
+  return ((st && st.je_mitarbeiter) || []).map((x) => `${x.name} ${x.text}`).join(" · ");
+}
+
+// onUpdate(uebersicht) läuft nach einer erfolgreichen Buchung — die
+// Detailansicht zeichnet damit ihre Aufschlüsselung neu, die Listenkarte
+// begnügt sich mit der aktualisierten Zeile darunter.
+function bindStundenBuchung(onUpdate) {
+  // Die Auftragskarte öffnet beim Klick das Detail — Eingaben dürfen das
+  // nicht auslösen.
+  document.querySelectorAll("[data-std-input],[data-std-notiz]").forEach((el) =>
+    el.addEventListener("click", (ev) => ev.stopPropagation()));
+
+  document.querySelectorAll("[data-std-add]").forEach((btn) => {
+    const id = btn.dataset.stdAdd;
+    btn.addEventListener("click", async (ev) => {
+      ev.stopPropagation();
+      const feld = document.querySelector(`[data-std-input="${CSS.escape(id)}"]`);
+      const notizFeld = document.querySelector(`[data-std-notiz="${CSS.escape(id)}"]`);
+      const wert = ((feld && feld.value) || "").trim();
+      if (!wert) { if (feld) feld.focus(); return; }
+      btn.disabled = true;
+      const res = await api(`/app/api/auftraege/${encodeURIComponent(id)}/stunden`,
+        { method: "POST", body: JSON.stringify({
+          stunden: wert, notiz: notizFeld ? notizFeld.value : "" }) });
+      if (!res) return;                       // api() hat schon umgeleitet
+      let j = null;
+      try { j = await res.json(); } catch (e) {}
+      btn.disabled = false;
+      if (!j || !j.ok) { alert((j && j.error) || "Stunden konnten nicht gebucht werden."); return; }
+      if (feld) feld.value = "";
+      if (notizFeld) notizFeld.value = "";
+      const summe = document.querySelector(`[data-std-summe="${CSS.escape(id)}"]`);
+      if (summe) summe.textContent = _stundenSummeText(j.stunden);
+      if (onUpdate) onUpdate(j.stunden);
+    });
+  });
 }
 
 // Bindet alle Regler im aktuellen Screen. onFertig() läuft, wenn der
@@ -4403,6 +4467,43 @@ const _ZUSTAND_TEXT = {
   erledigt: "✅ Erledigt", aktiv: "🔵 Läuft gerade", offen: "○ Steht noch aus",
 };
 
+// Wer wie lange an diesem Auftrag gearbeitet hat — Summe je Mitarbeiter,
+// darunter die einzelnen Buchungen. Korrigiert wird durch Löschen und neu
+// buchen; das ✕ steht nur an den eigenen Buchungen (der Inhaber sieht es
+// überall, er muss den Nachweis geradeziehen können).
+function stundenKarteHtml(d) {
+  const st = d.stunden || {};
+  const je = st.je_mitarbeiter || [];
+  const eintraege = st.eintraege || [];
+  const buchbar = !!(d.in_arbeit || d.fertig);
+  if (!je.length && !buchbar) return "";
+  const meineId = (App.me && App.me.employee && App.me.employee.id) || "";
+  const isInhaber = !!(App.me && App.me.employee && App.me.employee.is_inhaber);
+
+  const summen = je.length
+    ? je.map((x) => `<div class="row"><span>${esc(x.name)}</span><span class="sub">${esc(x.text)}</span></div>`).join("")
+      + `<div class="row"><span><b>Gesamt</b></span><span class="sub"><b>${esc(st.gesamt_text || "")}</b></span></div>`
+    : emptyRow("Noch keine Stunden gebucht");
+
+  const liste = eintraege.length
+    ? `<div style="margin-top:12px">` + eintraege.map((e) => {
+        const darf = isInhaber || (e.employee_id && e.employee_id === meineId);
+        return `<div class="row"><div style="min-width:0">
+            <div>${esc(e.datum)} · ${esc(e.name)}</div>
+            ${e.notiz ? `<div class="sub">${esc(e.notiz)}</div>` : ""}
+          </div>
+          <div style="display:flex;gap:8px;align-items:center;flex-shrink:0">
+            <span class="sub">${esc(e.text)}</span>
+            ${darf ? `<button class="btn-sm btn-ghost" data-std-del="${esc(e.id)}"
+                        aria-label="Buchung löschen" style="padding:4px 8px">✕</button>` : ""}
+          </div></div>`;
+      }).join("") + `</div>`
+    : "";
+
+  return `<div class="card" id="stunden-karte"><h2>Arbeitsstunden</h2>${summen}${
+    buchbar ? stundenFeld(d, true) : ""}${liste}</div>`;
+}
+
 async function showAuftragDetail(id, zurueck) {
   App.view.innerHTML = `<div class="loading">Lädt …</div>`;
   const res = await api("/app/api/auftraege/" + encodeURIComponent(id) + "/detail");
@@ -4443,20 +4544,64 @@ async function showAuftragDetail(id, zurueck) {
     `<h1 style="font-size:22px;margin:4px 4px 2px">${esc(d.kunde)}</h1>` +
     `<p class="muted" style="margin:0 4px 14px">${esc(d.status_label)}${d.betrag ? " · " + esc(d.betrag) : ""}</p>` +
     `<div class="card"><h2>Fortschritt</h2>${stepperHtml(d.schritte || [])}
-       ${fortschrittsRegler(d)}</div>` +
+       ${fortschrittsRegler(d, true)}</div>` +
     `<div class="card"><h2>Auftrag</h2>` +
       zeile("Kunde", d.kunde) + zeile("Anschrift", d.adresse) + zeile("E-Mail", d.email) +
       zeile("Betrag (brutto)", d.betrag) + zeile("Angebotsnummer", d.angebot_nr) +
       zeile("Angelegt", d.zeit) + zeile("Angebot versendet", d.angebot_versendet) +
       zeile("Angenommen", d.angenommen_am) + zeile("Abgeschlossen", d.abgeschlossen_am) +
     `</div>` +
-    positionen + archiv + aktionen;
+    stundenKarteHtml(d) + positionen + archiv + aktionen;
 
   document.getElementById("back-auftrag").addEventListener("click",
     () => navigate(zurueck || "auftraege_page"));
   bindFortschrittsRegler(() => openRechnungInQ(d.id));
+  // Nach einer Buchung die Karte neu zeichnen — Aufschlüsselung UND
+  // Einzelbuchungen ändern sich, dafür reicht die Zeile unter dem Feld nicht.
+  bindStundenBuchung((uebersicht) => {
+    d.stunden = uebersicht;
+    _stundenKarteNeu(d, id, zurueck);
+  });
+  _bindStundenLoeschen(d, id, zurueck);
   if (isInhaber) bindAuftragActions(() => showAuftragDetail(id, zurueck));
   bindStepper(d, id, zurueck);
+}
+
+// Zeichnet nur die Stunden-Karte neu, statt den ganzen Screen zu laden —
+// der Handwerker verliert dabei weder Scroll-Position noch offenen Schritt.
+function _stundenKarteNeu(d, id, zurueck) {
+  const alt = document.getElementById("stunden-karte");
+  if (!alt) return;
+  const html = stundenKarteHtml(d);
+  if (!html) { alt.remove(); return; }
+  const huelle = document.createElement("div");
+  huelle.innerHTML = html;
+  const neu = huelle.firstElementChild;
+  alt.replaceWith(neu);
+  // Frisches DOM = frische Listener. Die alten sind mit der alten Karte weg.
+  bindStundenBuchung((uebersicht) => {
+    d.stunden = uebersicht;
+    _stundenKarteNeu(d, id, zurueck);
+  });
+  _bindStundenLoeschen(d, id, zurueck);
+}
+
+function _bindStundenLoeschen(d, id, zurueck) {
+  document.querySelectorAll("[data-std-del]").forEach((btn) =>
+    btn.addEventListener("click", async (ev) => {
+      ev.stopPropagation();
+      if (!confirm("Diese Stundenbuchung löschen?")) return;
+      btn.disabled = true;
+      const res = await api(`/app/api/auftraege/${encodeURIComponent(id)}/stunden/${
+        encodeURIComponent(btn.dataset.stdDel)}/loeschen`, { method: "POST", body: "{}" });
+      if (!res) return;
+      let j = null;
+      try { j = await res.json(); } catch (e) {}
+      btn.disabled = false;
+      if (!j || !j.ok) { alert((j && j.error) || "Löschen fehlgeschlagen."); return; }
+      d.stunden = j.stunden;
+      _stundenKarteNeu(d, id, zurueck);
+    }));
 }
 
 // Antippen eines Schritts blendet darunter seine Infos ein. Eigene
@@ -4859,8 +5004,11 @@ function bindAktuelles() {
   document.querySelectorAll("[data-lead-nein]").forEach((b) =>
     b.addEventListener("click", () => beratungEntscheidung(b.dataset.leadNein, "ablehnen")));
 
-  // Fortschritts-Regler (gemeinsame Implementierung, siehe auftragCard)
+  // Fortschritts-Regler + Stundenbuchung (gemeinsame Implementierung,
+  // siehe auftragCard). Beide genau EINMAL pro Screen binden — zweimal
+  // hiesse zwei Listener am selben Knopf und damit eine Doppelbuchung.
   bindFortschrittsRegler();
+  bindStundenBuchung();
 
   // Fertiger Auftrag -> Rechnung in Q vorbereiten
   document.querySelectorAll("[data-rechnung]").forEach((b) =>

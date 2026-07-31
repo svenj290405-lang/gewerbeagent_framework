@@ -280,6 +280,9 @@ __all__ = [
     "STATE_DELIVERY_FAILED",
     "STATE_DIALOG",
     "AngebotPosition",
+    "AuftragStunden",
+    "STUNDEN_MIN",
+    "STUNDEN_MAX",
     "Kundengespraech",
     "GespraechDatei",
     "GESPRAECH_DATEI_FOTO",
@@ -353,6 +356,11 @@ from core.models.auftrag_prozess import (
     AuftragSchrittStatus,
     MAX_EIGENE_SCHRITTE,
     MAX_SCHRITT_LABEL,
+)
+from core.models.auftrag_stunden import (
+    AuftragStunden,
+    STUNDEN_MAX,
+    STUNDEN_MIN,
 )
 from core.models.kundengespraech import Kundengespraech
 from core.models.gespraech_datei import (

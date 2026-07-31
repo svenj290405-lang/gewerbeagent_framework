@@ -20,6 +20,20 @@ import pytest
 from core.api import app_screens
 
 
+@pytest.fixture(autouse=True)
+def _keine_stundenabfrage(monkeypatch):
+    """Die Auftragsliste reichert seit den Auftragsstunden noch eine Summe
+    an. Die laeuft ueber eine EIGENE Session im Stunden-Service, die
+    ``app_screens.get_session`` nicht mitfaelscht — hier stillgelegt, damit
+    die Tests dieser Datei ohne echte DB bleiben (eigene Abdeckung in
+    test_auftrag_stunden.py)."""
+    import core.services.auftrag_stunden as stunden_svc
+
+    async def _keine(tid, ids):
+        return {}
+    monkeypatch.setattr(stunden_svc, "summen_je_auftrag", _keine)
+
+
 class _FakeObjSession:
     def __init__(self, obj):
         self.obj = obj

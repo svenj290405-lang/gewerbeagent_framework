@@ -318,7 +318,40 @@ async def api_auftraege(
             .order_by(Angebot.created_at.desc())
             .limit(50)
         )).scalars().all()
-    return JSONResponse({"auftraege": [_auftrag_zeile(a) for a in rows]})
+    zeilen = [_auftrag_zeile(a) for a in rows]
+    await _stunden_anreichern(tid, zeilen)
+    return JSONResponse({"auftraege": zeilen})
+
+
+async def _stunden_anreichern(tid: uuid.UUID, zeilen: list[dict]) -> None:
+    """Haengt die gebuchten Stunden an fertige Listenzeilen — EINE
+    Sammelabfrage fuer alle Karten statt einer pro Karte.
+
+    Nur laufende Auftraege: an einem abgerechneten Auftrag traegt niemand
+    mehr Stunden ein, und die Karte soll nicht mit Zahlen zuwachsen.
+
+    Best-effort: die Stundenzeile ist eine Zusatzinfo auf der Karte, die
+    verbindliche Ansicht ist das Auftragsdetail. Faellt die Abfrage aus,
+    fehlt die Zeile — die Auftragsliste selbst muss trotzdem stehen.
+    """
+    from core.services.auftrag_stunden import summen_je_auftrag
+
+    kandidaten = [z for z in zeilen if z.get("in_arbeit") or z.get("fertig")]
+    if not kandidaten:
+        return
+    try:
+        ids = [uuid.UUID(z["id"]) for z in kandidaten]
+    except (ValueError, TypeError, KeyError):
+        return
+    try:
+        summen = await summen_je_auftrag(tid, ids)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Stundensummen fuer die Auftragsliste nicht ladbar: %s", exc)
+        return
+    for z in kandidaten:
+        daten = summen.get(z["id"])
+        z["stunden_gesamt"] = daten["gesamt_text"] if daten else ""
+        z["stunden_text"] = daten["text"] if daten else ""
 
 
 def _auftrag_zeile(a: Angebot) -> dict:
@@ -536,6 +569,7 @@ async def _aktuelle_auftraege(tenant_id: uuid.UUID) -> list[dict]:
                 "fortschritt": 0,
                 "zeit": _fmt_dt(k.termin_datum),
             })
+    await _stunden_anreichern(tenant_id, out)
     return out
 
 
@@ -739,6 +773,121 @@ async def api_auftrag_fortschritt(
 
 
 # =====================================================================
+# Auftragsstunden — was am Fortschrittsregler eingetragen wird
+#
+# Zweck ist die Nachkalkulation („was hat der Auftrag wirklich gekostet")
+# und die Abrechnung, NICHT die gesetzliche Arbeitszeiterfassung und
+# erst recht keine Leistungskontrolle. Die Abgrenzung steht ausfuehrlich
+# in core/models/auftrag_stunden.py.
+# =====================================================================
+
+async def _auftrag_fuer_stunden(tid: uuid.UUID, aid: uuid.UUID) -> bool:
+    """Gibt es den Auftrag in DIESEM Betrieb? Mehr braucht die Buchung
+    nicht zu wissen."""
+    async with get_session() as s:
+        treffer = (await s.execute(
+            select(func.count(Angebot.id))
+            .where(Angebot.id == aid, Angebot.tenant_id == tid)
+        )).scalar() or 0
+    return bool(treffer)
+
+
+@router.post("/auftraege/{angebot_id}/stunden")
+async def api_auftrag_stunden_buchen(
+    angebot_id: str,
+    request: Request,
+    emp: Employee = Depends(require_app_user),
+    _c=Depends(require_app_csrf),
+) -> JSONResponse:
+    """Bucht Arbeitsstunden auf einen Auftrag — immer auf den angemeldeten
+    Mitarbeiter, nie auf jemand anderen.
+
+    Body: ``{"stunden": "6,5", "notiz": "...", "datum": "2026-07-30"}``.
+    Ohne ``datum`` zaehlt heute. Antwort enthaelt die neue Uebersicht,
+    damit die Karte sich ohne zweiten Roundtrip aktualisiert.
+    """
+    from core.services.auftrag_stunden import (
+        buche_stunden, parse_stunden, stunden_uebersicht)
+    from core.models.auftrag_stunden import STUNDEN_MAX, STUNDEN_MIN
+
+    tid = current_tenant_id(request)
+    try:
+        aid = uuid.UUID(angebot_id)
+    except (ValueError, TypeError):
+        return JSONResponse({"ok": False, "error": "ungueltige id"}, status_code=400)
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        return JSONResponse({"ok": False, "error": "Ungueltige Daten."}, status_code=400)
+
+    stunden = parse_stunden((body or {}).get("stunden"))
+    if stunden is None:
+        return JSONResponse(
+            {"ok": False,
+             "error": f"Stunden zwischen {STUNDEN_MIN} und {STUNDEN_MAX} eintragen "
+                      "(z.B. 6,5)."},
+            status_code=400)
+
+    datum = None
+    roh_datum = ((body or {}).get("datum") or "").strip()
+    if roh_datum:
+        try:
+            datum = dt.date.fromisoformat(roh_datum[:10])
+        except ValueError:
+            return JSONResponse(
+                {"ok": False, "error": "Datum bitte als JJJJ-MM-TT."},
+                status_code=400)
+        if datum > dt.date.today():
+            return JSONResponse(
+                {"ok": False, "error": "Stunden für die Zukunft gibt es nicht."},
+                status_code=400)
+
+    if not await _auftrag_fuer_stunden(tid, aid):
+        return JSONResponse({"ok": False, "error": "Auftrag nicht gefunden."},
+                            status_code=404)
+
+    await buche_stunden(
+        tid, aid, employee_id=emp.id, employee_name=getattr(emp, "name", "") or "",
+        stunden=stunden, datum=datum, notiz=(body or {}).get("notiz"))
+    return JSONResponse({"ok": True, "stunden": await stunden_uebersicht(tid, aid)})
+
+
+@router.post("/auftraege/{angebot_id}/stunden/{eintrag_id}/loeschen")
+async def api_auftrag_stunden_loeschen(
+    angebot_id: str,
+    eintrag_id: str,
+    request: Request,
+    emp: Employee = Depends(require_app_user),
+    _c=Depends(require_app_csrf),
+) -> JSONResponse:
+    """Nimmt eine Stundenbuchung zurueck (Korrektur = loeschen und neu
+    buchen). Eigene Buchungen darf jeder, alle nur der Inhaber."""
+    from core.services.auftrag_stunden import loesche_stunden, stunden_uebersicht
+
+    tid = current_tenant_id(request)
+    try:
+        aid = uuid.UUID(angebot_id)
+        eid = uuid.UUID(eintrag_id)
+    except (ValueError, TypeError):
+        return JSONResponse({"ok": False, "error": "ungueltige id"}, status_code=400)
+
+    ok, fehler, gehoert_zu = await loesche_stunden(
+        tid, eid, employee_id=emp.id,
+        darf_alles=bool(getattr(request.state, "app_is_inhaber", False)))
+    if not ok:
+        return JSONResponse(
+            {"ok": False, "error": fehler},
+            status_code=403 if "deine" in fehler else 404)
+    if gehoert_zu != aid:
+        # Der Eintrag gehoert zu einem anderen Auftrag desselben Betriebs —
+        # dann stimmt die aufrufende Ansicht nicht, aber geloescht ist
+        # geloescht. Uebersicht zum angefragten Auftrag zurueckgeben.
+        logger.info("Stunden-Loeschung ueber fremde Auftrags-URL: %s != %s",
+                    gehoert_zu, aid)
+    return JSONResponse({"ok": True, "stunden": await stunden_uebersicht(tid, aid)})
+
+
+# =====================================================================
 # Auftrags-Detailansicht + konfigurierbarer Auftragsprozess
 # =====================================================================
 
@@ -751,6 +900,7 @@ async def api_auftrag_detail(
     eigene Schritte mit Erledigt-Zustand)."""
     from core.models.angebot_position import AngebotPosition
     from core.services.auftrag_prozess import lade_auftrag_schritte
+    from core.services.auftrag_stunden import stunden_uebersicht
 
     tid = current_tenant_id(request)
     try:
@@ -793,6 +943,7 @@ async def api_auftrag_detail(
         "angenommen_am": _fmt_dt(a.accepted_at) if a.accepted_at else "",
         "positionen": pos_out,
         "schritte": await lade_auftrag_schritte(tid, a),
+        "stunden": await stunden_uebersicht(tid, aid),
     })
 
 

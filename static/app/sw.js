@@ -129,7 +129,10 @@
 // v68: Kundengespraech hat ein Ende — „fertig, beim Kunden einpflegen"
 // (legt den Kunden an, Protokoll + Bilder in den Drive-Kundenordner) oder
 // verwerfen; oben in der Liste stehen die geplanten Termine aus dem Kalender.
-const CACHE = "ga-app-v68";
+// v69: Arbeitsstunden am Fortschrittsregler — jeder bucht seine Stunden auf
+// den Auftrag, am Auftrag steht danach, wer wie lange dran war
+// (Nachkalkulation, keine Anwesenheitserfassung).
+const CACHE = "ga-app-v69";
 const SHELL = [
   "/app",
   "/app/static/app-beta.css",
