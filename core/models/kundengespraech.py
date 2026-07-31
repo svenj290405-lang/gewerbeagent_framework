@@ -24,9 +24,22 @@ from core.database.base import Base
 # einen neuen Lead mit Termin: annehmen -> "angenommen" (geht in die
 # Auftrags-Pipeline), ablehnen -> "abgelehnt" (Soft-Delete, ueberall
 # ausgeblendet, wirkt wie geloescht).
+#
+# "abgeschlossen" ist das Ende des Arbeitsbereichs: der Handwerker hat
+# das Gespraech eingepflegt — Kunde steht im Kundenstamm, Protokoll und
+# Bilder liegen im Drive-Kundenordner (core/services/gespraech_abschluss.py).
+# Das Gespraech bleibt sichtbar, faellt aber aus den offenen Beratungs-
+# Leads raus.
 KUNDENGESPRAECH_STATUS_ERFASST = "erfasst"
 KUNDENGESPRAECH_STATUS_ANGENOMMEN = "angenommen"
 KUNDENGESPRAECH_STATUS_ABGELEHNT = "abgelehnt"
+KUNDENGESPRAECH_STATUS_ABGESCHLOSSEN = "abgeschlossen"
+
+# „Verwerfen" (Gespraech lief schlecht, soll weg) ist derselbe Zustand wie
+# „abgelehnt": ueberall ausgeblendet, Zeile bleibt aber stehen. Bewusst
+# KEIN eigener Status — sonst muesste jeder `status != abgelehnt`-Filter
+# im Projekt nachgezogen werden.
+KUNDENGESPRAECH_STATUS_VERWORFEN = KUNDENGESPRAECH_STATUS_ABGELEHNT
 
 
 class Kundengespraech(Base):
@@ -123,6 +136,28 @@ class Kundengespraech(Base):
     )
     reschedule_mail_conversation_id: Mapped[str | None] = mapped_column(
         String(500), nullable=True,
+    )
+
+    # Aus einem Kalendertermin heraus gestartet (Voice-Buchung, Outlook,
+    # Google). Haelt den geplanten Termin und das Gespraech zusammen:
+    # ein Event mit zugehoerigem Gespraech taucht in der Liste der
+    # geplanten Gespraeche nicht noch einmal als Vorschlag auf.
+    kalender_event_id: Mapped[str | None] = mapped_column(
+        String(500), nullable=True, index=True,
+    )
+
+    # Abschluss: wann eingepflegt und wo das Protokoll im Drive liegt.
+    # Gesetzt von core/services/gespraech_abschluss.py; die Drive-Felder
+    # bleiben leer, wenn Drive nicht verbunden war (der Abschluss selbst
+    # gilt trotzdem).
+    abgeschlossen_am: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+    protokoll_drive_file_id: Mapped[str | None] = mapped_column(
+        String(200), nullable=True,
+    )
+    protokoll_drive_url: Mapped[str | None] = mapped_column(
+        String(1000), nullable=True,
     )
 
     # created_at + updated_at aus Base

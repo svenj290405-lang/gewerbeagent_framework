@@ -629,14 +629,19 @@ const SCREENS = {
       `<button class="btn-sm btn-ghost" id="back-db" style="margin-bottom:10px">← Übersicht</button>` +
       `<h1 style="font-size:22px;margin:4px 4px 14px">Kundengespräche</h1>` +
       `<button class="btn-sm" id="gespr-neu" style="width:100%;margin-bottom:12px;padding:14px 10px">➕ Neues Kundengespräch</button>` +
+      // Platzhalter: der Kalender-Abruf geht über den Provider und dauert
+      // länger als die Liste — der Screen soll darauf nicht warten.
+      `<div class="card" id="gespr-geplant"><h2>Geplant</h2><div class="empty">Schaue in den Kalender …</div></div>` +
       `<div class="card"><h2>Bisherige Gespräche</h2>${
         liste.length
-          ? liste.map((x) => rowTap(x.kunde || "Gespräch", x.briefing || "", x.zeit, x.id)).join("")
+          ? liste.map((x) => rowTap(x.kunde || "Gespräch",
+              (x.abgeschlossen ? "✅ eingepflegt · " : "") + (x.briefing || ""), x.zeit, x.id)).join("")
           : emptyRow("Noch kein Gespräch erfasst")
       }</div>`;
     document.getElementById("back-db").addEventListener("click", () => navigate("aktuelles"));
     document.getElementById("gespr-neu").addEventListener("click", () => navigate("gespraech_neu"));
     bindAufnahmen();
+    _geplanteGespraecheLaden();
   },
 
   // Alter Screen-Name — Q („zeig mir die Aufnahmen") und alte Links zeigen
@@ -645,18 +650,29 @@ const SCREENS = {
 
   // Einstieg: erst der Kunde, dann alles andere. Nur so kann die App im
   // Gespräch seine Daten zeigen, statt sie hinterher aus dem Diktat zu raten.
+  //
+  // Aus einem geplanten Kalendertermin heraus (App.gespraechVorgabe) ist der
+  // Name schon vorgeschlagen — der Handwerker bestätigt ihn oder tippt um.
+  // Geraten wird er aus dem Termin-Betreff, deshalb wird er NIE ungefragt
+  // als Kunde angelegt.
   async gespraech_neu() {
+    const vorgabe = App.gespraechVorgabe || null;
+    App.gespraechVorgabe = null;
     App.view.innerHTML = `<div class="loading">Lädt …</div>`;
     const r = await api("/app/api/kunden");
     const d = r && r.ok ? await r.json() : { kunden: [] };
     const alle = (d.kunden || []).map((k) => (typeof k === "string" ? { name: k } : k));
     const inp = "width:100%;padding:12px;border:1px solid var(--line);border-radius:10px;font-size:16px";
+    const untertitel = vorgabe && vorgabe.zeit
+      ? `Termin ${esc(vorgabe.zeit)}${vorgabe.ort ? " · " + esc(vorgabe.ort) : ""} — mit wem sprichst du?`
+      : "Mit wem sprichst du?";
     App.view.innerHTML =
       `<button class="btn-sm btn-ghost" id="gn-back" style="margin-bottom:10px">← Gespräche</button>` +
       `<h1 style="font-size:22px;margin:4px 4px 6px">Neues Kundengespräch</h1>` +
-      `<p class="muted" style="margin:0 4px 14px">Mit wem sprichst du?</p>` +
+      `<p class="muted" style="margin:0 4px 14px">${untertitel}</p>` +
       `<div class="card">
-         <input type="text" id="gn-suche" placeholder="Kunde suchen oder neuen Namen eingeben" style="${inp}" autocomplete="off" />
+         <input type="text" id="gn-suche" placeholder="Kunde suchen oder neuen Namen eingeben" style="${inp}"
+                autocomplete="off" value="${esc((vorgabe && vorgabe.name) || "")}" />
          <div id="gn-treffer" style="margin-top:10px"></div>
        </div>`;
     document.getElementById("gn-back").addEventListener("click", () => navigate("gespraeche"));
@@ -678,8 +694,14 @@ const SCREENS = {
         b.addEventListener("click", () => starten(b.dataset.kid, b.dataset.kname)));
     };
     const starten = async (kid, kname) => {
+      const nutzlast = kid ? { kunde_id: kid } : { kunde_name: kname };
+      if (vorgabe) {
+        nutzlast.kalender_event_id = vorgabe.event_id || "";
+        nutzlast.termin_iso = vorgabe.termin_iso || "";
+        nutzlast.termin_ort = vorgabe.ort || "";
+      }
       const res = await api("/app/api/gespraeche", { method: "POST",
-        body: JSON.stringify(kid ? { kunde_id: kid } : { kunde_name: kname }) });
+        body: JSON.stringify(nutzlast) });
       const j = res ? await res.json().catch(() => null) : null;
       if (j && j.ok) { showGespraech(j.id); return; }
       alert((j && j.error) || "Konnte das Gespräch nicht anlegen.");
@@ -4885,6 +4907,41 @@ async function openRechnungInQ(angebotId) {
 // darunter die vier Werkzeuge (Diktat, Notiz, Foto, Visualisierung) und
 // alles, was schon zusammengekommen ist. Ganz unten die Kundenmail.
 
+// Geplante Gespräche: was im Kalender steht, bevor es das Gespräch gibt.
+// Zwei Sorten in einer Liste — ein schon angelegtes Gespräch öffnet direkt
+// seinen Arbeitsbereich, ein reiner Kalendertermin startet ein neues.
+let _geplanteGespraeche = [];
+
+async function _geplanteGespraecheLaden() {
+  const r = await api("/app/api/gespraeche/geplant");
+  const d = r && r.ok ? await r.json().catch(() => null) : null;
+  // Nach dem await kann der Screen längst gewechselt sein.
+  const box = document.getElementById("gespr-geplant");
+  if (!box) return;
+  _geplanteGespraeche = (d && d.geplant) || [];
+  if (!_geplanteGespraeche.length) { box.remove(); return; }
+  box.innerHTML = `<h2>Geplant</h2>` + _geplanteGespraeche.map((x, i) => {
+    const titel = x.quelle === "kalender" ? (x.titel || "Termin") : (x.kunde || "Gespräch");
+    const unter = [x.ort, x.quelle === "kalender" ? "aus dem Kalender" : "Gespräch läuft"]
+      .filter(Boolean).join(" · ");
+    return `<button class="row menu-item" data-geplant="${i}" style="align-items:flex-start">` +
+      `<div style="text-align:left"><div>${esc(titel)}</div><div class="sub">${esc(unter)}</div></div>` +
+      `<span class="sub">${esc(x.zeit || "")} ›</span></button>`;
+  }).join("");
+  box.querySelectorAll("[data-geplant]").forEach((b) =>
+    b.addEventListener("click", () => _geplantesOeffnen(_geplanteGespraeche[+b.dataset.geplant])));
+}
+
+function _geplantesOeffnen(x) {
+  if (!x) return;
+  if (x.quelle === "gespraech" && x.id) { showGespraech(x.id); return; }
+  App.gespraechVorgabe = {
+    name: x.kunde || "", event_id: x.event_id || "",
+    termin_iso: x.termin_iso || "", ort: x.ort || "", zeit: x.zeit || "",
+  };
+  navigate("gespraech_neu");
+}
+
 function _gespraechKopf(k) {
   const zeile = (label, wert) => wert
     ? `<div class="row"><span>${esc(label)}</span><span class="sub">${esc(wert)}</span></div>` : "";
@@ -4906,7 +4963,9 @@ function _gespraechKopf(k) {
   </div>`;
 }
 
-async function showGespraech(id) {
+// `meldung` wird nach dem Rendern in die Statuszeile geschrieben — so
+// überlebt die Rückmeldung eines Abschlusses das Neuladen des Screens.
+async function showGespraech(id, meldung) {
   App.view.innerHTML = `<div class="loading">Lädt …</div>`;
   const r = await api("/app/api/gespraeche/" + encodeURIComponent(id));
   if (!r || !r.ok) { App.view.innerHTML = `<div class="card"><p class="empty">Konnte das Gespräch nicht laden.</p></div>`; return; }
@@ -4941,6 +5000,25 @@ async function showGespraech(id) {
   const termin = d.termin
     ? `<div class="card"><h2>Termin</h2><div class="row"><span>${esc(d.termin)}</span><span class="sub">${esc(d.termin_ort || "")}</span></div></div>` : "";
 
+  // Das Ende des Arbeitsbereichs: einpflegen oder wegwerfen. Der Text sagt
+  // beim Namen, was passiert — beim unbekannten Kunden wird er angelegt.
+  const abschluss = d.abgeschlossen
+    ? `<div class="card"><h2>Eingepflegt</h2>
+         <div class="row"><span>Beim Kunden abgelegt</span><span class="sub">${esc(d.abgeschlossen_am || "")}</span></div>
+         ${d.protokoll_url ? `<a class="row" href="${esc(d.protokoll_url)}" target="_blank" rel="noopener" style="text-decoration:none;color:inherit"><span>Gesprächsprotokoll</span><span class="sub">📄 Drive ›</span></a>` : ""}
+       </div>`
+    : `<div class="card"><h2>Gespräch abschließen</h2>
+         <p class="muted" style="margin:0 0 10px;font-size:13px">${
+           k.kunde_id
+             ? "Protokoll, Notizen und Bilder landen im Kundenordner."
+             : `„${esc(k.name || "Der Kunde")}" wird als Kunde angelegt; Protokoll, Notizen und Bilder landen in seinem Ordner.`
+         }</p>
+         <button class="btn-sm" id="gs-fertig" style="width:100%;padding:14px 10px">✅ ${
+           k.kunde_id ? "Fertig — beim Kunden einpflegen" : "Fertig — Kunde anlegen & einpflegen"
+         }</button>
+         <button class="btn-sm btn-ghost" id="gs-verwerfen" style="width:100%;margin-top:8px">🗑 Gespräch verwerfen</button>
+       </div>`;
+
   App.view.innerHTML =
     `<button class="btn-sm btn-ghost" id="gs-back" style="margin-bottom:10px">← Gespräche</button>` +
     _gespraechKopf(k) +
@@ -4964,6 +5042,7 @@ async function showGespraech(id) {
          style="width:100%;padding:12px;border:1px solid var(--line);border-radius:10px;font-family:inherit;font-size:16px">${esc(d.handnotiz || "")}</textarea>
        <button class="btn-sm btn-ghost" id="gs-notiz-save" style="margin-top:8px;width:100%">Notiz speichern</button>
      </div>` +
+    abschluss +
     (d.transkript ? `<div class="card"><h2>Transkript</h2><div class="sub" style="white-space:pre-wrap">${esc(d.transkript)}</div></div>` : "");
 
   document.getElementById("gs-back").addEventListener("click", () => navigate("gespraeche"));
@@ -5037,6 +5116,43 @@ async function showGespraech(id) {
     if (Diktat.recording) { _gespraechDiktatStop(id, recEl, statusEl); return; }
     _gespraechDiktatStart(id, recEl, statusEl);
   });
+
+  // --- Abschluss: einpflegen oder verwerfen ---
+  const fertigBtn = document.getElementById("gs-fertig");
+  if (fertigBtn) fertigBtn.addEventListener("click", async (e) => {
+    const btn = e.currentTarget;
+    btn.disabled = true;
+    statusEl.textContent = "Pflege das Gespräch beim Kunden ein …";
+    const res = await api("/app/api/gespraeche/" + encodeURIComponent(id) + "/abschliessen", {
+      method: "POST", body: "{}" });
+    const j = res ? await res.json().catch(() => null) : null;
+    btn.disabled = false;
+    if (j && j.ok) {
+      const teile = [j.kunde_neu
+        ? `${j.kunde_name} als Kunde angelegt.`
+        : "Beim Kunden eingepflegt."];
+      if (j.hinweis) teile.push(j.hinweis);
+      else if (j.protokoll_url) teile.push("Protokoll liegt im Kundenordner.");
+      showGespraech(id, teile.join(" "));
+      return;
+    }
+    statusEl.textContent = (j && j.error) || "Konnte das Gespräch nicht einpflegen.";
+  });
+
+  const verwerfenBtn = document.getElementById("gs-verwerfen");
+  if (verwerfenBtn) verwerfenBtn.addEventListener("click", async (e) => {
+    if (!confirm("Gespräch verwerfen? Es verschwindet aus allen Listen.")) return;
+    const btn = e.currentTarget;
+    btn.disabled = true;
+    const res = await api("/app/api/gespraeche/" + encodeURIComponent(id) + "/verwerfen", {
+      method: "POST", body: "{}" });
+    const j = res ? await res.json().catch(() => null) : null;
+    btn.disabled = false;
+    if (j && j.ok) { navigate("gespraeche"); return; }
+    statusEl.textContent = (j && j.error) || "Konnte das Gespräch nicht verwerfen.";
+  });
+
+  if (meldung) statusEl.textContent = meldung;
 }
 
 async function _gespraechDiktatStart(id, recEl, statusEl) {

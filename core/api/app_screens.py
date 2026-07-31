@@ -11,8 +11,10 @@ fremden Betrieb sehen oder aendern.
 """
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import logging
+import re
 import uuid
 
 from fastapi import APIRouter, Depends, Request
@@ -47,8 +49,10 @@ from core.models.email_conversation import (
 from core.models.kundengespraech import (
     Kundengespraech,
     KUNDENGESPRAECH_STATUS_ABGELEHNT,
+    KUNDENGESPRAECH_STATUS_ABGESCHLOSSEN,
     KUNDENGESPRAECH_STATUS_ANGENOMMEN,
     KUNDENGESPRAECH_STATUS_ERFASST,
+    KUNDENGESPRAECH_STATUS_VERWORFEN,
 )
 from core.models.rechnung import Rechnung
 from core.models.tenant_knowledge import KATEGORIE_LABELS, TenantKnowledge
@@ -161,6 +165,7 @@ async def _recent_aufnahmen(tenant_id: uuid.UUID, limit: int = 20) -> list[dict]
         "kunde": k.kunde_name,
         "briefing": (k.briefing_kurz or "")[:160],
         "zeit": _fmt_dt(k.gespraech_datum),
+        "abgeschlossen": k.status == KUNDENGESPRAECH_STATUS_ABGESCHLOSSEN,
     } for k in rows]
 
 
@@ -1820,6 +1825,59 @@ _GESPRAECH_FOTO_MIMES = {
     "image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp",
 }
 
+# Wie weit die Geplant-Liste in den Kalender schaut. Jeder Tag ist ein
+# API-Call beim Provider (parallel abgesetzt) — 7 Tage sind die Woche,
+# die der Handwerker ueberblickt, ohne dass der Screen haengt.
+_GESPRAECH_GEPLANT_TAGE = 7
+_KALENDER_ZONE = "Europe/Berlin"
+
+# Betreff der gebuchten Termine: "[Betrieb] Anliegen - Kunde Name"
+# (plugins/kalender/handler.py). Der Betriebs-Praefix ist Rauschen, der
+# Name steht hinten.
+_BETREFF_PRAEFIX = re.compile(r"^\s*\[[^\]]*\]\s*")
+
+
+def _kunde_aus_betreff(betreff: str) -> str:
+    """Rät den Kundennamen aus einem Termin-Betreff.
+
+    Bewusst nur ein Vorschlag: die App legt damit nichts an, sondern
+    füllt das Suchfeld beim „Neues Gespräch" vor — der Handwerker
+    bestätigt oder korrigiert.
+    """
+    rest = _BETREFF_PRAEFIX.sub("", betreff or "").strip()
+    for trenner in (" - ", " – ", " — "):
+        if trenner in rest:
+            rest = rest.rsplit(trenner, 1)[1]
+            break
+    return rest.strip()[:300]
+
+
+def _kalender_termin_parsen(roh) -> dt.datetime | None:
+    """ISO-Zeit eines Kalendertermins → ``termin_datum``.
+
+    Wichtig: ``termin_datum`` trägt im ganzen Projekt die LOKALE
+    Wanduhrzeit mit UTC-Etikett (siehe ``_parse_diktat_termin``, und
+    ``_termine`` vergleicht mit dem naiven ``now()``). Angezeigt wird
+    ohne Umrechnung. Ein 14-Uhr-Termin muss deshalb als 14 Uhr in die
+    DB — nicht nach echtem UTC umgerechnet, sonst zeigt die App im
+    Sommer 12 Uhr an.
+    """
+    text = (roh or "").strip() if isinstance(roh, str) else ""
+    if not text:
+        return None
+    try:
+        wert = dt.datetime.fromisoformat(text)
+    except ValueError:
+        return _parse_diktat_termin(text)
+    if wert.tzinfo is not None:
+        try:
+            from zoneinfo import ZoneInfo
+            wert = wert.astimezone(ZoneInfo(_KALENDER_ZONE))
+        except Exception:  # noqa: BLE001
+            pass
+        wert = wert.replace(tzinfo=None)
+    return wert.replace(tzinfo=dt.timezone.utc)
+
 
 async def _gespraech_laden(tid: uuid.UUID, gid: uuid.UUID):
     """Gespräch + angehängte Dateien, tenant-gescoped."""
@@ -1937,7 +1995,11 @@ async def api_gespraech_neu(
     """Legt ein leeres Gespräch zu einem Kunden an — der Einstieg vor Ort.
 
     Body: {kunde_id} für einen Bestandskunden ODER {kunde_name} für einen
-    neuen. Diktat, Notiz und Fotos kommen danach dazu."""
+    neuen. Diktat, Notiz und Fotos kommen danach dazu.
+
+    Optional aus einem geplanten Kalendertermin heraus:
+    {kalender_event_id, termin_iso, termin_ort} — dann hängt das Gespräch
+    am Termin und der Termin verschwindet aus der Geplant-Liste."""
     from core.models import Kunde
     tid = current_tenant_id(request)
     try:
@@ -1947,6 +2009,9 @@ async def api_gespraech_neu(
 
     kid_raw = (body.get("kunde_id") or "").strip()
     name = (body.get("kunde_name") or "").strip()[:300]
+    event_id = (body.get("kalender_event_id") or "").strip()[:500]
+    termin_ort = (body.get("termin_ort") or "").strip()[:300]
+    termin = _kalender_termin_parsen(body.get("termin_iso"))
     kunde = None
     async with get_session() as s:
         if kid_raw:
@@ -1971,6 +2036,9 @@ async def api_gespraech_neu(
             status=KUNDENGESPRAECH_STATUS_ERFASST,
             created_by_employee_id=emp.id,
             assigned_employee_id=emp.id,
+            kalender_event_id=event_id or None,
+            termin_datum=termin,
+            termin_ort=termin_ort or None,
         )
         s.add(g)
         await s.flush()
@@ -1978,6 +2046,109 @@ async def api_gespraech_neu(
         await s.commit()
     logger.info("PWA-Gespräch angelegt: id=%s tenant=%s kunde=%r", gid, tid, name)
     return JSONResponse({"ok": True, "id": str(gid), "kunde": name})
+
+
+async def _geplante_kalendertermine(
+    tid: uuid.UUID, employee_id: uuid.UUID | None, tage: int,
+) -> list[dict]:
+    """Anstehende Termine aus dem echten Kalender des Mitarbeiters.
+
+    Provider-agnostisch über den Kalender-Adapter (Google ODER Outlook).
+    Failsafe: ohne Kalender-Verbindung kommt eine leere Liste zurück —
+    die Gesprächsliste funktioniert auch ohne.
+    """
+    try:
+        from plugins.kalender.adapters import get_calendar_adapter
+        adapter = await get_calendar_adapter(tid, employee_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.info("Geplante Gespräche: kein Kalender-Adapter (%s)", exc)
+        return []
+
+    heute = dt.datetime.now().date()
+    tage_liste = [heute + dt.timedelta(days=i) for i in range(max(1, tage))]
+    ergebnisse = await asyncio.gather(
+        *[adapter.list_events_for_day(tag) for tag in tage_liste],
+        return_exceptions=True,
+    )
+
+    jetzt = dt.datetime.now()
+    events: list[dict] = []
+    for ergebnis in ergebnisse:
+        if isinstance(ergebnis, BaseException):
+            logger.info("Geplante Gespräche: Tagesabruf gescheitert: %s", ergebnis)
+            continue
+        for ev in ergebnis or []:
+            start = ev.get("start_dt")
+            if not isinstance(start, dt.datetime) or start < jetzt:
+                continue  # vorbei — steht schon in der Historie
+            events.append({
+                "start": start,
+                "event_id": (ev.get("event_id") or "").strip(),
+                "titel": (ev.get("subject") or "").strip() or "Termin",
+                "ort": (ev.get("location") or "").strip(),
+            })
+    events.sort(key=lambda e: e["start"])
+    return events
+
+
+@router.get("/gespraeche/geplant")
+async def api_gespraeche_geplant(
+    request: Request, emp: Employee = Depends(require_app_user),
+) -> JSONResponse:
+    """Was als Nächstes ansteht — bevor das Gespräch überhaupt existiert.
+
+    Zwei Quellen, eine Liste:
+    * ``kalender`` — Termine aus dem Kalender des Mitarbeiters (auch die,
+      die Q am Telefon gebucht hat). Antippen startet das Gespräch dazu.
+    * ``gespraech`` — schon angelegte Gespräche mit Termin in der Zukunft.
+      Antippen öffnet den Arbeitsbereich.
+
+    Termine, zu denen bereits ein Gespräch läuft, erscheinen nur einmal:
+    der Kalender-Zweig lässt sie über ``kalender_event_id`` weg.
+    """
+    tid = current_tenant_id(request)
+
+    async with get_session() as s:
+        offen = (await s.execute(
+            select(Kundengespraech)
+            .where(Kundengespraech.tenant_id == tid)
+            .where(Kundengespraech.termin_datum.is_not(None))
+            .where(Kundengespraech.termin_datum >= dt.datetime.now())
+            .where(Kundengespraech.status.not_in(
+                [KUNDENGESPRAECH_STATUS_ABGELEHNT,
+                 KUNDENGESPRAECH_STATUS_ABGESCHLOSSEN]))
+            .order_by(Kundengespraech.termin_datum.asc())
+            .limit(50)
+        )).scalars().all()
+    belegt = {(g.kalender_event_id or "").strip() for g in offen if g.kalender_event_id}
+
+    geplant = [{
+        "quelle": "gespraech",
+        "id": str(g.id),
+        "kunde": g.kunde_name,
+        "titel": g.kunde_name,
+        "ort": g.termin_ort or "",
+        "zeit": _fmt_dt(g.termin_datum),
+        "termin_iso": g.termin_datum.isoformat() if g.termin_datum else "",
+        "event_id": g.kalender_event_id or "",
+    } for g in offen]
+
+    for ev in await _geplante_kalendertermine(tid, emp.id, _GESPRAECH_GEPLANT_TAGE):
+        if ev["event_id"] and ev["event_id"] in belegt:
+            continue
+        geplant.append({
+            "quelle": "kalender",
+            "id": "",
+            "kunde": _kunde_aus_betreff(ev["titel"]),
+            "titel": ev["titel"],
+            "ort": ev["ort"],
+            "zeit": _fmt_dt(ev["start"]),
+            "termin_iso": ev["start"].isoformat(),
+            "event_id": ev["event_id"],
+        })
+
+    geplant.sort(key=lambda x: x.get("termin_iso") or "")
+    return JSONResponse({"geplant": geplant})
 
 
 @router.get("/gespraeche/{gespraech_id}")
@@ -2013,7 +2184,74 @@ async def api_gespraech_detail(
         "termin": _fmt_dt(g.termin_datum) if g.termin_datum else "",
         "termin_ort": g.termin_ort or "",
         "bilder": [_datei_zeile(d) for d in dateien],
+        "status": g.status,
+        "abgeschlossen": g.status == KUNDENGESPRAECH_STATUS_ABGESCHLOSSEN,
+        "abgeschlossen_am": _fmt_dt(g.abgeschlossen_am),
+        "protokoll_url": g.protokoll_drive_url or "",
     })
+
+
+@router.post("/gespraeche/{gespraech_id}/abschliessen")
+async def api_gespraech_abschliessen(
+    gespraech_id: str,
+    request: Request,
+    emp: Employee = Depends(require_app_user),
+    _c=Depends(require_app_csrf),
+) -> JSONResponse:
+    """„Fertig — beim Kunden einpflegen": das Ende des Arbeitsbereichs.
+
+    Legt den Kunden an, falls es ihn im Kundenstamm noch nicht gibt, und
+    schreibt Protokoll + Bilder in seinen Drive-Ordner (siehe
+    core/services/gespraech_abschluss.py). Ohne Drive-Verbindung gilt das
+    Gespräch trotzdem als eingepflegt — dann kommt ein ``hinweis`` zurück.
+    """
+    from core.services.gespraech_abschluss import schliesse_gespraech_ab
+    tid = current_tenant_id(request)
+    try:
+        gid = uuid.UUID(gespraech_id)
+    except (ValueError, TypeError):
+        return JSONResponse({"ok": False, "error": "ungueltige id"}, status_code=400)
+
+    ergebnis = await schliesse_gespraech_ab(tid, gid, employee_id=emp.id)
+    if not ergebnis.get("ok"):
+        return JSONResponse(ergebnis, status_code=404)
+    return JSONResponse(ergebnis)
+
+
+@router.post("/gespraeche/{gespraech_id}/verwerfen")
+async def api_gespraech_verwerfen(
+    gespraech_id: str,
+    request: Request,
+    _e=Depends(require_app_user),
+    _c=Depends(require_app_csrf),
+) -> JSONResponse:
+    """Gespräch lief schlecht — weg damit.
+
+    Soft-Delete über den bestehenden Status ``abgelehnt``: überall
+    ausgeblendet (Liste, Termine, Beratungs-Leads), die Zeile bleibt aber
+    stehen. Ein bereits eingepflegtes Gespräch lässt sich nicht mehr
+    verwerfen — die Daten liegen dann schon beim Kunden.
+    """
+    tid = current_tenant_id(request)
+    try:
+        gid = uuid.UUID(gespraech_id)
+    except (ValueError, TypeError):
+        return JSONResponse({"ok": False, "error": "ungueltige id"}, status_code=400)
+    async with get_session() as s:
+        g = (await s.execute(
+            select(Kundengespraech).where(
+                Kundengespraech.id == gid, Kundengespraech.tenant_id == tid)
+        )).scalar_one_or_none()
+        if g is None:
+            return JSONResponse({"ok": False, "error": "nicht gefunden"}, status_code=404)
+        if g.status == KUNDENGESPRAECH_STATUS_ABGESCHLOSSEN:
+            return JSONResponse(
+                {"ok": False, "error": "Schon beim Kunden eingepflegt."},
+                status_code=409)
+        g.status = KUNDENGESPRAECH_STATUS_VERWORFEN
+        await s.commit()
+    logger.info("PWA-Gespräch verworfen: id=%s tenant=%s", gid, tid)
+    return JSONResponse({"ok": True})
 
 
 @router.post("/gespraeche/{gespraech_id}/notiz")

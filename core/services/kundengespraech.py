@@ -74,7 +74,7 @@ def _fallback_text(*, betrieb: str, kunde: str, briefing: str,
     return "\n".join(teile)
 
 
-async def _als_drive_anhang(
+async def als_drive_anhang(
     tid: uuid.UUID, kunde_name: str, datei, employee_id: uuid.UUID | None,
 ) -> dict | None:
     """Macht aus einer Gespraechs-Datei einen Drive-Anhang.
@@ -83,6 +83,10 @@ async def _als_drive_anhang(
     Visualisierungen liegen als Bytes in der DB; die werden beim Anhaengen
     in den Kundenordner geladen. Das ist kein Umweg, sondern gewollt: was
     beim Kunden landet, gehoert auch in seinen Ordner.
+
+    Oeffentlich, weil der Gespraechs-Abschluss dieselbe Bewegung macht:
+    beim Einpflegen wandern ALLE Visualisierungen in den Kundenordner
+    (core/services/gespraech_abschluss.py).
     """
     from core.models.gespraech_datei import GESPRAECH_DATEI_VISUALISIERUNG
 
@@ -158,7 +162,7 @@ async def baue_kundenmail(
 
     anhaenge: list[dict] = []
     for d in bilder:
-        a = await _als_drive_anhang(tid, kunde, d, employee_id)
+        a = await als_drive_anhang(tid, kunde, d, employee_id)
         if a and a.get("id"):
             anhaenge.append(a)
 

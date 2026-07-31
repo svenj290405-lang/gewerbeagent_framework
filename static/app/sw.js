@@ -126,7 +126,10 @@
 // Startschritt) — fuer Arbeit, die nie durch die Angebots-Pipeline lief.
 // v67: Aufnahmen sind zum Kundengespraech geworden — Kundendaten oben,
 // Diktat/Notiz/Foto/Visualisierung an einem Ort, am Ende die Kundenmail.
-const CACHE = "ga-app-v67";
+// v68: Kundengespraech hat ein Ende — „fertig, beim Kunden einpflegen"
+// (legt den Kunden an, Protokoll + Bilder in den Drive-Kundenordner) oder
+// verwerfen; oben in der Liste stehen die geplanten Termine aus dem Kalender.
+const CACHE = "ga-app-v68";
 const SHELL = [
   "/app",
   "/app/static/app-beta.css",

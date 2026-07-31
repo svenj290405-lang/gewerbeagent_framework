@@ -204,6 +204,239 @@ async def test_gespraech_mail_nimmt_nur_gewaehlte_bilder(monkeypatch):
     assert bekommen["betrieb"] == "Schreinerei Test"
 
 
+# =====================================================================
+# Abschluss: einpflegen statt liegenlassen
+# =====================================================================
+
+class _FakeObjSession:
+    """Session-Attrappe: liefert immer dasselbe Objekt zurueck."""
+
+    def __init__(self, obj):
+        self.obj = obj
+        self.committed = False
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def execute(self, stmt):
+        return SimpleNamespace(scalar_one_or_none=lambda: self.obj)
+
+    def expunge(self, obj):
+        """Der Abschluss loest das Gespraech aus der Session, um damit
+        ausserhalb weiterzuarbeiten — hier ein No-op."""
+
+    async def commit(self):
+        self.committed = True
+
+
+def test_protokoll_zeigt_internes_getrennt_und_ohne_transkript():
+    """Der Drive-Ordner gehoert dem Betrieb — die Handnotiz darf rein,
+    aber sichtbar abgesetzt. Das Roh-Transkript bleibt draussen: im Drive
+    wuerde es die Aufbewahrungsfrist ueberleben."""
+    from core.services.gespraech_abschluss import protokoll_html
+
+    html = protokoll_html({
+        "kunde": "Müller", "datum": "31.07.2026 um 09:00 Uhr",
+        "briefing": "Bad neu fliesen.", "notizen": "Fliesen 30x60.",
+        "todos": ["Material bestellen"],
+        "handnotiz": "zahlt schleppend, Vorkasse",
+        "transkript": "also der Müller sagt er zahlt nie puenktlich",
+        "bilder": ["foto.jpg"],
+    })
+    assert "Intern — nicht an den Kunden" in html
+    assert "Vorkasse" in html
+    assert "Material bestellen" in html
+    assert "zahlt nie puenktlich" not in html
+
+
+def test_protokoll_laesst_leere_abschnitte_weg():
+    from core.services.gespraech_abschluss import protokoll_html
+
+    html = protokoll_html({"kunde": "Müller", "briefing": "Nur das."})
+    assert "Zusammenfassung" in html
+    assert "Intern" not in html
+    assert "To-dos" not in html
+
+
+@pytest.mark.asyncio
+async def test_abschluss_gilt_auch_ohne_drive(monkeypatch):
+    """Ohne Drive-Verbindung ist das Gespraech trotzdem eingepflegt —
+    ein Drive-Ausfall darf den Arbeitsablauf nicht blockieren."""
+    from core.services import gespraech_abschluss as abschluss
+    from core.models.kundengespraech import (
+        KUNDENGESPRAECH_STATUS_ABGESCHLOSSEN)
+
+    kunde_id = uuid.uuid4()
+    row = SimpleNamespace(
+        id=uuid.uuid4(), kunde_name="Müller", kunde_id=None, status="erfasst",
+        gespraech_datum=None, termin_datum=None, termin_ort=None,
+        audio_dauer_sekunden=None, briefing_kurz="", notizen_lang="",
+        todos=None, handnotiz=None, abgeschlossen_am=None,
+        protokoll_drive_file_id=None, protokoll_drive_url=None)
+    sess = _FakeObjSession(row)
+    monkeypatch.setattr(abschluss, "get_session", lambda: sess)
+
+    async def _kunde(g, tid):
+        return {"kunde_id": kunde_id, "kunde_neu": True,
+                "email": "", "telefon": "", "adresse": ""}
+    monkeypatch.setattr(abschluss, "_kunde_sicherstellen", _kunde)
+
+    async def _bilder(tid, g, emp):
+        raise ValueError("Google Drive nicht verbunden")
+    monkeypatch.setattr(abschluss, "_bilder_sichern", _bilder)
+
+    ergebnis = await abschluss.schliesse_gespraech_ab(
+        uuid.uuid4(), row.id, employee_id=uuid.uuid4())
+    assert ergebnis["ok"] is True
+    assert ergebnis["kunde_neu"] is True
+    assert "Drive" in (ergebnis["hinweis"] or "")
+    assert row.status == KUNDENGESPRAECH_STATUS_ABGESCHLOSSEN
+    assert row.abgeschlossen_am is not None
+
+
+@pytest.mark.asyncio
+async def test_abschluss_ist_idempotent(monkeypatch):
+    """Zweimal tippen legt kein zweites Protokoll in den Ordner."""
+    from core.services import gespraech_abschluss as abschluss
+    from core.models.kundengespraech import (
+        KUNDENGESPRAECH_STATUS_ABGESCHLOSSEN)
+
+    row = SimpleNamespace(
+        id=uuid.uuid4(), kunde_name="Müller", kunde_id=uuid.uuid4(),
+        status=KUNDENGESPRAECH_STATUS_ABGESCHLOSSEN,
+        protokoll_drive_url="https://drive/protokoll")
+    monkeypatch.setattr(abschluss, "get_session",
+                        lambda: _FakeObjSession(row))
+
+    async def _darf_nicht(*a, **kw):
+        raise AssertionError("Abschluss lief ein zweites Mal durch")
+    monkeypatch.setattr(abschluss, "_kunde_sicherstellen", _darf_nicht)
+
+    ergebnis = await abschluss.schliesse_gespraech_ab(uuid.uuid4(), row.id)
+    assert ergebnis["ok"] is True
+    assert ergebnis["bereits"] is True
+    assert ergebnis["protokoll_url"] == "https://drive/protokoll"
+
+
+@pytest.mark.asyncio
+async def test_verwerfen_blendet_aus_statt_zu_loeschen(monkeypatch):
+    from core.models.kundengespraech import KUNDENGESPRAECH_STATUS_ABGELEHNT
+
+    row = SimpleNamespace(status="erfasst")
+    sess = _FakeObjSession(row)
+    monkeypatch.setattr(app_screens, "get_session", lambda: sess)
+    resp = await app_screens.api_gespraech_verwerfen(
+        gespraech_id=str(uuid.uuid4()), request=_req(), _e=None, _c=None)
+    assert resp.status_code == 200
+    assert row.status == KUNDENGESPRAECH_STATUS_ABGELEHNT
+    assert sess.committed is True
+
+
+@pytest.mark.asyncio
+async def test_eingepflegtes_gespraech_laesst_sich_nicht_verwerfen(monkeypatch):
+    from core.models.kundengespraech import (
+        KUNDENGESPRAECH_STATUS_ABGESCHLOSSEN)
+
+    row = SimpleNamespace(status=KUNDENGESPRAECH_STATUS_ABGESCHLOSSEN)
+    monkeypatch.setattr(app_screens, "get_session",
+                        lambda: _FakeObjSession(row))
+    resp = await app_screens.api_gespraech_verwerfen(
+        gespraech_id=str(uuid.uuid4()), request=_req(), _e=None, _c=None)
+    assert resp.status_code == 409
+    assert row.status == KUNDENGESPRAECH_STATUS_ABGESCHLOSSEN
+
+
+# =====================================================================
+# Geplante Gespraeche (Kalender)
+# =====================================================================
+
+def test_kunde_aus_termin_betreff():
+    """Gebuchte Termine heissen "[Betrieb] Anliegen - Kunde"."""
+    assert app_screens._kunde_aus_betreff(
+        "[Schreinerei Test] Badsanierung - Hans Müller") == "Hans Müller"
+    assert app_screens._kunde_aus_betreff("Aufmass – Frau Meier") == "Frau Meier"
+    # Kein Trenner: der ganze Betreff ist der beste Vorschlag, den wir haben.
+    assert app_screens._kunde_aus_betreff("Werkstatt aufräumen") == "Werkstatt aufräumen"
+    assert app_screens._kunde_aus_betreff("") == ""
+
+
+def test_kalender_termin_behaelt_die_wanduhrzeit():
+    """termin_datum traegt projektweit die lokale Wanduhrzeit mit
+    UTC-Etikett — sonst zeigt die App im Sommer zwei Stunden zu frueh."""
+    wert = app_screens._kalender_termin_parsen("2026-08-03T14:00:00")
+    assert wert is not None
+    assert (wert.hour, wert.minute) == (14, 0)
+    assert wert.tzinfo is not None
+    assert app_screens._kalender_termin_parsen("") is None
+    assert app_screens._kalender_termin_parsen(None) is None
+
+
+@pytest.mark.asyncio
+async def test_geplante_termine_ueberspringen_vergangenes(monkeypatch):
+    """Nur was noch kommt — Vergangenes steht in der Historie."""
+    import datetime as _dt
+
+    jetzt = _dt.datetime.now()
+
+    class _Adapter:
+        async def list_events_for_day(self, tag):
+            return [
+                {"start_dt": jetzt - _dt.timedelta(hours=2), "subject": "vorbei",
+                 "event_id": "alt", "location": ""},
+                {"start_dt": jetzt + _dt.timedelta(hours=2), "subject": "[B] Bad - Müller",
+                 "event_id": "neu", "location": "Hauptstr. 1"},
+            ]
+
+    import plugins.kalender.adapters as adapters
+
+    async def _adapter(tid, emp=None, fallback_calendar_id="primary"):
+        return _Adapter()
+    monkeypatch.setattr(adapters, "get_calendar_adapter", _adapter)
+
+    events = await app_screens._geplante_kalendertermine(
+        uuid.uuid4(), uuid.uuid4(), tage=1)
+    assert [e["event_id"] for e in events] == ["neu"]
+    assert events[0]["ort"] == "Hauptstr. 1"
+
+
+@pytest.mark.asyncio
+async def test_geplante_liste_zeigt_termine_mit_gespraech_nur_einmal(monkeypatch):
+    """Laeuft zu einem Kalendertermin schon ein Gespraech, ist der Termin
+    kein Vorschlag mehr — sonst legt man dasselbe Gespraech zweimal an."""
+    import datetime as _dt
+
+    gid = uuid.uuid4()
+    termin = _dt.datetime.now() + _dt.timedelta(hours=3)
+    row = SimpleNamespace(
+        id=gid, kunde_name="Müller", termin_datum=termin, termin_ort="",
+        kalender_event_id="evt-1", status="erfasst")
+
+    class _Sess:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *exc): return False
+        async def execute(self, stmt):
+            return SimpleNamespace(
+                scalars=lambda: SimpleNamespace(all=lambda: [row]))
+    monkeypatch.setattr(app_screens, "get_session", lambda: _Sess())
+
+    async def _kalender(tid, emp, tage):
+        return [
+            {"start": termin, "event_id": "evt-1", "titel": "[B] Bad - Müller", "ort": ""},
+            {"start": termin, "event_id": "evt-2", "titel": "[B] Dach - Meier", "ort": ""},
+        ]
+    monkeypatch.setattr(app_screens, "_geplante_kalendertermine", _kalender)
+
+    resp = await app_screens.api_gespraeche_geplant(
+        request=_req(), emp=SimpleNamespace(id=uuid.uuid4()))
+    geplant = _json_body(resp)["geplant"]
+    assert [x["quelle"] for x in geplant] == ["gespraech", "kalender"]
+    assert geplant[0]["id"] == str(gid)
+    assert geplant[1]["kunde"] == "Meier"
+
+
 def test_datei_zeile_verlinkt_je_nach_herkunft():
     """Foto kommt aus Drive (Proxy), Visualisierung aus der DB."""
     vid = uuid.uuid4()
