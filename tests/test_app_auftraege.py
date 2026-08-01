@@ -90,7 +90,8 @@ def _ang(**kw):
     """Angebot-Attrappe mit allen Feldern, die _auftrag_zeile liest."""
     basis = dict(
         id=uuid.uuid4(), kunde_name="Mueller", gesamtbetrag_brutto_eur=1000,
-        status="accepted", created_at=None, arbeit_fortschritt=0,
+        status="accepted", created_at=None, updated_at=None,
+        arbeit_fortschritt=0,
         abgeschlossen_am=None, archiv_drive_folder_url=None,
     )
     basis.update(kw)
@@ -142,18 +143,43 @@ async def test_abgeschlossene_liste_liefert_archiv_link(monkeypatch):
     assert j["auftraege"][0]["archiv_url"].endswith("/abc")
 
 
-def test_laufende_liste_schliesst_abgeschlossene_aus():
-    """Abgeschlossene Auftraege haben ihre eigene Liste — sonst waechst die
-    Arbeitsliste ewig. Der Status-Filter der laufenden Liste darf
-    rechnung_gesendet daher nicht enthalten."""
+def test_laufende_liste_schliesst_fertiggestellte_aus():
+    """Fertiggestellte Auftraege gehoeren in die Historie, nicht in die
+    Arbeitsliste — sonst waechst die ewig. Das gilt fuer abgerechnete
+    (rechnung_gesendet) UND fuer abgebrochene: an beiden ist nichts mehr
+    zu tun."""
     from core.models.angebot import (
         ANGEBOT_STATUS_ABGEBROCHEN, ANGEBOT_STATUS_RECHNUNG_GESENDET,
         AUFTRAG_LIFECYCLE,
     )
-    laufend = (set(AUFTRAG_LIFECYCLE) | {ANGEBOT_STATUS_ABGEBROCHEN}) - {
-        ANGEBOT_STATUS_RECHNUNG_GESENDET}
+    laufend = set(AUFTRAG_LIFECYCLE) - {ANGEBOT_STATUS_RECHNUNG_GESENDET}
     assert ANGEBOT_STATUS_RECHNUNG_GESENDET not in laufend
+    assert ANGEBOT_STATUS_ABGEBROCHEN not in laufend
     assert "arbeit_laeuft" in laufend
+    # ... und genau die beiden bilden die Historie.
+    assert app_screens._AUFTRAG_HISTORIE_STATES == {
+        ANGEBOT_STATUS_RECHNUNG_GESENDET, ANGEBOT_STATUS_ABGEBROCHEN}
+
+
+@pytest.mark.asyncio
+async def test_historie_enthaelt_abgerechnete_und_abgebrochene(monkeypatch):
+    """Die Historie ist die vollstaendige Vergangenheit: beide Endzustaende
+    stehen drin, jeder mit dem Zeitpunkt, an dem er durch war."""
+    import datetime as _dt
+
+    abbruch = _dt.datetime(2026, 3, 4, 9, 30)
+    rows = [
+        _ang(kunde_name="Fertig", status="rechnung_gesendet",
+             abgeschlossen_am=_dt.datetime(2026, 5, 1, 12, 0)),
+        _ang(kunde_name="Geplatzt", status="abgebrochen", updated_at=abbruch),
+    ]
+    monkeypatch.setattr(app_screens, "get_session", lambda: _FakeListSession(rows))
+    j = _json_body(await app_screens.api_auftraege_historie(request=_req(), _e=None))
+    fertig, geplatzt = j["auftraege"]
+    assert fertig["abgebrochen"] is False and fertig["beendet_am"]
+    # Abgebrochene haben keinen eigenen Stempel — updated_at ist der Abbruch.
+    assert geplatzt["abgebrochen"] is True
+    assert geplatzt["beendet_am"] == app_screens._fmt_dt(abbruch)
 
 
 # =====================================================================

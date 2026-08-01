@@ -303,14 +303,13 @@ _AUFTRAG_SETTABLE = {
 async def api_auftraege(
     request: Request, _e=Depends(require_app_user),
 ) -> JSONResponse:
-    """LAUFENDE Auftraege = Angebote im Lifecycle (inkl. abgebrochen), aber
-    ohne die abgeschlossenen — die haben ihre eigene Liste
-    (``/auftraege/abgeschlossen``), sonst waechst die Arbeitsliste ewig.
-    Tenant-gescoped."""
+    """LAUFENDE Auftraege = Angebote im Lifecycle, an denen noch gearbeitet
+    wird. Fertiggestellte fallen raus — abgerechnete (rechnung_gesendet)
+    genauso wie abgebrochene: an beiden ist nichts mehr zu tun, sie stehen
+    in der Auftragshistorie (``/auftraege/historie``). Sonst waechst die
+    Arbeitsliste ewig. Tenant-gescoped."""
     tid = current_tenant_id(request)
-    relevante = (
-        set(AUFTRAG_LIFECYCLE) | {ANGEBOT_STATUS_ABGEBROCHEN}
-    ) - {ANGEBOT_STATUS_RECHNUNG_GESENDET}
+    relevante = set(AUFTRAG_LIFECYCLE) - {ANGEBOT_STATUS_RECHNUNG_GESENDET}
     async with get_session() as s:
         rows = (await s.execute(
             select(Angebot)
@@ -374,6 +373,21 @@ def _auftrag_zeile(a: Angebot) -> dict:
     }
 
 
+def _historie_zeile(a: Angebot) -> dict:
+    """Listenzeile fuer die Auftragshistorie — Auftragszeile plus die Frage,
+    die dort als einzige zaehlt: wann war der Auftrag durch?
+
+    Abgerechnete tragen ``abgeschlossen_am``. Abgebrochene haben keinen
+    eigenen Stempel — dort ist ``updated_at`` der Zeitpunkt des Abbruchs,
+    denn danach wird an einem abgebrochenen Auftrag nichts mehr geaendert.
+    """
+    beendet = a.abgeschlossen_am or a.updated_at
+    return {
+        **_auftrag_zeile(a),
+        "beendet_am": _fmt_dt(beendet) if beendet else "",
+    }
+
+
 @router.get("/auftraege/abgeschlossen")
 async def api_auftraege_abgeschlossen(
     request: Request, _e=Depends(require_app_user),
@@ -396,6 +410,41 @@ async def api_auftraege_abgeschlossen(
             .limit(100)
         )).scalars().all()
     return JSONResponse({"auftraege": [_auftrag_zeile(a) for a in rows]})
+
+
+# Fertiggestellt = raus aus der Arbeitsliste. Zwei Wege dahin: abgerechnet
+# oder abgebrochen. Genau diese beiden bilden die Auftragshistorie.
+_AUFTRAG_HISTORIE_STATES = {
+    ANGEBOT_STATUS_RECHNUNG_GESENDET,
+    ANGEBOT_STATUS_ABGEBROCHEN,
+}
+
+
+@router.get("/auftraege/historie")
+async def api_auftraege_historie(
+    request: Request, _e=Depends(require_app_user),
+) -> JSONResponse:
+    """Auftragshistorie = ALLE fertiggestellten Auftraege, abgerechnete wie
+    abgebrochene. Das vollstaendige Nachschlagewerk „was hatten wir schon" —
+    die abgeschlossenen allein (``/auftraege/abgeschlossen``) beantworten
+    das nicht, weil ein abgebrochener Auftrag dort nie auftaucht.
+
+    Sortiert nach dem Zeitpunkt, an dem der Auftrag durch war, neueste
+    zuerst. Altbestand ohne ``abgeschlossen_am`` faellt auf ``updated_at``
+    zurueck, damit die Liste vollstaendig bleibt."""
+    tid = current_tenant_id(request)
+    async with get_session() as s:
+        rows = (await s.execute(
+            select(Angebot)
+            .where(Angebot.tenant_id == tid)
+            .where(Angebot.status.in_(_AUFTRAG_HISTORIE_STATES))
+            .order_by(
+                func.coalesce(Angebot.abgeschlossen_am, Angebot.updated_at).desc(),
+                Angebot.created_at.desc(),
+            )
+            .limit(200)
+        )).scalars().all()
+    return JSONResponse({"auftraege": [_historie_zeile(a) for a in rows]})
 
 
 @router.post("/auftraege/{angebot_id}/status")

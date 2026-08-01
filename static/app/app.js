@@ -396,12 +396,15 @@ const SCREENS = {
     const d = res && res.ok ? await res.json() : { auftraege: [] };
     const isInhaber = App.me.employee.is_inhaber;
     const list = (d.auftraege || []).map((a) => auftragCard(a, isInhaber)).join("");
-    // Unten die beiden Sammel-Funktionen: links das Archiv der fertigen
-    // Aufträge, rechts der Editor für den Ablauf selbst.
+    // Unten die Sammel-Funktionen: das Archiv der abgerechneten Aufträge,
+    // die vollständige Historie (abgerechnet UND abgebrochen) und der Editor
+    // für den Ablauf selbst. Umbrechend, damit die Knöpfe auf dem Handy nicht
+    // zu schmalen Streifen zusammengequetscht werden.
     const fuss =
-      `<div style="display:flex;gap:8px;margin-top:18px">
-         <button class="btn-sm btn-ghost" id="auf-fertig" style="flex:1;padding:14px 10px;text-align:center">✅ Abgeschlossene Aufträge</button>
-         ${isInhaber ? `<button class="btn-sm btn-ghost" id="auf-prozess" style="flex:1;padding:14px 10px;text-align:center">⚙️ Auftragsprozess bearbeiten</button>` : ""}
+      `<div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:18px">
+         <button class="btn-sm btn-ghost" id="auf-fertig" style="flex:1 1 45%;padding:14px 10px;text-align:center">✅ Abgeschlossene Aufträge</button>
+         <button class="btn-sm btn-ghost" id="auf-historie" style="flex:1 1 45%;padding:14px 10px;text-align:center">🗂️ Auftragshistorie</button>
+         ${isInhaber ? `<button class="btn-sm btn-ghost" id="auf-prozess" style="flex:1 1 100%;padding:14px 10px;text-align:center">⚙️ Auftragsprozess bearbeiten</button>` : ""}
        </div>`;
     // Neu-Button oben: Aufträge von Hand sind der Einstieg für alles, was
     // ohne Angebot reinkommt — der gehört über die Liste, nicht in den Fuß.
@@ -419,6 +422,8 @@ const SCREENS = {
     if (neuBtn) neuBtn.addEventListener("click", () => navigate("auftrag_neu"));
     document.getElementById("auf-fertig").addEventListener("click",
       () => navigate("auftraege_fertig"));
+    document.getElementById("auf-historie").addEventListener("click",
+      () => navigate("auftraege_historie"));
     const proz = document.getElementById("auf-prozess");
     if (proz) proz.addEventListener("click", () => showProzessEditor("auftraege_page"));
     bindAuftragOeffnen("auftraege_page");
@@ -451,6 +456,44 @@ const SCREENS = {
       (liste || `<div class="card">${emptyRow("Noch keine abgeschlossenen Aufträge")}</div>`);
     document.getElementById("back-auf").addEventListener("click", () => navigate("auftraege_page"));
     bindAuftragOeffnen("auftraege_fertig");
+  },
+
+  // Auftragshistorie: alles, was durch ist — abgerechnet UND abgebrochen.
+  // Bewusst neben der Abgeschlossenen-Liste: die ist das Rechnungs-Archiv
+  // mit den Drive-Ordnern, hier steht die vollständige Vergangenheit
+  // („was hatten wir bei dem Kunden schon"), inkl. der Abbrüche.
+  async auftraege_historie() {
+    App.view.innerHTML = `<div class="loading">Lädt …</div>`;
+    const res = await api("/app/api/auftraege/historie");
+    const d = res && res.ok ? await res.json() : { auftraege: [] };
+    const liste = (d.auftraege || []).map((a) => {
+      const archiv = a.archiv_url
+        ? `<a href="${esc(a.archiv_url)}" target="_blank" rel="noopener" class="sub" style="white-space:nowrap">📁 Drive ›</a>`
+        : "";
+      // Der Abbruch ist die Information, die man auf einen Blick braucht —
+      // sonst liest man eine Zeile wie einen erledigten Auftrag.
+      const pill = a.abgebrochen
+        ? `<span class="pill danger">Abgebrochen</span>`
+        : `<span class="pill ok">Abgerechnet</span>`;
+      const wann = a.beendet_am
+        ? (a.abgebrochen ? " · abgebrochen " : " · abgeschlossen ") + esc(a.beendet_am)
+        : "";
+      return `<div class="card" style="cursor:pointer">
+        <div class="row">
+          <div data-auftrag-open="${esc(a.id)}" style="flex:1">
+            <div><b>${esc(a.kunde)}</b></div>
+            <div class="sub">${esc(a.betrag)}${wann}</div>
+          </div>
+          <div style="display:flex;align-items:center;gap:8px">${pill}${archiv}</div>
+        </div></div>`;
+    }).join("");
+    App.view.innerHTML =
+      `<button class="btn-sm btn-ghost" id="back-auf" style="margin-bottom:10px">← Aufträge</button>` +
+      `<h1 style="font-size:22px;margin:4px 4px 6px">Auftragshistorie</h1>` +
+      `<p class="muted" style="margin:0 4px 14px">Alle fertiggestellten Aufträge — abgerechnete und abgebrochene. Sie sind aus der laufenden Liste raus.</p>` +
+      (liste || `<div class="card">${emptyRow("Noch keine fertiggestellten Aufträge")}</div>`);
+    document.getElementById("back-auf").addEventListener("click", () => navigate("auftraege_page"));
+    bindAuftragOeffnen("auftraege_historie");
   },
 
   // Auftrag von Hand — für Arbeit, die nie durch die Angebots-Pipeline lief
