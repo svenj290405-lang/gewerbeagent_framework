@@ -128,6 +128,16 @@ const HOME_SCREEN = "assistent";
 // Zurueck-Schritt erzeugen) oder "none" (wir rendern GERADE eine History-
 // Bewegung, die URL stimmt schon).
 function navigate(key, { mode = "push" } = {}) {
+  // Ungespeicherte Aenderungen: der aktuelle Screen darf den Wechsel
+  // abbrechen (fragt selbst nach). Muss vor jeder anderen Aufraeumarbeit
+  // laufen, sonst raeumt navigate() einen Screen ab, der bleiben soll.
+  if (App.dirtyGuard) {
+    let weiter = true;
+    try { weiter = App.dirtyGuard(); } catch (e) {}
+    if (!weiter) return;
+    App.dirtyGuard = null;
+  }
+  if (App.view) App.view.classList.remove("has-savebar");
   if (App.qSphereStop) { try { App.qSphereStop(); } catch (e) {} App.qSphereStop = null; App.qSphereCanvas = null; }
   if (App._qPasteListener) { document.removeEventListener("paste", App._qPasteListener); App._qPasteListener = null; }
   // Laeuft noch eine Sprachaufnahme, wird sie beim Verlassen verworfen —
@@ -213,6 +223,20 @@ window.addEventListener("popstate", (e) => {
     history.pushState({ screen: App.current, depth: depth + 1 }, "", "#" + App.current);
     updateBackButton();
     return;
+  }
+  // Ungespeicherte Aenderungen: hier muss der History-Schritt zurueckgelegt
+  // werden, wenn der Nutzer bleiben will — sonst zeigt die App den alten
+  // Screen, waehrend die Adresse schon auf dem neuen steht.
+  if (App.dirtyGuard) {
+    let weiter = true;
+    try { weiter = App.dirtyGuard(); } catch (er) {}
+    if (!weiter) {
+      const tiefe = (history.state && history.state.depth) || 0;
+      history.pushState({ screen: App.current, depth: tiefe + 1 }, "", "#" + App.current);
+      updateBackButton();
+      return;
+    }
+    App.dirtyGuard = null;
   }
   toggleQOverlay(true);  // offenes Q-Overlay schliessen, sonst liegt es ueber dem Screen
   const key = (e.state && e.state.screen) || screenFromHash() || HOME_SCREEN;
@@ -1247,41 +1271,119 @@ const SCREENS = {
         `<div class="section-title">${esc(g.name)}</div>` +
         `<div class="card">${g.items.map(zeile).join("")}</div>`
       ).join("") +
-      `<p class="muted" style="margin:4px 4px 0;font-size:12px">Gilt für den ganzen Betrieb, nicht nur für dein Gerät.</p>`;
+      `<p class="muted" style="margin:4px 4px 14px;font-size:12px">Gilt für den ganzen Betrieb, nicht nur für dein Gerät.</p>` +
+      // Speicherleiste: erscheint erst, wenn wirklich etwas geändert wurde.
+      // Bewusst kein Sofort-Speichern mehr — wer Q auf „automatisch" stellt,
+      // gibt ihm die Hand fuer den ganzen Betrieb frei, und ein
+      // versehentlicher Fingertipp soll das nicht tun.
+      `<div class="save-bar" id="auto-savebar" hidden>
+         <span class="save-bar-info" id="auto-saveinfo"></span>
+         <button class="btn-sm btn-ghost" id="auto-verwerfen">Verwerfen</button>
+         <button class="btn-sm" id="auto-speichern">Speichern</button>
+       </div>`;
 
     document.getElementById("back-einst").addEventListener("click", () => navigate("einstellungen"));
     if (!isInhaber) return;
 
-    App.view.querySelectorAll(".seg button").forEach((btn) => {
-      btn.addEventListener("click", async () => {
-        const seg = btn.parentElement;
-        const key = btn.dataset.key, mode = btn.dataset.mode;
-        const vorher = seg.querySelector("button.active");
-        if (vorher === btn) return;
-        // Optimistisch umschalten — der Schalter soll sich sofort anfühlen.
-        // Schlägt der POST fehl, springt er unten zurück.
-        seg.querySelectorAll("button").forEach((b) => b.classList.remove("active"));
-        btn.classList.add("active");
-        seg.querySelectorAll("button").forEach((b) => { b.disabled = true; });
-
-        const r = await api("/app/api/automatisierung",
-          { method: "POST", body: JSON.stringify({ key: key, mode: mode }) });
-        const j = r && r.ok ? await r.json().catch(() => null) : null;
-
-        seg.querySelectorAll("button").forEach((b) => {
-          // Vorher deaktivierte Stufen bleiben deaktiviert.
-          b.disabled = b.hasAttribute("data-was-disabled");
-        });
-        if (j && j.ok) return;
-        btn.classList.remove("active");
-        if (vorher) vorher.classList.add("active");
-        alert("Konnte nicht speichern: " + ((j && j.error) || "unbekannt"));
-      });
-    });
-    // Merken, welche Stufen dauerhaft gesperrt sind — der Handler oben
-    // stellt beim Wiederfreigeben genau diesen Zustand her.
+    // Merken, welche Stufen dauerhaft gesperrt sind (Feature/Registry) —
+    // die bleiben auch nach dem Speichern deaktiviert.
     App.view.querySelectorAll(".seg button[disabled]").forEach((b) =>
       b.setAttribute("data-was-disabled", "1"));
+
+    // gespeicherter Stand vom Server; dagegen wird „geändert" gemessen
+    const gespeichert = {};
+    (d.automations || []).forEach((a) => { gespeichert[a.key] = a.mode; });
+    const gewaehlt = Object.assign({}, gespeichert);
+
+    const savebar = document.getElementById("auto-savebar");
+    const saveinfo = document.getElementById("auto-saveinfo");
+    const saveBtn = document.getElementById("auto-speichern");
+    const undoBtn = document.getElementById("auto-verwerfen");
+
+    const geaendert = () =>
+      Object.keys(gewaehlt).filter((k) => gewaehlt[k] !== gespeichert[k]);
+
+    function markiere() {
+      const offen = geaendert();
+      savebar.hidden = offen.length === 0;
+      App.view.classList.toggle("has-savebar", offen.length > 0);
+      saveinfo.textContent = offen.length === 1
+        ? "1 Änderung noch nicht gespeichert"
+        : offen.length + " Änderungen noch nicht gespeichert";
+      // Geänderte Zeilen sichtbar machen, damit man beim Speichern weiss,
+      // was gleich passiert.
+      App.view.querySelectorAll(".autolist").forEach((row) => {
+        const seg = row.querySelector(".seg");
+        if (seg) row.classList.toggle("dirty", offen.indexOf(seg.dataset.seg) !== -1);
+      });
+    }
+
+    // Verlassen mit ungespeicherten Änderungen: nachfragen statt still
+    // wegwerfen. navigate() ruft den Waechter vor jedem Wechsel auf.
+    App.dirtyGuard = () => !geaendert().length ||
+      confirm("Du hast Änderungen an der Automatisierung noch nicht gespeichert. Trotzdem verlassen?");
+
+    App.view.querySelectorAll(".seg button").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        if (btn.disabled) return;
+        const seg = btn.parentElement;
+        seg.querySelectorAll("button").forEach((b) => b.classList.remove("active"));
+        btn.classList.add("active");
+        gewaehlt[btn.dataset.key] = btn.dataset.mode;
+        markiere();
+      });
+    });
+
+    undoBtn.addEventListener("click", () => {
+      Object.keys(gespeichert).forEach((k) => { gewaehlt[k] = gespeichert[k]; });
+      App.view.querySelectorAll(".seg").forEach((seg) => {
+        seg.querySelectorAll("button").forEach((b) =>
+          b.classList.toggle("active", b.dataset.mode === gespeichert[seg.dataset.seg]));
+      });
+      markiere();
+    });
+
+    saveBtn.addEventListener("click", async () => {
+      const offen = geaendert();
+      if (!offen.length) return;
+      saveBtn.disabled = true; undoBtn.disabled = true;
+      saveBtn.textContent = "Speichert …";
+      // Einzeln statt in einem Rutsch: der Server validiert pro Funktion,
+      // und so bleibt zuordenbar, welche Zeile gescheitert ist.
+      const fehler = [];
+      for (const key of offen) {
+        const r = await api("/app/api/automatisierung",
+          { method: "POST", body: JSON.stringify({ key: key, mode: gewaehlt[key] }) });
+        const j = r && r.ok ? await r.json().catch(() => null) : null;
+        if (j && j.ok) gespeichert[key] = gewaehlt[key];
+        else fehler.push(((d.automations || []).find((a) => a.key === key) || {}).label
+          || key + ": " + ((j && j.error) || "unbekannter Fehler"));
+      }
+      saveBtn.disabled = false; undoBtn.disabled = false;
+      saveBtn.textContent = "Speichern";
+      // Gescheiterte Zeilen auf den gespeicherten Stand zurueckstellen, damit
+      // der Schalter nicht etwas anderes zeigt als der Server kennt.
+      if (fehler.length) {
+        Object.keys(gespeichert).forEach((k) => { gewaehlt[k] = gespeichert[k]; });
+        App.view.querySelectorAll(".seg").forEach((seg) => {
+          seg.querySelectorAll("button").forEach((b) =>
+            b.classList.toggle("active", b.dataset.mode === gespeichert[seg.dataset.seg]));
+        });
+        alert("Nicht gespeichert: " + fehler.join(", "));
+        markiere();
+      } else {
+        // Kurze Bestaetigung stehen lassen, erst danach die Leiste einziehen —
+        // sonst verschwindet sie im selben Moment, in dem man speichert.
+        saveinfo.textContent = "Gespeichert ✓";
+        savebar.classList.add("ok");
+        // Zeilen-Markierung sofort weg — gespeichert ist gespeichert; nur die
+        // Bestaetigung in der Leiste bleibt noch kurz stehen.
+        App.view.querySelectorAll(".autolist.dirty").forEach((r) => r.classList.remove("dirty"));
+        setTimeout(() => { savebar.classList.remove("ok"); markiere(); }, 1400);
+      }
+    });
+
+    markiere();
   },
 
   async einstellungen_app() {

@@ -144,7 +144,9 @@
 // v73: Q-Overlay oeffnet halb hoch statt als schmaler Streifen und hat
 // dieselbe Sprachaufnahme wie der Assistent (Leiste mit Laufzeit + Pegel);
 // automatisch ausgefuehrte Aktionen werden im Overlay auch angezeigt.
-const CACHE = "ga-app-v73";
+// v74: Automatisierungs-Stufen werden erst mit „Speichern" wirksam
+// (Speicherleiste, Verwerfen, Warnung beim Verlassen) statt sofort beim Tippen.
+const CACHE = "ga-app-v74";
 const SHELL = [
   "/app",
   "/app/static/app-beta.css",

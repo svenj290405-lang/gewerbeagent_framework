@@ -111,6 +111,25 @@ button:disabled { opacity: .6; }
 .autolist .auto-label { font-size: 15px; font-weight: 600; }
 .autolist .auto-desc { color: var(--muted); font-size: 13px; margin: 2px 0 10px; }
 .autolist .auto-note { color: var(--muted); font-size: 12px; margin: 8px 0 0; }
+/* Geaenderte, noch nicht gespeicherte Zeile markieren — beim Speichern soll
+   klar sein, was gleich passiert. */
+.autolist.dirty { position: relative; }
+.autolist.dirty::before { content: ""; position: absolute; left: -14px; top: 10px; bottom: 10px;
+  width: 3px; border-radius: 2px; background: var(--primary); }
+
+/* Speicherleiste am unteren Rand: nur sichtbar, solange etwas offen ist. */
+.save-bar { position: fixed; left: 0; right: 0; z-index: 11;
+  bottom: calc(56px + env(safe-area-inset-bottom,0px));
+  display: flex; align-items: center; gap: 8px; padding: 10px 12px;
+  background: var(--card); border-top: 1px solid var(--line);
+  box-shadow: 0 -4px 18px rgba(0,0,0,.10); }
+.save-bar[hidden] { display: none; }
+/* Platz schaffen, solange die Leiste liegt — sonst deckt sie die letzte
+   Zeile ab und man kann sie nicht mehr umstellen. */
+.view.has-savebar { padding-bottom: 76px; }
+.save-bar-info { flex: 1; font-size: 13px; color: var(--muted); min-width: 0; }
+.save-bar .btn-sm { flex: 0 0 auto; }
+.save-bar.ok .save-bar-info { color: var(--ok); font-weight: 600; }
 
 .seg { display: flex; border: 1px solid var(--line); border-radius: 10px;
   overflow: hidden; background: var(--card); }
