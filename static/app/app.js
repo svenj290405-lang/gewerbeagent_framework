@@ -130,6 +130,9 @@ const HOME_SCREEN = "assistent";
 function navigate(key, { mode = "push" } = {}) {
   if (App.qSphereStop) { try { App.qSphereStop(); } catch (e) {} App.qSphereStop = null; App.qSphereCanvas = null; }
   if (App._qPasteListener) { document.removeEventListener("paste", App._qPasteListener); App._qPasteListener = null; }
+  // Laeuft noch eine Sprachaufnahme, wird sie beim Verlassen verworfen —
+  // sonst bliebe das Mikrofon offen und die Leiste ohne Screen zurueck.
+  if (App.recAbort) { try { App.recAbort(); } catch (e) {} App.recAbort = null; }
   // Ein angehängtes Bild bleibt absichtlich „kleben" — sonst ginge ein Tab-
   // Wechsel zwischen Rückfrage und Antwort verloren und der Folge-Befehl
   // landete im Text-Pfad. clearPending() räumt es auf (Aktion/Entfernen).
@@ -1934,9 +1937,10 @@ const SCREENS = {
       mic: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="2" width="6" height="11" rx="3"/><path d="M5 10v1a7 7 0 0 0 14 0v-1"/><line x1="12" y1="19" x2="12" y2="22"/></svg>`,
       stop: `<svg viewBox="0 0 24 24" fill="currentColor" stroke="none"><rect x="6" y="6" width="12" height="12" rx="3"/></svg>`,
       send: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="20" x2="12" y2="5"/><polyline points="6 11 12 5 18 11"/></svg>`,
+      trash: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>`,
     };
     const _miniSphereHtml =
-      `<button class="cbtn q-composer-mic" id="q-mini-sphere" title="Halten zum Sprechen" hidden aria-label="Sprechen">
+      `<button class="cbtn q-composer-mic" id="q-mini-sphere" title="${SPRECH_TITEL}" hidden aria-label="Sprechen">
         <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <rect x="9" y="2" width="6" height="11" rx="3"/>
           <path d="M5 10a7 7 0 0 0 14 0"/>
@@ -1944,6 +1948,17 @@ const SCREENS = {
           <line x1="8" y1="22" x2="16" y2="22"/>
         </svg>
       </button>`;
+    // Aufnahme-Leiste (WhatsApp-Prinzip): ersetzt die Eingabezeile, solange
+    // aufgenommen wird — roter Punkt + Laufzeit + Live-Pegel zeigen, dass es
+    // wirklich laeuft; verwerfen links, senden rechts.
+    const _recBarHtml =
+      `<div class="q-recbar" id="q-recbar" hidden>
+         <button class="q-rec-x" id="q-rec-cancel" title="Aufnahme verwerfen" aria-label="Aufnahme verwerfen">${IC.trash}</button>
+         <span class="q-rec-dot" aria-hidden="true"></span>
+         <span class="q-rec-time" id="q-rec-time">0:00</span>
+         <canvas class="q-rec-wave" id="q-rec-wave" aria-hidden="true"></canvas>
+         <button class="cbtn q-rec-go" id="q-rec-send" title="Aufnahme senden" aria-label="Aufnahme senden">${IC.send}</button>
+       </div>`;
     App.view.innerHTML =
       `<div class="chat" id="q-chat"></div>
        <div class="composer">
@@ -1957,6 +1972,7 @@ const SCREENS = {
            ${_miniSphereHtml}
            <button class="cbtn" id="q-send" title="Senden" aria-label="Senden">${IC.send}</button>
          </div>
+         ${_recBarHtml}
        </div>
        <input type="file" id="q-file" accept="image/jpeg,image/png,image/webp,application/pdf" style="display:none">
        <input type="file" id="q-camera-file" accept="image/*" capture="environment" style="display:none">`;
@@ -2015,7 +2031,7 @@ const SCREENS = {
     // Energiebögen) wie auf der Website; Three.js wird lokal geladen. Fallback
     // auf das SVG-Ring-Muster bei fehlendem/instabilem WebGL.
     const sphereWrap =
-      `<div class="q-sphere-wrap" id="q-sphere-wrap" role="button" tabindex="0" aria-label="Halten zum Sprechen">
+      `<div class="q-sphere-wrap" id="q-sphere-wrap" role="button" tabindex="0" aria-label="${SPRECH_TITEL}">
          <canvas id="q-sphere-canvas"></canvas>
          <svg class="q-sphere-fallback" viewBox="0 0 100 100" aria-hidden="true">
            <circle class="ring-1" cx="50" cy="50" r="35"/>
@@ -2045,8 +2061,11 @@ const SCREENS = {
         App.qWorking = false;
         const miniSphHide = document.getElementById("q-mini-sphere");
         if (miniSphHide) miniSphHide.hidden = true;
-        chatEl.innerHTML = `<div class="q-hero">${sphereWrap}<p class="q-sphere-hint" id="q-sphere-hint">Halten zum Sprechen</p></div>`;
+        chatEl.innerHTML = `<div class="q-hero">${sphereWrap}<p class="q-sphere-hint" id="q-sphere-hint">${SPRECH_TITEL}</p></div>`;
         mountQSphere();
+        // Laeuft gerade eine Aufnahme, muss der frisch gebaute Globus wieder
+        // in den Aufnahme-Zustand (Klasse + Hinweistext gingen sonst verloren).
+        if (Rec) _recSetUi(true);
         return;
       }
       if (App.qSphereStop) { try { App.qSphereStop(); } catch (e) {} App.qSphereStop = null; App.qSphereCanvas = null; }
@@ -2684,9 +2703,23 @@ const SCREENS = {
       if (files && files[0]) onFilePicked(files[0]);
     });
 
-    // Sphere → Halten zum Sprechen (Press-and-Hold ersetzt den alten Mic-Button)
-    let _sphereHoldTimer = null;
-    let _sphereDown = false;
+    // ---- Sprechen: einmal tippen startet, einmal tippen sendet -------------
+    // Wie bei WhatsApp: ein Tipp auf den Globus (oder das Mikro im Composer)
+    // startet die Aufnahme und laesst sie laufen — die Aufnahme-Leiste zeigt
+    // Laufzeit und Live-Pegel, gesendet wird per Tipp auf den Knopf oder auf
+    // den Globus. Wer den Knopf gedrueckt HAELT, bekommt weiterhin das alte
+    // Verhalten: Loslassen sendet sofort.
+    const REC_MAX_SEC = 120;   // harte Obergrenze, danach wird automatisch gesendet
+    const REC_HOLD_MS = 450;   // laenger gedrueckt = Halte-Geste statt Tipp
+
+    const recBar = document.getElementById("q-recbar");
+    const recTimeEl = document.getElementById("q-rec-time");
+    const recWave = document.getElementById("q-rec-wave");
+    const composerInner = App.view.querySelector(".composer-inner");
+
+    // Laufende Aufnahme: { raf, levels, lastPush, busy } — sonst null.
+    let Rec = null;
+    let _recDownTs = 0;        // Zeitpunkt des pointerdown, der sie gestartet hat
 
     // Mikrofon-Freigabe: War sie in diesem Browser schon erteilt, darf der
     // Globus sofort aufnehmen. Diese Vorab-Abfrage blockiert nicht (Permissions-
@@ -2698,16 +2731,17 @@ const SCREENS = {
     }
 
     // Erster Druck auf den Globus: einmalig die Browser-Mikrofon-Freigabe
-    // einholen, BEVOR aufgenommen wird. Sonst unterbricht der Berechtigungs-
-    // Dialog die Halte-Geste und die allererste Aufnahme geht verloren.
-    async function _primeMic() {
+    // einholen. Sagt der Nutzer ja, laeuft die Aufnahme direkt los — der
+    // Tipp war ja als "jetzt sprechen" gemeint.
+    async function _primeMic(startAfter) {
       const hint = document.getElementById("q-sphere-hint");
       if (hint) hint.textContent = "Mikrofon erlauben …";
       try {
         const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
         stream.getTracks().forEach((t) => t.stop());
         App.micReady = true;
-        if (hint) hint.textContent = "Mikrofon erlaubt — zum Sprechen halten";
+        if (hint) hint.textContent = SPRECH_TITEL;
+        if (startAfter) recStart();
       } catch (er) {
         if (hint) hint.textContent = (er && er.name === "NotAllowedError")
           ? "Mikrofon abgelehnt — im Browser erlauben"
@@ -2715,22 +2749,105 @@ const SCREENS = {
       }
     }
 
-    async function _sphereRelease(shouldUpload) {
-      clearTimeout(_sphereHoldTimer); _sphereHoldTimer = null;
-      if (!_sphereDown) return;
-      _sphereDown = false;
+    // Aufnahme-Zustand sichtbar machen: Globus + Mikro rot/aktiv, Eingabe-
+    // zeile weicht der Aufnahme-Leiste.
+    function _recSetUi(on) {
       const wrap = document.getElementById("q-sphere-wrap");
       const hint = document.getElementById("q-sphere-hint");
-      if (wrap) wrap.classList.remove("recording");
-      if (hint) { hint.textContent = "Halten zum Sprechen"; hint.classList.remove("rec"); }
-      if (App.qSphereActive) App.qSphereActive(false);
-      if (!shouldUpload || !Diktat.recording) { _diktatTeardown(); return; }
-      const out = _diktatFinish();
+      const mini = document.getElementById("q-mini-sphere");
+      if (wrap) wrap.classList.toggle("recording", on);
+      if (mini) mini.classList.toggle("recording", on);
+      if (hint) {
+        hint.textContent = on ? SPRECH_HINT_REC : SPRECH_TITEL;
+        hint.classList.toggle("rec", on);
+      }
+      if (recBar) recBar.hidden = !on;
+      if (composerInner) composerInner.hidden = on;
+      if (App.qSphereActive) App.qSphereActive(on);
+    }
+
+    // Wellenform: je Tick ein Balken aus dem aktuellen Pegel, aeltere wandern
+    // nach links raus — die Bewegung ist der Beweis, dass Ton ankommt.
+    function _recDrawWave() {
+      if (!recWave || !Rec) return;
+      const w = recWave.clientWidth, h = recWave.clientHeight;
+      if (!w || !h) return;
+      const dpr = window.devicePixelRatio || 1;
+      if (recWave.width !== Math.round(w * dpr)) {
+        recWave.width = Math.round(w * dpr);
+        recWave.height = Math.round(h * dpr);
+      }
+      const ctx = recWave.getContext("2d");
+      if (!ctx) return;
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, w, h);
+      const now = performance.now();
+      if (now - Rec.lastPush >= 55) { Rec.lastPush = now; Rec.levels.push(_diktatLevel()); }
+      const barW = 3, step = 5;
+      const maxBars = Math.max(1, Math.floor(w / step));
+      if (Rec.levels.length > maxBars) Rec.levels.splice(0, Rec.levels.length - maxBars);
+      ctx.fillStyle = getComputedStyle(recWave).color;
+      for (let i = 0; i < Rec.levels.length; i++) {
+        // Wurzel-Kennlinie: leise Sprache bewegt den Balken sichtbar, laute
+        // laeuft nicht sofort oben an.
+        const lvl = Math.min(1, Math.sqrt(Rec.levels[i]) * 1.9);
+        const bh = Math.max(3, lvl * (h - 4));
+        const x = w - (Rec.levels.length - i) * step;
+        const y = (h - bh) / 2;
+        ctx.beginPath();
+        if (ctx.roundRect) ctx.roundRect(x, y, barW, bh, barW / 2);
+        else ctx.rect(x, y, barW, bh);
+        ctx.fill();
+      }
+    }
+
+    function _recTick() {
+      if (!Rec) return;
+      const secs = Math.max(0, Math.floor((Date.now() - Diktat.startTs) / 1000));
+      if (recTimeEl) {
+        recTimeEl.textContent = Math.floor(secs / 60) + ":" + String(secs % 60).padStart(2, "0");
+        recTimeEl.classList.toggle("warn", secs >= REC_MAX_SEC - 15);
+      }
+      _recDrawWave();
+      Rec.raf = requestAnimationFrame(_recTick);
+    }
+
+    async function recStart() {
+      if (Rec) return;
+      Rec = { raf: 0, levels: [], lastPush: 0, busy: false };
+      _recSetUi(true);
+      if (recTimeEl) { recTimeEl.textContent = "0:00"; recTimeEl.classList.remove("warn"); }
+      try {
+        await _diktatStartRecording();
+      } catch (er) {
+        Rec = null;
+        _recSetUi(false);
+        _diktatTeardown();
+        push({ role: "err", text: (er && er.name === "NotAllowedError")
+          ? "Mikrofon-Zugriff abgelehnt. Bitte im Browser erlauben."
+          : "Mikrofon nicht verfügbar." });
+        return;
+      }
+      Diktat.autostop = setTimeout(() => { if (Rec) recStop("send"); }, REC_MAX_SEC * 1000);
+      Rec.raf = requestAnimationFrame(_recTick);
+    }
+
+    // mode: "send" = transkribieren und abschicken, "cancel" = wegwerfen.
+    async function recStop(mode) {
+      if (!Rec || Rec.busy) return;
+      Rec.busy = true;
+      if (Rec.raf) cancelAnimationFrame(Rec.raf);
+      const out = Diktat.recording ? _diktatFinish() : null;
+      _diktatTeardown();
+      Rec = null;
+      _recDownTs = 0;
+      _recSetUi(false);
+      if (mode !== "send" || !out) return;
       if (out.durationSec < 1 || out.blob.size < 2000) {
-        push({ role: "err", text: "Aufnahme war zu kurz — bitte länger halten." }); return;
+        push({ role: "err", text: "Aufnahme war zu kurz — bitte nochmal." }); return;
       }
       push({ role: "typing" });
-      let res; let j = null;
+      let res, j = null;
       try {
         res = await fetch("/app/api/assistent/transkript", {
           method: "POST",
@@ -2742,98 +2859,75 @@ const SCREENS = {
       try { j = await res.json(); } catch (e) {}
       popTyping();
       if (res.ok && j && j.ok && j.text) { input.value = j.text; send(); }
-      else push({ role: "err", text: (j && j.error) || "Nichts verstanden — bitte erneut halten." });
+      else push({ role: "err", text: (j && j.error) || "Nichts verstanden — bitte nochmal." });
     }
 
+    // Tab-Wechsel/Verlassen: Mikrofon nicht offen stehen lassen.
+    App.recAbort = () => { if (Rec) recStop("cancel"); };
+
+    // Ein Druck auf Globus oder Mikro: laeuft nichts → starten; laeuft etwas
+    // → senden. Ob es ein Tipp oder ein Halten war, entscheidet erst das
+    // Loslassen (_recPointerUp).
+    function _recPointerDown() {
+      if (Rec) { recStop("send"); return; }
+      if (!App.micReady) { _primeMic(true); return; }
+      _recDownTs = Date.now();
+      recStart();
+    }
+
+    function _recPointerUp() {
+      if (!_recDownTs) return;
+      const held = Date.now() - _recDownTs;
+      _recDownTs = 0;
+      // Gedrueckt gehalten = Sprechtaste: Loslassen sendet. Kurzer Tipp:
+      // Aufnahme laeuft freihaendig weiter.
+      if (held >= REC_HOLD_MS) recStop("send");
+    }
+
+    function _recPointerCancel() {
+      if (!_recDownTs) return;
+      const held = Date.now() - _recDownTs;
+      _recDownTs = 0;
+      if (held >= REC_HOLD_MS) recStop("cancel");
+    }
+
+    // Globus (Hero-Ansicht)
     chatEl.addEventListener("pointerdown", (e) => {
       const wrap = e.target.closest("#q-sphere-wrap");
       if (!wrap) return;
       e.preventDefault();
-      // Beim ersten Mal nur die Freigabe einholen — noch nicht aufnehmen.
-      if (!App.micReady) { _primeMic(); return; }
-      wrap.setPointerCapture(e.pointerId);
-      _sphereHoldTimer = setTimeout(async () => {
-        _sphereDown = true;
-        const w = document.getElementById("q-sphere-wrap");
-        const hint = document.getElementById("q-sphere-hint");
-        if (w) w.classList.add("recording");
-        if (hint) { hint.textContent = "🔴 Aufnahme läuft …"; hint.classList.add("rec"); }
-        try {
-          await _diktatStartRecording();
-          Diktat.autostop = setTimeout(() => { if (Diktat.recording) _sphereRelease(true); }, 60 * 1000);
-        } catch (er) {
-          _sphereDown = false;
-          if (w) w.classList.remove("recording");
-          if (hint) { hint.textContent = "Halten zum Sprechen"; hint.classList.remove("rec"); }
-          if (App.qSphereActive) App.qSphereActive(false);
-          _diktatTeardown();
-          push({ role: "err", text: (er && er.name === "NotAllowedError")
-            ? "Mikrofon-Zugriff abgelehnt. Bitte im Browser erlauben."
-            : "Mikrofon nicht verfügbar." });
-        }
-      }, 200);
+      try { wrap.setPointerCapture(e.pointerId); } catch (_) {}
+      _recPointerDown();
+    });
+    chatEl.addEventListener("pointerup", (e) => {
+      if (e.target.closest("#q-sphere-wrap")) _recPointerUp();
+    });
+    chatEl.addEventListener("pointercancel", () => _recPointerCancel());
+    // Tastatur: der Globus ist role="button" — Enter/Leertaste schalten um.
+    chatEl.addEventListener("keydown", (e) => {
+      if (!e.target.closest("#q-sphere-wrap")) return;
+      if (e.key !== "Enter" && e.key !== " ") return;
+      e.preventDefault();
+      if (Rec) recStop("send"); else if (!App.micReady) _primeMic(true); else recStart();
     });
 
-    chatEl.addEventListener("pointerup", () => {
-      if (_sphereDown || _sphereHoldTimer) _sphereRelease(true);
-    });
-
-    chatEl.addEventListener("pointercancel", () => _sphereRelease(false));
-
-    // Mini-Sphere im Composer: gleiche Hold-to-Speak-Logik wie der große Globus.
-    // Erscheint wenn Chat-Nachrichten vorhanden sind.
-    {
-      const miniBtn = document.getElementById("q-mini-sphere");
-      let _miniTimer = null, _miniDown = false;
-
-      async function _miniRelease(shouldUpload) {
-        clearTimeout(_miniTimer); _miniTimer = null;
-        if (!_miniDown) return;
-        _miniDown = false;
-        miniBtn.classList.remove("recording");
-        if (!shouldUpload || !Diktat.recording) { _diktatTeardown(); return; }
-        const out = _diktatFinish();
-        if (out.durationSec < 1 || out.blob.size < 2000) {
-          push({ role: "err", text: "Aufnahme war zu kurz — bitte länger halten." }); return;
-        }
-        push({ role: "typing" });
-        const fd = new FormData();
-        fd.append("audio", out.blob, "aufnahme.wav");
-        let res, j = null;
-        try {
-          res = await fetch("/app/api/diktat", { method: "POST",
-            headers: { "X-CSRF-Token": App.me.csrf }, body: fd });
-        } catch (_) { popTyping(); push({ role: "err", text: "Netzwerkfehler." }); return; }
-        try { j = await res.json(); } catch (_) {}
-        popTyping();
-        if (res.ok && j && j.ok && j.text) { input.value = j.text; send(); }
-        else push({ role: "err", text: "Nichts verstanden — bitte erneut halten." });
-      }
-
-      if (miniBtn) {
-        miniBtn.addEventListener("pointerdown", (e) => {
-          e.preventDefault();
-          if (!App.micReady) { _primeMic(); return; }
-          miniBtn.setPointerCapture(e.pointerId);
-          _miniTimer = setTimeout(async () => {
-            _miniDown = true;
-            miniBtn.classList.add("recording");
-            if (App.qSphereActive) App.qSphereActive(false);
-            try {
-              await _diktatStartRecording();
-              Diktat.autostop = setTimeout(() => { if (Diktat.recording) _miniRelease(true); }, 60 * 1000);
-            } catch (er) {
-              _miniDown = false; miniBtn.classList.remove("recording");
-              push({ role: "err", text: er && er.name === "NotAllowedError"
-                ? "Mikrofon-Zugriff abgelehnt. Bitte im Browser erlauben."
-                : "Mikrofon nicht verfügbar." });
-            }
-          }, 200);
-        });
-        miniBtn.addEventListener("pointerup", () => { if (_miniDown || _miniTimer) _miniRelease(true); });
-        miniBtn.addEventListener("pointercancel", () => _miniRelease(false));
-      }
+    // Mikro im Composer (sichtbar, sobald Nachrichten da sind)
+    const miniBtn = document.getElementById("q-mini-sphere");
+    if (miniBtn) {
+      miniBtn.addEventListener("pointerdown", (e) => {
+        e.preventDefault();
+        try { miniBtn.setPointerCapture(e.pointerId); } catch (_) {}
+        _recPointerDown();
+      });
+      miniBtn.addEventListener("pointerup", () => _recPointerUp());
+      miniBtn.addEventListener("pointercancel", () => _recPointerCancel());
     }
+
+    // Knöpfe der Aufnahme-Leiste
+    const recCancelBtn = document.getElementById("q-rec-cancel");
+    const recSendBtn = document.getElementById("q-rec-send");
+    if (recCancelBtn) recCancelBtn.addEventListener("click", () => recStop("cancel"));
+    if (recSendBtn) recSendBtn.addEventListener("click", () => recStop("send"));
 
     // ---- Funktions-Dropdown (Quick-Aktionen) ----
     // Damit der Handwerker nicht alles per Hand in eigenen Fenstern anlegt:
@@ -3040,7 +3134,7 @@ const SCREENS = {
         steps.push(() => obSay("Zum Schluss: Aktiviere Benachrichtigungen, damit du neue Anfragen und Rückrufe sofort mitbekommst.", () => obCard("push")));
       }
 
-      steps.push(() => { obDone(); obSay("Fertig — du bist startklar! 🎉 Frag mich einfach, was du brauchst: tippe es ein oder <b>halte den Globus gedrückt</b> und sprich es mir.", null); });
+      steps.push(() => { obDone(); obSay("Fertig — du bist startklar! 🎉 Frag mich einfach, was du brauchst: tippe es ein oder <b>tippe den Globus an</b> und sprich es mir — noch ein Tipp schickt die Aufnahme ab.", null); });
 
       let idx = 0;
       obNext = () => { if (idx < steps.length) { const fn = steps[idx++]; fn(obNext); } };
@@ -3742,8 +3836,14 @@ function showEmployeeActivationLink(j, name) {
 const DIKTAT_TARGET_RATE = 16000;
 const DIKTAT_MAX_SECONDS = 15 * 60; // Auto-Stopp; 15 min WAV ≈ 28 MB < 50 MB
 
+// Beschriftungen fuer den Sprech-Knopf bei Q. Ein Tipp startet die Aufnahme
+// und laesst sie laufen, ein zweiter Tipp sendet sie.
+const SPRECH_TITEL = "Tippen zum Sprechen";
+const SPRECH_HINT_REC = "🔴 Aufnahme läuft — tippen zum Senden";
+
 const Diktat = {
   ctx: null, source: null, node: null, zero: null, stream: null,
+  analyser: null, levelBuf: null,
   chunks: [], length: 0, inRate: DIKTAT_TARGET_RATE,
   recording: false, startTs: 0, tick: null, autostop: null,
 };
@@ -3808,6 +3908,13 @@ async function _diktatStartRecording() {
   // zurueckgespielt wird (sonst Rueckkopplung).
   Diktat.zero = Diktat.ctx.createGain();
   Diktat.zero.gain.value = 0;
+  // Zweiter Abgriff nur fuer die Pegel-Anzeige (Wellenform in der Aufnahme-
+  // Leiste). Haengt parallel am Source, beeinflusst die Aufnahme nicht.
+  Diktat.analyser = Diktat.ctx.createAnalyser();
+  Diktat.analyser.fftSize = 1024;
+  Diktat.analyser.smoothingTimeConstant = 0.5;
+  Diktat.levelBuf = new Uint8Array(Diktat.analyser.fftSize);
+  Diktat.source.connect(Diktat.analyser);
   Diktat.source.connect(Diktat.node);
   Diktat.node.connect(Diktat.zero);
   Diktat.zero.connect(Diktat.ctx.destination);
@@ -3815,9 +3922,23 @@ async function _diktatStartRecording() {
   Diktat.startTs = Date.now();
 }
 
+// Momentaner Eingangspegel 0..1 (RMS) — Futter fuer die Wellenform.
+function _diktatLevel() {
+  if (!Diktat.analyser || !Diktat.levelBuf) return 0;
+  try { Diktat.analyser.getByteTimeDomainData(Diktat.levelBuf); } catch (e) { return 0; }
+  let sum = 0;
+  for (let i = 0; i < Diktat.levelBuf.length; i++) {
+    const v = (Diktat.levelBuf[i] - 128) / 128;
+    sum += v * v;
+  }
+  return Math.sqrt(sum / Diktat.levelBuf.length);
+}
+
 function _diktatTeardown() {
   Diktat.recording = false;
   try { if (Diktat.node) { Diktat.node.disconnect(); Diktat.node.onaudioprocess = null; } } catch (e) {}
+  try { if (Diktat.analyser) Diktat.analyser.disconnect(); } catch (e) {}
+  Diktat.analyser = null; Diktat.levelBuf = null;
   try { if (Diktat.zero) Diktat.zero.disconnect(); } catch (e) {}
   try { if (Diktat.source) Diktat.source.disconnect(); } catch (e) {}
   try { if (Diktat.stream) Diktat.stream.getTracks().forEach((t) => t.stop()); } catch (e) {}
@@ -6001,45 +6122,65 @@ function initQOverlay() {
   sendBtn.addEventListener("click", send);
   inp.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } });
 
-  // Hold-to-Speak im Overlay
+  // Sprechen im Overlay — gleiche Bedienung wie beim Globus: einmal tippen
+  // startet, einmal tippen sendet. Statt einer eigenen Leiste laeuft die Zeit
+  // hier im (waehrenddessen gesperrten) Eingabefeld mit.
   if (micBtn) {
-    let _ot = null, _od = false;
-    async function _oRelease(upload) {
-      clearTimeout(_ot); _ot = null;
-      if (!_od) return;
-      _od = false;
-      micBtn.classList.remove("recording");
-      if (!upload || !Diktat.recording) { _diktatTeardown(); return; }
-      const out = _diktatFinish();
+    let _oRec = false, _oTick = null, _oPh = "";
+    function _oUi(on) {
+      micBtn.classList.toggle("recording", on);
+      micBtn.title = on ? "Aufnahme senden" : "Tippen zum Sprechen";
+      inp.disabled = on;
+      if (on) { _oPh = inp.placeholder; }
+      else { inp.placeholder = _oPh || "Frag Q …"; }
+    }
+    function _oTime() {
+      const s = Math.max(0, Math.floor((Date.now() - Diktat.startTs) / 1000));
+      inp.placeholder = "🔴 " + Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0")
+        + " — tippen zum Senden";
+    }
+    async function _oStop(upload) {
+      if (!_oRec) return;
+      _oRec = false;
+      if (_oTick) { clearInterval(_oTick); _oTick = null; }
+      const out = Diktat.recording ? _diktatFinish() : null;
+      _diktatTeardown();
+      _oUi(false);
+      if (!upload || !out) return;
       if (out.durationSec < 1 || out.blob.size < 2000) return;
-      const fd = new FormData();
-      fd.append("audio", out.blob, "aufnahme.wav");
       try {
-        const r = await fetch("/app/api/diktat", { method: "POST",
-          headers: { "X-CSRF-Token": App.me.csrf }, body: fd });
+        const r = await fetch("/app/api/assistent/transkript", {
+          method: "POST",
+          headers: { "X-CSRF-Token": App.me.csrf, "Content-Type": "audio/wav" },
+          body: out.blob,
+        });
         const j = r.ok ? await r.json().catch(() => null) : null;
         if (j && j.ok && j.text) await _qOverlaySend(j.text);
       } catch (_) {}
     }
-    micBtn.addEventListener("pointerdown", (e) => {
+    async function _oStart() {
+      if (_oRec) return;
+      _oRec = true;
+      _oUi(true); _oTime();
+      try {
+        await _diktatStartRecording();
+      } catch (_) {
+        _oRec = false; _oUi(false); _diktatTeardown(); return;
+      }
+      _oTick = setInterval(_oTime, 250);
+      Diktat.autostop = setTimeout(() => { if (_oRec) _oStop(true); }, 120000);
+    }
+    micBtn.addEventListener("click", (e) => {
       e.preventDefault();
+      if (_oRec) { _oStop(true); return; }
       if (!App.micReady) {
         navigator.mediaDevices.getUserMedia({ audio: true })
-          .then((s) => { s.getTracks().forEach((t) => t.stop()); App.micReady = true; })
+          .then((s) => { s.getTracks().forEach((t) => t.stop()); App.micReady = true; _oStart(); })
           .catch(() => {});
         return;
       }
-      micBtn.setPointerCapture(e.pointerId);
-      _ot = setTimeout(async () => {
-        _od = true; micBtn.classList.add("recording");
-        try {
-          await _diktatStartRecording();
-          Diktat.autostop = setTimeout(() => { if (Diktat.recording) _oRelease(true); }, 60000);
-        } catch (_) { _od = false; micBtn.classList.remove("recording"); _diktatTeardown(); }
-      }, 200);
+      _oStart();
     });
-    micBtn.addEventListener("pointerup", () => { if (_od || _ot) _oRelease(true); });
-    micBtn.addEventListener("pointercancel", () => _oRelease(false));
   }
 }
 

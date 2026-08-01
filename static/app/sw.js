@@ -132,7 +132,16 @@
 // v69: Arbeitsstunden am Fortschrittsregler — jeder bucht seine Stunden auf
 // den Auftrag, am Auftrag steht danach, wer wie lange dran war
 // (Nachkalkulation, keine Anwesenheitserfassung).
-const CACHE = "ga-app-v69";
+// v70: Auftragshistorie — alle fertiggestellten Auftraege (abgerechnete UND
+// abgebrochene) an einem Ort; abgebrochene sind dafuer aus der laufenden
+// Liste raus, dort steht nur noch, woran wirklich gearbeitet wird.
+// v71: Einstellungen → Automatisierung — pro Funktion einstellbar, ob Q
+// manuell (gar nicht), assistiert (fragt vorher) oder automatisch (macht
+// direkt) handelt. Gilt fuer den Q-Chat sowie Telefon und Mail-Eingang.
+// v72: Sprechen bei Q wie bei WhatsApp — ein Tipp auf Globus/Mikro startet die
+// Aufnahme und laesst sie laufen (Leiste mit Laufzeit + Live-Pegel, verwerfen
+// oder senden per Knopf); Gedrueckthalten sendet weiterhin beim Loslassen.
+const CACHE = "ga-app-v72";
 const SHELL = [
   "/app",
   "/app/static/app-beta.css",

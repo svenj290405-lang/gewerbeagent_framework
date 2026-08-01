@@ -101,6 +101,29 @@ button:disabled { opacity: .6; }
 .banner { background: #fff7e0; border: 1px solid #f0dca0; color: #7a5c00;
   border-radius: 10px; padding: 12px 14px; font-size: 14px; margin-bottom: 12px; }
 
+/* ---------- Automatisierungsgrad (Einstellungen → Automatisierung) ----------
+   Dreifach-Schalter manuell | assistiert | automatisch, eine Zeile pro
+   Funktion. Nicht unterstuetzte Stufen bleiben sichtbar, aber deaktiviert:
+   kein display:none, sonst waeren die Schalter je Zeile unterschiedlich
+   breit und die Stufe wirkte, als gaebe es sie gar nicht. */
+.autolist { display: block; padding: 12px 0; border-bottom: 1px solid var(--line); }
+.autolist:last-child { border-bottom: 0; }
+.autolist .auto-label { font-size: 15px; font-weight: 600; }
+.autolist .auto-desc { color: var(--muted); font-size: 13px; margin: 2px 0 10px; }
+.autolist .auto-note { color: var(--muted); font-size: 12px; margin: 8px 0 0; }
+
+.seg { display: flex; border: 1px solid var(--line); border-radius: 10px;
+  overflow: hidden; background: var(--card); }
+.seg button {
+  flex: 1; background: none; color: var(--muted); border: 0; border-radius: 0;
+  padding: 9px 4px; font-size: 13px; font-weight: 600; cursor: pointer;
+  border-left: 1px solid var(--line); line-height: 1.2;
+}
+.seg button:first-child { border-left: 0; }
+.seg button.active { background: var(--primary); color: #fff; }
+.seg button:disabled { opacity: .38; cursor: not-allowed; }
+.seg button:disabled.active { background: var(--muted); color: #fff; opacity: .6; }
+
 /* Q-Tagesbriefing-Karte oben auf "Aktuelles" */
 .q-briefing { background: linear-gradient(135deg, #eaf2ff 0%, #ffffff 72%);
   border: 1px solid #d6e4ff; }
@@ -293,6 +316,32 @@ button:disabled { opacity: .6; }
 .composer .cbtn.ghost:active { background: #e3e9f1; }
 .composer .cbtn.rec { background: var(--danger); color: #fff; animation: recpulse 1s infinite; }
 @keyframes recpulse { 0%,100% { box-shadow: 0 0 0 0 rgba(217,69,63,.4); } 50% { box-shadow: 0 0 0 7px rgba(217,69,63,0); } }
+
+/* Aufnahme-Leiste: tritt an die Stelle der Eingabezeile, solange Q zuhört.
+   Roter Punkt + Laufzeit + Live-Pegel zeigen, dass wirklich aufgenommen wird. */
+.composer-inner[hidden] { display: none; }
+.q-recbar { max-width: 720px; margin: 0 auto; width: 100%;
+  display: flex; align-items: center; gap: 10px; min-height: 42px; }
+.q-recbar[hidden] { display: none; }
+.q-rec-x { flex: 0 0 auto; width: 38px; height: 38px; border: 0; border-radius: 50%;
+  background: transparent; color: var(--muted); cursor: pointer;
+  display: flex; align-items: center; justify-content: center; }
+.q-rec-x svg { width: 20px; height: 20px; display: block; }
+/* --pill-danger-bg kennt nur das Beta-Design (inkl. Dunkelmodus) — der
+   Fallback haelt die Regel im alten Design gueltig. */
+.q-rec-x:hover { background: var(--pill-danger-bg, #fce6e5); color: var(--danger); }
+.q-rec-dot { flex: 0 0 auto; width: 10px; height: 10px; border-radius: 50%;
+  background: var(--danger); animation: recdot 1.1s ease-in-out infinite; }
+@keyframes recdot { 0%,100% { opacity: 1; } 50% { opacity: .25; } }
+.q-rec-time { flex: 0 0 auto; font-size: 15px; font-weight: 600; color: var(--text);
+  font-variant-numeric: tabular-nums; min-width: 38px; }
+.q-rec-time.warn { color: var(--danger); }
+.q-rec-wave { flex: 1; height: 32px; min-width: 0; color: var(--primary); opacity: .85; }
+.q-recbar .cbtn.q-rec-go { flex: 0 0 auto; width: 42px; height: 42px; border-radius: 50%;
+  border: 0; padding: 0; cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+  background: var(--primary); color: #fff; }
+.q-recbar .cbtn.q-rec-go svg { width: 21px; height: 21px; display: block; }
 
 /* Anhang-Vorschau im Composer (Bild vor dem Senden) */
 .composer-preview { display: flex; gap: 8px; flex-wrap: wrap; max-width: 720px; width: 100%; margin: 0 auto; padding: 2px 0 4px; }
