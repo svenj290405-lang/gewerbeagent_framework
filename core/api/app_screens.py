@@ -4188,6 +4188,107 @@ async def api_einstellungen_set(
 
 
 # ─────────────────────────────────────────────────────────────────────
+# Automatisierung: wie selbstaendig darf Q pro Funktion handeln?
+# ─────────────────────────────────────────────────────────────────────
+# Registry + Semantik der Stufen: core/features/automations.py.
+# Nur der Inhaber darf schreiben — ein Geselle soll Q nicht fuer den
+# ganzen Betrieb auf 'automatisch' stellen koennen.
+
+
+@router.get("/automatisierung")
+async def api_automatisierung_get(
+    request: Request, _e=Depends(require_app_user),
+) -> JSONResponse:
+    """Alle fuer diesen Betrieb sichtbaren Automatisierungen mit ihrer Stufe.
+
+    Gefiltert nach aktiven Features: was der Betrieb nicht gebucht hat,
+    braucht auch keinen Schalter.
+    """
+    from core.features.automation_check import automation_modes_for_tenant
+    from core.features.automations import (
+        ALL_MODES, AUTOMATIONS, MODE_DESCRIPTIONS, MODE_LABELS,
+    )
+    from core.features.check import enabled_features_for_tenant
+
+    tid = current_tenant_id(request)
+    feats = await enabled_features_for_tenant(tid)
+    modes = await automation_modes_for_tenant(tid)
+
+    items = []
+    for auto in AUTOMATIONS.values():
+        if auto.feature and auto.feature not in feats:
+            continue
+        items.append({
+            "key": auto.key,
+            "label": auto.label,
+            "description": auto.description,
+            "group": auto.group,
+            "mode": modes.get(auto.key, auto.default_mode),
+            "allowed_modes": list(auto.allowed_modes),
+            "unsupported_hint": auto.unsupported_hint,
+        })
+
+    return JSONResponse({
+        "ok": True,
+        "automations": items,
+        "modes": [
+            {"key": m, "label": MODE_LABELS[m],
+             "description": MODE_DESCRIPTIONS[m]}
+            for m in ALL_MODES
+        ],
+        "is_inhaber": bool(request.state.app_is_inhaber),
+    })
+
+
+@router.post("/automatisierung")
+async def api_automatisierung_set(
+    request: Request,
+    _e=Depends(require_app_inhaber),
+    _c=Depends(require_app_csrf),
+) -> JSONResponse:
+    """Setzt die Stufe einer Automatisierung.
+
+    Body: { "key": "termin_buchen", "mode": "automatisch" }
+
+    ``set_automation_mode`` validiert gegen die Registry (Key bekannt?
+    Stufe fuer genau diese Automatisierung erlaubt?) — der Client kann
+    also weder eine unbekannte Funktion anlegen noch 'assistiert' auf
+    die Telefon-Buchung schummeln.
+    """
+    from core.features.automation_check import set_automation_mode
+    from core.features.automations import AUTOMATIONS
+    from core.features.check import enabled_features_for_tenant
+
+    tid = current_tenant_id(request)
+    body = await request.json()
+    key = ((body or {}).get("key") or "").strip()
+    mode = ((body or {}).get("mode") or "").strip()
+
+    auto = AUTOMATIONS.get(key)
+    if auto is None:
+        return JSONResponse(
+            {"ok": False, "error": "Unbekannte Funktion."}, status_code=400,
+        )
+    # Feature aus? Dann gibt es den Schalter in der UI nicht, also darf ihn
+    # auch ein direkter POST nicht setzen.
+    if auto.feature:
+        feats = await enabled_features_for_tenant(tid)
+        if auto.feature not in feats:
+            return JSONResponse(
+                {"ok": False, "error": "Diese Funktion ist nicht freigeschaltet."},
+                status_code=403,
+            )
+
+    if not await set_automation_mode(tid, key, mode):
+        return JSONResponse(
+            {"ok": False,
+             "error": "Diese Stufe gibt es für diese Funktion nicht."},
+            status_code=400,
+        )
+    return JSONResponse({"ok": True, "key": key, "mode": mode})
+
+
+# ─────────────────────────────────────────────────────────────────────
 # Branding: Firmenlogo + Website-Link fuer die App-Kopfzeile
 # ─────────────────────────────────────────────────────────────────────
 
@@ -5055,15 +5156,18 @@ _ASSISTENT_MAX_BODY_BYTES = 20 * 1024 * 1024
 async def _build_command_ctx(request: Request):
     """Baut den Ausfuehrungskontext (tenant-isoliert) fuer das command_center."""
     from core.ai.command_center import Ctx
+    from core.features.automation_check import automation_modes_for_tenant
     from core.features.check import enabled_features_for_tenant
 
     tid = current_tenant_id(request)
     feats = await enabled_features_for_tenant(tid)
+    modes = await automation_modes_for_tenant(tid)
     return Ctx(
         tenant=request.state.app_tenant,
         employee=request.state.app_employee,
         tid=tid,
         features=set(feats),
+        automation_modes=modes,
     )
 
 

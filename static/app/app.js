@@ -1171,12 +1171,113 @@ const SCREENS = {
         item("einstellungen_app", "📱", "App-Einstellungen", "Farbe & Darstellung") +
         item("einstellungen_betrieb", "🏢", "Betrieb",
           isInhaber ? "Firmendaten, Adresse, Logo & Website" : "Firmendaten & Adresse") +
+        item("einstellungen_automatisierung", "🎚️", "Automatisierung",
+          isInhaber ? "Wie selbstständig Q handeln darf" : "Was Q selbst erledigt") +
         (isInhaber ? item("einstellungen_verbindungen", "🔌", "Verbindungen", "Google, Outlook, Lexware") : "") +
         item("einstellungen_system", "ℹ️", "System", "Paket, Funktionen, Daten-Speicherung") +
       `</div>`;
     document.getElementById("back-mehr").addEventListener("click", () => navigate("mehr"));
     App.view.querySelectorAll("[data-go]").forEach((b) =>
       b.addEventListener("click", () => navigate(b.dataset.go)));
+  },
+
+  async einstellungen_automatisierung() {
+    // Pro Funktion einstellen, wie selbstständig Q handeln darf:
+    // manuell (gar nicht) · assistiert (fragt vorher) · automatisch (macht
+    // direkt). Registry + Semantik liegen im Backend
+    // (core/features/automations.py) — hier wird nur gerendert, was
+    // /app/api/automatisierung liefert. Kein Feature-Wissen im Frontend.
+    const isInhaber = !!(App.me && App.me.employee && App.me.employee.is_inhaber);
+    const res = await api("/app/api/automatisierung");
+    const d = res && res.ok ? await res.json() : null;
+    const back =
+      `<button class="btn-sm btn-ghost" id="back-einst" style="margin-bottom:10px">← Einstellungen</button>` +
+      `<h1 style="font-size:22px;margin:4px 4px 6px">Automatisierung</h1>`;
+
+    if (!d || !d.ok) {
+      App.view.innerHTML = back +
+        `<div class="card"><p class="empty">Konnte die Einstellungen nicht laden.</p></div>`;
+      document.getElementById("back-einst").addEventListener("click", () => navigate("einstellungen"));
+      return;
+    }
+
+    const modes = d.modes || [];
+    const legende = modes
+      .map((m) => `<b>${esc(m.label)}</b> — ${esc(m.description)}`)
+      .join("<br>");
+
+    // Nach group bündeln, Reihenfolge wie vom Backend geliefert.
+    const groups = [];
+    (d.automations || []).forEach((a) => {
+      let g = groups.find((x) => x.name === a.group);
+      if (!g) { g = { name: a.group, items: [] }; groups.push(g); }
+      g.items.push(a);
+    });
+
+    const zeile = (a) => {
+      const segs = modes.map((m) => {
+        const on = a.mode === m.key;
+        const erlaubt = (a.allowed_modes || []).indexOf(m.key) !== -1;
+        return `<button type="button" class="${on ? "active" : ""}"` +
+          ` data-key="${esc(a.key)}" data-mode="${esc(m.key)}"` +
+          `${erlaubt && isInhaber ? "" : " disabled"}>${esc(m.label)}</button>`;
+      }).join("");
+      // Hinweis nur zeigen, wenn wirklich eine Stufe fehlt — sonst wäre er
+      // bei den meisten Zeilen nur Rauschen.
+      const fehlt = modes.length !== (a.allowed_modes || []).length;
+      const note = fehlt && a.unsupported_hint
+        ? `<p class="auto-note">${esc(a.unsupported_hint)}</p>` : "";
+      return `<div class="autolist">
+          <div class="auto-label">${esc(a.label)}</div>
+          <div class="auto-desc">${esc(a.description)}</div>
+          <div class="seg" data-seg="${esc(a.key)}">${segs}</div>
+          ${note}
+        </div>`;
+    };
+
+    App.view.innerHTML = back +
+      `<p class="muted" style="margin:0 4px 14px;font-size:14px">${legende}</p>` +
+      (isInhaber ? "" :
+        `<div class="banner">Ändern darf das nur der Inhaber. Du siehst hier, was Q für euch selbst erledigt.</div>`) +
+      groups.map((g) =>
+        `<div class="section-title">${esc(g.name)}</div>` +
+        `<div class="card">${g.items.map(zeile).join("")}</div>`
+      ).join("") +
+      `<p class="muted" style="margin:4px 4px 0;font-size:12px">Gilt für den ganzen Betrieb, nicht nur für dein Gerät.</p>`;
+
+    document.getElementById("back-einst").addEventListener("click", () => navigate("einstellungen"));
+    if (!isInhaber) return;
+
+    App.view.querySelectorAll(".seg button").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const seg = btn.parentElement;
+        const key = btn.dataset.key, mode = btn.dataset.mode;
+        const vorher = seg.querySelector("button.active");
+        if (vorher === btn) return;
+        // Optimistisch umschalten — der Schalter soll sich sofort anfühlen.
+        // Schlägt der POST fehl, springt er unten zurück.
+        seg.querySelectorAll("button").forEach((b) => b.classList.remove("active"));
+        btn.classList.add("active");
+        seg.querySelectorAll("button").forEach((b) => { b.disabled = true; });
+
+        const r = await api("/app/api/automatisierung",
+          { method: "POST", body: JSON.stringify({ key: key, mode: mode }) });
+        const j = r && r.ok ? await r.json().catch(() => null) : null;
+
+        seg.querySelectorAll("button").forEach((b) => {
+          // Vorher deaktivierte Stufen bleiben deaktiviert.
+          b.disabled = b.hasAttribute("data-was-disabled");
+        });
+        if (j && j.ok) return;
+        btn.classList.remove("active");
+        if (vorher) vorher.classList.add("active");
+        alert("Konnte nicht speichern: " + ((j && j.error) || "unbekannt"));
+      });
+    });
+    // Merken, welche Stufen dauerhaft gesperrt sind — der Handler oben
+    // stellt beim Wiederfreigeben genau diesen Zustand her.
+    App.view.querySelectorAll(".seg button[disabled]").forEach((b) =>
+      b.setAttribute("data-was-disabled", "1"));
   },
 
   async einstellungen_app() {
@@ -2356,8 +2457,24 @@ const SCREENS = {
       if (j.type === "message") push({ role: "q", text: j.text });
       else if (j.type === "error") push({ role: "err", text: j.text });
       else if (j.type === "confirm") push({ role: "confirm", tool: j.tool, args: j.args, summary: j.summary, frage: j.frage, resolved: false });
+      else if (j.type === "done") pushDone(j);
       else if (j.type === "email_entwurf") push(mailDraftMsg(j));
       else if (j.type === "navigate") { if (j.text) push({ role: "q", text: j.text }); handleNavigate(j.bereich, j.kunde, j.kategorie); }
+    }
+
+    // Aktion lief bereits durch — Automatisierungsgrad "automatisch"
+    // (Einstellungen → Automatisierung). Es gab keine Bestätigung, deshalb
+    // zeigen wir zusätzlich zur Vollzugsmeldung die summary, damit der
+    // Nutzer schwarz auf weiß sieht, was Q in seinem Namen getan hat.
+    function pushDone(j) {
+      if (j.result && j.result.ok === false) {
+        push({ role: "err", text: (j.result.error) || "Aktion fehlgeschlagen." });
+        return;
+      }
+      const html = resultHtml(j.tool, j.result || {});
+      if (html) push({ role: "q", text: html, html: true });
+      else push({ role: "q", text: "✓ " + resultText(j.tool, j.result || {}) });
+      if (j.summary) push({ role: "q", text: "Erledigt ohne Rückfrage: " + j.summary });
     }
 
     // Q-Antwort als Modell-Turn in den Verlauf übernehmen, damit die nächste
@@ -2367,6 +2484,7 @@ const SCREENS = {
       let say = null;
       if (j.type === "message" || j.type === "navigate") say = j.text;
       else if (j.type === "confirm") say = j.frage || j.summary;
+      else if (j.type === "done") say = j.summary || j.frage;
       else if (j.type === "email_entwurf") say = j.frage || `Mail-Entwurf an ${j.empfaenger || j.empfaenger_name || "den Kunden"}: ${j.betreff || ""}`;
       if (say) App.qhistory.push({ role: "model", text: say });
     }
@@ -2396,6 +2514,7 @@ const SCREENS = {
       else if (j.type === "message") push({ role: "q", text: j.text });
       else if (j.type === "error") push({ role: "err", text: j.text });
       else if (j.type === "confirm") push({ role: "confirm", tool: j.tool, args: j.args, summary: j.summary, frage: j.frage, resolved: false });
+      else if (j.type === "done") pushDone(j);
       else if (j.type === "email_entwurf") push(mailDraftMsg(j));
       else if (j.type === "navigate") { if (j.text) push({ role: "q", text: j.text }); handleNavigate(j.bereich, j.kunde, j.kategorie); }
       input.focus();

@@ -12,10 +12,21 @@ Architektur — bewusst sicher:
     fließt an Gemini zurück, das daraus den nächsten Schritt ableitet
     (erst Slot suchen → dann Termin buchen).
   * **Write-Tools** (Termin anlegen/stornieren, Rückruf anlegen, Material
-    bestellen, Abwesenheit melden) werden NICHT automatisch ausgeführt.
-    Gemini schlägt sie vor; ``run_command`` gibt einen ``confirm``-Vorschlag
-    zurück. Erst nach ausdrücklicher Bestätigung des Nutzers führt
-    ``execute_confirmed`` die Aktion aus (fail-closed).
+    bestellen, Abwesenheit melden) richten sich nach dem
+    **Automatisierungsgrad**, den der Betrieb pro Funktion einstellt
+    (``core/features/automations.py``, App: Einstellungen → Automatisierung):
+
+      - ``manuell``    — das Tool wird Gemini gar nicht erst angeboten; Q
+                         sagt stattdessen, dass der Betrieb das selbst macht.
+      - ``assistiert`` — Gemini schlägt vor, ``run_command`` gibt einen
+                         ``confirm``-Vorschlag zurück, und erst nach
+                         ausdrücklicher Bestätigung führt
+                         ``execute_confirmed`` aus (fail-closed). Default.
+      - ``automatisch``— ``run_command`` führt direkt aus und meldet
+                         ``{"type": "done"}`` zurück.
+
+    Ein Write-Tool ohne Registry-Eintrag verhält sich wie ``assistiert``,
+    damit ein neues Tool nie versehentlich ungefragt läuft.
   * **E-Mail schreiben** ist derselbe Mechanismus mit reicherer Vorschau:
     statt einer Bestätigungszeile kommt ein vollständiger Entwurf
     (Empfänger, Betreff, Text, Anhänge) zurück, den der Nutzer in der App
@@ -41,6 +52,8 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
+from core.features.automations import MODE_AUTOMATISCH
+
 logger = logging.getLogger(__name__)
 
 # Wie viele Gemini-Runden maximal (Read-Tool → Ergebnis → nächste Runde),
@@ -55,10 +68,19 @@ class Ctx:
     employee: Any               # Employee-Objekt (.id, .name, .slug, .is_default)
     tid: uuid.UUID              # current_tenant_id(request)
     features: set[str] = field(default_factory=set)
+    # Automatisierungsgrad pro Funktion (automation_key -> Stufe). Leer
+    # bedeutet "nichts geladen" → mode_for_tool fällt auf die Defaults der
+    # Registry zurück, also auf das bisherige Verhalten (Bestätigung).
+    automation_modes: dict[str, str] = field(default_factory=dict)
 
     @property
     def is_inhaber(self) -> bool:
         return bool(getattr(self.employee, "is_default", False))
+
+    def mode_for(self, tool_name: str) -> str:
+        """Stufe für ein Write-Tool dieses Befehls."""
+        from core.features.automation_check import mode_for_tool
+        return mode_for_tool(self.automation_modes, tool_name)
 
 
 # ---------------------------------------------------------------------------
@@ -79,15 +101,50 @@ class ToolSpec:
 
 
 def _available_tools(ctx: Ctx) -> list[ToolSpec]:
-    """Filtert die Registry auf das, was dieser Mitarbeiter nutzen darf."""
+    """Filtert die Registry auf das, was dieser Mitarbeiter nutzen darf.
+
+    Zusätzlich zum Feature- und Inhaber-Gate fliegen Write-Tools raus,
+    deren Automatisierung auf ``manuell`` steht — Gemini bekommt sie erst
+    gar nicht zu sehen. Read-Tools sind nie betroffen: "manuell" heißt,
+    dass Q nicht *handelt*, nicht dass Q nichts mehr nachschauen darf.
+    """
+    from core.features.automations import MODE_MANUELL
+
     out: list[ToolSpec] = []
     for spec in _REGISTRY:
         if spec.feature and spec.feature not in ctx.features:
             continue
         if spec.requires_inhaber and not ctx.is_inhaber:
             continue
+        if spec.kind == "write" and ctx.mode_for(spec.name) == MODE_MANUELL:
+            continue
         out.append(spec)
     return out
+
+
+def _manuelle_hinweise(ctx: Ctx) -> list[str]:
+    """Was Q auf 'manuell' gestellt bekommen hat — für den System-Prompt.
+
+    Ohne diesen Hinweis würde Gemini das fehlende Tool nur bemerken und
+    ausweichend antworten. Mit Hinweis sagt Q den Satz, den der Betrieb in
+    der Registry hinterlegt hat ("Termine trägst du selbst ein …").
+    """
+    from core.features.automations import AUTOMATIONS, MODE_MANUELL
+
+    hinweise: list[str] = []
+    for auto in AUTOMATIONS.values():
+        if not auto.tools:
+            continue  # reine Hintergrund-Automatisierung, im Chat irrelevant
+        if auto.feature and auto.feature not in ctx.features:
+            continue
+        mode = ctx.automation_modes.get(auto.key, auto.default_mode)
+        if mode != MODE_MANUELL:
+            continue
+        hinweise.append(
+            f"- {auto.label}: NICHT ausführen. Sag stattdessen sinngemäß: "
+            f"„{auto.manuell_hint}“"
+        )
+    return hinweise
 
 
 def _spec_by_name(name: str) -> ToolSpec | None:
@@ -125,6 +182,17 @@ def _system_instruction(ctx: Ctx, screen_context: dict | None = None) -> str:
                  "Freitag", "Samstag", "Sonntag"][heute.weekday()]
     name = (getattr(ctx.employee, "name", "") or "").split(" ")[0] or "der Nutzer"
     betrieb = getattr(ctx.tenant, "company_name", "") or "dem Betrieb"
+
+    # Auf 'manuell' gestellte Funktionen: Gemini sieht die Tools nicht mehr
+    # (siehe _available_tools) und braucht deshalb einen Satz, mit dem Q
+    # freundlich ablehnt, statt ratlos zu wirken.
+    manuell = _manuelle_hinweise(ctx)
+    manuell_block = (
+        "\n\nDiese Aufgaben erledigt der Betrieb bewusst selbst — du hast "
+        "dafür KEIN Tool und darfst sie nicht ausführen:\n"
+        + "\n".join(manuell)
+        if manuell else ""
+    )
 
     context_line = ""
     if screen_context:
@@ -199,6 +267,7 @@ def _system_instruction(ctx: Ctx, screen_context: dict | None = None) -> str:
         "kunde_name=<exakter Kundenname>, kategorie='notizen' auf — "
         "NICHT kunden_profil.\n"
         "- Antworte kurz und auf Deutsch, in der Du-Form, wie ein Kollege."
+        + manuell_block
         + context_line
     )
 
@@ -272,6 +341,12 @@ async def run_command(text: str, ctx: Ctx, history: list | None = None, screen_c
          "frage": str|None}
             Eine schreibende Aktion ist vorbereitet und wartet auf
             Bestätigung. ``summary`` ist die Klartext-Zeile für die UI.
+            Nur bei Automatisierungsgrad ``assistiert``.
+      * {"type": "done", "tool": str, "result": dict, "summary": str,
+         "frage": str|None}
+            Die Aktion lief schon — Automatisierungsgrad ``automatisch``.
+            ``summary`` ist dieselbe Klartext-Zeile, diesmal als
+            Vollzugsmeldung für die UI.
       * {"type": "email_entwurf", "tool": "email_schreiben", "empfaenger",
          "empfaenger_name", "betreff", "text", "kunde_name", "anhaenge",
          "hinweis", "frage"}
@@ -401,14 +476,42 @@ async def run_command(text: str, ctx: Ctx, history: list | None = None, screen_c
             # Statt der Einzeiler-Bestätigung den kompletten Entwurf an die
             # App geben — der Nutzer redigiert Empfänger/Betreff/Text und
             # gibt erst dann frei (Versand läuft über execute_confirmed).
+            #
+            # Auch bei 'automatisch' bauen wir den Entwurf, denn erst der
+            # löst die Empfänger-Adresse aus dem Kundennamen auf und hängt
+            # die Archiv-Dateien an; Gemini liefert oft nur kunde_name. Wir
+            # überspringen dann nur die Freigabe-Schleife. Bleibt die
+            # Adresse leer, ist Senden unmöglich — dann kommt der Entwurf
+            # doch in die App, statt eine Mail ins Nichts zu schicken.
             entwurf = await _build_email_entwurf(ctx, args)
-            entwurf["frage"] = say or None
-            return entwurf
+            if (ctx.mode_for(spec.name) != MODE_AUTOMATISCH
+                    or not (entwurf.get("empfaenger") or "").strip()):
+                entwurf["frage"] = say or None
+                return entwurf
+            args = {k: v for k, v in entwurf.items()
+                    if k not in ("type", "tool", "hinweis")}
 
         if spec.kind == "write":
-            # NICHT ausführen — Bestätigung einholen.
             summary = spec.summarize(ctx, args) if spec.summarize else f"{spec.name} ausführen"
-            return {"type": "confirm", "tool": spec.name, "args": args,
+
+            if ctx.mode_for(spec.name) != MODE_AUTOMATISCH:
+                # 'assistiert': NICHT ausführen — Bestätigung einholen.
+                return {"type": "confirm", "tool": spec.name, "args": args,
+                        "summary": summary, "frage": say or None}
+
+            # 'automatisch': direkt ausführen. Bewusst dieselbe summary wie
+            # bei der Bestätigung, damit der Betrieb hinterher schwarz auf
+            # weiß sieht, was Q in seinem Namen getan hat.
+            try:
+                result = await spec.run(ctx, args)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception(
+                    "command_center write-tool %s (automatisch) crash: %s",
+                    spec.name, exc,
+                )
+                return {"type": "error",
+                        "text": "Aktion fehlgeschlagen. Bitte erneut versuchen."}
+            return {"type": "done", "tool": spec.name, "result": _to_plain(result),
                     "summary": summary, "frage": say or None}
 
         # Read-Tool: ausführen und Ergebnis an Gemini zurückgeben.
@@ -432,12 +535,21 @@ async def run_command(text: str, ctx: Ctx, history: list | None = None, screen_c
 async def execute_confirmed(tool_name: str, args: dict, ctx: Ctx) -> dict:
     """Führt eine zuvor vorgeschlagene **Write**-Aktion nach Bestätigung aus.
 
-    Re-validiert Tool-Name, Feature- und Inhaber-Gating (der Client darf
-    nichts erzwingen, was Gemini nicht auch durfte).
+    Re-validiert Tool-Name, Feature-, Inhaber- und Automatisierungs-Gating
+    (der Client darf nichts erzwingen, was Gemini nicht auch durfte). Das
+    Automatisierungs-Gate steckt in ``_available_tools``: auf 'manuell'
+    gestellte Write-Tools sind dort nicht mehr enthalten, ein nachträglich
+    abgeschalteter Bestätigungs-Dialog läuft also ins Leere statt zu feuern.
     """
+    from core.features.automations import MODE_MANUELL
+
     spec = _spec_by_name(tool_name)
     if spec is None or spec.kind != "write":
         return {"type": "error", "text": "Unbekannte Aktion."}
+    if ctx.mode_for(tool_name) == MODE_MANUELL:
+        return {"type": "error",
+                "text": "Diese Aktion ist auf „manuell“ gestellt — ich darf "
+                        "sie nicht für dich ausführen."}
     if spec not in _available_tools(ctx):
         return {"type": "error", "text": "Diese Aktion ist für dich nicht freigeschaltet."}
     try:

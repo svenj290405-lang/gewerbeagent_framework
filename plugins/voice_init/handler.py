@@ -820,6 +820,46 @@ class Plugin(BasePlugin):
                 "nachricht": f"Tenant '{tenant_slug}' nicht gefunden",
             }
 
+        # Automatisierungs-Gate (Einstellungen → Automatisierung →
+        # "Terminbuchung am Telefon"). Auf 'manuell' bucht Q nicht selbst,
+        # sondern nimmt das Anliegen als Rueckruf auf — der Anrufer wird
+        # also nicht abgewiesen, der Betrieb meldet sich nur selbst.
+        from core.features.automation_check import is_automation_enabled
+        if not await is_automation_enabled(tenant.id, "telefon_buchung"):
+            logger.info(
+                f"buche_termin: telefon_buchung=manuell tenant={tenant_slug} "
+                f"— Rueckruf statt Buchung"
+            )
+            rr = await self._handle_rueckruf_anfordern({
+                "kunde_name": name,
+                "kunde_telefon": (payload.get("kunde_telefon") or "").strip(),
+                "anliegen": (
+                    f"{(payload.get('anliegen') or 'Terminwunsch').strip()} "
+                    f"— Wunschtermin {datum} {uhrzeit}"
+                ),
+                "kunde_email": (payload.get("kunde_email") or "").strip() or None,
+                "tenant_slug": tenant_slug,
+            })
+            if not rr.get("success"):
+                # Meist fehlt die Rufnummer — der Agent soll danach fragen,
+                # statt dem Anrufer einen gebuchten Termin vorzugaukeln.
+                return {
+                    "erfolg": False,
+                    "nachricht": (
+                        "Termine werden hier nicht am Telefon gebucht. Frage "
+                        "nach einer Rueckrufnummer, dann meldet sich der "
+                        "Betrieb."
+                    ),
+                }
+            return {
+                "erfolg": False,
+                "nachricht": (
+                    "Der Termin wurde NICHT gebucht — der Betrieb vergibt "
+                    "Termine selbst. Der Terminwunsch ist notiert; sage dem "
+                    "Anrufer zu, dass sich der Betrieb zeitnah zurueckmeldet."
+                ),
+            }
+
         kalender = await get_plugin_for_tenant(tenant_slug, "kalender")
         if kalender is None:
             return {

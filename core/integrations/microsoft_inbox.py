@@ -220,6 +220,14 @@ async def poll_microsoft_inbox(
     tenant_company = tenant.company_name or "Handwerksbetrieb"
     tenant_branche = getattr(tenant, "branche", None) or "Handwerk"
 
+    # Automatisierungsgrad einmal pro Poll-Durchlauf lesen, nicht pro Mail:
+    # ein Durchlauf verarbeitet bis zu 25 Nachrichten, und die Einstellung
+    # aendert sich in der Zwischenzeit nicht.
+    from core.features.automation_check import is_automation_enabled
+    auto_antwort_erlaubt = await is_automation_enabled(
+        tenant_id, "mail_auto_antwort",
+    )
+
     try:
         messages = await fetch_unread_messages(
             tenant_id, top=25, employee_id=employee_id,
@@ -461,8 +469,57 @@ async def poll_microsoft_inbox(
         #   5. spam_throttled               → Outlook-Kategorie, kein Reply
         #   6. confidence == low            → Outlook-Kategorie, kein Reply
         #   7. sonst (neu_anfrage default)  → process_relevant_kunde_mail
+        #
+        # Davor liegt das Automatisierungs-Gate: steht 'mail_auto_antwort'
+        # auf 'manuell', wird der GESAMTE Dispatch uebersprungen. Bewusst
+        # nicht nur die Neuanfrage — Storno und Verschiebung sind ebenso
+        # selbstaendige Aktionen (sie schreiben Mails und aendern den
+        # Kalender), und wer den Schalter umlegt, will genau die nicht.
         process_result = None
-        if classification == "RELEVANT_KUNDE" and intent == "termin_stornieren":
+        if classification == "RELEVANT_KUNDE" and not auto_antwort_erlaubt:
+            logger.info(
+                "poll: mail_auto_antwort=manuell (tenant=%s sender=%s) — "
+                "nur Benachrichtigung, keine Auto-Aktion",
+                tenant_id, sender_email,
+            )
+            process_result = {
+                "success": False, "skipped": True, "reason": "automatisierung-manuell",
+            }
+            # Outlook-Kategorie wie im Low-Confidence-Pfad: die Mail bleibt
+            # sichtbar in der Inbox und ist als "Q hat nicht geantwortet"
+            # markiert.
+            try:
+                target_category = Q_CATEGORY_BY_CLASSIFICATION.get("UNSICHER")
+                if target_category and msg.get("id"):
+                    await set_message_categories(
+                        tenant_id=tenant_id, message_id=msg.get("id"),
+                        categories=(msg.get("categories") or []) + [target_category],
+                        employee_id=employee_id,
+                    )
+            except Exception as e:
+                logger.warning(
+                    "poll: Outlook-Kategorie setzen fehlgeschlagen "
+                    "(automatisierung-manuell) tenant=%s sender=%s: %s",
+                    tenant_id, sender_email, e,
+                )
+            # Benachrichtigen ist der ganze Sinn dieser Stufe — ohne Push
+            # wuerde die Anfrage im Postfach untergehen.
+            try:
+                from core.integrations.mail_pipeline import (
+                    push_tenant_new_anfrage_notification,
+                )
+                await push_tenant_new_anfrage_notification(
+                    tenant,
+                    sender_email=sender_email, sender_name=sender_name,
+                    subject=subject, body_preview=body_preview,
+                    web_link=msg.get("webLink"), employee_id=employee_id,
+                )
+            except Exception as e:
+                logger.warning(
+                    "poll: Push (automatisierung-manuell) fehlgeschlagen "
+                    "tenant=%s sender=%s: %s", tenant_id, sender_email, e,
+                )
+        elif classification == "RELEVANT_KUNDE" and intent == "termin_stornieren":
             try:
                 process_result = await _handle_storno_intent(
                     tenant=tenant, tenant_id=tenant_id,
