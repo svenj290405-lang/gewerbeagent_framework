@@ -141,7 +141,10 @@
 // v72: Sprechen bei Q wie bei WhatsApp — ein Tipp auf Globus/Mikro startet die
 // Aufnahme und laesst sie laufen (Leiste mit Laufzeit + Live-Pegel, verwerfen
 // oder senden per Knopf); Gedrueckthalten sendet weiterhin beim Loslassen.
-const CACHE = "ga-app-v72";
+// v73: Q-Overlay oeffnet halb hoch statt als schmaler Streifen und hat
+// dieselbe Sprachaufnahme wie der Assistent (Leiste mit Laufzeit + Pegel);
+// automatisch ausgefuehrte Aktionen werden im Overlay auch angezeigt.
+const CACHE = "ga-app-v73";
 const SHELL = [
   "/app",
   "/app/static/app-beta.css",

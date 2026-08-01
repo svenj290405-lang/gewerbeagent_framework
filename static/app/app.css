@@ -473,7 +473,12 @@ button:disabled { opacity: .6; }
   border-radius: 18px 18px 0 0; box-shadow: 0 -6px 28px rgba(0,0,0,.13);
   transform: translateY(calc(100% + 56px + env(safe-area-inset-bottom,0px)));
   transition: transform .28s cubic-bezier(.4,0,.2,1);
-  max-height: 55vh; display: flex; flex-direction: column;
+  /* Feste halbe Hoehe statt „so hoch wie der Inhalt": vorher war das Panel
+     bei kurzen Antworten ein schmaler Streifen und sprang bei jeder Antwort
+     in der Hoehe. Halb offen ist es ein ruhiges Fenster, in dem auch die
+     Aufnahme-Leiste Platz hat. */
+  height: 50vh; max-height: calc(100vh - 140px); min-height: 220px;
+  display: flex; flex-direction: column;
   pointer-events: none; }
 .q-overlay.open {
   transform: translateY(0);
@@ -500,9 +505,14 @@ button:disabled { opacity: .6; }
 .q-ov-bbl.typing span:nth-child(3) { animation-delay: .3s; }
 /* Kein safe-area-Padding mehr noetig: die Leiste sitzt jetzt ueber der
    Tabbar, die den unteren Geraeterand bereits abdeckt. */
-.q-overlay-bar { display: flex; align-items: center; gap: 8px;
+.q-overlay-bar { display: flex; flex-direction: column; gap: 8px;
   padding: 8px 10px;
   border-top: 1px solid var(--line); flex-shrink: 0; }
+/* Eingabezeile und Aufnahme-Leiste teilen sich denselben Platz — immer nur
+   eine von beiden ist sichtbar. */
+.q-ov-inputrow { display: flex; align-items: center; gap: 8px; width: 100%; }
+.q-ov-inputrow[hidden] { display: none; }
+.q-overlay-bar .q-recbar { padding: 0; }
 .q-overlay-bar input { flex: 1; padding: 10px 14px; border: 1px solid var(--line);
   border-radius: 21px; font-size: 16px; font-family: inherit;
   background: var(--bg); outline: none; }

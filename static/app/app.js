@@ -133,6 +133,7 @@ function navigate(key, { mode = "push" } = {}) {
   // Laeuft noch eine Sprachaufnahme, wird sie beim Verlassen verworfen —
   // sonst bliebe das Mikrofon offen und die Leiste ohne Screen zurueck.
   if (App.recAbort) { try { App.recAbort(); } catch (e) {} App.recAbort = null; }
+  App.qVoice = null;
   // Ein angehängtes Bild bleibt absichtlich „kleben" — sonst ginge ein Tab-
   // Wechsel zwischen Rückfrage und Antwort verloren und der Folge-Befehl
   // landete im Text-Pfad. clearPending() räumt es auf (Aktion/Entfernen).
@@ -2065,7 +2066,7 @@ const SCREENS = {
         mountQSphere();
         // Laeuft gerade eine Aufnahme, muss der frisch gebaute Globus wieder
         // in den Aufnahme-Zustand (Klasse + Hinweistext gingen sonst verloren).
-        if (Rec) _recSetUi(true);
+        if (App.qVoice) App.qVoice.refreshUi();
         return;
       }
       if (App.qSphereStop) { try { App.qSphereStop(); } catch (e) {} App.qSphereStop = null; App.qSphereCanvas = null; }
@@ -2704,192 +2705,40 @@ const SCREENS = {
     });
 
     // ---- Sprechen: einmal tippen startet, einmal tippen sendet -------------
-    // Wie bei WhatsApp: ein Tipp auf den Globus (oder das Mikro im Composer)
-    // startet die Aufnahme und laesst sie laufen — die Aufnahme-Leiste zeigt
-    // Laufzeit und Live-Pegel, gesendet wird per Tipp auf den Knopf oder auf
-    // den Globus. Wer den Knopf gedrueckt HAELT, bekommt weiterhin das alte
-    // Verhalten: Loslassen sendet sofort.
-    const REC_MAX_SEC = 120;   // harte Obergrenze, danach wird automatisch gesendet
-    const REC_HOLD_MS = 450;   // laenger gedrueckt = Halte-Geste statt Tipp
-
-    const recBar = document.getElementById("q-recbar");
-    const recTimeEl = document.getElementById("q-rec-time");
-    const recWave = document.getElementById("q-rec-wave");
+    // Steuerung siehe createVoiceRecorder(); hier haengt nur die Optik dieses
+    // Screens dran (Globus, Hinweistext, Mikro im Composer, Eingabezeile).
     const composerInner = App.view.querySelector(".composer-inner");
+    primeMicPermissionState();
 
-    // Laufende Aufnahme: { raf, levels, lastPush, busy } — sonst null.
-    let Rec = null;
-    let _recDownTs = 0;        // Zeitpunkt des pointerdown, der sie gestartet hat
+    const voice = createVoiceRecorder({
+      bar: document.getElementById("q-recbar"),
+      wave: document.getElementById("q-rec-wave"),
+      time: document.getElementById("q-rec-time"),
+      onUi(on) {
+        const wrap = document.getElementById("q-sphere-wrap");
+        const hint = document.getElementById("q-sphere-hint");
+        const mini = document.getElementById("q-mini-sphere");
+        if (wrap) wrap.classList.toggle("recording", on);
+        if (mini) mini.classList.toggle("recording", on);
+        if (hint) {
+          hint.textContent = on ? SPRECH_HINT_REC : SPRECH_TITEL;
+          hint.classList.toggle("rec", on);
+        }
+        if (composerInner) composerInner.hidden = on;
+        if (App.qSphereActive) App.qSphereActive(on);
+      },
+      onHint(text) {
+        const hint = document.getElementById("q-sphere-hint");
+        if (hint) hint.textContent = text;
+      },
+      onText(text) { input.value = text; send(); },
+      onError(msg) { push({ role: "err", text: msg }); },
+    });
 
-    // Mikrofon-Freigabe: War sie in diesem Browser schon erteilt, darf der
-    // Globus sofort aufnehmen. Diese Vorab-Abfrage blockiert nicht (Permissions-
-    // API), sodass wiederkehrende Nutzer ohne Extra-Tipp loslegen können.
-    if (navigator.permissions && navigator.permissions.query) {
-      navigator.permissions.query({ name: "microphone" })
-        .then((st) => { if (st.state === "granted") App.micReady = true; })
-        .catch(() => {}); // Safari/iOS kennt 'microphone' nicht — dann fragt der erste Druck
-    }
-
-    // Erster Druck auf den Globus: einmalig die Browser-Mikrofon-Freigabe
-    // einholen. Sagt der Nutzer ja, laeuft die Aufnahme direkt los — der
-    // Tipp war ja als "jetzt sprechen" gemeint.
-    async function _primeMic(startAfter) {
-      const hint = document.getElementById("q-sphere-hint");
-      if (hint) hint.textContent = "Mikrofon erlauben …";
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        stream.getTracks().forEach((t) => t.stop());
-        App.micReady = true;
-        if (hint) hint.textContent = SPRECH_TITEL;
-        if (startAfter) recStart();
-      } catch (er) {
-        if (hint) hint.textContent = (er && er.name === "NotAllowedError")
-          ? "Mikrofon abgelehnt — im Browser erlauben"
-          : "Mikrofon nicht verfügbar";
-      }
-    }
-
-    // Aufnahme-Zustand sichtbar machen: Globus + Mikro rot/aktiv, Eingabe-
-    // zeile weicht der Aufnahme-Leiste.
-    function _recSetUi(on) {
-      const wrap = document.getElementById("q-sphere-wrap");
-      const hint = document.getElementById("q-sphere-hint");
-      const mini = document.getElementById("q-mini-sphere");
-      if (wrap) wrap.classList.toggle("recording", on);
-      if (mini) mini.classList.toggle("recording", on);
-      if (hint) {
-        hint.textContent = on ? SPRECH_HINT_REC : SPRECH_TITEL;
-        hint.classList.toggle("rec", on);
-      }
-      if (recBar) recBar.hidden = !on;
-      if (composerInner) composerInner.hidden = on;
-      if (App.qSphereActive) App.qSphereActive(on);
-    }
-
-    // Wellenform: je Tick ein Balken aus dem aktuellen Pegel, aeltere wandern
-    // nach links raus — die Bewegung ist der Beweis, dass Ton ankommt.
-    function _recDrawWave() {
-      if (!recWave || !Rec) return;
-      const w = recWave.clientWidth, h = recWave.clientHeight;
-      if (!w || !h) return;
-      const dpr = window.devicePixelRatio || 1;
-      if (recWave.width !== Math.round(w * dpr)) {
-        recWave.width = Math.round(w * dpr);
-        recWave.height = Math.round(h * dpr);
-      }
-      const ctx = recWave.getContext("2d");
-      if (!ctx) return;
-      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-      ctx.clearRect(0, 0, w, h);
-      const now = performance.now();
-      if (now - Rec.lastPush >= 55) { Rec.lastPush = now; Rec.levels.push(_diktatLevel()); }
-      const barW = 3, step = 5;
-      const maxBars = Math.max(1, Math.floor(w / step));
-      if (Rec.levels.length > maxBars) Rec.levels.splice(0, Rec.levels.length - maxBars);
-      ctx.fillStyle = getComputedStyle(recWave).color;
-      for (let i = 0; i < Rec.levels.length; i++) {
-        // Wurzel-Kennlinie: leise Sprache bewegt den Balken sichtbar, laute
-        // laeuft nicht sofort oben an.
-        const lvl = Math.min(1, Math.sqrt(Rec.levels[i]) * 1.9);
-        const bh = Math.max(3, lvl * (h - 4));
-        const x = w - (Rec.levels.length - i) * step;
-        const y = (h - bh) / 2;
-        ctx.beginPath();
-        if (ctx.roundRect) ctx.roundRect(x, y, barW, bh, barW / 2);
-        else ctx.rect(x, y, barW, bh);
-        ctx.fill();
-      }
-    }
-
-    function _recTick() {
-      if (!Rec) return;
-      const secs = Math.max(0, Math.floor((Date.now() - Diktat.startTs) / 1000));
-      if (recTimeEl) {
-        recTimeEl.textContent = Math.floor(secs / 60) + ":" + String(secs % 60).padStart(2, "0");
-        recTimeEl.classList.toggle("warn", secs >= REC_MAX_SEC - 15);
-      }
-      _recDrawWave();
-      Rec.raf = requestAnimationFrame(_recTick);
-    }
-
-    async function recStart() {
-      if (Rec) return;
-      Rec = { raf: 0, levels: [], lastPush: 0, busy: false };
-      _recSetUi(true);
-      if (recTimeEl) { recTimeEl.textContent = "0:00"; recTimeEl.classList.remove("warn"); }
-      try {
-        await _diktatStartRecording();
-      } catch (er) {
-        Rec = null;
-        _recSetUi(false);
-        _diktatTeardown();
-        push({ role: "err", text: (er && er.name === "NotAllowedError")
-          ? "Mikrofon-Zugriff abgelehnt. Bitte im Browser erlauben."
-          : "Mikrofon nicht verfügbar." });
-        return;
-      }
-      Diktat.autostop = setTimeout(() => { if (Rec) recStop("send"); }, REC_MAX_SEC * 1000);
-      Rec.raf = requestAnimationFrame(_recTick);
-    }
-
-    // mode: "send" = transkribieren und abschicken, "cancel" = wegwerfen.
-    async function recStop(mode) {
-      if (!Rec || Rec.busy) return;
-      Rec.busy = true;
-      if (Rec.raf) cancelAnimationFrame(Rec.raf);
-      const out = Diktat.recording ? _diktatFinish() : null;
-      _diktatTeardown();
-      Rec = null;
-      _recDownTs = 0;
-      _recSetUi(false);
-      if (mode !== "send" || !out) return;
-      if (out.durationSec < 1 || out.blob.size < 2000) {
-        push({ role: "err", text: "Aufnahme war zu kurz — bitte nochmal." }); return;
-      }
-      push({ role: "typing" });
-      let res, j = null;
-      try {
-        res = await fetch("/app/api/assistent/transkript", {
-          method: "POST",
-          headers: { "X-CSRF-Token": App.me.csrf, "Content-Type": "audio/wav" },
-          body: out.blob,
-        });
-      } catch (e) { popTyping(); push({ role: "err", text: "Netzwerkfehler." }); return; }
-      if (res.status === 303 || res.status === 401 || res.redirected) { location.href = "/app/login"; return; }
-      try { j = await res.json(); } catch (e) {}
-      popTyping();
-      if (res.ok && j && j.ok && j.text) { input.value = j.text; send(); }
-      else push({ role: "err", text: (j && j.error) || "Nichts verstanden — bitte nochmal." });
-    }
-
+    // render() baut den Globus neu auf und braucht die Aufnahme-Optik zurueck.
+    App.qVoice = voice;
     // Tab-Wechsel/Verlassen: Mikrofon nicht offen stehen lassen.
-    App.recAbort = () => { if (Rec) recStop("cancel"); };
-
-    // Ein Druck auf Globus oder Mikro: laeuft nichts → starten; laeuft etwas
-    // → senden. Ob es ein Tipp oder ein Halten war, entscheidet erst das
-    // Loslassen (_recPointerUp).
-    function _recPointerDown() {
-      if (Rec) { recStop("send"); return; }
-      if (!App.micReady) { _primeMic(true); return; }
-      _recDownTs = Date.now();
-      recStart();
-    }
-
-    function _recPointerUp() {
-      if (!_recDownTs) return;
-      const held = Date.now() - _recDownTs;
-      _recDownTs = 0;
-      // Gedrueckt gehalten = Sprechtaste: Loslassen sendet. Kurzer Tipp:
-      // Aufnahme laeuft freihaendig weiter.
-      if (held >= REC_HOLD_MS) recStop("send");
-    }
-
-    function _recPointerCancel() {
-      if (!_recDownTs) return;
-      const held = Date.now() - _recDownTs;
-      _recDownTs = 0;
-      if (held >= REC_HOLD_MS) recStop("cancel");
-    }
+    App.recAbort = () => voice.stop("cancel");
 
     // Globus (Hero-Ansicht)
     chatEl.addEventListener("pointerdown", (e) => {
@@ -2897,18 +2746,18 @@ const SCREENS = {
       if (!wrap) return;
       e.preventDefault();
       try { wrap.setPointerCapture(e.pointerId); } catch (_) {}
-      _recPointerDown();
+      voice.pointerDown();
     });
     chatEl.addEventListener("pointerup", (e) => {
-      if (e.target.closest("#q-sphere-wrap")) _recPointerUp();
+      if (e.target.closest("#q-sphere-wrap")) voice.pointerUp();
     });
-    chatEl.addEventListener("pointercancel", () => _recPointerCancel());
+    chatEl.addEventListener("pointercancel", () => voice.pointerCancel());
     // Tastatur: der Globus ist role="button" — Enter/Leertaste schalten um.
     chatEl.addEventListener("keydown", (e) => {
       if (!e.target.closest("#q-sphere-wrap")) return;
       if (e.key !== "Enter" && e.key !== " ") return;
       e.preventDefault();
-      if (Rec) recStop("send"); else if (!App.micReady) _primeMic(true); else recStart();
+      voice.toggle();
     });
 
     // Mikro im Composer (sichtbar, sobald Nachrichten da sind)
@@ -2917,17 +2766,17 @@ const SCREENS = {
       miniBtn.addEventListener("pointerdown", (e) => {
         e.preventDefault();
         try { miniBtn.setPointerCapture(e.pointerId); } catch (_) {}
-        _recPointerDown();
+        voice.pointerDown();
       });
-      miniBtn.addEventListener("pointerup", () => _recPointerUp());
-      miniBtn.addEventListener("pointercancel", () => _recPointerCancel());
+      miniBtn.addEventListener("pointerup", () => voice.pointerUp());
+      miniBtn.addEventListener("pointercancel", () => voice.pointerCancel());
     }
 
     // Knöpfe der Aufnahme-Leiste
     const recCancelBtn = document.getElementById("q-rec-cancel");
     const recSendBtn = document.getElementById("q-rec-send");
-    if (recCancelBtn) recCancelBtn.addEventListener("click", () => recStop("cancel"));
-    if (recSendBtn) recSendBtn.addEventListener("click", () => recStop("send"));
+    if (recCancelBtn) recCancelBtn.addEventListener("click", () => voice.stop("cancel"));
+    if (recSendBtn) recSendBtn.addEventListener("click", () => voice.stop("send"));
 
     // ---- Funktions-Dropdown (Quick-Aktionen) ----
     // Damit der Handwerker nicht alles per Hand in eigenen Fenstern anlegt:
@@ -3953,6 +3802,198 @@ function _diktatFinish() {
   const resampled = _diktatResample(raw, Diktat.inRate, DIKTAT_TARGET_RATE);
   _diktatTeardown();
   return { blob: _diktatEncodeWav(resampled, DIKTAT_TARGET_RATE), durationSec };
+}
+
+// ---------- Sprechen: Aufnahme-Steuerung (Assistent + Q-Overlay) ----------
+// Wie bei WhatsApp: ein Tipp startet die Aufnahme und laesst sie laufen, ein
+// zweiter sendet sie. Wer den Knopf gedrueckt HAELT, sendet beim Loslassen.
+// Beide Q-Oberflaechen benutzen dieselbe Steuerung — die Wellenform und die
+// Halten-Erkennung gibt es deshalb nur einmal.
+//
+// opts: { bar, wave, time, onUi(on), onHint(text), onText(text), onError(msg) }
+//   bar/wave/time  Elemente der Aufnahme-Leiste (duerfen fehlen)
+//   onUi           schaltet die bildschirm-eigene Optik um (Globus, Mikro,
+//                  Eingabezeile aus-/einblenden)
+//   onHint         Statustext waehrend der Mikrofon-Freigabe (optional)
+//   onText         fertiger Transkript-Text
+//   onError        Fehlertext fuer den Nutzer
+const REC_MAX_SEC = 120;   // harte Obergrenze, danach wird automatisch gesendet
+const REC_HOLD_MS = 450;   // laenger gedrueckt = Halte-Geste statt Tipp
+
+function createVoiceRecorder(opts) {
+  const bar = opts.bar || null;
+  const wave = opts.wave || null;
+  const timeEl = opts.time || null;
+  let rec = null;      // { raf, levels, lastPush, busy } — sonst nicht am Aufnehmen
+  let downTs = 0;      // pointerdown, der die laufende Aufnahme gestartet hat
+
+  function setUi(on) {
+    if (bar) bar.hidden = !on;
+    if (timeEl && on) { timeEl.textContent = "0:00"; timeEl.classList.remove("warn"); }
+    if (opts.onUi) opts.onUi(on);
+  }
+
+  // Wellenform: je Tick ein Balken aus dem aktuellen Pegel, aeltere wandern
+  // nach links raus — die Bewegung ist der Beweis, dass Ton ankommt.
+  function draw() {
+    if (!wave || !rec) return;
+    const w = wave.clientWidth, h = wave.clientHeight;
+    if (!w || !h) return;
+    const dpr = window.devicePixelRatio || 1;
+    if (wave.width !== Math.round(w * dpr)) {
+      wave.width = Math.round(w * dpr);
+      wave.height = Math.round(h * dpr);
+    }
+    const ctx = wave.getContext("2d");
+    if (!ctx) return;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, w, h);
+    const now = performance.now();
+    if (now - rec.lastPush >= 55) { rec.lastPush = now; rec.levels.push(_diktatLevel()); }
+    const barW = 3, step = 5;
+    const maxBars = Math.max(1, Math.floor(w / step));
+    if (rec.levels.length > maxBars) rec.levels.splice(0, rec.levels.length - maxBars);
+    ctx.fillStyle = getComputedStyle(wave).color;
+    for (let i = 0; i < rec.levels.length; i++) {
+      // Wurzel-Kennlinie: leise Sprache bewegt den Balken sichtbar, laute
+      // laeuft nicht sofort oben an.
+      const lvl = Math.min(1, Math.sqrt(rec.levels[i]) * 1.9);
+      const bh = Math.max(3, lvl * (h - 4));
+      const x = w - (rec.levels.length - i) * step;
+      const y = (h - bh) / 2;
+      ctx.beginPath();
+      if (ctx.roundRect) ctx.roundRect(x, y, barW, bh, barW / 2);
+      else ctx.rect(x, y, barW, bh);
+      ctx.fill();
+    }
+  }
+
+  function tick() {
+    if (!rec) return;
+    const secs = Math.max(0, Math.floor((Date.now() - Diktat.startTs) / 1000));
+    if (timeEl) {
+      timeEl.textContent = Math.floor(secs / 60) + ":" + String(secs % 60).padStart(2, "0");
+      timeEl.classList.toggle("warn", secs >= REC_MAX_SEC - 15);
+    }
+    draw();
+    rec.raf = requestAnimationFrame(tick);
+  }
+
+  // Erster Druck: einmalig die Browser-Mikrofon-Freigabe einholen. Sagt der
+  // Nutzer ja, laeuft die Aufnahme direkt los — der Tipp war ja als "jetzt
+  // sprechen" gemeint.
+  async function primeMic(startAfter) {
+    if (opts.onHint) opts.onHint("Mikrofon erlauben …");
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      stream.getTracks().forEach((t) => t.stop());
+      App.micReady = true;
+      if (opts.onHint) opts.onHint(SPRECH_TITEL);
+      if (startAfter) start();
+    } catch (er) {
+      if (opts.onHint) opts.onHint((er && er.name === "NotAllowedError")
+        ? "Mikrofon abgelehnt — im Browser erlauben"
+        : "Mikrofon nicht verfügbar");
+    }
+  }
+
+  async function start() {
+    if (rec) return;
+    rec = { raf: 0, levels: [], lastPush: 0, busy: false };
+    setUi(true);
+    try {
+      await _diktatStartRecording();
+    } catch (er) {
+      rec = null;
+      setUi(false);
+      _diktatTeardown();
+      if (opts.onError) opts.onError((er && er.name === "NotAllowedError")
+        ? "Mikrofon-Zugriff abgelehnt. Bitte im Browser erlauben."
+        : "Mikrofon nicht verfügbar.");
+      return;
+    }
+    Diktat.autostop = setTimeout(() => { if (rec) stop("send"); }, REC_MAX_SEC * 1000);
+    rec.raf = requestAnimationFrame(tick);
+  }
+
+  // mode: "send" = transkribieren und weitergeben, "cancel" = wegwerfen.
+  async function stop(mode) {
+    if (!rec || rec.busy) return;
+    rec.busy = true;
+    if (rec.raf) cancelAnimationFrame(rec.raf);
+    const out = Diktat.recording ? _diktatFinish() : null;
+    _diktatTeardown();
+    rec = null;
+    downTs = 0;
+    setUi(false);
+    if (mode !== "send" || !out) return;
+    if (out.durationSec < 1 || out.blob.size < 2000) {
+      if (opts.onError) opts.onError("Aufnahme war zu kurz — bitte nochmal.");
+      return;
+    }
+    let res, j = null;
+    try {
+      res = await fetch("/app/api/assistent/transkript", {
+        method: "POST",
+        headers: { "X-CSRF-Token": App.me.csrf, "Content-Type": "audio/wav" },
+        body: out.blob,
+      });
+    } catch (e) {
+      if (opts.onError) opts.onError("Netzwerkfehler.");
+      return;
+    }
+    if (res.status === 303 || res.status === 401 || res.redirected) { location.href = "/app/login"; return; }
+    try { j = await res.json(); } catch (e) {}
+    if (res.ok && j && j.ok && j.text) opts.onText(j.text);
+    else if (opts.onError) opts.onError((j && j.error) || "Nichts verstanden — bitte nochmal.");
+  }
+
+  // Ein Druck auf den Sprech-Knopf: laeuft nichts → starten; laeuft etwas →
+  // senden. Ob es ein Tipp oder ein Halten war, entscheidet erst pointerUp.
+  function pointerDown() {
+    if (rec) { stop("send"); return; }
+    if (!App.micReady) { primeMic(true); return; }
+    downTs = Date.now();
+    start();
+  }
+
+  function pointerUp() {
+    if (!downTs) return;
+    const held = Date.now() - downTs;
+    downTs = 0;
+    // Gedrueckt gehalten = Sprechtaste: Loslassen sendet. Kurzer Tipp:
+    // Aufnahme laeuft freihaendig weiter.
+    if (held >= REC_HOLD_MS) stop("send");
+  }
+
+  function pointerCancel() {
+    if (!downTs) return;
+    const held = Date.now() - downTs;
+    downTs = 0;
+    if (held >= REC_HOLD_MS) stop("cancel");
+  }
+
+  // Fuer Tastatur-Bedienung und die Knoepfe der Leiste.
+  function toggle() {
+    if (rec) stop("send");
+    else if (!App.micReady) primeMic(true);
+    else start();
+  }
+
+  return {
+    start, stop, toggle, pointerDown, pointerUp, pointerCancel,
+    isActive: () => !!rec,
+    refreshUi: () => { if (rec) setUi(true); },
+  };
+}
+
+// Mikrofon-Freigabe: War sie in diesem Browser schon erteilt, darf der erste
+// Tipp sofort aufnehmen. Die Abfrage blockiert nicht (Permissions-API).
+function primeMicPermissionState() {
+  if (!navigator.permissions || !navigator.permissions.query) return;
+  navigator.permissions.query({ name: "microphone" })
+    .then((st) => { if (st.state === "granted") App.micReady = true; })
+    .catch(() => {}); // Safari/iOS kennt 'microphone' nicht — dann fragt der erste Druck
 }
 
 // ---------- Kunden-Profil (gebündelte Historie) ----------
@@ -5985,6 +6026,8 @@ function toggleQOverlay(forceClose) {
     return;
   }
   const opening = forceClose ? false : !overlay.classList.contains("open");
+  // Zugeklapptes Panel darf nicht weiter mithoeren.
+  if (!opening && App.qOverlayVoice) App.qOverlayVoice.stop("cancel");
   overlay.classList.toggle("open", opening);
   document.querySelectorAll(".tabbar button[data-tab='_qoverlay']").forEach((b) =>
     b.classList.toggle("active", opening));
@@ -6088,6 +6131,12 @@ async function _qOverlaySend(text) {
     const say = j.frage || `Mail-Entwurf an ${j.empfaenger || j.empfaenger_name || "den Kunden"}: ${j.betreff || ""}`;
     App.qhistory.push({ role: "model", text: say });
     App.qchat.push(mailDraftMsg(j));
+  } else if (j.type === "done") {
+    // Automatisierung steht auf 'automatisch': die Aktion ist schon
+    // gelaufen. Ohne diesen Zweig bliebe das Overlay stumm.
+    const txt = (j.frage ? j.frage + " " : "") + "✓ " + (j.summary || "Erledigt.");
+    App.qhistory.push({ role: "model", text: txt });
+    App.qchat.push({ role: "q", text: txt });
   } else if (j.type === "error") {
     App.qchat.push({ role: "err", text: j.text });
   }
@@ -6122,65 +6171,38 @@ function initQOverlay() {
   sendBtn.addEventListener("click", send);
   inp.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } });
 
-  // Sprechen im Overlay — gleiche Bedienung wie beim Globus: einmal tippen
-  // startet, einmal tippen sendet. Statt einer eigenen Leiste laeuft die Zeit
-  // hier im (waehrenddessen gesperrten) Eingabefeld mit.
+  // Sprechen im Overlay — dieselbe Steuerung wie im Assistenten: ein Tipp
+  // startet, ein zweiter sendet, Halten sendet beim Loslassen. Waehrend der
+  // Aufnahme weicht die Eingabezeile der Leiste mit Laufzeit und Live-Pegel.
   if (micBtn) {
-    let _oRec = false, _oTick = null, _oPh = "";
-    function _oUi(on) {
-      micBtn.classList.toggle("recording", on);
-      micBtn.title = on ? "Aufnahme senden" : "Tippen zum Sprechen";
-      inp.disabled = on;
-      if (on) { _oPh = inp.placeholder; }
-      else { inp.placeholder = _oPh || "Frag Q …"; }
-    }
-    function _oTime() {
-      const s = Math.max(0, Math.floor((Date.now() - Diktat.startTs) / 1000));
-      inp.placeholder = "🔴 " + Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0")
-        + " — tippen zum Senden";
-    }
-    async function _oStop(upload) {
-      if (!_oRec) return;
-      _oRec = false;
-      if (_oTick) { clearInterval(_oTick); _oTick = null; }
-      const out = Diktat.recording ? _diktatFinish() : null;
-      _diktatTeardown();
-      _oUi(false);
-      if (!upload || !out) return;
-      if (out.durationSec < 1 || out.blob.size < 2000) return;
-      try {
-        const r = await fetch("/app/api/assistent/transkript", {
-          method: "POST",
-          headers: { "X-CSRF-Token": App.me.csrf, "Content-Type": "audio/wav" },
-          body: out.blob,
-        });
-        const j = r.ok ? await r.json().catch(() => null) : null;
-        if (j && j.ok && j.text) await _qOverlaySend(j.text);
-      } catch (_) {}
-    }
-    async function _oStart() {
-      if (_oRec) return;
-      _oRec = true;
-      _oUi(true); _oTime();
-      try {
-        await _diktatStartRecording();
-      } catch (_) {
-        _oRec = false; _oUi(false); _diktatTeardown(); return;
-      }
-      _oTick = setInterval(_oTime, 250);
-      Diktat.autostop = setTimeout(() => { if (_oRec) _oStop(true); }, 120000);
-    }
-    micBtn.addEventListener("click", (e) => {
-      e.preventDefault();
-      if (_oRec) { _oStop(true); return; }
-      if (!App.micReady) {
-        navigator.mediaDevices.getUserMedia({ audio: true })
-          .then((s) => { s.getTracks().forEach((t) => t.stop()); App.micReady = true; _oStart(); })
-          .catch(() => {});
-        return;
-      }
-      _oStart();
+    const inputRow = document.getElementById("q-ov-inputrow");
+    const ovVoice = createVoiceRecorder({
+      bar: document.getElementById("q-ov-recbar"),
+      wave: document.getElementById("q-ov-rec-wave"),
+      time: document.getElementById("q-ov-rec-time"),
+      onUi(on) {
+        micBtn.classList.toggle("recording", on);
+        if (inputRow) inputRow.hidden = on;
+      },
+      onText(text) { _qOverlaySend(text); },
+      onError(msg) {
+        App.qchat = App.qchat || [];
+        App.qchat.push({ role: "err", text: msg });
+        _qOverlayRender();
+      },
     });
+    App.qOverlayVoice = ovVoice;
+    micBtn.addEventListener("pointerdown", (e) => {
+      e.preventDefault();
+      try { micBtn.setPointerCapture(e.pointerId); } catch (_) {}
+      ovVoice.pointerDown();
+    });
+    micBtn.addEventListener("pointerup", () => ovVoice.pointerUp());
+    micBtn.addEventListener("pointercancel", () => ovVoice.pointerCancel());
+    const ovCancel = document.getElementById("q-ov-rec-cancel");
+    const ovSend = document.getElementById("q-ov-rec-send");
+    if (ovCancel) ovCancel.addEventListener("click", () => ovVoice.stop("cancel"));
+    if (ovSend) ovSend.addEventListener("click", () => ovVoice.stop("send"));
   }
 }
 
