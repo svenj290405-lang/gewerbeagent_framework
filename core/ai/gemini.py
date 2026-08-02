@@ -262,6 +262,28 @@ _BILD_AKTIONEN = {
         "es sich um eine Quittung, einen Kassenbon oder eine Rechnung handelt.",
         {},
     ),
+    "objekt_frage": (
+        "objekt_suche",
+        "Bestimmt, WAS auf dem Foto zu sehen ist (Geraet, Typenschild, "
+        "Bauteil, Hersteller/Modell) und schlaegt dazu in der Hersteller-"
+        "Dokumentation im Netz nach. Waehlen bei Fragen zum abgebildeten "
+        "Gegenstand: 'was ist das fuer ein Geraet?', 'welches Modell ist das?', "
+        "'was bedeutet der Fehlercode?', 'wie stelle ich das ein?', 'welches "
+        "Ersatzteil passt?', 'was sagt die Anleitung dazu?'. NICHT waehlen, "
+        "wenn das Bild veraendert werden soll.",
+        {"frage": "Die Frage des Nutzers zum Gegenstand, moeglichst woertlich. "
+                  "Ohne eigene Frage: 'Was ist das genau?'"},
+    ),
+    "objekt_kaufen": (
+        "objekt_suche",
+        "Sucht Bezugsquellen fuer das fotografierte Teil — wo der Betrieb "
+        "genau das kaufen kann. Waehlen bei 'wo bekomme ich das?', 'wo kaufe "
+        "ich das nach?', 'brauche ich nochmal', 'nachbestellen', 'Ersatz "
+        "besorgen', 'was kostet sowas'.",
+        {"beschreibung": "Was gesucht wird, so konkret wie moeglich aus dem "
+                         "Text des Nutzers (z.B. 'Ersatz-Dichtung fuer diese "
+                         "Armatur'). Ohne Angabe: 'Wo bekomme ich genau das?'"},
+    ),
 }
 
 
@@ -315,6 +337,8 @@ async def route_image_intent(
         "visualisieren": "eine Visualisierung erstellen (Aenderung am Foto)",
         "archiv": "im Kundenarchiv (Google Drive) ablegen",
         "beleg": "als Beleg in der Buchhaltung erfassen",
+        "objekt_frage": "bestimmen was das ist und in der Hersteller-Doku nachschlagen",
+        "objekt_kaufen": "Bezugsquellen suchen (wo kaufe ich das)",
     }
     optionen = "; ".join(aktions_text[a] for a in aktiv) or "keine"
 
@@ -344,9 +368,20 @@ async def route_image_intent(
         + viz_hinweis +
         "- Fehlt eine Pflichtangabe (z.B. der Kundenname zum Ablegen), dann "
         "FRAGE kurz nach, statt zu raten — rufe noch keine Funktion auf.\n"
-        "- Stellt der Nutzer eine FRAGE zum Bild ('was ist das?', 'was "
-        "stimmt hier nicht?'), beantworte sie kurz als Text, ohne Funktion.\n"
-        "- Hat der Nutzer NICHTS oder nur Unklares geschrieben, frage in EINEM "
+        + (
+            # Mit Objekt-Suche gehen Sachfragen ins Netz statt ins Blaue: das
+            # Modell weiss aus sich heraus weder die Typenbezeichnung noch,
+            # was in der Anleitung steht.
+            "- Stellt der Nutzer eine Sachfrage zum abgebildeten Gegenstand "
+            "('was ist das?', 'welches Modell?', 'was bedeutet der Fehler?', "
+            "'wie stelle ich das ein?'), rufe objekt_frage auf — rate NICHT "
+            "aus dem Gedaechtnis. Fragt er, wo er es bekommt, rufe "
+            "objekt_kaufen auf.\n"
+            if "objekt_frage" in aktiv else
+            "- Stellt der Nutzer eine FRAGE zum Bild ('was ist das?', 'was "
+            "stimmt hier nicht?'), beantworte sie kurz als Text, ohne Funktion.\n"
+        )
+        + "- Hat der Nutzer NICHTS oder nur Unklares geschrieben, frage in EINEM "
         "kurzen Satz nach, was mit dem Bild passieren soll, und nenne die "
         "moeglichen Aktionen. Beschreibe das Bild dann nicht von dir aus.\n"
         "- Antworte immer kurz, auf Deutsch, in der Du-Form, wie ein Kollege."
@@ -2795,3 +2830,241 @@ async def extract_beleg_from_image(
         out.get("haendler"), out.get("betrag_brutto_eur"),
         out.get("mwst_prozent"), out.get("kategorie"), out.get("sicherheit"))
     return out
+
+
+# ---------------------------------------------------------------------------
+# Objekt-Erkennung mit Web-Erdung
+#
+# Der Handwerker fotografiert ein Geraet, ein Typenschild oder ein Bauteil
+# beim Kunden. Gemini erkennt, was es ist, und schlaegt in der echten
+# Hersteller-Dokumentation nach — dafuer bekommt es die Google-Suche als
+# Werkzeug (Grounding auf Vertex, europe-west3/Frankfurt).
+#
+# Warum nicht Google Lens: Lens hat keine oeffentliche API. Fuer diesen
+# Zweck ist die Kombination aus Bild + geerdeter Suche ohnehin besser —
+# Lens findet aehnliche Bilder, hier wird die Typenbezeichnung gelesen und
+# damit gezielt in Handbuechern gesucht.
+# ---------------------------------------------------------------------------
+
+# Wie viele Quellen wir dem Nutzer zeigen. Mehr macht die Karte unlesbar.
+OBJEKT_MAX_QUELLEN = 6
+
+
+def _grounding_quellen(candidate) -> tuple[list[dict], list[str]]:
+    """Quellen + tatsaechlich abgesetzte Suchanfragen aus der Antwort ziehen.
+
+    Die URLs sind Vertex-Weiterleitungen (vertexaisearch.cloud.google.com);
+    das ist so vorgesehen und funktioniert im Browser. Die echte Domain
+    steht separat im Chunk und wird als Beschriftung genutzt, damit der
+    Nutzer sieht, wo er landet.
+    """
+    gm = getattr(candidate, "grounding_metadata", None)
+    if not gm:
+        return [], []
+    quellen: list[dict] = []
+    gesehen: set[str] = set()
+    for chunk in (getattr(gm, "grounding_chunks", None) or []):
+        web = getattr(chunk, "web", None)
+        if not web:
+            continue
+        uri = getattr(web, "uri", None)
+        domain = (getattr(web, "domain", None) or "").strip()
+        titel = (getattr(web, "title", None) or domain or "Quelle").strip()
+        if not uri or domain in gesehen:
+            continue
+        gesehen.add(domain)
+        quellen.append({"titel": titel[:120], "domain": domain[:80], "url": uri})
+        if len(quellen) >= OBJEKT_MAX_QUELLEN:
+            break
+    anfragen = list(getattr(gm, "web_search_queries", None) or [])
+    return quellen, anfragen
+
+
+async def _geerdet_fragen(
+    parts: list,
+    *,
+    system_text: str,
+    tenant_id: str | None = None,
+    max_output_tokens: int = 3000,
+) -> dict:
+    """Ein Gemini-Aufruf MIT Google-Suche als Werkzeug.
+
+    Rueckgabe: ``{"ok": bool, "text": str, "quellen": [...], "suchanfragen": [...]}``
+    Wirft nie — bei jedem Fehler ``ok:False`` mit verstaendlicher Meldung.
+    """
+    from google.genai.types import (
+        GenerateContentConfig, GoogleSearch, Tool,
+    )
+
+    config = GenerateContentConfig(
+        temperature=0.1,
+        max_output_tokens=max_output_tokens,
+        system_instruction=system_text,
+        tools=[Tool(google_search=GoogleSearch())],
+    )
+    client = _get_genai_client(location=GENAI_TEXT_LOCATION)
+
+    def _sync_call():
+        return client.models.generate_content(
+            model="gemini-2.5-flash", contents=parts, config=config)
+
+    # Wie bei den anderen Bild-Pfaden: ein 429 ist meist nur ein kurzer
+    # Burst des Vertex-Minutenkontingents.
+    resp = None
+    for versuch in range(2):
+        try:
+            resp = await asyncio.to_thread(_sync_call)
+            break
+        except Exception as e:  # noqa: BLE001
+            if "RESOURCE_EXHAUSTED" in str(e) or "429" in str(e):
+                if versuch == 0:
+                    await asyncio.sleep(2)
+                    continue
+                logger.warning("objekt: Vertex-Kontingent erschoepft")
+                return {"ok": False, "error": "Gerade zu viele Anfragen — "
+                                              "bitte in einer Minute nochmal."}
+            logger.warning("objekt: Gemini-Fehler: %s", e)
+            return {"ok": False, "error": "Die Suche hat gerade nicht geklappt."}
+
+    if resp is None or not resp.candidates:
+        return {"ok": False, "error": "Keine Antwort erhalten."}
+    cand = resp.candidates[0]
+    if not cand.content or not cand.content.parts:
+        logger.warning("objekt: leere Parts, finish_reason=%s",
+                       getattr(cand, "finish_reason", "?"))
+        return {"ok": False, "error": "Keine Antwort erhalten."}
+    text = "".join(p.text for p in cand.content.parts if getattr(p, "text", None)).strip()
+    quellen, anfragen = _grounding_quellen(cand)
+    if not text:
+        return {"ok": False, "error": "Keine Antwort erhalten."}
+    return {"ok": True, "text": text, "quellen": quellen, "suchanfragen": anfragen}
+
+
+async def objekt_erkennen(
+    image_bytes: bytes,
+    mime_type: str,
+    frage: str = "",
+    *,
+    tenant_id: str | None = None,
+    branche: str | None = None,
+    verlauf: list | None = None,
+) -> dict:
+    """Foto eines Geraets/Bauteils → was ist das, und Antwort aus der Doku.
+
+    ``frage`` ist die konkrete Frage des Handwerkers ("wie stelle ich den
+    Druck ein?", "was heisst der Fehlercode?"). Ohne Frage wird das Objekt
+    bestimmt und das Wichtigste dazu genannt.
+
+    ``verlauf`` traegt Rueckfragen (Liste aus {"role": "user"|"model",
+    "text": ...}), damit "und wo sitzt das Ventil?" im Kontext bleibt.
+    """
+    from google.genai import types
+
+    if not image_bytes:
+        return {"ok": False, "error": "Kein Bild erhalten."}
+
+    branche_satz = f" Der Betrieb arbeitet im Bereich: {branche}." if branche else ""
+    system_text = (
+        "Du hilfst einem Handwerker, der beim Kunden steht und ein Foto von "
+        "einem Geraet, Typenschild oder Bauteil gemacht hat."
+        f"{branche_satz}\n\n"
+        "So gehst du vor:\n"
+        "1. Bestimme so genau wie moeglich, was auf dem Bild ist — Hersteller, "
+        "Modell-/Typenbezeichnung, Artikelnummer. Steht ein Typenschild drauf, "
+        "lies es Zeichen fuer Zeichen ab; das ist die zuverlaessigste Quelle.\n"
+        "2. Suche mit dieser Bezeichnung im Netz nach der Hersteller-"
+        "Dokumentation (Bedienungs- und Installationsanleitung, Datenblatt) "
+        "und beantworte damit die Frage des Handwerkers.\n\n"
+        "Regeln:\n"
+        "- Beginne mit einer Zeile, was das Geraet ist (fett).\n"
+        "- Antworte knapp und praktisch, so wie ein erfahrener Kollege am "
+        "Telefon: was ist zu tun, in welcher Reihenfolge.\n"
+        "- Bist du dir beim Modell nicht sicher, sage das offen und nenne, "
+        "was du brauchst (z.B. 'fotografier bitte das Typenschild').\n"
+        "- Erfinde NIEMALS technische Werte. Was du nicht in einer Quelle "
+        "findest, sagst du nicht. Lieber 'steht so nicht in der Anleitung'.\n"
+        "- Sicherheitsrelevantes (Gas, Strom, Druck) nur mit dem Hinweis, was "
+        "der Hersteller vorschreibt — keine Bastelloesungen.\n"
+        "- Deutsch, Du-Form, keine Quellenliste im Text (die haengt das "
+        "System selbst an)."
+    )
+
+    contents: list = []
+    for turn in (verlauf or [])[-8:]:
+        rolle = "model" if (turn or {}).get("role") == "model" else "user"
+        t = ((turn or {}).get("text") or "").strip()
+        if t:
+            contents.append(types.Content(
+                role=rolle, parts=[types.Part.from_text(text=t)]))
+    contents.append(types.Content(role="user", parts=[
+        types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
+        types.Part.from_text(text=(frage.strip() or
+                                   "Was ist das genau, und was muss ich dazu wissen?")),
+    ]))
+
+    ergebnis = await _geerdet_fragen(
+        contents, system_text=system_text, tenant_id=tenant_id)
+    if ergebnis.get("ok"):
+        logger.info("objekt_erkennen OK: %d Quellen, Anfragen=%s",
+                    len(ergebnis.get("quellen") or []),
+                    (ergebnis.get("suchanfragen") or [])[:2])
+    return ergebnis
+
+
+async def objekt_kaufen(
+    image_bytes: bytes | None,
+    mime_type: str | None,
+    beschreibung: str = "",
+    *,
+    tenant_id: str | None = None,
+    verlauf: list | None = None,
+) -> dict:
+    """Foto eines Teils → wo bekommt man genau das zu kaufen.
+
+    Sucht bewusst nach der konkreten Typenbezeichnung und nach deutschen
+    Haendlern; ohne sichere Bezeichnung wird das gesagt, statt irgendein
+    aehnliches Teil zu verlinken — ein falsch bestelltes Ersatzteil kostet
+    den Handwerker mehr Zeit als gar keins.
+    """
+    from google.genai import types
+
+    if not image_bytes and not beschreibung.strip():
+        return {"ok": False, "error": "Kein Bild und keine Beschreibung."}
+
+    system_text = (
+        "Du hilfst einem deutschen Handwerker, ein Teil nachzukaufen, das er "
+        "fotografiert hat.\n\n"
+        "So gehst du vor:\n"
+        "1. Bestimme das Teil so genau wie moeglich — Hersteller, Typ- oder "
+        "Artikelnummer. Steht eine Nummer drauf, ist sie das Wichtigste.\n"
+        "2. Suche im Netz, wo genau dieses Teil in Deutschland zu kaufen ist. "
+        "Bevorzuge Haendler mit klarer Artikelseite (Hersteller-Shop, "
+        "Fachhandel, grosse Ersatzteil-Haendler).\n\n"
+        "Antworte so:\n"
+        "- Erste Zeile: was das Teil ist (fett), mit Typ-/Artikelnummer.\n"
+        "- Dann 2-4 Bezugsquellen als Aufzaehlung, jeweils mit Haendlername "
+        "und, wenn du ihn kennst, dem Preis.\n"
+        "- Bist du dir beim Teil NICHT sicher, sage das zuerst und nenne, "
+        "was du zur sicheren Bestimmung brauchst. Verlinke dann nichts auf "
+        "gut Glueck — ein falsch bestelltes Teil kostet mehr Zeit als keins.\n"
+        "- Keine Quellenliste im Text, die haengt das System an.\n"
+        "- Deutsch, Du-Form, kurz."
+    )
+
+    contents: list = []
+    for turn in (verlauf or [])[-6:]:
+        rolle = "model" if (turn or {}).get("role") == "model" else "user"
+        t = ((turn or {}).get("text") or "").strip()
+        if t:
+            contents.append(types.Content(
+                role=rolle, parts=[types.Part.from_text(text=t)]))
+    teile = []
+    if image_bytes:
+        teile.append(types.Part.from_bytes(
+            data=image_bytes, mime_type=mime_type or "image/jpeg"))
+    teile.append(types.Part.from_text(
+        text=(beschreibung.strip() or "Wo bekomme ich genau das zu kaufen?")))
+    contents.append(types.Content(role="user", parts=teile))
+
+    return await _geerdet_fragen(
+        contents, system_text=system_text, tenant_id=tenant_id)

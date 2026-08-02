@@ -133,6 +133,14 @@ FEATURES: dict[str, Feature] = {
         description="Foto + Text-Beschreibung -> photorealistisches Rendering.",
         telegram_commands=("/visualisierung",),
     ),
+    "objekt_suche": Feature(
+        key="objekt_suche",
+        label="Objekt erkennen",
+        description=(
+            "Foto von Geraet/Typenschild/Bauteil -> Modell bestimmen, in der "
+            "Hersteller-Dokumentation nachschlagen, Bezugsquellen finden."
+        ),
+    ),
     "kunde_lookup": Feature(
         key="kunde_lookup",
         label="Kunden-Verlauf",

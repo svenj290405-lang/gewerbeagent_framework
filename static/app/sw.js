@@ -158,7 +158,10 @@
 // Lexware-Konto), alles korrigierbar, gebucht wird erst auf Tipp.
 // v78: Zahlungserinnerung + Angebot nachfassen direkt aus der Buchhaltung —
 // Q schreibt den Entwurf (drei Tonfaelle), alles aenderbar, senden auf Tipp.
-const CACHE = "ga-app-v78";
+// v79: Objekt erkennen — Foto vom Geraet/Typenschild/Bauteil, Q bestimmt das
+// Modell, schlaegt in der Hersteller-Doku nach (Google-Suche als Werkzeug) und
+// antwortet mit Quellen; im Kauf-Modus mit Bezugsquellen + "als Material merken".
+const CACHE = "ga-app-v79";
 const SHELL = [
   "/app",
   "/app/static/app-beta.css",

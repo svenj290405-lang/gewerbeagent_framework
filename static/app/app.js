@@ -2615,6 +2615,10 @@ const SCREENS = {
 
       if (j.type === "action") {
         // Q hat sich für eine Aktion entschieden → im Hintergrund ausführen.
+        // Objekt-Fragen behalten das Bild angehängt: „und wo sitzt das
+        // Ventil?" ist eine Rückfrage zum selben Gegenstand.
+        if (j.action === "objekt_frage") { doObjekt(file, j.frage || text, "doku"); return; }
+        if (j.action === "objekt_kaufen") { doObjekt(file, j.beschreibung || text, "kaufen"); return; }
         clearPending();
         if (j.action === "visualisieren") doVisualisieren(file, j.beschreibung || text);
         else if (j.action === "archiv") doArchiv(file, j.kunde_name || "");
@@ -2837,6 +2841,88 @@ const SCREENS = {
       } else {
         push({ role: "err", text: (j && j.error) || "Konnte kein Bild erzeugen — bitte anderes Foto/Beschreibung versuchen." });
       }
+    }
+
+    // Objekt erkennen / Bezugsquelle suchen. Q liest das Foto, schlägt im
+    // Netz nach und antwortet mit Quellen — die stehen darunter als echte
+    // Links, damit der Handwerker die Anleitung selbst aufmachen kann.
+    async function doObjekt(file, frage, modus) {
+      const kaufen = modus === "kaufen";
+      App.qImgChat = App.qImgChat || [];
+      let bubbleUrl = null;
+      try { bubbleUrl = URL.createObjectURL(file); } catch (_) {}
+      push({ role: "me", text: frage || (kaufen ? "Wo bekomme ich das?" : "Was ist das?"),
+             previewUrl: bubbleUrl, fileName: file.name });
+      push({ role: "typing" });
+      const hist = encodeURIComponent(JSON.stringify(
+        App.qImgChat.slice(-6).map((t) => ({ role: t.role, text: (t.text || "").slice(0, 500) }))));
+      const url = "/app/api/objekt/frage?frage=" + encodeURIComponent(frage || "") +
+        "&modus=" + (kaufen ? "kaufen" : "doku") + "&hist=" + hist;
+      let res, j = null;
+      try {
+        res = await fetch(url, { method: "POST",
+          headers: { "X-CSRF-Token": App.me.csrf, "Content-Type": file.type }, body: file });
+      } catch (_) { popTyping(); push({ role: "err", text: "Netzwerkfehler bei der Suche." }); return; }
+      if (res.status === 303 || res.status === 401 || res.redirected) { location.href = "/app/login"; return; }
+      try { j = await res.json(); } catch (_) {}
+      popTyping();
+      if (!j || !j.ok) {
+        push({ role: "err", text: (j && j.error) || "Konnte nichts dazu finden." });
+        return;
+      }
+      const quellen = j.quellen || [];
+      let html = linkify(esc(j.text || "")).replace(/\n/g, "<br>");
+      if (quellen.length) {
+        html += `<div style="margin-top:10px;border-top:1px solid var(--line);padding-top:8px">` +
+          `<div class="sub" style="margin-bottom:4px">${kaufen ? "Bezugsquellen" : "Quellen"}</div>` +
+          quellen.map((q) =>
+            `<div style="margin:3px 0"><a href="${esc(q.url)}" target="_blank" rel="noopener noreferrer">` +
+            `${esc(q.domain || q.titel)} ↗</a></div>`).join("") + `</div>`;
+      }
+      push({ role: "q", html: true, text: html });
+      App.qImgChat.push({ role: "user", text: frage || "(Bild)" });
+      App.qImgChat.push({ role: "model", text: (j.text || "").slice(0, 900) });
+      // Beim Nachkaufen: den Fund direkt in den Material-Katalog übernehmen,
+      // dann ist es beim nächsten Mal ein Knopfdruck statt einer neuen Suche.
+      if (kaufen && quellen.length) merkenAnbieten(j.text || "", quellen);
+    }
+
+    // Kleines Formular unter der Kauf-Antwort: Name + Quelle wählen → landet
+    // als Material mit Bestell-Link im Katalog.
+    function merkenAnbieten(antwort, quellen) {
+      const vorschlag = (antwort.split("\n")[0] || "")
+        .replace(/\*\*/g, "").replace(/^[-•*\s]+/, "").slice(0, 120);
+      const id = "mrk" + Date.now();
+      push({ role: "q", html: true, text:
+        `<div id="${id}">
+           <div class="sub" style="margin-bottom:6px">Als Material merken?</div>
+           <input type="text" data-mrk="name" value="${esc(vorschlag)}" placeholder="Name des Teils"
+                  style="width:100%;padding:10px;border:1px solid var(--line);border-radius:9px;margin-bottom:6px;font-size:15px;min-width:0" />
+           <select data-mrk="link" style="width:100%;padding:10px;border:1px solid var(--line);border-radius:9px;margin-bottom:6px;font-size:15px;min-width:0">
+             ${quellen.map((q) => `<option value="${esc(q.url)}">${esc(q.domain || q.titel)}</option>`).join("")}
+           </select>
+           <button class="btn-sm btn-ghost" data-mrk="save" style="width:100%">Merken</button>
+           <div class="sub" data-mrk="status" style="margin-top:6px"></div>
+         </div>` });
+      setTimeout(() => {
+        const box = document.getElementById(id);
+        if (!box) return;
+        const btn = box.querySelector('[data-mrk="save"]');
+        const stat = box.querySelector('[data-mrk="status"]');
+        btn.addEventListener("click", async () => {
+          const name = box.querySelector('[data-mrk="name"]').value.trim();
+          const link = box.querySelector('[data-mrk="link"]').value;
+          const sel = box.querySelector('[data-mrk="link"]');
+          if (name.length < 2) { stat.textContent = "Bitte einen Namen eintragen."; return; }
+          btn.disabled = true; stat.textContent = "Speichere …";
+          const r = await api("/app/api/objekt/merken", { method: "POST",
+            body: JSON.stringify({ name, bestell_link: link,
+              lieferant: sel.options[sel.selectedIndex].text }) });
+          const d = r ? await r.json().catch(() => null) : null;
+          if (d && d.ok) { box.innerHTML = `<div class="sub">✓ „${esc(name)}" liegt jetzt im Material-Katalog.</div>`; }
+          else { btn.disabled = false; stat.textContent = (d && d.error) || "Konnte nicht speichern."; }
+        });
+      }, 0);
     }
 
     async function doUploadBeleg(file) {

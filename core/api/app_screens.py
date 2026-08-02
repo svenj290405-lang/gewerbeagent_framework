@@ -5484,6 +5484,131 @@ async def api_assistent_ausfuehren(
     return JSONResponse(result, status_code=status)
 
 
+_OBJEKT_MAX_BYTES = 15 * 1024 * 1024
+_OBJEKT_MIMES = ("image/jpeg", "image/png", "image/webp")
+
+
+@router.post("/objekt/frage")
+async def api_objekt_frage(
+    request: Request,
+    _e=Depends(require_app_user),
+    _c=Depends(require_app_csrf),
+) -> JSONResponse:
+    """Foto eines Geraets/Bauteils → was ist das, Antwort aus der Doku.
+
+    Body: rohe Bild-Bytes, Content-Type = MIME.
+    Query: ``?frage=`` (was der Handwerker wissen will),
+           ``?modus=kaufen`` fuer Bezugsquellen statt Doku,
+           ``?hist=`` (JSON [{role,text}]) fuer Rueckfragen zum selben Bild.
+
+    Gemini bekommt hier die Google-Suche als Werkzeug (Grounding, Vertex
+    europe-west3). Das Bild bleibt in Frankfurt; nach draussen gehen nur die
+    Suchbegriffe, die das Modell daraus bildet — die stehen als
+    ``suchanfragen`` in der Antwort, damit nachvollziehbar ist, was gesucht
+    wurde.
+    """
+    import json
+
+    from core.ai.gemini import objekt_erkennen, objekt_kaufen
+    from core.features.check import is_feature_enabled
+    from core.models.tenant import Tenant
+
+    tid = current_tenant_id(request)
+    if not await is_feature_enabled(tid, "objekt_suche"):
+        return JSONResponse(
+            {"ok": False, "error": "Objekt-Erkennung ist für diesen Betrieb nicht aktiv."},
+            status_code=403)
+
+    image_bytes = await request.body()
+    if not image_bytes or len(image_bytes) < 100:
+        return JSONResponse({"ok": False, "error": "Kein Bild empfangen."}, status_code=400)
+    if len(image_bytes) > _OBJEKT_MAX_BYTES:
+        return JSONResponse({"ok": False, "error": "Bild zu groß (max 15 MB)."},
+                            status_code=413)
+    mime = (request.headers.get("content-type") or "").split(";")[0].strip().lower()
+    if mime not in _OBJEKT_MIMES:
+        return JSONResponse(
+            {"ok": False, "error": "Nur Bilder (JPEG, PNG, WebP) werden unterstützt."},
+            status_code=415)
+
+    frage = (request.query_params.get("frage") or "")[:1000]
+    modus = (request.query_params.get("modus") or "").strip()
+    verlauf = []
+    roh = request.query_params.get("hist")
+    if roh:
+        try:
+            geladen = json.loads(roh)
+            if isinstance(geladen, list):
+                verlauf = geladen[-8:]
+        except (ValueError, TypeError):
+            verlauf = []
+
+    async with get_session() as s:
+        branche = (await s.execute(
+            select(Tenant.branche).where(Tenant.id == tid))).scalar_one_or_none()
+
+    if modus == "kaufen":
+        ergebnis = await objekt_kaufen(
+            image_bytes, mime, frage, tenant_id=str(tid), verlauf=verlauf)
+    else:
+        ergebnis = await objekt_erkennen(
+            image_bytes, mime, frage, tenant_id=str(tid),
+            branche=branche, verlauf=verlauf)
+    ergebnis["modus"] = modus or "doku"
+    return JSONResponse(ergebnis)
+
+
+@router.post("/objekt/merken")
+async def api_objekt_merken(
+    request: Request,
+    emp: Employee = Depends(require_app_user),
+    _c=Depends(require_app_csrf),
+) -> JSONResponse:
+    """Ein gefundenes Teil als Material mit Bestell-Link ablegen.
+
+    Damit landet der Fund nicht in einem Chatverlauf, sondern im
+    Material-Katalog, den der Betrieb ohnehin fuer Nachbestellungen nutzt —
+    beim naechsten Mal ist es ein Knopfdruck statt einer neuen Suche.
+
+    Body: { name, bestell_link, lieferant?, notiz? }
+    """
+    from core.models.tenant_material import TenantMaterial
+
+    tid = current_tenant_id(request)
+    body = await request.json() if (await request.body()) else {}
+    name = (body.get("name") or "").strip()[:200]
+    link = (body.get("bestell_link") or "").strip()[:2000]
+    if len(name) < 2:
+        return JSONResponse({"ok": False, "error": "Bitte einen Namen angeben."},
+                            status_code=400)
+    if not link.startswith(("http://", "https://")):
+        return JSONResponse({"ok": False, "error": "Bitte einen gültigen Link angeben."},
+                            status_code=400)
+
+    basis = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")[:60] or "teil"
+    async with get_session() as s:
+        vorhanden = set((await s.execute(
+            select(TenantMaterial.slug).where(TenantMaterial.tenant_id == tid)
+        )).scalars().all())
+        slug = basis
+        n = 2
+        while slug in vorhanden:
+            slug = f"{basis}-{n}"[:80]
+            n += 1
+        material = TenantMaterial(
+            tenant_id=tid, slug=slug, name=name, bestell_link=link,
+            lieferant_name=(body.get("lieferant") or "").strip()[:200] or None,
+            notes=(body.get("notiz") or "").strip()[:1000] or None,
+        )
+        s.add(material)
+        await s.commit()
+        await s.refresh(material)
+        mid = material.id
+
+    logger.info("Objekt als Material gemerkt: %s (tenant=%s)", slug, tid)
+    return JSONResponse({"ok": True, "id": str(mid), "slug": slug, "name": name})
+
+
 @router.post("/assistent/mit-bild")
 async def api_assistent_mit_bild(
     request: Request,
