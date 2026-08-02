@@ -156,7 +156,9 @@
 // v77: Beleg-Foto wird gelesen — Q schlaegt Haendler, Datum, Betrag,
 // Steuersatz und Buchungskategorie vor (Kategorien aus dem echten
 // Lexware-Konto), alles korrigierbar, gebucht wird erst auf Tipp.
-const CACHE = "ga-app-v77";
+// v78: Zahlungserinnerung + Angebot nachfassen direkt aus der Buchhaltung —
+// Q schreibt den Entwurf (drei Tonfaelle), alles aenderbar, senden auf Tipp.
+const CACHE = "ga-app-v78";
 const SHELL = [
   "/app",
   "/app/static/app-beta.css",

@@ -861,14 +861,17 @@ const SCREENS = {
     // Entwuerfe ("liegt noch hier") sind extra markiert.
     if (posten.length) {
       parts.push(`<div class="section-title">Offene Posten (${posten.length})</div>`);
-      parts.push(`<div class="card">${posten.map(postenRow).join("")}</div>`);
+      parts.push(`<div class="card">${posten.map((p) => postenRow(p, isInhaber)).join("")}</div>`);
     }
 
     if (nachfassen.length) {
       parts.push(`<div class="section-title">Angebote ohne Rückmeldung (${nachfassen.length})</div>`);
       parts.push(`<div class="card">${nachfassen.map((n) =>
         rowPillLink(n.kunde, `${fmtEur(n.betrag_eur)} · seit ${n.tage} Tagen`,
-                    "nachfassen", "warn", n.lexware_link)).join("")}</div>`);
+                    "nachfassen", "warn", n.lexware_link) +
+        (isInhaber
+          ? `<div style="margin:-4px 0 10px"><button class="btn-sm btn-ghost" data-erinnern="nachfass" data-id="${esc(n.id)}" style="padding:7px 12px">✉️ Nachfassen</button></div>`
+          : "")).join("")}</div>`);
     }
 
     parts.push(abschnitt("Rechnungen", rechnungen, VORSCHAU, "bu-alle-rechnungen",
@@ -897,6 +900,8 @@ const SCREENS = {
     on("bu-angebot-neu", () => { App.lastScreen = "buchhaltung"; showAngebotForm(); });
     on("bu-alle-rechnungen", () => navigate("rechnungen_page"));
     on("bu-alle-angebote", () => navigate("angebote_page"));
+    document.querySelectorAll("[data-erinnern]").forEach((b) =>
+      b.addEventListener("click", () => zeigeErinnerung(b.dataset.erinnern, b.dataset.id)));
     on("bu-pruefen", async () => {
       const btn = document.getElementById("bu-pruefen");
       const orig = btn.textContent;
@@ -3275,7 +3280,7 @@ function geldKpi(label, betrag, sub, ton) {
     <span class="geld-kpi-sub">${esc(sub || "")}</span>
   </div>`;
 }
-function postenRow(p) {
+function postenRow(p, isInhaber) {
   // Drei Faelle: ueberfaellig (rot), versendet und noch in der Frist,
   // oder noch gar nicht raus (Entwurf liegt beim Betrieb selbst).
   const stand = !p.versendet
@@ -3284,8 +3289,101 @@ function postenRow(p) {
       ? ["Überfällig", "danger", `versendet vor ${p.tage} Tagen`]
       : ["Offen", "", `versendet vor ${p.tage} Tagen`];
   const titel = p.kunde + (p.nummer ? " · " + p.nummer : "");
-  return rowPillLink(titel, `${fmtEur(p.betrag_eur)} · ${stand[2]}`,
-                     stand[0], stand[1], p.lexware_link);
+  const zeile = rowPillLink(titel, `${fmtEur(p.betrag_eur)} · ${stand[2]}`,
+                            stand[0], stand[1], p.lexware_link);
+  // Erinnern gibt es nur, wenn die Rechnung wirklich beim Kunden ist.
+  // Ein Entwurf muss erst raus — daran zu erinnern wäre absurd.
+  if (!isInhaber || !p.versendet) return zeile;
+  return zeile +
+    `<div style="margin:-4px 0 10px"><button class="btn-sm btn-ghost" data-erinnern="zahlung" data-id="${esc(p.id)}" style="padding:7px 12px">✉️ Erinnern</button></div>`;
+}
+
+// Entwurf holen, zeigen, ändern lassen, senden. Ein Bildschirm für beides
+// (Zahlungserinnerung + Angebot nachfassen) — der Ablauf ist derselbe.
+async function zeigeErinnerung(typ, id) {
+  const zurueck = () => navigate("buchhaltung", { mode: "none" });
+  App.view.innerHTML = `<div class="loading">Q schreibt …</div>`;
+  const res = await api("/app/api/erinnerung/entwurf", {
+    method: "POST", body: JSON.stringify({ typ, id }),
+  });
+  const d = res ? await res.json().catch(() => null) : null;
+  if (!d || !d.ok) {
+    App.view.innerHTML =
+      `<button class="btn-sm btn-ghost" id="er-back" style="margin-bottom:10px">← Buchhaltung</button>` +
+      `<div class="card">${emptyRow((d && d.error) || "Konnte keinen Entwurf schreiben.")}</div>`;
+    document.getElementById("er-back").addEventListener("click", zurueck);
+    return;
+  }
+  const inp = "width:100%;padding:12px;border:1px solid var(--line);border-radius:10px;margin:4px 0 10px;font-size:16px;min-width:0";
+  const istZahlung = typ === "zahlung";
+  const toene = [["freundlich", "Freundlich"], ["bestimmt", "Bestimmt"], ["letzte", "Letzte Frist"]];
+  App.view.innerHTML =
+    `<button class="btn-sm btn-ghost" id="er-back" style="margin-bottom:10px">← Buchhaltung</button>` +
+    `<h1 style="font-size:22px;margin:4px 4px 4px">${istZahlung ? "Zahlungserinnerung" : "Angebot nachfassen"}</h1>` +
+    `<p class="muted" style="margin:0 4px 14px">${esc(d.kunde)} · ${esc(d.betrag)} · seit ${d.tage} Tagen</p>` +
+    (istZahlung
+      ? `<div class="card"><label class="sub">Tonfall</label>
+           <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:6px">
+             ${toene.map(([w, l]) => `<button class="btn-sm ${w === d.ton ? "" : "btn-ghost"}" data-ton="${w}" style="flex:1 1 30%;padding:10px 6px">${l}</button>`).join("")}
+           </div></div>` : "") +
+    `<div class="card">
+       <label class="sub">Empfänger</label>
+       <input type="email" id="er-mail" value="${esc(d.empfaenger || "")}" placeholder="kunde@example.de" style="${inp}" />
+       <label class="sub">Betreff</label>
+       <input type="text" id="er-betreff" value="${esc(d.betreff || "")}" style="${inp}" />
+       <label class="sub">Text</label>
+       <textarea id="er-text" rows="10" style="${inp};font-family:inherit">${esc(d.text || "")}</textarea>
+       <p class="muted" style="margin:0 0 10px;font-size:12px">Grußformel und Kontaktdaten hängt das System selbst an.</p>
+       <button class="btn-sm" id="er-send" style="width:100%">Senden</button>
+       <p class="muted" id="er-status" style="margin:10px 0 0;min-height:18px"></p>
+     </div>`;
+  document.getElementById("er-back").addEventListener("click", zurueck);
+  // Tonfall wechseln = neu schreiben lassen. Was der Nutzer schon selbst
+  // getippt hat, geht dabei verloren — deshalb erst fragen.
+  document.querySelectorAll("[data-ton]").forEach((b) =>
+    b.addEventListener("click", async () => {
+      if (b.dataset.ton === d.ton) return;
+      const feld = document.getElementById("er-text");
+      if (feld.value.trim() !== (d.text || "").trim() &&
+          !confirm("Neu schreiben lassen? Deine Änderungen am Text gehen verloren.")) return;
+      feld.value = "Q schreibt …";
+      const r = await api("/app/api/erinnerung/entwurf", {
+        method: "POST", body: JSON.stringify({ typ, id, ton: b.dataset.ton }),
+      });
+      const n = r ? await r.json().catch(() => null) : null;
+      if (n && n.ok) {
+        d.ton = n.ton; d.text = n.text;
+        feld.value = n.text;
+        document.querySelectorAll("[data-ton]").forEach((x) =>
+          x.classList.toggle("btn-ghost", x.dataset.ton !== n.ton));
+      } else { feld.value = d.text || ""; }
+    }));
+  const send = document.getElementById("er-send");
+  const stat = document.getElementById("er-status");
+  send.addEventListener("click", async () => {
+    const empfaenger = document.getElementById("er-mail").value.trim();
+    if (!empfaenger) { stat.textContent = "Bitte die Empfänger-Adresse eintragen."; return; }
+    send.disabled = true; stat.textContent = "Sende …";
+    const r = await api("/app/api/erinnerung/senden", {
+      method: "POST",
+      body: JSON.stringify({
+        empfaenger,
+        betreff: document.getElementById("er-betreff").value.trim(),
+        text: document.getElementById("er-text").value.trim(),
+      }),
+    });
+    const j = r ? await r.json().catch(() => null) : null;
+    if (j && j.ok) {
+      App.view.innerHTML =
+        `<div class="card"><h2>✓ Verschickt</h2>
+           <p class="muted" style="margin:6px 0 0">${esc(d.kunde)} hat die Nachricht bekommen.</p></div>` +
+        `<button class="btn-sm btn-ghost" id="er-back2" style="width:100%;margin-top:10px">← Buchhaltung</button>`;
+      document.getElementById("er-back2").addEventListener("click", zurueck);
+    } else {
+      send.disabled = false;
+      stat.textContent = (j && j.error) || "Konnte nicht senden.";
+    }
+  });
 }
 // Beleg-Vorkontierung: Gemini liest den eben hochgeladenen Beleg und
 // schlaegt Händler/Datum/Betrag/Steuersatz/Kategorie vor. Alles bleibt

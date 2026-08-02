@@ -342,6 +342,67 @@ async def api_buchhaltung(request: Request, _e=Depends(require_app_user)) -> JSO
     })
 
 
+@router.post("/erinnerung/entwurf")
+async def api_erinnerung_entwurf(
+    request: Request,
+    _e=Depends(require_app_inhaber),
+    _c=Depends(require_app_csrf),
+) -> JSONResponse:
+    """Formuliert eine Zahlungserinnerung oder ein Angebots-Nachfassen.
+
+    Body: ``typ`` = "zahlung" | "nachfass", ``id`` = Rechnungs- bzw.
+    Angebots-ID, optional ``ton`` (freundlich|bestimmt|letzte).
+    Verschickt nichts — der Text geht zurueck in die App, wo er gelesen
+    und geaendert wird.
+
+    Inhaber-Gate: wer mahnt, spricht fuer den Betrieb.
+    """
+    from core.features.check import is_feature_enabled
+    from core.services import erinnerung
+
+    tid = current_tenant_id(request)
+    if not await is_feature_enabled(tid, "lexware"):
+        return JSONResponse({"ok": False, "error": "Die Buchhaltung ist nicht aktiv."},
+                            status_code=403)
+    body = await request.json() if (await request.body()) else {}
+    typ = (body.get("typ") or "").strip()
+    try:
+        oid = uuid.UUID(str(body.get("id") or ""))
+    except (ValueError, TypeError):
+        return JSONResponse({"ok": False, "error": "ungueltige id"}, status_code=400)
+
+    if typ == "zahlung":
+        return JSONResponse(await erinnerung.entwurf_zahlungserinnerung(
+            tid, oid, ton=(body.get("ton") or "freundlich")))
+    if typ == "nachfass":
+        return JSONResponse(await erinnerung.entwurf_nachfassen(tid, oid))
+    return JSONResponse({"ok": False, "error": "Unbekannter Typ."}, status_code=400)
+
+
+@router.post("/erinnerung/senden")
+async def api_erinnerung_senden(
+    request: Request,
+    emp: Employee = Depends(require_app_inhaber),
+    _c=Depends(require_app_csrf),
+) -> JSONResponse:
+    """Verschickt den freigegebenen Erinnerungs-/Nachfass-Text per Mail."""
+    from core.features.check import is_feature_enabled
+    from core.services import erinnerung
+
+    tid = current_tenant_id(request)
+    if not await is_feature_enabled(tid, "lexware"):
+        return JSONResponse({"ok": False, "error": "Die Buchhaltung ist nicht aktiv."},
+                            status_code=403)
+    body = await request.json() if (await request.body()) else {}
+    return JSONResponse(await erinnerung.senden(
+        tid,
+        to_email=(body.get("empfaenger") or "").strip(),
+        betreff=(body.get("betreff") or "").strip(),
+        text=(body.get("text") or "").strip(),
+        employee_id=getattr(emp, "id", None),
+    ))
+
+
 @router.get("/buchhaltung/ausgaben")
 async def api_buchhaltung_ausgaben(
     request: Request, _e=Depends(require_app_user),
