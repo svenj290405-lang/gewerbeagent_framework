@@ -150,7 +150,10 @@
 // „Rechnungen" — mit Kennzahlen (offen/ueberfaellig/bezahlt), offenen Posten,
 // Angeboten zum Nachfassen, den Belegen (waren vorher praktisch unsichtbar)
 // und Lexware-Deeplinks auf jeder Zeile.
-const CACHE = "ga-app-v75";
+// v76: Ausgaben-Abschnitt (Eingangsrechnungen aus Lexware — die Seite, die
+// bisher komplett fehlte) und das Zahlungsziel kommt aus Lexware statt aus
+// einer Schaetzung; ist keins hinterlegt, sagt die Anzeige das auch.
+const CACHE = "ga-app-v76";
 const SHELL = [
   "/app",
   "/app/static/app-beta.css",

@@ -219,6 +219,93 @@ class LexwareProvider(AccountingProvider):
         return True
 
     # ------------------------------------------------------------------
+    # Beleglisten + Stammdaten des Kontos
+    #
+    # Bis 2026-08 hat die App Lexware nur beschrieben und einzelne Belege
+    # per ID zurueckgelesen. Damit war alles, was wir ueber offene Betraege
+    # sagten, aus unserer eigenen DB geschaetzt. Diese Leser holen die
+    # Wahrheit dort, wo sie steht.
+    # ------------------------------------------------------------------
+
+    async def get_voucherlist(
+        self,
+        voucher_type: str,
+        voucher_status: str,
+        *,
+        page: int = 0,
+        size: int = 50,
+    ) -> dict:
+        """GET /v1/voucherlist — Belege eines Typs in einem Status.
+
+        ``voucher_type`` darf kommasepariert sein (``"invoice,creditnote"``),
+        ``voucher_status`` NICHT — Lexware antwortet darauf mit 400. Wer
+        mehrere Status braucht, fragt mehrfach (und zahlt das Rate-Limit).
+
+        Rueckgabe ist die rohe Seite: ``{"content": [...], "totalElements": n}``.
+        Eintraege fuehren u.a. id, voucherType, voucherStatus, voucherNumber,
+        voucherDate, contactName, totalAmount, currency, archived — je nach
+        Typ zusaetzlich dueDate und openAmount.
+        """
+        await self._rate_limit()
+        params = {
+            "voucherType": voucher_type,
+            "voucherStatus": voucher_status,
+            "page": page,
+            "size": size,
+        }
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            r = await client.get(
+                f"{LEXWARE_API_BASE}/v1/voucherlist",
+                headers=self._headers,
+                params=params,
+            )
+            self._raise_for_status(r, "get_voucherlist")
+            return r.json()
+
+    async def get_payment_conditions(self) -> list[dict]:
+        """GET /v1/payment-conditions — Zahlungsbedingungen des Betriebs.
+
+        Eintraege: id, organizationDefault, paymentTermLabelTemplate,
+        paymentTermDuration (Tage), optional paymentDiscountConditions
+        (Skonto: discountPercentage + discountRange in Tagen).
+        """
+        await self._rate_limit()
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            r = await client.get(
+                f"{LEXWARE_API_BASE}/v1/payment-conditions",
+                headers=self._headers,
+            )
+            self._raise_for_status(r, "get_payment_conditions")
+            data = r.json()
+        return data if isinstance(data, list) else []
+
+    async def get_default_payment_term(self) -> dict | None:
+        """Die Standard-Zahlungsbedingung des Betriebs (oder None).
+
+        Genau das steht auf jeder Rechnung, die ohne eigene Bedingung
+        angelegt wird — also das echte Zahlungsziel des Betriebs.
+        """
+        for cond in await self.get_payment_conditions():
+            if cond.get("organizationDefault"):
+                return cond
+        return None
+
+    async def get_posting_categories(self) -> list[dict]:
+        """GET /v1/posting-categories — Buchungskategorien des Kontos.
+
+        Eintraege: id, name, type ("income"|"outgo"), contactRequired,
+        splitAllowed, groupName. Der pilot-Betrieb hat davon 169 fuer
+        Ausgaben — genau die Liste, aus der ein Beleg vorkontiert wird.
+        """
+        await self._rate_limit()
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            r = await client.get(
+                f"{LEXWARE_API_BASE}/v1/posting-categories",
+                headers=self._headers,
+            )
+            self._raise_for_status(r, "get_posting_categories")
+            data = r.json()
+        return data if isinstance(data, list) else []
 
     # ------------------------------------------------------------------
     # Contacts

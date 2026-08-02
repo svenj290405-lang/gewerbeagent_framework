@@ -50,19 +50,81 @@ def _tage_her(zeitpunkt: dt.datetime | None, jetzt: dt.datetime) -> int:
     return max(0, (jetzt - zeitpunkt).days)
 
 
-async def einstellungen(tid: uuid.UUID) -> dict:
-    """Zahlungsziel + Nachfass-Frist des Betriebs (mit Defaults).
+# Zahlungsziel aus Lexware, gecacht: tenant_id -> (wert, skonto, ablauf_ts).
+# Das aendert sich hoechstens, wenn der Betrieb seine Zahlungsbedingung
+# umstellt — eine Stunde alt zu sein ist voellig unkritisch, und der
+# Buchhaltungs-Screen soll nicht bei jedem Aufruf gegen Lexware laufen.
+_ZIEL_CACHE: dict[uuid.UUID, tuple[int | None, dict | None, float]] = {}
+_ZIEL_CACHE_TTL = 3600.0
 
-    Failsafe: faellt auf die Defaults zurueck, wenn keine ToolConfig da ist
-    oder unsinnige Werte drinstehen — eine kaputte Zahl darf die Uebersicht
-    nicht kippen.
+
+def invalidate_zahlungsziel_cache(tid: uuid.UUID | None = None) -> None:
+    """Nach dem Verbinden eines neuen Lexware-Keys aufrufen."""
+    if tid is None:
+        _ZIEL_CACHE.clear()
+    else:
+        _ZIEL_CACHE.pop(tid, None)
+
+
+async def _lexware_zahlungsziel(tid: uuid.UUID) -> tuple[int | None, dict | None]:
+    """(Zahlungsziel in Tagen, Skonto-Bedingung) aus Lexware — oder (None, None).
+
+    Fail-soft: Lexware unerreichbar, kein Key, kaputte Antwort → None, dann
+    greift die Kaskade in ``einstellungen()``. Der Geld-Bildschirm darf nie
+    an einer fremden API haengen.
+    """
+    import time
+
+    treffer = _ZIEL_CACHE.get(tid)
+    if treffer and treffer[2] > time.monotonic():
+        return treffer[0], treffer[1]
+
+    tage: int | None = None
+    skonto: dict | None = None
+    try:
+        from core.integrations.rechnung_payment_monitor import _build_lexware_provider
+        provider = await _build_lexware_provider(tid)
+        if provider is not None:
+            cond = await provider.get_default_payment_term()
+            if cond:
+                roh = cond.get("paymentTermDuration")
+                if isinstance(roh, int) and 0 <= roh <= 180:
+                    tage = roh
+                rabatte = cond.get("paymentDiscountConditions")
+                if isinstance(rabatte, dict) and rabatte.get("discountPercentage"):
+                    skonto = {
+                        "prozent": rabatte.get("discountPercentage"),
+                        "tage": rabatte.get("discountRange"),
+                    }
+    except Exception:  # noqa: BLE001 - Lexware down/langsam darf nichts kippen
+        logger.info("buchhaltung: Zahlungsziel nicht aus Lexware lesbar", exc_info=True)
+
+    _ZIEL_CACHE[tid] = (tage, skonto, time.monotonic() + _ZIEL_CACHE_TTL)
+    return tage, skonto
+
+
+async def einstellungen(tid: uuid.UUID) -> dict:
+    """Zahlungsziel + Nachfass-Frist des Betriebs.
+
+    Kaskade, absichtlich in dieser Reihenfolge:
+      1. ToolConfig(lexware).config — was der Betrieb bei UNS eingestellt hat
+      2. Lexware-Standard-Zahlungsbedingung — was tatsaechlich auf der
+         Rechnung steht (der pilot-Betrieb steht z.B. auf 0 Tagen,
+         "zahlbar sofort")
+      3. 14 Tage als letzte Annahme
+
+    ``quelle`` sagt, welche Stufe gewonnen hat — die Oberflaeche soll nicht
+    so tun, als waere eine Annahme eine Tatsache.
+
+    Failsafe: unsinnige Werte fallen auf den Default zurueck, eine kaputte
+    Zahl darf die Uebersicht nicht kippen.
     """
     from sqlalchemy import select
 
     from core.database.connection import get_session
     from core.models import ToolConfig
 
-    zahlungsziel = ZAHLUNGSZIEL_DEFAULT_TAGE
+    eigen_ziel: int | None = None
     nachfass = NACHFASS_DEFAULT_TAGE
     try:
         async with get_session() as s:
@@ -73,17 +135,32 @@ async def einstellungen(tid: uuid.UUID) -> dict:
                 )
             )).scalar_one_or_none() or {}
         if isinstance(cfg, dict):
-            zahlungsziel = int(cfg.get("zahlungsziel_tage") or zahlungsziel)
+            if cfg.get("zahlungsziel_tage") is not None:
+                eigen_ziel = int(cfg["zahlungsziel_tage"])
             nachfass = int(cfg.get("nachfass_tage") or nachfass)
     except (TypeError, ValueError):
-        zahlungsziel, nachfass = ZAHLUNGSZIEL_DEFAULT_TAGE, NACHFASS_DEFAULT_TAGE
+        eigen_ziel, nachfass = None, NACHFASS_DEFAULT_TAGE
     except Exception:  # pragma: no cover - DB-Ausfall
         logger.warning("buchhaltung: ToolConfig nicht lesbar, nutze Defaults", exc_info=True)
-    if not 1 <= zahlungsziel <= 180:
-        zahlungsziel = ZAHLUNGSZIEL_DEFAULT_TAGE
+
+    skonto = None
+    if eigen_ziel is not None and 0 <= eigen_ziel <= 180:
+        ziel, quelle = eigen_ziel, "betrieb"
+    else:
+        lex_ziel, skonto = await _lexware_zahlungsziel(tid)
+        if lex_ziel is not None:
+            ziel, quelle = lex_ziel, "lexware"
+        else:
+            ziel, quelle = ZAHLUNGSZIEL_DEFAULT_TAGE, "standard"
+
     if not 1 <= nachfass <= 180:
         nachfass = NACHFASS_DEFAULT_TAGE
-    return {"zahlungsziel_tage": zahlungsziel, "nachfass_tage": nachfass}
+    return {
+        "zahlungsziel_tage": ziel,
+        "zahlungsziel_quelle": quelle,
+        "skonto": skonto,
+        "nachfass_tage": nachfass,
+    }
 
 
 async def uebersicht(tid: uuid.UUID, *, limit: int = 100) -> dict:
@@ -197,11 +274,91 @@ async def uebersicht(tid: uuid.UUID, *, limit: int = 100) -> dict:
 
     return {
         "zahlungsziel_tage": ziel,
+        "zahlungsziel_quelle": einst.get("zahlungsziel_quelle", "standard"),
+        "skonto": einst.get("skonto"),
         "nachfass_tage": nachfass_tage,
         "kennzahlen": kennzahlen,
         "offene_posten": posten,
         "nachfassen": nachfassen,
     }
+
+
+async def ausgaben(tid: uuid.UUID, *, limit: int = 25) -> dict:
+    """Was der Betrieb ausgegeben hat — aus Lexware, nicht aus unserer DB.
+
+    Wir schieben Belege bisher nur nach Lexware hinein und haben sie nie
+    zurueckgelesen; deshalb konnte der Buchhaltungs-Bereich nur "was kommt
+    rein" beantworten. Hier kommt die zweite Haelfte: Eingangsrechnungen
+    (``purchaseinvoice``) offen + bezahlt, plus die Summe der letzten
+    30 Tage.
+
+    Zwei Lexware-Aufrufe (offen/bezahlt) — deshalb laeuft das als eigener
+    Endpunkt und nicht im Haupt-Screen mit. ``ok:false`` statt Ausnahme,
+    wenn Lexware nicht mitspielt: eine fehlende Ausgabenliste darf den
+    Bereich nicht kippen.
+    """
+    jetzt = dt.datetime.now(dt.timezone.utc)
+    seit_30t = jetzt - dt.timedelta(days=30)
+
+    try:
+        from core.integrations.rechnung_payment_monitor import _build_lexware_provider
+        provider = await _build_lexware_provider(tid)
+    except Exception:  # noqa: BLE001
+        provider = None
+    if provider is None:
+        return {"ok": False, "error": "Buchhaltung ist nicht verbunden."}
+
+    posten: list[dict] = []
+    try:
+        for status in ("open", "paid"):
+            seite = await provider.get_voucherlist(
+                "purchaseinvoice", status, page=0, size=limit)
+            for e in seite.get("content") or []:
+                datum = _parse_iso(e.get("voucherDate"))
+                posten.append({
+                    "id": e.get("id"),
+                    "lieferant": e.get("contactName") or "—",
+                    "nummer": e.get("voucherNumber") or "",
+                    "betrag_eur": _to_float(e.get("totalAmount")),
+                    "offen": status == "open",
+                    "datum_iso": datum.isoformat() if datum else None,
+                    "tage": _tage_her(datum, jetzt),
+                    "lexware_link": (
+                        _voucher_link(e.get("id")) if e.get("id") else None
+                    ),
+                })
+    except Exception:  # noqa: BLE001 - Lexware down/Rate-Limit
+        logger.info("buchhaltung: Ausgaben nicht abrufbar", exc_info=True)
+        return {"ok": False, "error": "Ausgaben konnten nicht geladen werden."}
+
+    posten.sort(key=lambda p: p["tage"])
+    letzte_30t = [p for p in posten if p["tage"] <= 30]
+    offen = [p for p in posten if p["offen"]]
+    return {
+        "ok": True,
+        "posten": posten[:limit],
+        "kennzahlen": {
+            "ausgaben_30t_eur": round(sum(p["betrag_eur"] for p in letzte_30t), 2),
+            "ausgaben_30t_anzahl": len(letzte_30t),
+            "offen_eur": round(sum(p["betrag_eur"] for p in offen), 2),
+            "offen_anzahl": len(offen),
+        },
+    }
+
+
+def _voucher_link(voucher_id) -> str:
+    """Deeplink auf einen Beleg in der Lexware-App."""
+    from core.integrations.lexware import LexwareProvider
+    return LexwareProvider.voucher_deeplink(voucher_id)
+
+
+def _parse_iso(wert: str | None) -> dt.datetime | None:
+    if not wert:
+        return None
+    try:
+        return dt.datetime.fromisoformat(wert.replace("Z", "+00:00"))
+    except ValueError:
+        return None
 
 
 def als_text(daten: dict, *, max_zeilen: int = 8) -> str:

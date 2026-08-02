@@ -332,12 +332,37 @@ async def api_buchhaltung(request: Request, _e=Depends(require_app_user)) -> JSO
         "ok": True,
         "kennzahlen": geld["kennzahlen"],
         "zahlungsziel_tage": geld["zahlungsziel_tage"],
+        "zahlungsziel_quelle": geld.get("zahlungsziel_quelle", "standard"),
+        "skonto": geld.get("skonto"),
         "offene_posten": geld["offene_posten"],
         "nachfassen": geld["nachfassen"],
         "angebote": angebote,
         "rechnungen": rechnungen,
         "belege": belege,
     })
+
+
+@router.get("/buchhaltung/ausgaben")
+async def api_buchhaltung_ausgaben(
+    request: Request, _e=Depends(require_app_user),
+) -> JSONResponse:
+    """Eingangsrechnungen aus Lexware — die Ausgabenseite.
+
+    Bewusst ein eigener Endpunkt: das sind zwei Lexware-Aufrufe (offen +
+    bezahlt) und damit deutlich langsamer als der Rest. Die App laedt den
+    Abschnitt nach, der Haupt-Screen bleibt schnell und funktioniert auch,
+    wenn Lexware gerade nicht mag.
+    """
+    from core.features.check import is_feature_enabled
+    from core.services import buchhaltung as buch
+
+    tid = current_tenant_id(request)
+    if not await is_feature_enabled(tid, "lexware"):
+        return JSONResponse(
+            {"ok": False, "error": "Die Buchhaltung ist für diesen Betrieb nicht aktiv."},
+            status_code=403,
+        )
+    return JSONResponse(await buch.ausgaben(tid))
 
 
 # =====================================================================

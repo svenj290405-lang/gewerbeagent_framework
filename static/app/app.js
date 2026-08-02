@@ -827,14 +827,23 @@ const SCREENS = {
        </div>`);
 
     // Kennzahlen zuerst: die eine Zahl, die der Chef morgens wissen will.
+    // Die Frist steht dran, inklusive Herkunft — bei "standard" ist sie
+    // geraten, und dann soll die Anzeige das auch zugeben.
+    const zielText = d.zahlungsziel_tage === 0
+      ? "sofort fällig"
+      : `über ${d.zahlungsziel_tage} Tage`;
     parts.push(
       `<div class="geld-grid">
          ${geldKpi("Offen", k.offen_eur, `${k.offen_anzahl || 0} Rechnung(en)`, "")}
          ${geldKpi("Überfällig", k.ueberfaellig_eur,
-                   `${k.ueberfaellig_anzahl || 0} über ${d.zahlungsziel_tage} Tage`,
+                   `${k.ueberfaellig_anzahl || 0} ${zielText}`,
                    (k.ueberfaellig_anzahl || 0) > 0 ? "danger" : "")}
          ${geldKpi("Bezahlt (30 T)", k.bezahlt_30t_eur, `${k.bezahlt_30t_anzahl || 0} Zahlung(en)`, "ok")}
        </div>`);
+    if (d.zahlungsziel_quelle === "standard") {
+      parts.push(
+        `<p class="muted" style="margin:-8px 6px 14px;font-size:12px">Zahlungsziel geschätzt (${d.zahlungsziel_tage} Tage) — in Lexware ist keins hinterlegt.</p>`);
+    }
 
     if (isInhaber) {
       parts.push(
@@ -872,7 +881,15 @@ const SCREENS = {
     parts.push(abschnitt("Belege", belege, VORSCHAU, "",
       belegRow, "Noch keine Belege — Quittungen einfach abfotografieren"));
 
+    // Ausgaben kommen aus Lexware (zwei Aufrufe) und werden deshalb
+    // nachgeladen — der Bereich soll nicht auf eine fremde API warten.
+    parts.push(
+      `<div class="card" id="bu-ausgaben"><h2>Ausgaben</h2>
+         <div class="loading" style="padding:8px 0">Lädt aus Lexware …</div>
+       </div>`);
+
     App.view.innerHTML = parts.join("");
+    ladeAusgaben();
     document.getElementById("back-db").addEventListener("click", () => navigate("aktuelles"));
     const on = (id, fn) => { const el = document.getElementById(id); if (el) el.addEventListener("click", fn); };
     on("bu-beleg-neu", showBelegUpload);
@@ -3270,6 +3287,39 @@ function postenRow(p) {
   return rowPillLink(titel, `${fmtEur(p.betrag_eur)} · ${stand[2]}`,
                      stand[0], stand[1], p.lexware_link);
 }
+// Ausgaben (Eingangsrechnungen aus Lexware) in ihre Karte nachladen.
+// Fehlschlag ist kein Drama: dann steht dort eine Zeile statt einer Liste,
+// der Rest des Bereichs bleibt benutzbar.
+async function ladeAusgaben() {
+  const box = document.getElementById("bu-ausgaben");
+  if (!box) return;
+  const res = await api("/app/api/buchhaltung/ausgaben");
+  const j = res && res.ok ? await res.json().catch(() => null) : null;
+  if (!j || !j.ok) {
+    box.innerHTML = `<h2>Ausgaben</h2>` +
+      emptyRow((j && j.error) || "Ausgaben gerade nicht abrufbar.");
+    return;
+  }
+  const k = j.kennzahlen || {};
+  const posten = j.posten || [];
+  const kopf =
+    `<div class="row"><div><div><b>Letzte 30 Tage</b></div>` +
+    `<div class="sub">${k.ausgaben_30t_anzahl || 0} Eingangsrechnung(en)</div></div>` +
+    `<b>${esc(fmtEur(k.ausgaben_30t_eur))}</b></div>` +
+    ((k.offen_anzahl || 0)
+      ? `<div class="row"><div><div>Davon noch nicht bezahlt</div>` +
+        `<div class="sub">${k.offen_anzahl} offen</div></div>` +
+        `<span class="pill warn">${esc(fmtEur(k.offen_eur))}</span></div>`
+      : "");
+  const liste = posten.slice(0, 6).map((p) =>
+    rowPillLink(p.lieferant + (p.nummer ? " · " + p.nummer : ""),
+                `${fmtEur(p.betrag_eur)} · vor ${p.tage} Tagen`,
+                p.offen ? "offen" : "bezahlt", p.offen ? "warn" : "ok",
+                p.lexware_link)).join("");
+  box.innerHTML = `<h2>Ausgaben</h2>` + kopf +
+    (liste || emptyRow("Keine Eingangsrechnungen in Lexware"));
+}
+
 // Karte mit Ueberschrift, den ersten `max` Zeilen und optional einem
 // "Alle anzeigen"-Knopf, der auf den Vollbild-Screen fuehrt.
 function abschnitt(titel, items, max, alleId, rowFn, leerText) {

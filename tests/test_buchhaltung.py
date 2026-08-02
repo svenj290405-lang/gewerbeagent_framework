@@ -177,6 +177,7 @@ async def test_zahlungsziel_aus_toolconfig(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_unsinniges_zahlungsziel_faellt_auf_default(monkeypatch):
+    _patch_lexware_ziel(monkeypatch, None)
     class _S:
         async def __aenter__(self): return self
         async def __aexit__(self, *e): return False
@@ -188,8 +189,135 @@ async def test_unsinniges_zahlungsziel_faellt_auf_default(monkeypatch):
     assert e["zahlungsziel_tage"] == buch.ZAHLUNGSZIEL_DEFAULT_TAGE
 
 
+def _patch_toolconfig(monkeypatch, cfg):
+    class _S:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *e): return False
+        async def execute(self, stmt):
+            return SimpleNamespace(scalar_one_or_none=lambda: cfg)
+    import core.database.connection as conn
+    monkeypatch.setattr(conn, "get_session", lambda: _S())
+
+
+def _patch_lexware_ziel(monkeypatch, tage, skonto=None):
+    async def _fake(tid):
+        return tage, skonto
+    monkeypatch.setattr(buch, "_lexware_zahlungsziel", _fake)
+
+
+@pytest.mark.asyncio
+async def test_zahlungsziel_faellt_auf_lexware_zurueck(monkeypatch):
+    # Betrieb hat bei UNS nichts eingestellt -> Lexware entscheidet.
+    buch.invalidate_zahlungsziel_cache()
+    _patch_toolconfig(monkeypatch, {})
+    _patch_lexware_ziel(monkeypatch, 21)
+    e = await buch.einstellungen(uuid.uuid4())
+    assert e["zahlungsziel_tage"] == 21
+    assert e["zahlungsziel_quelle"] == "lexware"
+
+
+@pytest.mark.asyncio
+async def test_eigene_einstellung_schlaegt_lexware(monkeypatch):
+    _patch_toolconfig(monkeypatch, {"zahlungsziel_tage": 30})
+    _patch_lexware_ziel(monkeypatch, 21)
+    e = await buch.einstellungen(uuid.uuid4())
+    assert e["zahlungsziel_tage"] == 30
+    assert e["zahlungsziel_quelle"] == "betrieb"
+
+
+@pytest.mark.asyncio
+async def test_zahlbar_sofort_null_tage_bleibt_null(monkeypatch):
+    # "Zahlbar sofort" = 0 Tage. Darf NICHT als "unsinnig" auf 14 kippen —
+    # genau so steht es im pilot-Konto.
+    _patch_toolconfig(monkeypatch, {})
+    _patch_lexware_ziel(monkeypatch, 0)
+    e = await buch.einstellungen(uuid.uuid4())
+    assert e["zahlungsziel_tage"] == 0
+    assert e["zahlungsziel_quelle"] == "lexware"
+
+
+@pytest.mark.asyncio
+async def test_ohne_lexware_ist_die_quelle_geschaetzt(monkeypatch):
+    _patch_toolconfig(monkeypatch, {})
+    _patch_lexware_ziel(monkeypatch, None)
+    e = await buch.einstellungen(uuid.uuid4())
+    assert e["zahlungsziel_tage"] == buch.ZAHLUNGSZIEL_DEFAULT_TAGE
+    assert e["zahlungsziel_quelle"] == "standard"
+
+
+@pytest.mark.asyncio
+async def test_sofort_faellig_macht_gestern_ueberfaellig(monkeypatch):
+    async def _null(_tid):
+        return {"zahlungsziel_tage": 0, "nachfass_tage": 7,
+                "zahlungsziel_quelle": "lexware", "skonto": None}
+    monkeypatch.setattr(buch, "einstellungen", _null)
+    _patch_session(monkeypatch,
+                   [_rechnung(tage_her=1, betrag="500.00")], [], [])
+    d = await buch.uebersicht(uuid.uuid4())
+    assert d["kennzahlen"]["ueberfaellig_anzahl"] == 1
+    assert d["zahlungsziel_quelle"] == "lexware"
+
+
+# ===================== Ausgaben (Lexware-Eingangsrechnungen) =====================
+
+class _FakeProvider:
+    def __init__(self, seiten):
+        self._seiten = seiten
+        self.aufrufe = []
+
+    async def get_voucherlist(self, typ, status, page=0, size=50):
+        self.aufrufe.append((typ, status))
+        return self._seiten.get(status, {"content": []})
+
+
+def _patch_provider(monkeypatch, provider):
+    import core.integrations.rechnung_payment_monitor as pm
+    async def _build(tid):
+        return provider
+    monkeypatch.setattr(pm, "_build_lexware_provider", _build)
+
+
+@pytest.mark.asyncio
+async def test_ausgaben_summiert_und_verlinkt(monkeypatch):
+    heute = _jetzt().isoformat()
+    prov = _FakeProvider({
+        "open": {"content": [
+            {"id": "11111111-1111-1111-1111-111111111111", "contactName": "Bauhaus",
+             "voucherNumber": "ER-1", "totalAmount": 119.0, "voucherDate": heute}]},
+        "paid": {"content": [
+            {"id": "22222222-2222-2222-2222-222222222222", "contactName": "Aral",
+             "voucherNumber": "ER-2", "totalAmount": 81.0, "voucherDate": heute}]},
+    })
+    _patch_provider(monkeypatch, prov)
+    d = await buch.ausgaben(uuid.uuid4())
+    assert d["ok"] is True
+    assert d["kennzahlen"]["ausgaben_30t_eur"] == 200.0
+    assert d["kennzahlen"]["offen_eur"] == 119.0
+    assert prov.aufrufe == [("purchaseinvoice", "open"), ("purchaseinvoice", "paid")]
+    assert "vouchers/view" in d["posten"][0]["lexware_link"]
+
+
+@pytest.mark.asyncio
+async def test_ausgaben_ohne_lexware_faellt_weich(monkeypatch):
+    _patch_provider(monkeypatch, None)
+    d = await buch.ausgaben(uuid.uuid4())
+    assert d["ok"] is False
+
+
+@pytest.mark.asyncio
+async def test_ausgaben_bei_api_fehler_faellt_weich(monkeypatch):
+    class _Kaputt:
+        async def get_voucherlist(self, *a, **kw):
+            raise RuntimeError("Lexware 503")
+    _patch_provider(monkeypatch, _Kaputt())
+    d = await buch.ausgaben(uuid.uuid4())
+    assert d["ok"] is False
+    assert "nicht geladen" in d["error"]
+
+
 @pytest.mark.asyncio
 async def test_kaputte_toolconfig_kippt_nicht(monkeypatch):
+    _patch_lexware_ziel(monkeypatch, None)
     class _S:
         async def __aenter__(self): return self
         async def __aexit__(self, *e): return False
