@@ -166,7 +166,8 @@ _SCREEN_LABELS: dict[str, str] = {
     "mehr":             "Mehr",
     "rechnungen_page":  "Rechnungen",
     "angebote_page":    "Angebote",
-    "buchhaltung":      "Buchhaltung",
+    "buchhaltung":      "Buchhaltung (offene Posten, Rechnungen, Angebote, Belege)",
+    "belege":           "Belege erfassen",
     "team":             "Team",
     "material":         "Materialien",
     "wissen":           "Wissensbasis",
@@ -1235,6 +1236,22 @@ async def _run_rechnungen_pruefen(ctx: Ctx, args: dict) -> dict:
             "fehler": summary.get("errors", 0)}
 
 
+async def _run_offene_posten(ctx: Ctx, args: dict) -> dict:
+    """Wer schuldet uns noch Geld? Nutzt dieselbe Auswertung wie der
+    Buchhaltungs-Bereich der App (core.services.buchhaltung), damit Q und
+    Bildschirm nie unterschiedliche Zahlen nennen."""
+    from core.services import buchhaltung as buch
+
+    daten = await buch.uebersicht(ctx.tid)
+    return {
+        "zusammenfassung": buch.als_text(daten),
+        "kennzahlen": daten["kennzahlen"],
+        "zahlungsziel_tage": daten["zahlungsziel_tage"],
+        "offene_posten": daten["offene_posten"][:15],
+        "angebote_zum_nachfassen": daten["nachfassen"][:10],
+    }
+
+
 async def _run_formulare_status(ctx: Ctx, args: dict) -> dict:
     """Status der Kunden-Anfrage-Formulare der letzten 30 Tage
     (spiegelt /formulare-Überschrift: offen/ausgefüllt/abgelaufen)."""
@@ -1709,8 +1726,12 @@ _REGISTRY: list[ToolSpec] = [
         parameters={"type": "OBJECT", "properties": {
             "bereich": {"type": _S, "description":
                 "Genau einer von: aktuelles, anfragen, termine, auftraege, "
-                "rueckrufe, aufnahmen, angebote, rechnungen, kunden, kunden_profil, "
+                "rueckrufe, aufnahmen, buchhaltung, angebote, rechnungen, belege, "
+                "kunden, kunden_profil, "
                 "kunden_archiv, wissen, material, team, einstellungen. "
+                "'buchhaltung' = der Geld-Bereich mit offenen Posten, Rechnungen, "
+                "Angeboten und Belegen (nimm den, wenn der Wunsch allgemein ist), "
+                "'belege' = Beleg/Quittung erfassen. "
                 "'rueckrufe' = offene Rueckrufbitten vom Telefon-Agenten (To-do-"
                 "Liste), 'aufnahmen' = aufgezeichnete Kundengespraeche/Diktate."},
             "kunde_name": {"type": _S, "description":
@@ -1871,6 +1892,17 @@ _REGISTRY: list[ToolSpec] = [
                     "und markiert bezahlte. Verschickt nichts.",
         parameters={"type": "OBJECT", "properties": {}},
         run=_run_rechnungen_pruefen),
+    ToolSpec(
+        name="offene_posten", kind="read", feature="lexware",
+        description="Zeigt, welches Geld noch aussteht: unbezahlte und "
+                    "überfällige Rechnungen mit Summe, Rechnungs-Entwürfe die "
+                    "noch nicht raus sind, und versendete Angebote ohne "
+                    "Rückmeldung. Für Fragen wie 'wer schuldet mir noch was', "
+                    "'wie viel ist offen', 'welche Rechnung ist überfällig', "
+                    "'wo muss ich nachfassen'. Fragt Lexware NICHT neu ab — "
+                    "dafür ist rechnungen_pruefen da.",
+        parameters={"type": "OBJECT", "properties": {}},
+        run=_run_offene_posten),
     ToolSpec(
         name="archiv_dateien", kind="read", feature="drive_archiv",
         description="Listet die Dateien im Drive-Archiv-Ordner eines Kunden "

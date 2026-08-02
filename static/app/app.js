@@ -293,18 +293,21 @@ const SCREENS = {
     const hasMail = feats.has("mail_intake");
     const hasKal = feats.has("kalender");
     const hasLex = feats.has("lexware");
-    const [akRes, termRes, anfRes, angebRes, rechRes] = await Promise.all([
+    // Eine Abfrage fuer den ganzen Geld-Teil: /app/api/buchhaltung liefert
+    // Kennzahlen, Rechnungen und Angebote zusammen — vorher waren das zwei
+    // Aufrufe, deren Zahlen die Kachel dann selbst zusammenzaehlen musste.
+    const [akRes, termRes, anfRes, buchRes] = await Promise.all([
       api("/app/api/aktuelles"),
       hasKal ? api("/app/api/termine") : Promise.resolve(null),
       hasMail ? api("/app/api/anfragen") : Promise.resolve(null),
-      hasLex ? api("/app/api/angebote") : Promise.resolve(null),
-      hasLex ? api("/app/api/rechnungen") : Promise.resolve(null),
+      hasLex ? api("/app/api/buchhaltung") : Promise.resolve(null),
     ]);
     const ak = akRes && akRes.ok ? await akRes.json() : {};
     const td = termRes && termRes.ok ? await termRes.json() : { termine: [] };
     const ad = anfRes && anfRes.ok ? await anfRes.json() : { items: [] };
-    const angd = angebRes && angebRes.ok ? await angebRes.json() : { angebote: [] };
-    const rechd = rechRes && rechRes.ok ? await rechRes.json() : { rechnungen: [] };
+    const buch = buchRes && buchRes.ok ? await buchRes.json() : null;
+    const angd = { angebote: (buch && buch.angebote) || [] };
+    const rechd = { rechnungen: (buch && buch.rechnungen) || [] };
     const beratung = ak.beratung || [];
     const auftraege = ak.auftraege || [];
     const rueckrufe = ak.rueckrufe || [];
@@ -313,7 +316,6 @@ const SCREENS = {
     const anfragenOffen = (ad.items || []).filter((x) => !x.closed);
     const angebote = angd.angebote || [];
     const rechnungen = rechd.rechnungen || [];
-    const rechnungenOffen = rechnungen.filter((x) => x.status === "Versendet").length;
     const parts = [];
 
     parts.push(
@@ -364,16 +366,23 @@ const SCREENS = {
       count: anfragenOffen.length ? `${anfragenOffen.length} offen` : "Keine offen",
       badge: anfragenOffen.length || null, badgeClass: "",
     });
-    if (hasLex) tiles.push({
-      ico: "📄", label: "Angebote", screen: "angebote_page",
-      count: angebote.length ? `${angebote.length} gesamt` : "Keine",
-      badge: null,
-    });
-    if (hasLex) tiles.push({
-      ico: "🧾", label: "Rechnungen", screen: "rechnungen_page",
-      count: rechnungen.length ? `${rechnungen.length} gesamt` : "Keine",
-      badge: rechnungenOffen || null, badgeClass: "warn",
-    });
+    // Angebote, Rechnungen und Belege lagen frueher als eigene Kacheln
+    // (bzw. gar nicht) herum — alles Geld steckt jetzt hinter EINER Kachel.
+    // Das Abzeichen zeigt, was Geld kostet: ueberfaellige Rechnungen, sonst
+    // die offenen. Zahlen kommen aus /app/api/buchhaltung (eine Quelle).
+    if (hasLex) {
+      const bk = (buch && buch.kennzahlen) || {};
+      const ueberfaellig = bk.ueberfaellig_anzahl || 0;
+      const offen = bk.offen_anzahl || 0;
+      tiles.push({
+        ico: "💰", label: "Buchhaltung", screen: "buchhaltung",
+        count: offen
+          ? `${fmtEur(bk.offen_eur)} offen`
+          : (rechnungen.length || angebote.length ? "Alles bezahlt" : "Keine Belege"),
+        badge: ueberfaellig || offen || null,
+        badgeClass: ueberfaellig ? "" : "warn",
+      });
+    }
     tiles.push({
       ico: "🛠️", label: "Aufträge", screen: "auftraege_page",
       count: auftraege.length ? `${auftraege.length} laufend` : "Keine laufenden",
@@ -597,15 +606,15 @@ const SCREENS = {
            <button class="btn-sm" id="rech-new-btn" style="padding:8px 14px">+ Neu</button>
          </div>` : "";
     App.view.innerHTML =
-      `<button class="btn-sm btn-ghost" id="back-db" style="margin-bottom:10px">← Übersicht</button>` +
+      `<button class="btn-sm btn-ghost" id="back-db" style="margin-bottom:10px">← Buchhaltung</button>` +
       `<div style="display:flex;align-items:center;justify-content:space-between;margin:4px 4px 14px">
          <h1 style="font-size:22px;margin:0">Rechnungen</h1>${btns}
        </div>` +
       `<div class="card">${rechnungen.length
-        ? rechnungen.map((x) => rowPill(x.kunde + (x.nummer ? " · " + esc(x.nummer) : ""), x.betrag + " · " + x.zeit, x.status, x.pill)).join("")
+        ? rechnungen.map((x) => rowPillLink(x.kunde + (x.nummer ? " · " + x.nummer : ""), x.betrag + " · " + x.zeit, x.status, x.pill, x.lexware_link)).join("")
         : emptyRow("Noch keine Rechnungen")
       }</div>`;
-    document.getElementById("back-db").addEventListener("click", () => navigate("aktuelles"));
+    document.getElementById("back-db").addEventListener("click", () => navigate("buchhaltung"));
     const rBtn = document.getElementById("rech-new-btn");
     if (rBtn) rBtn.addEventListener("click", () => { App.lastScreen = "rechnungen_page"; showRechnungForm(); });
     const pBtn = document.getElementById("rech-pruefen-btn");
@@ -632,16 +641,16 @@ const SCREENS = {
     const d = res && res.ok ? await res.json() : { angebote: [] };
     const angebote = d.angebote || [];
     App.view.innerHTML =
-      `<button class="btn-sm btn-ghost" id="back-db" style="margin-bottom:10px">← Übersicht</button>` +
+      `<button class="btn-sm btn-ghost" id="back-db" style="margin-bottom:10px">← Buchhaltung</button>` +
       `<div style="display:flex;align-items:center;justify-content:space-between;margin:4px 4px 14px">
          <h1 style="font-size:22px;margin:0">Angebote</h1>
          ${isInhaber ? `<button class="btn-sm" id="ang-new-btn" style="padding:8px 14px">+ Neu</button>` : ""}
        </div>` +
       `<div class="card">${angebote.length
-        ? angebote.map((x) => rowPill(x.kunde, x.betrag + " · " + x.zeit, x.status, x.pill)).join("")
+        ? angebote.map((x) => rowPillLink(x.kunde, x.betrag + " · " + x.zeit, x.status, x.pill, x.lexware_link)).join("")
         : emptyRow("Noch keine Angebote")
       }</div>`;
-    document.getElementById("back-db").addEventListener("click", () => navigate("aktuelles"));
+    document.getElementById("back-db").addEventListener("click", () => navigate("buchhaltung"));
     const aBtn = document.getElementById("ang-new-btn");
     if (aBtn) aBtn.addEventListener("click", () => { App.lastScreen = "angebote_page"; showAngebotForm(); });
   },
@@ -782,59 +791,109 @@ const SCREENS = {
     zeichnen();
   },
 
+  // Ein Bereich fuer alles, was mit Geld zu tun hat: offene Posten,
+  // Rechnungen, Angebote, Belege. Frueher lagen die auf drei Kacheln
+  // ("Angebote", "Rechnungen") plus einem verwaisten "Buero"-Screen, den
+  // man nur ueber Hilfe & Tour fand — die Belege waren damit praktisch
+  // unsichtbar. Eine einzige Abfrage (/app/api/buchhaltung) liefert alles.
   async buchhaltung() {
+    const feats = new Set(App.me.features || []);
+    if (!feats.has("lexware")) { navigate("aktuelles", { mode: "replace" }); return; }
     const isInhaber = App.me.employee.is_inhaber;
-    const [a, r, b] = await Promise.all([
-      api("/app/api/angebote"), api("/app/api/rechnungen"), api("/app/api/belege"),
-    ]);
-    const ad = a && a.ok ? await a.json() : { angebote: [] };
-    const rd = r && r.ok ? await r.json() : { rechnungen: [] };
-    const bd = b && b.ok ? await b.json() : { belege: [] };
-    App.view.innerHTML =
+    App.view.innerHTML = `<div class="loading">Lädt …</div>`;
+    const res = await api("/app/api/buchhaltung");
+    const d = res && res.ok ? await res.json() : null;
+    if (!d || !d.ok) {
+      App.view.innerHTML =
+        `<button class="btn-sm btn-ghost" id="back-db" style="margin-bottom:10px">← Übersicht</button>` +
+        `<div class="card">${emptyRow((d && d.error) || "Buchhaltung nicht erreichbar.")}</div>`;
+      document.getElementById("back-db").addEventListener("click", () => navigate("aktuelles"));
+      return;
+    }
+    const k = d.kennzahlen || {};
+    const posten = d.offene_posten || [];
+    const nachfassen = d.nachfassen || [];
+    const rechnungen = d.rechnungen || [];
+    const angebote = d.angebote || [];
+    const belege = d.belege || [];
+    const VORSCHAU = 6;   // wie viele Zeilen pro Abschnitt, Rest hinter "Alle"
+
+    const parts = [];
+    parts.push(
+      `<button class="btn-sm btn-ghost" id="back-db" style="margin-bottom:10px">← Übersicht</button>` +
       `<div style="display:flex;align-items:center;justify-content:space-between;margin:4px 4px 14px">
-         <h1 style="font-size:22px;margin:0">Büro</h1>
-         <div style="display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end">
-           <button class="btn-sm btn-ghost" id="auftraege-btn" style="padding:8px 12px">🛠 Aufträge</button>
-           <button class="btn-sm" id="beleg-new-btn" style="padding:8px 12px">📄 Beleg</button>
-           ${isInhaber ? `
-           <button class="btn-sm btn-ghost" id="rechnung-pruefen-btn" style="padding:8px 12px">🔄 Zahlungen</button>
-           <button class="btn-sm btn-ghost" id="rechnung-new-btn" style="padding:8px 12px">+ Rechnung</button>
-           <button class="btn-sm btn-ghost" id="angebot-new-btn" style="padding:8px 12px">+ Angebot</button>` : ""}
-         </div>
-       </div>` +
-      `<div class="card"><h2>Rechnungen</h2>${
-        (rd.rechnungen || []).length ? rd.rechnungen.map((x) =>
-          rowPill(x.kunde + (x.nummer ? " · " + esc(x.nummer) : ""), x.betrag + " · " + x.zeit, x.status, x.pill)).join("")
-        : emptyRow("Noch keine Rechnungen")
-      }</div>` +
-      `<div class="card"><h2>Angebote</h2>${
-        (ad.angebote || []).length ? ad.angebote.map((x) =>
-          rowPill(x.kunde, x.betrag + " · " + x.zeit, x.status, x.pill)).join("")
-        : emptyRow("Noch keine Angebote")
-      }</div>` +
-      `<div class="card"><h2>Belege</h2>${
-        (bd.belege || []).length ? bd.belege.map(belegRow).join("")
-        : emptyRow("Noch keine Belege")
-      }</div>`;
-    const aBtn = document.getElementById("angebot-new-btn");
-    const rBtn = document.getElementById("rechnung-new-btn");
-    document.getElementById("beleg-new-btn").addEventListener("click", showBelegUpload);
-    // Eine einzige Aufträge-Ansicht (auftraege_page) — sie trägt auch das
-    // Archiv und den Prozess-Editor; ein zweiter Zwilling würde driften.
-    document.getElementById("auftraege-btn").addEventListener("click",
-      () => navigate("auftraege_page"));
-    if (aBtn) aBtn.addEventListener("click", () => showAngebotForm());
-    if (rBtn) rBtn.addEventListener("click", () => showRechnungForm());
-    const pBtn = document.getElementById("rechnung-pruefen-btn");
-    if (pBtn) pBtn.addEventListener("click", async () => {
-      const orig = pBtn.textContent;
-      pBtn.disabled = true; pBtn.textContent = "Prüfe …";
+         <h1 style="font-size:22px;margin:0">Buchhaltung</h1>
+         ${isInhaber ? `<button class="btn-sm btn-ghost" id="bu-pruefen" style="padding:8px 12px">🔄 Zahlungen</button>` : ""}
+       </div>`);
+
+    // Kennzahlen zuerst: die eine Zahl, die der Chef morgens wissen will.
+    parts.push(
+      `<div class="geld-grid">
+         ${geldKpi("Offen", k.offen_eur, `${k.offen_anzahl || 0} Rechnung(en)`, "")}
+         ${geldKpi("Überfällig", k.ueberfaellig_eur,
+                   `${k.ueberfaellig_anzahl || 0} über ${d.zahlungsziel_tage} Tage`,
+                   (k.ueberfaellig_anzahl || 0) > 0 ? "danger" : "")}
+         ${geldKpi("Bezahlt (30 T)", k.bezahlt_30t_eur, `${k.bezahlt_30t_anzahl || 0} Zahlung(en)`, "ok")}
+       </div>`);
+
+    if (isInhaber) {
+      parts.push(
+        `<div style="display:flex;flex-wrap:wrap;gap:8px;margin:0 4px 16px">
+           <button class="btn-sm" id="bu-rechnung-neu" style="flex:1 1 30%;padding:12px 8px">+ Rechnung</button>
+           <button class="btn-sm btn-ghost" id="bu-angebot-neu" style="flex:1 1 30%;padding:12px 8px">+ Angebot</button>
+           <button class="btn-sm btn-ghost" id="bu-beleg-neu" style="flex:1 1 30%;padding:12px 8px">📄 Beleg</button>
+         </div>`);
+    } else {
+      parts.push(
+        `<button class="btn-sm" id="bu-beleg-neu" style="width:100%;margin-bottom:16px;padding:12px 8px">📄 Beleg erfassen</button>`);
+    }
+
+    // Offene Posten = die eigentliche Arbeit. Ueberfaellige stehen oben,
+    // Entwuerfe ("liegt noch hier") sind extra markiert.
+    if (posten.length) {
+      parts.push(`<div class="section-title">Offene Posten (${posten.length})</div>`);
+      parts.push(`<div class="card">${posten.map(postenRow).join("")}</div>`);
+    }
+
+    if (nachfassen.length) {
+      parts.push(`<div class="section-title">Angebote ohne Rückmeldung (${nachfassen.length})</div>`);
+      parts.push(`<div class="card">${nachfassen.map((n) =>
+        rowPillLink(n.kunde, `${fmtEur(n.betrag_eur)} · seit ${n.tage} Tagen`,
+                    "nachfassen", "warn", n.lexware_link)).join("")}</div>`);
+    }
+
+    parts.push(abschnitt("Rechnungen", rechnungen, VORSCHAU, "bu-alle-rechnungen",
+      (x) => rowPillLink(x.kunde + (x.nummer ? " · " + x.nummer : ""),
+                         `${x.betrag} · ${x.zeit}`, x.status, x.pill, x.lexware_link),
+      "Noch keine Rechnungen"));
+    parts.push(abschnitt("Angebote", angebote, VORSCHAU, "bu-alle-angebote",
+      (x) => rowPillLink(x.kunde, `${x.betrag} · ${x.zeit}`, x.status, x.pill, x.lexware_link),
+      "Noch keine Angebote"));
+    parts.push(abschnitt("Belege", belege, VORSCHAU, "",
+      belegRow, "Noch keine Belege — Quittungen einfach abfotografieren"));
+
+    App.view.innerHTML = parts.join("");
+    document.getElementById("back-db").addEventListener("click", () => navigate("aktuelles"));
+    const on = (id, fn) => { const el = document.getElementById(id); if (el) el.addEventListener("click", fn); };
+    on("bu-beleg-neu", showBelegUpload);
+    on("bu-rechnung-neu", () => { App.lastScreen = "buchhaltung"; showRechnungForm(); });
+    on("bu-angebot-neu", () => { App.lastScreen = "buchhaltung"; showAngebotForm(); });
+    on("bu-alle-rechnungen", () => navigate("rechnungen_page"));
+    on("bu-alle-angebote", () => navigate("angebote_page"));
+    on("bu-pruefen", async () => {
+      const btn = document.getElementById("bu-pruefen");
+      const orig = btn.textContent;
+      btn.disabled = true; btn.textContent = "Prüfe …";
       const r = await api("/app/api/rechnungen/pruefen", { method: "POST", body: "{}" });
       const j = r ? await r.json().catch(() => null) : null;
-      pBtn.disabled = false; pBtn.textContent = orig;
+      btn.disabled = false; btn.textContent = orig;
       if (j && j.ok) {
-        if ((j.bezahlt || 0) > 0) { alert(`✓ ${j.bezahlt} Rechnung(en) als bezahlt markiert (${j.geprueft} geprüft).`); navigate("buchhaltung"); }
-        else { alert(`Geprüft: ${j.geprueft || 0} offene Rechnung(en) — keine neuen Zahlungen.`); }
+        if ((j.bezahlt || 0) > 0) {
+          alert(`✓ ${j.bezahlt} Rechnung(en) als bezahlt markiert (${j.geprueft} geprüft).`);
+          navigate("buchhaltung", { mode: "none" });
+        } else {
+          alert(`Geprüft: ${j.geprueft || 0} offene Rechnung(en) — keine neuen Zahlungen.`);
+        }
       } else { alert((j && j.error) || "Konnte nicht prüfen."); }
     });
   },
@@ -1950,16 +2009,15 @@ const SCREENS = {
       `</div>`;
 
     const tagesarbeit = [
-      { icon: "📋", label: "Übersicht", go: "aktuelles", hint: "Dashboard mit allen 6 Bereichen auf einen Blick" },
+      { icon: "📋", label: "Übersicht", go: "aktuelles", hint: "Alle Bereiche auf einen Blick" },
       { icon: "📅", label: "Termine", go: "termine", hint: "Termine anschauen + neu anlegen" },
       { icon: "📞", label: "Rückrufe", go: "rueckrufe_page", hint: "Offene Rückrufe abhaken oder neu anlegen" },
       { icon: "✉️", label: "Anfragen", go: "anfragen", hint: "Mail-Anfragen lesen + direkt antworten" },
       { icon: "🛠️", label: "Aufträge", go: "auftraege_page", hint: "Laufende Aufträge + Fortschritt" },
-      { icon: "📄", label: "Angebote", go: "angebote_page", hint: "Angebote anlegen + senden" },
-      { icon: "🧾", label: "Rechnungen", go: "rechnungen_page", hint: "Rechnungen anlegen + Zahlungen prüfen" },
+      { icon: "💰", label: "Buchhaltung", go: "buchhaltung", hint: "Offene Posten, Rechnungen, Angebote, Belege" },
     ];
     const buero = [
-      { icon: "🧾", label: "Büro", go: "buchhaltung", hint: "Angebote + Rechnungen anlegen + senden" },
+      { icon: "💰", label: "Buchhaltung", go: "buchhaltung", hint: "Offene Posten, Rechnungen, Angebote, Belege — alles an einem Ort" },
       { icon: "🤖", label: "Q-Assistent", go: "assistent", hint: "Diktiere Termin/Rückruf/Angebot/Rechnung" },
     ];
     const stammdaten = [
@@ -3134,11 +3192,14 @@ function handleNavigate(bereich, kunde, kategorie) {
   if (b === "kunden_profil" && kunde) { showKundenProfil(kunde); return; }
   if (b === "kunden_archiv" && kunde) { openArchivKategorie(kunde, kategorie || "bilder"); return; }
   const mehr = { kunden: 1, wissen: 1, material: 1, team: 1, einstellungen: 1, formulare: 1 };
+  // "Beleg erfassen" ist ein Formular, kein Screen — direkt oeffnen; sein
+  // Zurueck-Knopf fuehrt in den Buchhaltungs-Bereich.
+  if (b === "belege") { showBelegUpload(); return; }
   const subscreen = {
     auftraege: "auftraege_page", rechnungen: "rechnungen_page",
     angebote: "angebote_page", rueckrufe: "rueckrufe_page",
     anfragen: "anfragen", termine: "termine", aufnahmen: "gespraeche",
-    gespraeche: "gespraeche",
+    gespraeche: "gespraeche", buchhaltung: "buchhaltung",
   };
   if (mehr[b]) { navigate(b); return; }
   if (subscreen[b]) { navigate(subscreen[b]); return; }
@@ -3171,6 +3232,55 @@ function rowAction(a, b, c, id, action, label) {
 function rowPill(a, b, status, pill) {
   return `<div class="row"><div><div>${esc(a)}</div>${b ? `<div class="sub">${esc(b)}</div>` : ""}</div>` +
     `<span class="pill ${pill || ""}">${esc(status)}</span></div>`;
+}
+// Wie rowPill, nur dass die ganze Zeile nach Lexware verlinkt, wenn es dort
+// einen Beleg gibt. Der Deeplink existierte im Backend schon lange
+// (invoice_deeplink_view / quotation_deeplink_view), wurde in der App aber
+// nirgends genutzt — Rechnung ansehen hiess: Lexware selbst suchen.
+function rowPillLink(a, b, status, pill, link) {
+  const inner =
+    `<div><div>${esc(a)}</div>${b ? `<div class="sub">${esc(b)}</div>` : ""}</div>` +
+    `<span class="pill ${pill || ""}">${esc(status)}${link ? " ›" : ""}</span>`;
+  if (!link) return `<div class="row">${inner}</div>`;
+  return `<a class="row" href="${esc(link)}" target="_blank" rel="noopener" ` +
+    `style="text-decoration:none;color:inherit">${inner}</a>`;
+}
+
+// ---------- Buchhaltung: Kennzahl-Kachel, offener Posten, Abschnitt ----------
+function fmtEur(v) {
+  const n = Number(v || 0);
+  return n.toLocaleString("de-DE", { style: "currency", currency: "EUR" });
+}
+function geldKpi(label, betrag, sub, ton) {
+  return `<div class="geld-kpi ${ton || ""}">
+    <span class="geld-kpi-label">${esc(label)}</span>
+    <span class="geld-kpi-wert">${esc(fmtEur(betrag))}</span>
+    <span class="geld-kpi-sub">${esc(sub || "")}</span>
+  </div>`;
+}
+function postenRow(p) {
+  // Drei Faelle: ueberfaellig (rot), versendet und noch in der Frist,
+  // oder noch gar nicht raus (Entwurf liegt beim Betrieb selbst).
+  const stand = !p.versendet
+    ? ["Nicht versendet", "warn", `Entwurf seit ${p.tage} Tagen`]
+    : p.ueberfaellig
+      ? ["Überfällig", "danger", `versendet vor ${p.tage} Tagen`]
+      : ["Offen", "", `versendet vor ${p.tage} Tagen`];
+  const titel = p.kunde + (p.nummer ? " · " + p.nummer : "");
+  return rowPillLink(titel, `${fmtEur(p.betrag_eur)} · ${stand[2]}`,
+                     stand[0], stand[1], p.lexware_link);
+}
+// Karte mit Ueberschrift, den ersten `max` Zeilen und optional einem
+// "Alle anzeigen"-Knopf, der auf den Vollbild-Screen fuehrt.
+function abschnitt(titel, items, max, alleId, rowFn, leerText) {
+  const sichtbar = items.slice(0, max);
+  const rest = items.length - sichtbar.length;
+  const alle = (rest > 0 && alleId)
+    ? `<button class="btn-sm btn-ghost" id="${esc(alleId)}" style="width:100%;margin-top:8px">Alle ${items.length} anzeigen</button>`
+    : "";
+  return `<div class="card"><h2>${esc(titel)}</h2>` +
+    (sichtbar.length ? sichtbar.map(rowFn).join("") : emptyRow(leerText)) +
+    alle + `</div>`;
 }
 function rowTap(a, b, c, id) {
   return `<button class="row menu-item" data-aufnahme="${esc(id)}" style="align-items:flex-start">` +

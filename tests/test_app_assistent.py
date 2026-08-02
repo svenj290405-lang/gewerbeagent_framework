@@ -198,7 +198,7 @@ _ERWARTETE_TOOLS = {
     "freie_termine_finden", "kunde_suchen", "material_liste", "offene_rueckrufe",
     "anzeige_oeffnen", "anstehende_termine", "team_status", "offene_anfragen",
     "wissen_suchen", "archiv_suchen", "archiv_dateien", "rechnungen_pruefen",
-    "formulare_status",
+    "offene_posten", "formulare_status",
     # write
     "termin_anlegen", "termin_stornieren", "termin_verschieben", "rueckruf_anlegen",
     "rueckruf_erledigt", "material_bestellen", "material_anlegen",

@@ -232,15 +232,15 @@ async def api_rueckrufe(request: Request, _e=Depends(require_app_user)) -> JSONR
     return JSONResponse({"rueckrufe": await _open_rueckrufe(tid)})
 
 
-@router.get("/angebote")
-async def api_angebote(request: Request, _e=Depends(require_app_user)) -> JSONResponse:
-    tid = current_tenant_id(request)
+async def _angebote_liste(tid: uuid.UUID, limit: int = 50) -> list[dict]:
+    """Angebots-Zeilen fuer die App — inkl. Lexware-Deeplink."""
+    from core.integrations.lexware import LexwareProvider
     async with get_session() as s:
         rows = (await s.execute(
             select(Angebot)
             .where(Angebot.tenant_id == tid)
             .order_by(Angebot.created_at.desc())
-            .limit(50)
+            .limit(limit)
         )).scalars().all()
     out = []
     for a in rows:
@@ -252,19 +252,23 @@ async def api_angebote(request: Request, _e=Depends(require_app_user)) -> JSONRe
             "status": label,
             "pill": pill,
             "zeit": _fmt_dt(a.created_at),
+            "lexware_link": (
+                LexwareProvider.quotation_deeplink_view(a.lexware_quotation_id)
+                if a.lexware_quotation_id else None
+            ),
         })
-    return JSONResponse({"angebote": out})
+    return out
 
 
-@router.get("/rechnungen")
-async def api_rechnungen(request: Request, _e=Depends(require_app_user)) -> JSONResponse:
-    tid = current_tenant_id(request)
+async def _rechnungen_liste(tid: uuid.UUID, limit: int = 50) -> list[dict]:
+    """Rechnungs-Zeilen fuer die App — inkl. Lexware-Deeplink."""
+    from core.integrations.lexware import LexwareProvider
     async with get_session() as s:
         rows = (await s.execute(
             select(Rechnung)
             .where(Rechnung.tenant_id == tid)
             .order_by(Rechnung.created_at.desc())
-            .limit(50)
+            .limit(limit)
         )).scalars().all()
     out = []
     for r in rows:
@@ -277,8 +281,63 @@ async def api_rechnungen(request: Request, _e=Depends(require_app_user)) -> JSON
             "status": label,
             "pill": pill,
             "zeit": _fmt_dt(r.created_at),
+            "bezahlt": r.bezahlt_am is not None,
+            "lexware_link": (
+                LexwareProvider.invoice_deeplink_view(r.lexware_invoice_id)
+                if r.lexware_invoice_id else None
+            ),
         })
-    return JSONResponse({"rechnungen": out})
+    return out
+
+
+@router.get("/angebote")
+async def api_angebote(request: Request, _e=Depends(require_app_user)) -> JSONResponse:
+    return JSONResponse({"angebote": await _angebote_liste(current_tenant_id(request))})
+
+
+@router.get("/rechnungen")
+async def api_rechnungen(request: Request, _e=Depends(require_app_user)) -> JSONResponse:
+    return JSONResponse({"rechnungen": await _rechnungen_liste(current_tenant_id(request))})
+
+
+@router.get("/buchhaltung")
+async def api_buchhaltung(request: Request, _e=Depends(require_app_user)) -> JSONResponse:
+    """Alles fuer den Buchhaltungs-Bereich in EINEM Aufruf.
+
+    Fasst zusammen, was vorher auf drei Screens verstreut war (Angebote,
+    Rechnungen, Belege) und ergaenzt die Geld-Sicht aus
+    ``core.services.buchhaltung``: offene Posten, ueberfaellige Rechnungen,
+    Angebote zum Nachfassen, Kennzahlen.
+
+    Feature-Gate ``lexware``: ohne Buchhaltungs-Anbindung gibt es hier nichts
+    zu sehen — dann kommt ``ok:false`` statt leerer Listen, damit die App
+    einen ehrlichen Hinweis zeigen kann.
+    """
+    from core.features.check import is_feature_enabled
+    from core.services import buchhaltung as buch
+
+    tid = current_tenant_id(request)
+    if not await is_feature_enabled(tid, "lexware"):
+        return JSONResponse(
+            {"ok": False, "error": "Die Buchhaltung ist für diesen Betrieb nicht aktiv."},
+            status_code=403,
+        )
+    geld, angebote, rechnungen, belege = await asyncio.gather(
+        buch.uebersicht(tid),
+        _angebote_liste(tid),
+        _rechnungen_liste(tid),
+        _recent_belege(tid),
+    )
+    return JSONResponse({
+        "ok": True,
+        "kennzahlen": geld["kennzahlen"],
+        "zahlungsziel_tage": geld["zahlungsziel_tage"],
+        "offene_posten": geld["offene_posten"],
+        "nachfassen": geld["nachfassen"],
+        "angebote": angebote,
+        "rechnungen": rechnungen,
+        "belege": belege,
+    })
 
 
 # =====================================================================

@@ -477,6 +477,38 @@ button:disabled { opacity: .6; }
 .tile-badge.warn { background: var(--warn); color: #7a5c00; }
 .tile-badge.ok { background: var(--ok); color: #fff; }
 
+/* ---------- Buchhaltung: Kennzahlen ----------
+   Drei Zahlen nebeneinander (offen / ueberfaellig / bezahlt). Nur Tokens,
+   damit der Dunkelmodus aus app-beta.css automatisch greift. Die Kacheln
+   duerfen auf 320 px schmal werden, aber nie ueberlaufen — darum minmax()
+   mit 0 als Minimum statt fester Breite. */
+.geld-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  margin: 0 4px 16px;
+}
+.geld-kpi {
+  background: var(--card);
+  border: 1.5px solid var(--line);
+  border-radius: 14px;
+  padding: 12px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  text-align: center;
+}
+.geld-kpi-label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+.geld-kpi-wert {
+  font-size: 17px; font-weight: 800; letter-spacing: -.02em;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.geld-kpi-sub { font-size: 11px; color: var(--muted); }
+.geld-kpi.danger { border-color: var(--danger); }
+.geld-kpi.danger .geld-kpi-wert { color: var(--danger); }
+.geld-kpi.ok .geld-kpi-wert { color: var(--ok); }
+
 /* Mikrofon-Button im Composer (erscheint wenn Chat-Nachrichten vorhanden) */
 .q-composer-mic { background: #e8f0fe !important; color: var(--primary) !important; }
 .q-composer-mic:hover { background: #d2e3fc !important; }

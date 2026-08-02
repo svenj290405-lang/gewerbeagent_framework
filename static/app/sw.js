@@ -146,7 +146,11 @@
 // automatisch ausgefuehrte Aktionen werden im Overlay auch angezeigt.
 // v74: Automatisierungs-Stufen werden erst mit „Speichern" wirksam
 // (Speicherleiste, Verwerfen, Warnung beim Verlassen) statt sofort beim Tippen.
-const CACHE = "ga-app-v74";
+// v75: EIN Buchhaltungs-Bereich statt der getrennten Kacheln „Angebote" und
+// „Rechnungen" — mit Kennzahlen (offen/ueberfaellig/bezahlt), offenen Posten,
+// Angeboten zum Nachfassen, den Belegen (waren vorher praktisch unsichtbar)
+// und Lexware-Deeplinks auf jeder Zeile.
+const CACHE = "ga-app-v75";
 const SHELL = [
   "/app",
   "/app/static/app-beta.css",
