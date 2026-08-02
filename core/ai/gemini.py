@@ -2636,3 +2636,162 @@ async def classify_angebot_response(
         logger.warning(f"classify_angebot_response Fehler: {e}")
         return {"classification": "UNSICHER", "confidence": "low", "reason": f"Fehler: {e}"}
 
+
+
+# ---------------------------------------------------------------------------
+# Beleg-Vorkontierung
+#
+# Bis 2026-08 landete ein fotografierter Beleg als unbearbeiteter Stub in
+# Lexware — Haendler, Datum, Betrag, Steuersatz und Buchungskategorie hat
+# der Betrieb dort von Hand nachgetragen. Gemini liest das Foto und schlaegt
+# alles vor; die Kategorien bekommt es als Auswahl aus dem echten Konto
+# (der pilot-Betrieb hat 169 Ausgabe-Kategorien), damit es sich keine
+# ausdenkt.
+# ---------------------------------------------------------------------------
+
+BELEG_RESPONSE_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "haendler": {"type": "STRING", "nullable": True},
+        "datum": {"type": "STRING", "nullable": True},
+        "betrag_brutto_eur": {"type": "NUMBER", "nullable": True},
+        "mwst_prozent": {"type": "INTEGER", "nullable": True},
+        "kategorie": {"type": "STRING", "nullable": True},
+        "beschreibung": {"type": "STRING", "nullable": True},
+        "ist_beleg": {"type": "BOOLEAN"},
+        "sicherheit": {"type": "STRING"},
+        "unklar": {"type": "ARRAY", "items": {"type": "STRING"}},
+    },
+    "required": ["ist_beleg", "sicherheit"],
+}
+
+# Mehr Kategorien passen zwar in den Prompt, machen die Auswahl fuer das
+# Modell aber schlechter statt besser. Die Liste wird vorher auf die
+# plausibelsten gekuerzt (siehe core/services/beleg_kontierung.py).
+BELEG_MAX_KATEGORIEN = 60
+
+
+async def extract_beleg_from_image(
+    image_bytes: bytes,
+    mime_type: str,
+    *,
+    kategorien: list[str] | None = None,
+    branche: str | None = None,
+) -> dict:
+    """Beleg-Foto/PDF → Haendler, Datum, Brutto, Steuersatz, Buchungskategorie.
+
+    ``kategorien`` sind die echten Ausgabe-Kategorien des Lexware-Kontos.
+    Gemini darf NUR daraus waehlen — eine erfundene Kategorie waere beim
+    Zurueckschreiben wertlos.
+
+    Rueckgabe immer ein dict; bei jedem Fehler ``ist_beleg=False`` und
+    ``sicherheit="niedrig"``, damit der Aufrufer nie ungeprueft bucht.
+    Verarbeitung in europe-west3 (Frankfurt) — DSGVO-konform.
+    """
+    import datetime as _dt
+    import json as _json
+    from google.genai.types import GenerateContentConfig, Part
+
+    leer = {"ist_beleg": False, "sicherheit": "niedrig", "unklar": ["alles"],
+            "haendler": None, "datum": None, "betrag_brutto_eur": None,
+            "mwst_prozent": None, "kategorie": None, "beschreibung": None}
+    if not image_bytes:
+        return leer
+
+    kat = (kategorien or [])[:BELEG_MAX_KATEGORIEN]
+    kat_block = (
+        "\n\nWaehle die Buchungskategorie AUSSCHLIESSLICH aus dieser Liste "
+        "(exakte Schreibweise, sonst null):\n" + "\n".join(f"- {k}" for k in kat)
+        if kat else ""
+    )
+    branche_block = f"\nDer Betrieb ist: {branche}." if branche else ""
+
+    prompt = (
+        "Du liest einen Ausgabe-Beleg eines Handwerksbetriebs (Quittung, "
+        "Kassenbon, Eingangsrechnung, Tankbeleg).\n"
+        f"Heute ist {_dt.date.today().isoformat()}."
+        f"{branche_block}\n\n"
+        "Lies heraus:\n"
+        "- haendler: wer hat das ausgestellt (Firmenname, nicht die Adresse)\n"
+        "- datum: Belegdatum als YYYY-MM-DD. Nicht das heutige Datum raten — "
+        "steht keins drauf, gib null zurueck.\n"
+        "- betrag_brutto_eur: der GESAMTE Endbetrag inkl. MwSt. Bei Kassenbons "
+        "ist das die Zeile 'SUMME'/'TOTAL', nicht 'gegeben' oder 'zurueck'.\n"
+        "- mwst_prozent: 19, 7 oder 0. Stehen mehrere Saetze drauf, nimm den "
+        "des groessten Anteils.\n"
+        "- beschreibung: 3-6 Woerter, was gekauft wurde\n"
+        "- ist_beleg: false, wenn das gar kein Beleg ist (Baustellenfoto, "
+        "Screenshot, Person)\n"
+        "- sicherheit: hoch | mittel | niedrig — wie sicher du bei Betrag UND "
+        "Datum bist\n"
+        "- unklar: Feldnamen, die du raten musstest\n"
+        "Erfinde nichts. Was du nicht lesen kannst, ist null."
+        f"{kat_block}"
+    )
+
+    try:
+        client = _get_genai_client(location=GENAI_TEXT_LOCATION)
+        config = GenerateContentConfig(
+            temperature=0.0,
+            max_output_tokens=2048,
+            response_mime_type="application/json",
+            response_schema=BELEG_RESPONSE_SCHEMA,
+        )
+        parts = [
+            Part.from_bytes(data=image_bytes, mime_type=mime_type),
+            Part.from_text(text=prompt),
+        ]
+
+        def _sync_call():
+            return client.models.generate_content(
+                model="gemini-2.5-flash", contents=parts, config=config)
+
+        loop = asyncio.get_event_loop()
+        response = await loop.run_in_executor(None, _sync_call)
+        if not response.candidates:
+            logger.warning("extract_beleg: keine Candidates")
+            return leer
+        cand = response.candidates[0]
+        if not cand.content or not cand.content.parts:
+            logger.warning(
+                "extract_beleg: leere Parts, finish_reason=%s",
+                getattr(cand, "finish_reason", "?"))
+            return leer
+        roh = "".join(p.text for p in cand.content.parts if getattr(p, "text", None))
+        if not roh:
+            return leer
+        data = _json.loads(roh)
+    except _json.JSONDecodeError as e:
+        logger.warning("extract_beleg: JSON kaputt: %s", e)
+        return leer
+    except Exception as e:  # noqa: BLE001
+        logger.warning("extract_beleg: %s", e)
+        return leer
+
+    # Nachbereiten: nur Werte durchlassen, die auch stimmen koennen.
+    out = dict(leer)
+    out.update({k: v for k, v in data.items() if k in leer or k in ("ist_beleg", "sicherheit")})
+    if out.get("mwst_prozent") not in (0, 7, 19, None):
+        out["mwst_prozent"] = None
+        out.setdefault("unklar", []).append("mwst_prozent")
+    try:
+        betrag = float(out.get("betrag_brutto_eur") or 0)
+        out["betrag_brutto_eur"] = round(betrag, 2) if betrag > 0 else None
+    except (TypeError, ValueError):
+        out["betrag_brutto_eur"] = None
+    if out.get("kategorie") and kat and out["kategorie"] not in kat:
+        # Halluzinierte Kategorie — lieber keine als eine falsche.
+        logger.info("extract_beleg: Kategorie %r nicht im Konto", out["kategorie"])
+        out["kategorie"] = None
+    if out.get("datum"):
+        try:
+            _dt.date.fromisoformat(str(out["datum"])[:10])
+            out["datum"] = str(out["datum"])[:10]
+        except ValueError:
+            out["datum"] = None
+
+    logger.info(
+        "extract_beleg OK: haendler=%r betrag=%s mwst=%s kategorie=%r sicherheit=%s",
+        out.get("haendler"), out.get("betrag_brutto_eur"),
+        out.get("mwst_prozent"), out.get("kategorie"), out.get("sicherheit"))
+    return out

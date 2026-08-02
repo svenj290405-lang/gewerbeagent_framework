@@ -3287,6 +3287,87 @@ function postenRow(p) {
   return rowPillLink(titel, `${fmtEur(p.betrag_eur)} · ${stand[2]}`,
                      stand[0], stand[1], p.lexware_link);
 }
+// Beleg-Vorkontierung: Gemini liest den eben hochgeladenen Beleg und
+// schlaegt Händler/Datum/Betrag/Steuersatz/Kategorie vor. Alles bleibt
+// änderbar — gebucht wird erst auf Tipp. Scheitert irgendetwas, verschwindet
+// die Karte einfach; der Beleg liegt trotzdem in Lexware.
+async function zeigeKontierung(belegId) {
+  const box = document.getElementById("bl-kontierung");
+  if (!box) return;
+  box.innerHTML = `<div class="card"><div class="loading" style="padding:6px 0">Q liest den Beleg …</div></div>`;
+  let j = null;
+  try {
+    const res = await api(`/app/api/belege/${encodeURIComponent(belegId)}/vorschlag`,
+                          { method: "POST", body: "{}" });
+    j = res && res.ok ? await res.json() : null;
+  } catch (e) { /* egal — s.o. */ }
+  if (!j || !j.ok) { box.innerHTML = ""; return; }
+  if (!j.ist_beleg) {
+    box.innerHTML = `<div class="card"><p class="muted" style="margin:0">${esc(j.hinweis || "Konnte den Beleg nicht lesen.")}</p></div>`;
+    return;
+  }
+  const v = j.vorschlag || {};
+  const kats = j.kategorien || [];
+  const inp = "width:100%;padding:11px;border:1px solid var(--line);border-radius:10px;margin:4px 0 10px;font-size:16px;min-width:0";
+  const unsicher = v.sicherheit !== "hoch";
+  box.innerHTML =
+    `<div class="card">
+       <h2>Vorschlag von Q</h2>
+       ${unsicher ? `<p class="muted" style="margin:0 0 10px">Bitte kurz prüfen — ich war mir nicht ganz sicher.</p>` : ""}
+       <label class="sub">Händler</label>
+       <input type="text" id="kt-haendler" value="${esc(v.haendler || "")}" style="${inp}" />
+       <label class="sub">Belegdatum</label>
+       <input type="date" id="kt-datum" value="${esc(v.datum || "")}" style="${inp}" />
+       <div style="display:flex;gap:8px">
+         <div style="flex:1;min-width:0">
+           <label class="sub">Betrag brutto</label>
+           <input type="number" step="0.01" inputmode="decimal" id="kt-betrag" value="${esc(v.betrag_brutto_eur != null ? v.betrag_brutto_eur : "")}" style="${inp}" />
+         </div>
+         <div style="flex:0 0 96px;min-width:0">
+           <label class="sub">MwSt</label>
+           <select id="kt-mwst" style="${inp}">
+             ${[19, 7, 0].map((s) => `<option value="${s}"${(v.mwst_prozent === s || (v.mwst_prozent == null && s === 19)) ? " selected" : ""}>${s} %</option>`).join("")}
+           </select>
+         </div>
+       </div>
+       <label class="sub">Buchungskategorie</label>
+       <select id="kt-kategorie" style="${inp}">
+         <option value="">— keine —</option>
+         ${kats.map((k) => `<option value="${esc(k)}"${k === v.kategorie ? " selected" : ""}>${esc(k)}</option>`).join("")}
+       </select>
+       <button class="btn-sm" id="kt-save" style="width:100%"${j.kontierbar ? "" : " disabled"}>In Lexware übernehmen</button>
+       <p class="muted" id="kt-status" style="margin:10px 0 0;min-height:18px"></p>
+     </div>`;
+  const btn = document.getElementById("kt-save");
+  const stat = document.getElementById("kt-status");
+  if (!btn) return;
+  btn.addEventListener("click", async () => {
+    const betrag = parseFloat(document.getElementById("kt-betrag").value);
+    const datum = document.getElementById("kt-datum").value;
+    if (!(betrag > 0)) { stat.textContent = "Bitte den Betrag eintragen."; return; }
+    if (!datum) { stat.textContent = "Bitte das Belegdatum eintragen."; return; }
+    btn.disabled = true; stat.textContent = "Übernehme …";
+    const res = await api(`/app/api/belege/${encodeURIComponent(belegId)}/kontieren`, {
+      method: "POST",
+      body: JSON.stringify({
+        haendler: document.getElementById("kt-haendler").value.trim(),
+        datum,
+        betrag_brutto_eur: betrag,
+        mwst_prozent: parseInt(document.getElementById("kt-mwst").value, 10),
+        kategorie: document.getElementById("kt-kategorie").value,
+      }),
+    });
+    const r = res ? await res.json().catch(() => null) : null;
+    if (r && r.ok) {
+      box.innerHTML = `<div class="card"><h2>✓ Beleg gebucht</h2>
+        <p class="muted" style="margin:6px 0 0">Händler, Datum, Betrag und Kategorie stehen in Lexware.</p></div>`;
+    } else {
+      btn.disabled = false;
+      stat.textContent = (r && r.error) || "Konnte nicht übernehmen.";
+    }
+  });
+}
+
 // Ausgaben (Eingangsrechnungen aus Lexware) in ihre Karte nachladen.
 // Fehlschlag ist kein Drama: dann steht dort eine Zeile statt einer Liste,
 // der Rest des Bereichs bleibt benutzbar.
@@ -5324,11 +5405,16 @@ async function showBelegUpload() {
       statusEl.textContent = "";
       const dup = j.duplikat ? `<p class="muted" style="margin:6px 0 0">Dieser Beleg war schon in Lexware.</p>` : "";
       const link = j.lexware_link
-        ? `<a class="btn-sm" href="${esc(j.lexware_link)}" target="_blank" rel="noopener" style="display:block;text-align:center;width:100%;margin-top:4px;text-decoration:none">In Lexware öffnen & verbuchen</a>` : "";
+        ? `<a class="btn-sm btn-ghost" href="${esc(j.lexware_link)}" target="_blank" rel="noopener" style="display:block;text-align:center;width:100%;margin-top:4px;text-decoration:none">In Lexware öffnen</a>` : "";
       resultEl.innerHTML =
-        `<div class="card"><h2>✓ Beleg übergeben</h2>${dup}</div>` + link +
+        `<div class="card"><h2>✓ Beleg übergeben</h2>${dup}</div>` +
+        `<div id="bl-kontierung"></div>` + link +
         `<button class="btn-sm btn-ghost" id="bl-again" style="width:100%;margin-top:8px">Nächsten Beleg</button>`;
       document.getElementById("bl-again").addEventListener("click", showBelegUpload);
+      // Der Beleg liegt jetzt in Lexware. Ab hier ist alles Zugabe: Gemini
+      // liest ihn und schlaegt die Buchung vor. Geht das schief, bleibt es
+      // bei dem, was vorher auch passiert waere.
+      if (j.id && !j.duplikat) zeigeKontierung(j.id);
     } else {
       statusEl.textContent = (j && j.error) || "Upload fehlgeschlagen. Bitte erneut versuchen.";
       upBtn.disabled = false;

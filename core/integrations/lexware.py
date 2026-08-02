@@ -307,6 +307,37 @@ class LexwareProvider(AccountingProvider):
             data = r.json()
         return data if isinstance(data, list) else []
 
+    async def update_voucher(self, voucher_id: UUID, changes: dict) -> dict:
+        """PUT /v1/vouchers/{id} — einen Beleg ergaenzen.
+
+        Lexware verlangt beim Update das VOLLSTAENDIGE Objekt inklusive
+        ``version`` (optimistisches Sperren). Darum wird der Beleg erst
+        gelesen, dann werden die Aenderungen daraufgelegt und das Ganze
+        zurueckgeschickt. Wer nur ein Feld schickt, verliert den Rest.
+        """
+        await self._rate_limit()
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            r = await client.get(
+                f"{LEXWARE_API_BASE}/v1/vouchers/{voucher_id}",
+                headers=self._headers,
+            )
+            self._raise_for_status(r, "update_voucher(read)")
+            aktuell = r.json()
+
+        payload = {**aktuell, **changes}
+        payload["version"] = aktuell.get("version", 0)
+
+        await self._rate_limit()
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            r = await client.put(
+                f"{LEXWARE_API_BASE}/v1/vouchers/{voucher_id}",
+                headers={**self._headers, "Content-Type": "application/json"},
+                json=payload,
+            )
+            self._raise_for_status(r, "update_voucher")
+            logger.info("Lexware update_voucher OK: %s", voucher_id)
+            return r.json() if r.content else {}
+
     # ------------------------------------------------------------------
     # Contacts
     # ------------------------------------------------------------------

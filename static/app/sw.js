@@ -153,7 +153,10 @@
 // v76: Ausgaben-Abschnitt (Eingangsrechnungen aus Lexware — die Seite, die
 // bisher komplett fehlte) und das Zahlungsziel kommt aus Lexware statt aus
 // einer Schaetzung; ist keins hinterlegt, sagt die Anzeige das auch.
-const CACHE = "ga-app-v76";
+// v77: Beleg-Foto wird gelesen — Q schlaegt Haendler, Datum, Betrag,
+// Steuersatz und Buchungskategorie vor (Kategorien aus dem echten
+// Lexware-Konto), alles korrigierbar, gebucht wird erst auf Tipp.
+const CACHE = "ga-app-v77";
 const SHELL = [
   "/app",
   "/app/static/app-beta.css",

@@ -3742,6 +3742,75 @@ async def api_belege_list(
     return JSONResponse({"belege": await _recent_belege(current_tenant_id(request))})
 
 
+@router.post("/belege/{beleg_id}/vorschlag")
+async def api_beleg_vorschlag(
+    beleg_id: str, request: Request,
+    _e=Depends(require_app_user),
+    _c=Depends(require_app_csrf),
+) -> JSONResponse:
+    """Gemini liest den hochgeladenen Beleg und schlaegt die Buchung vor.
+
+    Aendert nichts — weder bei uns noch in Lexware. Der Mensch bekommt den
+    Vorschlag zu sehen und entscheidet.
+    """
+    from core.features.check import is_feature_enabled
+    from core.services import beleg_kontierung
+
+    tid = current_tenant_id(request)
+    if not await is_feature_enabled(tid, "lexware"):
+        return JSONResponse({"ok": False, "error": "Die Buchhaltung ist nicht aktiv."},
+                            status_code=403)
+    try:
+        bid = uuid.UUID(beleg_id)
+    except (ValueError, TypeError):
+        return JSONResponse({"ok": False, "error": "ungueltige id"}, status_code=400)
+    return JSONResponse(await beleg_kontierung.vorschlag(tid, bid))
+
+
+@router.post("/belege/{beleg_id}/kontieren")
+async def api_beleg_kontieren(
+    beleg_id: str, request: Request,
+    _e=Depends(require_app_user),
+    _c=Depends(require_app_csrf),
+) -> JSONResponse:
+    """Schreibt die bestaetigten Buchungsfelder an den Beleg in Lexware.
+
+    Body: haendler, datum (YYYY-MM-DD), betrag_brutto_eur, mwst_prozent,
+    kategorie. Die Werte kommen aus der Bestaetigungs-Karte — dort kann der
+    Nutzer alles korrigieren, was Gemini falsch gelesen hat.
+    """
+    from core.features.check import is_feature_enabled
+    from core.services import beleg_kontierung
+
+    tid = current_tenant_id(request)
+    if not await is_feature_enabled(tid, "lexware"):
+        return JSONResponse({"ok": False, "error": "Die Buchhaltung ist nicht aktiv."},
+                            status_code=403)
+    try:
+        bid = uuid.UUID(beleg_id)
+    except (ValueError, TypeError):
+        return JSONResponse({"ok": False, "error": "ungueltige id"}, status_code=400)
+
+    body = await request.json() if (await request.body()) else {}
+    try:
+        betrag = float(body.get("betrag_brutto_eur") or 0) or None
+    except (TypeError, ValueError):
+        betrag = None
+    try:
+        mwst = int(body.get("mwst_prozent")) if body.get("mwst_prozent") is not None else None
+    except (TypeError, ValueError):
+        mwst = None
+
+    return JSONResponse(await beleg_kontierung.uebernehmen(
+        tid, bid,
+        haendler=(body.get("haendler") or "").strip() or None,
+        datum=(body.get("datum") or "").strip() or None,
+        betrag_brutto_eur=betrag,
+        mwst_prozent=mwst,
+        kategorie=(body.get("kategorie") or "").strip() or None,
+    ))
+
+
 @router.post("/belege/upload")
 async def api_beleg_upload(
     request: Request,
