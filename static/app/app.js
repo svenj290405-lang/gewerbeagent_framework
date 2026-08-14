@@ -196,7 +196,10 @@ function navigate(key, { mode = "push" } = {}) {
   const fn = SCREENS[key];
   App.view.innerHTML = `<div class="loading">Lädt …</div>`;
   fn().catch((e) => {
-    App.view.innerHTML = `<div class="card"><p class="empty">Konnte nicht laden.</p></div>`;
+    // Netz-/Laufzeitfehler beim Rendern eines Screens: nie sang- und klanglos
+    // leer lassen — ein Retry-Button (rendert App.current neu) muss immer da
+    // sein, sonst steckt der Nutzer im Funkloch fest.
+    App.view.innerHTML = errorScreen("Konnte nicht laden. Bist du gerade offline?");
     console.error(e);
   });
 }
@@ -303,6 +306,10 @@ const SCREENS = {
       hasLex ? api("/app/api/buchhaltung") : Promise.resolve(null),
     ]);
     const ak = akRes && akRes.ok ? await akRes.json() : {};
+    // Der Primaer-Call traegt Beratung/Auftraege/Rueckrufe. Faellt er, waere
+    // der Hub still leer ("nichts zu tun") — hier stattdessen ein sichtbarer
+    // Hinweis mit Retry, damit kein offener Rueckruf uebersehen wird.
+    const akFailed = akRes && !akRes.ok;
     const td = termRes && termRes.ok ? await termRes.json() : { termine: [] };
     const ad = anfRes && anfRes.ok ? await anfRes.json() : { items: [] };
     const buch = buchRes && buchRes.ok ? await buchRes.json() : null;
@@ -322,6 +329,14 @@ const SCREENS = {
     // beides steht schon in der eigenen Kachel (dort mit voller Liste).
     parts.push(
       `<h1 style="font-size:22px;margin:4px 4px 14px">Aktionen</h1>`);
+
+    if (akFailed) {
+      parts.push(
+        `<div class="banner" style="background:#fde8e8;border-color:#f5b5b5">
+           Einige Daten konnten gerade nicht geladen werden — die Liste ist evtl. unvollständig.
+           <button class="btn-sm btn-ghost" onclick="navigate(App.current)">Neu laden</button>
+         </div>`);
+    }
 
     parts.push(
       `<details class="card q-briefing" open>
@@ -402,8 +417,9 @@ const SCREENS = {
         count: "Was Kunden ausfüllen", badge: null,
       });
     }
-    // Tiles mit Badge (= Handlungsbedarf) nach oben sortieren
-    tiles.sort((a, b) => (b.badge || 0) - (a.badge || 0));
+    // Feste Reihenfolge — NICHT nach Badge umsortieren. Die Zielgruppe lernt
+    // die Kachel-Position per Muskelgedaechtnis ("Buchhaltung ist da unten");
+    // ein wanderndes Grid zerstoert das. Handlungsbedarf zeigt das Badge.
     parts.push(`<div class="homescreen-grid">`);
     tiles.forEach((t) => {
       const badge = (t.badge && t.badge > 0)
@@ -432,6 +448,7 @@ const SCREENS = {
   async auftraege_page() {
     App.view.innerHTML = `<div class="loading">Lädt …</div>`;
     const res = await api("/app/api/auftraege");
+    if (res && !res.ok) { App.view.innerHTML = errorScreen("Auftraege konnten nicht geladen werden."); return; }
     const d = res && res.ok ? await res.json() : { auftraege: [] };
     const isInhaber = App.me.employee.is_inhaber;
     const list = (d.auftraege || []).map((a) => auftragCard(a, isInhaber)).join("");
@@ -474,6 +491,7 @@ const SCREENS = {
   async auftraege_fertig() {
     App.view.innerHTML = `<div class="loading">Lädt …</div>`;
     const res = await api("/app/api/auftraege/abgeschlossen");
+    if (res && !res.ok) { App.view.innerHTML = errorScreen("Auftraege konnten nicht geladen werden."); return; }
     const d = res && res.ok ? await res.json() : { auftraege: [] };
     const liste = (d.auftraege || []).map((a) => {
       const archiv = a.archiv_url
@@ -504,6 +522,7 @@ const SCREENS = {
   async auftraege_historie() {
     App.view.innerHTML = `<div class="loading">Lädt …</div>`;
     const res = await api("/app/api/auftraege/historie");
+    if (res && !res.ok) { App.view.innerHTML = errorScreen("Historie konnte nicht geladen werden."); return; }
     const d = res && res.ok ? await res.json() : { auftraege: [] };
     const liste = (d.auftraege || []).map((a) => {
       const archiv = a.archiv_url
@@ -600,6 +619,7 @@ const SCREENS = {
     if (!feats.has("lexware")) { navigate("aktuelles", { mode: "replace" }); return; }
     const isInhaber = App.me.employee.is_inhaber;
     const res = await api("/app/api/rechnungen");
+    if (res && !res.ok) { App.view.innerHTML = errorScreen("Rechnungen konnten nicht geladen werden."); return; }
     const d = res && res.ok ? await res.json() : { rechnungen: [] };
     const rechnungen = d.rechnungen || [];
     const btns = isInhaber
@@ -640,6 +660,7 @@ const SCREENS = {
     if (!feats.has("lexware")) { navigate("aktuelles", { mode: "replace" }); return; }
     const isInhaber = App.me.employee.is_inhaber;
     const res = await api("/app/api/angebote");
+    if (res && !res.ok) { App.view.innerHTML = errorScreen("Angebote konnten nicht geladen werden."); return; }
     const d = res && res.ok ? await res.json() : { angebote: [] };
     const angebote = d.angebote || [];
     App.view.innerHTML =
@@ -659,6 +680,7 @@ const SCREENS = {
 
   async rueckrufe_page() {
     const res = await api("/app/api/rueckrufe");
+    if (res && !res.ok) { App.view.innerHTML = errorScreen("Rueckrufe konnten nicht geladen werden."); return; }
     const d = res && res.ok ? await res.json() : { rueckrufe: [] };
     const rueckrufe = d.rueckrufe || [];
     App.view.innerHTML =
@@ -678,6 +700,7 @@ const SCREENS = {
 
   async termine() {
     const [t, a] = await Promise.all([api("/app/api/termine"), api("/app/api/aufnahmen")]);
+    if (t && !t.ok) { App.view.innerHTML = errorScreen("Termine konnten nicht geladen werden."); return; }
     const d = t && t.ok ? await t.json() : { termine: [] };
     const ad = a && a.ok ? await a.json() : { aufnahmen: [] };
     const list = d.termine || [];
@@ -706,6 +729,7 @@ const SCREENS = {
   // haengt inzwischen alles vom Kundentermin (Diktat, Notiz, Fotos, Bilder).
   async gespraeche() {
     const a = await api("/app/api/gespraeche");
+    if (a && !a.ok) { App.view.innerHTML = errorScreen("Gespraeche konnten nicht geladen werden."); return; }
     const ad = a && a.ok ? await a.json() : { gespraeche: [] };
     const liste = ad.gespraeche || [];
     App.view.innerHTML =
@@ -924,6 +948,7 @@ const SCREENS = {
 
   async team() {
     const res = await api("/app/api/team");
+    if (res && !res.ok) { App.view.innerHTML = errorScreen("Team konnte nicht geladen werden."); return; }
     const d = res && res.ok ? await res.json() : { team: [] };
     const isInhaber = App.me.employee.is_inhaber;
     const cards = (d.team || []).map((e) => {
@@ -1046,6 +1071,7 @@ const SCREENS = {
 
   async anfragen() {
     const res = await api("/app/api/anfragen");
+    if (res && !res.ok) { App.view.innerHTML = errorScreen("Anfragen konnten nicht geladen werden."); return; }
     const d = res && res.ok ? await res.json() : { items: [] };
     const items = d.items || [];
     // Aufteilung: offene oben, erledigte unten (collapsed). Erledigte-
@@ -1088,6 +1114,7 @@ const SCREENS = {
 
   async wissen() {
     const res = await api("/app/api/wissen");
+    if (res && !res.ok) { App.view.innerHTML = errorScreen("Wissen konnte nicht geladen werden."); return; }
     const d = res && res.ok ? await res.json() : { eintraege: [], kategorien: [] };
     const isInhaber = App.me.employee.is_inhaber;
     // nach Kategorie gruppieren
@@ -3762,6 +3789,16 @@ function rowTap(a, b, c, id) {
     `<span class="sub">${esc(c)} ›</span></button>`;
 }
 function emptyRow(txt) { return `<div class="empty">${esc(txt)}</div>`; }
+// Echter Fehlerzustand — klar unterscheidbar von "nichts zu tun". Wichtig,
+// weil ein verschluckter Server-/Netzfehler sonst wie eine leere Liste
+// aussieht ("Keine offenen Rueckrufe") und der Nutzer echte Arbeit uebersieht.
+// Retry rendert den aktuellen Screen neu (App.current haelt den Schluessel).
+function errorScreen(txt) {
+  return `<div class="card" style="text-align:center">
+    <p class="empty">${esc(txt || "Konnte gerade nicht laden.")}</p>
+    <button class="btn" onclick="navigate(App.current)" style="margin-top:8px">Erneut versuchen</button>
+  </div>`;
+}
 
 // =================== Angebot / Rechnung Composer ===================
 //
