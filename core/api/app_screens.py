@@ -4742,8 +4742,12 @@ async def api_oauth_start(
     tenant = request.state.app_tenant
     emp = request.state.app_employee
     try:
+        # allow_rebind=True: dieser Pfad ist per require_app_inhaber
+        # authentifiziert — der Inhaber darf auch auf ein anderes Konto
+        # umstellen. Der oeffentliche GET-Einstieg darf das nicht.
         auth_url = await generate_auth_url(
             tenant_slug=tenant.slug, provider=provider, employee_slug=emp.slug,
+            allow_rebind=True,
         )
     except Exception:
         # Kein str(e) ans Frontend — interne Details nicht leaken.

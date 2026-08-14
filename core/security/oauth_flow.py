@@ -106,14 +106,38 @@ def _get_redirect_uri() -> str:
     return f"{settings.public_url.rstrip('/')}/oauth/callback"
 
 
+# State-Praefix kodiert, ob dieser Flow eine bestehende, bereits verbundene
+# Kalender-/Mail-Anbindung auf ein ANDERES Konto umbiegen darf. Nur der
+# authentifizierte PWA-Pfad (require_app_inhaber) setzt "r"; der oeffentliche
+# GET /oauth/start (Telegram-Deeplinks, Reauth-Mails) bleibt "n" und kann so
+# eine verbundene Anbindung nicht fremduebernehmen (Confused-Deputy-Schutz).
+_STATE_PREFIX_REBIND = "r"
+_STATE_PREFIX_NORMAL = "n"
+
+
+def _make_state(allow_rebind: bool) -> str:
+    """Neuen State-Token mit Rebind-Recht-Praefix erzeugen."""
+    prefix = _STATE_PREFIX_REBIND if allow_rebind else _STATE_PREFIX_NORMAL
+    return prefix + secrets.token_urlsafe(32)
+
+
+def _state_allows_rebind(state: str) -> bool:
+    """Liest aus dem State-Praefix, ob Konto-Umbiegen erlaubt ist.
+
+    Fail-closed: unbekanntes/fehlendes Praefix -> kein Rebind.
+    """
+    return bool(state) and state[0] == _STATE_PREFIX_REBIND
+
+
 async def _generate_auth_url_microsoft(
     tenant_slug: str, employee_slug: str | None = None,
+    allow_rebind: bool = False,
 ) -> str:
     """Microsoft-OAuth-Autorisierungs-URL mit PKCE."""
     from urllib.parse import urlencode
 
     cfg = await _load_microsoft_config()
-    state = secrets.token_urlsafe(32)
+    state = _make_state(allow_rebind)
     code_verifier, code_challenge = _generate_pkce_pair()
 
     redirect_uri = cfg.get("redirect_uri") or _get_redirect_uri()
@@ -156,15 +180,24 @@ async def _generate_auth_url_microsoft(
 async def generate_auth_url(
     tenant_slug: str, provider: str = "google",
     employee_slug: str | None = None,
+    allow_rebind: bool = False,
 ) -> str:
     """Erzeugt OAuth-Autorisierungs-URL und persistiert State in DB.
 
     Phase 1 Multi-OAuth: optional employee_slug — wird im OAuth-State
     gespeichert damit der Callback weiss FUER WEN der Token abgelegt
     werden soll.
+
+    allow_rebind: Nur True aus dem authentifizierten PWA-Pfad. Erlaubt dem
+    Callback, eine bereits verbundene Anbindung auf ein ANDERES Konto
+    umzubiegen. Der oeffentliche GET-Einstieg laesst es auf False, damit
+    niemand ueber einen geratenen Tenant-Slug eine fremde Kalender-/Mail-
+    Anbindung auf sein eigenes Konto uebernehmen kann.
     """
     if provider == "microsoft":
-        return await _generate_auth_url_microsoft(tenant_slug, employee_slug)
+        return await _generate_auth_url_microsoft(
+            tenant_slug, employee_slug, allow_rebind=allow_rebind,
+        )
     if provider != "google":
         raise NotImplementedError(f"Provider {provider} noch nicht unterstuetzt")
 
@@ -182,7 +215,7 @@ async def generate_auth_url(
     code_verifier, _ = _generate_pkce_pair()
     flow.code_verifier = code_verifier
 
-    state = secrets.token_urlsafe(32)
+    state = _make_state(allow_rebind)
     auth_url, _ = flow.authorization_url(
         access_type="offline",
         include_granted_scopes="true",
@@ -242,6 +275,46 @@ async def _resolve_employee_id(
 
     emp = await get_default_employee(tenant_id)
     return emp.id if emp else None
+
+
+class OAuthRebindRejected(Exception):
+    """Callback wollte eine bereits verbundene Anbindung auf ein anderes
+    Konto umbiegen, ohne dazu berechtigt zu sein (Hijack-Schutz)."""
+
+
+def _reject_hijack(
+    oauth_token: OAuthToken,
+    new_email: str,
+    *,
+    allow_rebind: bool,
+    tenant_slug: str,
+    provider: str,
+) -> None:
+    """Verhindert, dass ein oeffentlich gestarteter OAuth-Flow eine bereits
+    verbundene Anbindung auf ein anderes Konto umbiegt.
+
+    Erlaubt bleibt: Erst-Verbindung (noch kein refresh_token) und Reauth
+    desselben Kontos (gleiche account_email). Abgelehnt wird nur der Wechsel
+    auf ein ANDERES Konto ueber einen nicht dazu berechtigten (oeffentlichen)
+    Flow. Der authentifizierte PWA-Pfad setzt allow_rebind=True und darf das.
+    """
+    if allow_rebind:
+        return
+    existing_email = (oauth_token.account_email or "").strip().casefold()
+    already_connected = bool((oauth_token.refresh_token or "").strip())
+    if not already_connected or not existing_email:
+        return  # Erst-Verbindung — unkritisch
+    if existing_email == (new_email or "").strip().casefold():
+        return  # Reauth desselben Kontos — ok
+    logger.warning(
+        "OAuth-Hijack abgewehrt: tenant=%s provider=%s verbunden=%s "
+        "Callback-Konto=%s (oeffentlicher Flow ohne Rebind-Recht)",
+        tenant_slug, provider, oauth_token.account_email, new_email,
+    )
+    raise OAuthRebindRejected(
+        "Diese Anbindung ist bereits mit einem anderen Konto verbunden. "
+        "Ein Wechsel ist nur in der App unter Einstellungen moeglich."
+    )
 
 
 async def _upsert_oauth_token(
@@ -359,6 +432,11 @@ async def _handle_callback_microsoft(
             tenant_id=tenant.id,
             employee_id=employee_id,
             provider="microsoft",
+        )
+        _reject_hijack(
+            oauth_token, account_email,
+            allow_rebind=_state_allows_rebind(state),
+            tenant_slug=tenant_slug, provider="microsoft",
         )
 
         oauth_token.refresh_token = refresh_token
@@ -499,6 +577,11 @@ async def handle_callback(code: str, state: str) -> OAuthToken:
             tenant_id=tenant.id,
             employee_id=employee_id,
             provider=provider,
+        )
+        _reject_hijack(
+            oauth_token, account_email,
+            allow_rebind=_state_allows_rebind(state),
+            tenant_slug=tenant_slug, provider=provider,
         )
 
         oauth_token.refresh_token = creds.refresh_token or ""
