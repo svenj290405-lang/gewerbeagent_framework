@@ -149,11 +149,18 @@ async def lifespan(app: FastAPI):
     logger.info("Framework faehrt runter.")
 
 
+# In Produktion die interaktive API-Doku abschalten: /docs, /redoc und
+# /openapi.json sind sonst oeffentlich und geben Angreifern die komplette
+# Endpunkt-Landkarte (~120 Routen). Im Dev bleiben sie an.
+_docs_enabled = not settings.is_production
 app = FastAPI(
     title="Gewerbeagent Framework",
     description="Multi-Tenant SaaS fuer Handwerksbetriebe",
     version="0.1.0",
     lifespan=lifespan,
+    docs_url="/docs" if _docs_enabled else None,
+    redoc_url="/redoc" if _docs_enabled else None,
+    openapi_url="/openapi.json" if _docs_enabled else None,
 )
 
 
