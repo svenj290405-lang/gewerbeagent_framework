@@ -475,6 +475,26 @@ async def poll_microsoft_inbox(
                     f"poll: conv-lookup fehlgeschlagen sender={sender_email}: {e}"
                 )
 
+        # Angebots-Antwort erkennen: gehoert die Mail zu einem versandten
+        # Angebot (deterministisch ueber die conversationId), klassifiziert Q
+        # Zusage/Absage und handelt gemaess Automatisierungsgrad. Der teure
+        # Gemini-Call passiert NUR, wenn der billige DB-Lookup im Service ein
+        # offenes Angebot auf genau diesem Thread findet. Voll fail-safe — der
+        # Service schluckt jeden Fehler und gibt None zurueck.
+        if not spam_throttled and msg.get("conversationId"):
+            try:
+                from core.services.angebot_reply import (
+                    detect_and_handle_angebot_reply,
+                )
+                await detect_and_handle_angebot_reply(
+                    tenant_id=tenant_id,
+                    conversation_id=msg.get("conversationId"),
+                    mail_subject=subject,
+                    mail_body=body_preview_for_ai,
+                )
+            except Exception as e:
+                logger.warning(f"poll: angebot-antwort-check fehlgeschlagen: {e}")
+
         # Auto-Verarbeitung NUR bei RELEVANT_KUNDE und nicht throttled.
         # Confidence-Gate: bei "low" eskalieren statt blind auto-antworten,
         # damit Q nicht auf falsch verstandene Mails halluziniert.

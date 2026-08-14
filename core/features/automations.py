@@ -225,6 +225,27 @@ AUTOMATIONS: dict[str, Automation] = {
         ),
         group=_GRUPPE_HINTERGRUND,
     ),
+    "angebot_antwort": Automation(
+        key="angebot_antwort",
+        label="Angebots-Antworten erkennen",
+        description=(
+            "Q liest die Kundenantwort auf ein versandtes Angebot und erkennt "
+            "Zusage oder Absage. Assistiert: Q schlägt dir vor, den Auftrag zu "
+            "starten. Automatisch: Q setzt den Status direkt."
+        ),
+        feature="lexware",
+        # Alle drei Stufen moeglich: anders als beim Mail-Auto-Antworten wird
+        # hier NICHTS an den Kunden gesendet — assistiert heisst nur „Q meldet
+        # dir den Vorschlag", die Freigabe ist der bestehende Status-Schalter
+        # in der Auftrags-Ansicht. Darum braucht es keine Entwurfs-Schlange.
+        allowed_modes=ALL_MODES,
+        default_mode=MODE_ASSISTIERT,
+        manuell_hint=(
+            "Ob ein Kunde zugesagt hat, liest du selbst — ich fasse dir die "
+            "Mail nur zusammen."
+        ),
+        group=_GRUPPE_HINTERGRUND,
+    ),
     "mail_auto_antwort": Automation(
         key="mail_auto_antwort",
         label="Eingehende Mails beantworten",
