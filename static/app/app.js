@@ -318,14 +318,10 @@ const SCREENS = {
     const rechnungen = rechd.rechnungen || [];
     const parts = [];
 
+    // Kopf ohne Schnellstart-Knöpfe: „Gespräch" und „Rückruf" waren doppelt —
+    // beides steht schon in der eigenen Kachel (dort mit voller Liste).
     parts.push(
-      `<div style="display:flex;align-items:center;justify-content:space-between;margin:4px 4px 14px">
-         <h1 style="font-size:22px;margin:0">Aktionen</h1>
-         <div style="display:flex;gap:6px">
-           <button class="btn-sm" id="ak-diktat" style="padding:8px 12px">🎤 Gespräch</button>
-           <button class="btn-sm btn-ghost" id="ak-rueckruf" style="padding:8px 12px">+ Rückruf</button>
-         </div>
-       </div>`);
+      `<h1 style="font-size:22px;margin:4px 4px 14px">Aktionen</h1>`);
 
     parts.push(
       `<details class="card q-briefing" open>
@@ -417,8 +413,6 @@ const SCREENS = {
     App.view.innerHTML = parts.join("");
     const inline = document.getElementById("enable-notif-inline");
     if (inline) inline.addEventListener("click", enablePush);
-    document.getElementById("ak-diktat").addEventListener("click", () => navigate("gespraech_neu"));
-    document.getElementById("ak-rueckruf").addEventListener("click", showNewRueckrufForm);
     const briefRefresh = document.getElementById("ak-briefing-refresh");
     if (briefRefresh) briefRefresh.addEventListener("click", () => loadBriefing(true));
     loadBriefing(false);
