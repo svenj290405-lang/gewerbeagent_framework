@@ -2430,7 +2430,12 @@ const SCREENS = {
         App.qWorking = false;
         const miniSphHide = document.getElementById("q-mini-sphere");
         if (miniSphHide) miniSphHide.hidden = true;
-        chatEl.innerHTML = `<div class="q-hero">${sphereWrap}<p class="q-sphere-hint" id="q-sphere-hint">${SPRECH_TITEL}</p></div>`;
+        // Vorschlags-Chips: machen die haeufigsten ERSTELLEN-Funktionen sichtbar.
+        // Ohne sie sind "Termin eintragen", "E-Mail schreiben" usw. nur ueber
+        // das unbeschriftete ⚡-Menue erreichbar — fuer die Zielgruppe unauffindbar.
+        // Ein Tipp befuellt das Eingabefeld (senden entscheidet der Nutzer).
+        const chips = qSuggestChips();
+        chatEl.innerHTML = `<div class="q-hero">${sphereWrap}<p class="q-sphere-hint" id="q-sphere-hint">${SPRECH_TITEL}</p>${chips}</div>`;
         mountQSphere();
         // Laeuft gerade eine Aufnahme, muss der frisch gebaute Globus wieder
         // in den Aufnahme-Zustand (Klasse + Hinweistext gingen sonst verloren).
@@ -3437,7 +3442,7 @@ const SCREENS = {
         steps.push(() => obSay("Zum Schluss: Aktiviere Benachrichtigungen, damit du neue Anfragen und Rückrufe sofort mitbekommst.", () => obCard("push")));
       }
 
-      steps.push(() => { obDone(); obSay("Fertig — du bist startklar! 🎉 Frag mich einfach, was du brauchst: tippe es ein oder <b>tippe den Globus an</b> und sprich es mir — noch ein Tipp schickt die Aufnahme ab.", null); });
+      steps.push(() => { obDone(); obSay("Fertig — du bist startklar! 🎉 Frag mich einfach, was du brauchst: tippe es ein oder <b>tippe den Globus an</b> und sprich es mir — noch ein Tipp schickt die Aufnahme ab. Über das <b>✨-Symbol</b> links neben dem Eingabefeld findest du fertige Funktionen wie Termin eintragen, E-Mail schreiben oder etwas merken.", null); });
 
       let idx = 0;
       obNext = () => { if (idx < steps.length) { const fn = steps[idx++]; fn(obNext); } };
@@ -3798,6 +3803,35 @@ function errorScreen(txt) {
     <p class="empty">${esc(txt || "Konnte gerade nicht laden.")}</p>
     <button class="btn" onclick="navigate(App.current)" style="margin-top:8px">Erneut versuchen</button>
   </div>`;
+}
+
+// Vorschlags-Chips fuer den leeren Q-Chat. Machen die haeufigsten ERSTELLEN-
+// Funktionen sichtbar, die sonst nur im unbeschrifteten ⚡-Menue stecken.
+const Q_CHIPS = [
+  { need: "kalender",   ico: "📅", label: "Termin eintragen",  seed: "Trag einen Termin ein: " },
+  { need: "mail_intake", ico: "✉️", label: "E-Mail schreiben",  seed: "Schreib eine E-Mail an " },
+  { need: "lexware",    ico: "🧾", label: "Angebot erstellen", seed: "Erstell ein Angebot für " },
+  { need: null,          ico: "💡", label: "Etwas merken",      seed: "Merk dir: " },
+];
+function qSuggestChips() {
+  const feats = new Set((App.me && App.me.features) || []);
+  const avail = Q_CHIPS.filter((c) => !c.need || feats.has(c.need));
+  if (!avail.length) return "";
+  return `<div class="q-chips" style="display:flex;flex-wrap:wrap;gap:8px;justify-content:center;margin-top:20px;padding:0 12px">` +
+    avail.map((c) =>
+      `<button class="btn-sm btn-ghost" onclick="qSuggest(${Q_CHIPS.indexOf(c)})">${c.ico} ${esc(c.label)}</button>`
+    ).join("") + `</div>`;
+}
+// Chip-Tap: Eingabefeld vorbefuellen (Absenden entscheidet der Nutzer). Das
+// input-Event triggert die Auto-Resize-Logik des Composers.
+function qSuggest(i) {
+  const c = Q_CHIPS[i];
+  const inp = document.getElementById("q-input");
+  if (!c || !inp) return;
+  inp.value = c.seed;
+  inp.focus();
+  inp.setSelectionRange(inp.value.length, inp.value.length);
+  inp.dispatchEvent(new Event("input", { bubbles: true }));
 }
 
 // =================== Angebot / Rechnung Composer ===================
@@ -6739,7 +6773,13 @@ function toggleQOverlay(forceClose) {
   // Overlay bleibt zu. App.current reicht als Kriterium nicht: showKundenProfil()
   // rendert z.B. das Profil in die View, ohne App.current zu aendern, und dann
   // muss Q per Overlay erreichbar sein.
-  if (!forceClose && document.getElementById("q-chat")) return;
+  // Statt stillem No-Op (fuehlt sich an wie "App kaputt") das Eingabefeld
+  // fokussieren — sichtbares Feedback, dass Q genau hier schon bereit ist.
+  if (!forceClose && document.getElementById("q-chat")) {
+    const inp = document.getElementById("q-input");
+    if (inp) { inp.focus(); inp.scrollIntoView({ block: "center", behavior: "smooth" }); }
+    return;
+  }
   // Archiv-Bild offen: Bild in den Assistent laden statt Overlay öffnen,
   // damit Q mit vollem Bildkontext antworten kann.
   if (!forceClose && App._archivPreviewFile) {
