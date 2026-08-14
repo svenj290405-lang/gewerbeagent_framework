@@ -1703,6 +1703,12 @@ const SCREENS = {
       if (!m.available) { mSub = "Nicht verfügbar — bitte Support kontaktieren"; mBtns = ""; }
       else if (m.connected) {
         mSub = `✓ ${esc(m.account || "verbunden")}`;
+        // Freemail-Postfach: Mails an neue Kunden landen damit oft im
+        // Spam-Ordner — und zwar lautlos, es kommt keine Fehlermeldung
+        // zurück. Lieber hier einmal warnen als später rätseln.
+        if (m.freemail) {
+          mSub += `<div style="margin-top:6px;padding:8px 10px;border-radius:8px;background:rgba(255,149,0,.12);font-size:12px;line-height:1.45">⚠️ Privates Freemail-Postfach. Mails an <b>neue</b> Kunden (Angebote, Rechnungen) landen damit häufig im Spam — ohne Fehlermeldung. Für den Echtbetrieb ein Postfach auf der <b>eigenen Domain</b> verbinden.</div>`;
+        }
         mBtns = `<button class="btn-sm btn-ghost" data-oauth="microsoft">Neu verbinden</button><button class="btn-sm btn-ghost" data-trennen="microsoft">Trennen</button><button class="btn-sm btn-ghost" data-test="microsoft">Test-Mail</button>`;
       } else {
         mSub = "Outlook-Postfach & Kalender verbinden";
@@ -2591,8 +2597,35 @@ const SCREENS = {
     // Ein Bild-Turn: Bild + (optionaler) Text an Q. Q entscheidet, was zu tun
     // ist. Bei einer Rückfrage bleibt das Bild angehängt, damit die Antwort
     // des Nutzers ("bei Müller ablegen") im selben Kontext weiterläuft.
+    // Wonach der Handwerker fragt, wenn er nachkaufen will bzw. wenn er das
+    // Dokument sucht. Reicht für die Modus-Wahl — die teure Entscheidung
+    // trifft ohnehin die Suche selbst.
+    const KAUF_WORTE = /(kauf|bestell|besorg|shop|angebot|anbieter|wo bekomm|wo krieg|wo gibt|wo kann ich|preis|kostet|ersatz|liefer|händler|haendler|bezugsquelle|artikelnummer)/i;
+    const ANLEITUNG_WORTE = /(anleitung|handbuch|manual|bedienungs|montage|installations|datenblatt|doku|pdf|betriebsanleitung|wartungsanleitung)/i;
+
+    // Ein getippter Text nach dem Foto ist fast immer eine der drei Fragen.
+    // Die Anleitung sticht den Kauf: „Anleitung zum Ersatzteil" will das
+    // Dokument, nicht den Händler.
+    function modusAusText(text) {
+      const t = text || "";
+      if (ANLEITUNG_WORTE.test(t)) return "anleitung";
+      if (KAUF_WORTE.test(t)) return "kaufen";
+      return "doku";
+    }
+
     async function sendImageTurn(text, file) {
       App.qImgChat = App.qImgChat || [];
+
+      // Ist die Objekt-Suche an, wird JEDES Bild zuerst gesucht — ohne
+      // Umweg über die Absichts-Erkennung. Das spart eine ganze Gemini-Runde
+      // (spürbar schneller) und beendet die Rückfrage „Was soll ich mit dem
+      // Bild machen?". Beleg, Archiv und Visualisierung hängen danach als
+      // Knöpfe unter der Antwort.
+      const feats = new Set(App.me.features || []);
+      if (feats.has("objekt_suche")) {
+        await doObjekt(file, text, modusAusText(text));
+        return;
+      }
       // hist = bisheriger Verlauf OHNE den aktuellen Turn — der aktuelle Text
       // geht als ?text= mit und wird serverseitig als finaler Bild-Turn
       // angehängt; sonst stünde er doppelt im Kontext und verwirrt die Runde.
@@ -2846,18 +2879,24 @@ const SCREENS = {
     // Objekt erkennen / Bezugsquelle suchen. Q liest das Foto, schlägt im
     // Netz nach und antwortet mit Quellen — die stehen darunter als echte
     // Links, damit der Handwerker die Anleitung selbst aufmachen kann.
+    const OBJEKT_MODI = { doku: "Was ist das?", anleitung: "Gibt es dazu eine Anleitung?",
+                          kaufen: "Wo bekomme ich das?" };
+
     async function doObjekt(file, frage, modus) {
+      // Unbekannter Modus → „was ist das". Der Server kennt dieselben drei;
+      // ein Tippfehler landet sonst still in der falschen Suche.
+      if (!OBJEKT_MODI[modus]) modus = "doku";
       const kaufen = modus === "kaufen";
       App.qImgChat = App.qImgChat || [];
       let bubbleUrl = null;
       try { bubbleUrl = URL.createObjectURL(file); } catch (_) {}
-      push({ role: "me", text: frage || (kaufen ? "Wo bekomme ich das?" : "Was ist das?"),
+      push({ role: "me", text: frage || OBJEKT_MODI[modus],
              previewUrl: bubbleUrl, fileName: file.name });
       push({ role: "typing" });
       const hist = encodeURIComponent(JSON.stringify(
         App.qImgChat.slice(-6).map((t) => ({ role: t.role, text: (t.text || "").slice(0, 500) }))));
       const url = "/app/api/objekt/frage?frage=" + encodeURIComponent(frage || "") +
-        "&modus=" + (kaufen ? "kaufen" : "doku") + "&hist=" + hist;
+        "&modus=" + modus + "&hist=" + hist;
       let res, j = null;
       try {
         res = await fetch(url, { method: "POST",
@@ -2868,13 +2907,18 @@ const SCREENS = {
       popTyping();
       if (!j || !j.ok) {
         push({ role: "err", text: (j && j.error) || "Konnte nichts dazu finden." });
+        // Gerade wenn die Suche nichts findet, war es oft gar kein Gerät —
+        // eine Quittung zum Beispiel. Dann braucht es die anderen Wege erst
+        // recht, sonst ist der Nutzer in der Sackgasse.
+        folgeAktionen(file, modus);
         return;
       }
       const quellen = j.quellen || [];
       let html = linkify(esc(j.text || "")).replace(/\n/g, "<br>");
       if (quellen.length) {
         html += `<div style="margin-top:10px;border-top:1px solid var(--line);padding-top:8px">` +
-          `<div class="sub" style="margin-bottom:4px">${kaufen ? "Bezugsquellen" : "Quellen"}</div>` +
+          `<div class="sub" style="margin-bottom:4px">${
+             kaufen ? "Bezugsquellen" : modus === "anleitung" ? "Dokumente" : "Quellen"}</div>` +
           quellen.map((q) =>
             `<div style="margin:3px 0"><a href="${esc(q.url)}" target="_blank" rel="noopener noreferrer">` +
             `${esc(q.domain || q.titel)} ↗</a></div>`).join("") + `</div>`;
@@ -2885,6 +2929,93 @@ const SCREENS = {
       // Beim Nachkaufen: den Fund direkt in den Material-Katalog übernehmen,
       // dann ist es beim nächsten Mal ein Knopfdruck statt einer neuen Suche.
       if (kaufen && quellen.length) merkenAnbieten(j.text || "", quellen);
+      folgeAktionen(file, modus);
+    }
+
+    // Wie es nach der Antwort weitergeht. Zwei Gruppen, und die Reihenfolge
+    // ist Absicht: oben die beiden Fragen, die der Handwerker am Gerät
+    // wirklich als Nächstes hat — „gibt es dazu eine Anleitung?" und „wo
+    // kriege ich das?". Darunter erst das, was mit dem Foto als Datei
+    // passiert (buchen, ablegen, visualisieren).
+    //
+    // Der jeweils laufende Modus wird weggelassen: nach der Kauf-Antwort
+    // nochmal „Angebot" anzubieten, wäre nur ein Knopf für dieselbe Antwort.
+    function folgeAktionen(file, modus) {
+      const feats = new Set(App.me.features || []);
+
+      const suche = [];
+      if (modus !== "anleitung") suche.push(["📄 Anleitung suchen", "anleitung"]);
+      if (modus !== "kaufen") suche.push(["🛒 Angebot aus dem Shop", "kaufen"]);
+
+      const datei = [];
+      if (feats.has("lexware")) datei.push(["Als Beleg buchen", "beleg"]);
+      if (feats.has("drive_archiv")) datei.push(["Bei Kunde ablegen", "archiv"]);
+      if (feats.has("visualisierung")) datei.push(["Visualisieren", "viz"]);
+
+      if (!suche.length && !datei.length) return;
+
+      const reihe = (knoepfe, klasse) =>
+        `<div style="display:flex;flex-wrap:wrap;gap:6px">` +
+        knoepfe.map(([label, was]) =>
+          `<button class="btn-sm ${klasse}" data-akt="${was}">${esc(label)}</button>`).join("") +
+        `</div>`;
+
+      const id = "akt" + Date.now();
+      push({ role: "q", html: true, text:
+        `<div id="${id}">
+           ${suche.length ? reihe(suche, "btn-ghost") : ""}
+           ${datei.length ? `<div class="sub" style="margin:8px 0 6px">Oder mit dem Foto:</div>` +
+             reihe(datei, "btn-ghost") : ""}
+         </div>` });
+      setTimeout(() => {
+        const box = document.getElementById(id);
+        if (!box) return;
+        box.querySelectorAll("[data-akt]").forEach((b) => {
+          b.addEventListener("click", () => {
+            const was = b.getAttribute("data-akt");
+            // Anleitung und Kauf sind dieselbe Bild-Schleife nochmal — das
+            // Bild bleibt angehängt, damit die nächste Rückfrage weiter im
+            // selben Gegenstand steht. Deshalb hier KEIN clearPending().
+            if (was === "anleitung" || was === "kaufen") {
+              box.remove();
+              doObjekt(file, was === "anleitung"
+                ? "Gibt es dazu eine Anleitung?"
+                : "Wo bekomme ich genau das, und was kostet es?", was);
+              return;
+            }
+            // Der Beleg braucht nichts weiter — die anderen beiden schon,
+            // und ohne die Angabe landet sonst Müll im Archiv.
+            if (was === "beleg") { box.remove(); clearPending(); doUploadBeleg(file); return; }
+            if (was === "archiv") {
+              nachfrage(box, "Bei welchem Kunden ablegen?", "Name des Kunden",
+                (wert) => { clearPending(); doArchiv(file, wert); });
+            } else if (was === "viz") {
+              nachfrage(box, "Was soll ich am Foto ändern?", "z. B. Wände in warmem Grau",
+                (wert) => { clearPending(); doVisualisieren(file, wert); });
+            }
+          });
+        });
+      }, 0);
+    }
+
+    // Eine Zeile nachfragen, bevor die Aktion läuft. Ersetzt den Inhalt der
+    // Knopfleiste, damit der Chat nicht immer länger wird.
+    function nachfrage(box, label, platzhalter, weiter) {
+      box.innerHTML =
+        `<div class="sub" style="margin-bottom:6px">${esc(label)}</div>
+         <input type="text" data-nf="wert" placeholder="${esc(platzhalter)}"
+                style="width:100%;padding:10px;border:1px solid var(--line);border-radius:9px;margin-bottom:6px;font-size:15px;min-width:0" />
+         <button class="btn-sm btn-ghost" data-nf="ok" style="width:100%">Weiter</button>`;
+      const feld = box.querySelector('[data-nf="wert"]');
+      const los = () => {
+        const wert = (feld.value || "").trim();
+        if (wert.length < 2) { feld.focus(); return; }
+        box.remove();
+        weiter(wert);
+      };
+      box.querySelector('[data-nf="ok"]').addEventListener("click", los);
+      feld.addEventListener("keydown", (e) => { if (e.key === "Enter") los(); });
+      feld.focus();
     }
 
     // Kleines Formular unter der Kauf-Antwort: Name + Quelle wählen → landet

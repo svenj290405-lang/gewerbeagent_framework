@@ -4680,11 +4680,22 @@ async def _verbindungen_status(tid: uuid.UUID, employee_id: uuid.UUID) -> dict:
     }
 
     # Microsoft / Outlook — eigener Token
+    #
+    # freemail: das verbundene Postfach liegt auf einer geteilten
+    # Freemail-Domain (@outlook.de, @gmx.de …). Dann signiert DKIM auf die
+    # Domain des Anbieters statt auf die des Betriebs — es gibt keine
+    # eigene Reputation, und Erstkontakt-Mails (ein Angebot an eine neue
+    # Adresse) landen ueberdurchschnittlich oft im Spam-Ordner. Und zwar
+    # ohne Bounce: ohne diese Warnung wuerde es schlicht niemand merken.
+    from core.utils.mail_absender import ist_freemail_adresse
+
     m = await find_oauth_token(tid, "microsoft", employee_id)
+    m_account = getattr(m, "account_email", None) if m else None
     microsoft = {
         "connected": m is not None,
-        "account": getattr(m, "account_email", None) if m else None,
+        "account": m_account,
         "available": await _microsoft_oauth_available(),
+        "freemail": ist_freemail_adresse(m_account),
     }
 
     # Lexware — API-Key in ToolConfig (kein OAuth)
@@ -5498,8 +5509,14 @@ async def api_objekt_frage(
 
     Body: rohe Bild-Bytes, Content-Type = MIME.
     Query: ``?frage=`` (was der Handwerker wissen will),
-           ``?modus=kaufen`` fuer Bezugsquellen statt Doku,
+           ``?modus=`` — ``doku`` (Standard: was ist das), ``anleitung``
+           (Hersteller-Dokument suchen), ``kaufen`` (Bezugsquellen),
            ``?hist=`` (JSON [{role,text}]) fuer Rueckfragen zum selben Bild.
+
+    Die drei Modi sind derselbe Gegenstand aus drei Blickwinkeln — der
+    Handwerker beginnt mit ``doku`` („was ist das?") und geht von dort per
+    Knopf weiter. Deshalb traegt ``hist`` den Verlauf mit: die Anleitungs-
+    Suche weiss dann schon, welches Geraet bestimmt wurde.
 
     Gemini bekommt hier die Google-Suche als Werkzeug (Grounding, Vertex
     europe-west3). Das Bild bleibt in Frankfurt; nach draussen gehen nur die
@@ -5509,7 +5526,7 @@ async def api_objekt_frage(
     """
     import json
 
-    from core.ai.gemini import objekt_erkennen, objekt_kaufen
+    from core.ai.gemini import objekt_anleitung, objekt_erkennen, objekt_kaufen
     from core.features.check import is_feature_enabled
     from core.models.tenant import Tenant
 
@@ -5549,6 +5566,9 @@ async def api_objekt_frage(
 
     if modus == "kaufen":
         ergebnis = await objekt_kaufen(
+            image_bytes, mime, frage, tenant_id=str(tid), verlauf=verlauf)
+    elif modus == "anleitung":
+        ergebnis = await objekt_anleitung(
             image_bytes, mime, frage, tenant_id=str(tid), verlauf=verlauf)
     else:
         ergebnis = await objekt_erkennen(
@@ -5630,6 +5650,8 @@ async def api_assistent_mit_bild(
       { "type": "action", "action": "visualisieren", "beschreibung": ... }
       { "type": "action", "action": "archiv", "kunde_name": ... }
       { "type": "action", "action": "beleg" }
+      { "type": "action", "action": "objekt_frage", "frage": ... }
+      { "type": "action", "action": "objekt_kaufen", "beschreibung": ... }
     """
     import json
 

@@ -161,7 +161,26 @@
 // v79: Objekt erkennen — Foto vom Geraet/Typenschild/Bauteil, Q bestimmt das
 // Modell, schlaegt in der Hersteller-Doku nach (Google-Suche als Werkzeug) und
 // antwortet mit Quellen; im Kauf-Modus mit Bezugsquellen + "als Material merken".
-const CACHE = "ga-app-v79";
+// v80: jedes Foto geht direkt in die Objekt-Suche statt vorher zu fragen, was
+// damit passieren soll. Davor laeuft die Umkehr-Bildsuche (Cloud Vision ueber
+// den EU-Endpunkt), die das Teil AM BILD wiedererkennt statt am abgelesenen
+// Typenschild — damit hat auch ein unbeschriftetes Bauteil eine Chance. Beleg,
+// Kundenarchiv und Visualisierung haengen als Knoepfe unter der Antwort.
+// v81: nach der Objekt-Antwort geht es weiter — „Anleitung suchen" (eigener
+// Modus, der die Hersteller-Anleitung sucht statt zu erklaeren) und „Angebot
+// aus dem Shop" stehen als Knoepfe darunter; getippte Rueckfragen treffen
+// denselben Modus. Das Bild bleibt angehaengt, die Suche kennt den Verlauf.
+// Die in v80 angekuendigte Umkehr-Bildsuche ist wieder RAUS: WEB_DETECTION
+// gibt es nur am globalen Vision-Endpunkt (das Foto muesste Europa
+// verlassen), und der Nutzen trug das nicht — gemessen kam "handheld power
+// drill" statt einer Typenbezeichnung. Gemini liest Typenschilder besser.
+// v82: Zustellbarkeit — Antworten tragen jetzt In-Reply-To/References und
+// haengen beim Kunden IM Thread statt lose daneben; der Mail-Footer zeigt
+// die Adresse des Postfachs, aus dem wirklich gesendet wird (vorher konnte
+// dort eine abweichende Adresse stehen: Spam-Merkmal, und eine Antwort
+// dorthin sah der Inbox-Poller nie). Einstellungen > Verbindungen warnt,
+// wenn ein privates Freemail-Postfach verbunden ist.
+const CACHE = "ga-app-v82";
 const SHELL = [
   "/app",
   "/app/static/app-beta.css",

@@ -74,6 +74,66 @@ async def test_ohne_bild_kein_aufruf():
     assert (await gemini.objekt_kaufen(None, None, ""))["ok"] is False
 
 
+# Registriert allein reicht nicht: der Funktionsaufruf muss auch als Aktion
+# zurueckkommen. Genau daran hing es — Gemini rief objekt_frage, die
+# Auswertung kannte den Namen nicht und lieferte die Rueckfrage
+# "Was soll ich mit dem Bild machen?".
+
+class _FakeModels:
+    def __init__(self, name, args):
+        self._name, self._args = name, args
+
+    def generate_content(self, *, model, contents, config):
+        teil = SimpleNamespace(
+            function_call=SimpleNamespace(name=self._name, args=self._args))
+        return SimpleNamespace(candidates=[
+            SimpleNamespace(content=SimpleNamespace(parts=[teil]))])
+
+
+def _fake_gemini(monkeypatch, name, args):
+    monkeypatch.setattr(
+        gemini, "_get_genai_client",
+        lambda **kw: SimpleNamespace(models=_FakeModels(name, args)))
+
+
+@pytest.mark.asyncio
+async def test_router_reicht_objekt_frage_durch(monkeypatch):
+    _fake_gemini(monkeypatch, "objekt_frage", {"frage": "Welcher Druck ist zulaessig?"})
+    r = await gemini.route_image_intent(
+        b"x" * 200, "image/jpeg", "Welcher Druck ist zulaessig?",
+        features={"objekt_suche"})
+    assert r == {"type": "action", "action": "objekt_frage",
+                 "frage": "Welcher Druck ist zulaessig?"}
+
+
+@pytest.mark.asyncio
+async def test_router_reicht_objekt_kaufen_durch(monkeypatch):
+    _fake_gemini(monkeypatch, "objekt_kaufen", {"beschreibung": "Dichtung fuer VC 20"})
+    r = await gemini.route_image_intent(
+        b"x" * 200, "image/jpeg", "Wo bekomme ich das?",
+        features={"objekt_suche"})
+    assert r == {"type": "action", "action": "objekt_kaufen",
+                 "beschreibung": "Dichtung fuer VC 20"}
+
+
+@pytest.mark.asyncio
+async def test_router_ohne_frage_nimmt_den_default(monkeypatch):
+    _fake_gemini(monkeypatch, "objekt_frage", {})
+    r = await gemini.route_image_intent(
+        b"x" * 200, "image/jpeg", "", features={"objekt_suche"})
+    assert r["action"] == "objekt_frage"
+    assert r["frage"] == "Was ist das genau?"
+
+
+@pytest.mark.asyncio
+async def test_router_ohne_feature_keine_objekt_aktion(monkeypatch):
+    """Ist das Feature aus, wird die Aktion gar nicht erst angeboten."""
+    _fake_gemini(monkeypatch, "objekt_frage", {"frage": "egal"})
+    r = await gemini.route_image_intent(
+        b"x" * 200, "image/jpeg", "Was ist das?", features={"visualisierung"})
+    assert r["type"] == "message"
+
+
 # ===================== Endpunkt =====================
 
 class _Req:
@@ -102,6 +162,19 @@ def _feature(monkeypatch, an=True):
     async def _f(tid, key):
         return an
     monkeypatch.setattr(check, "is_feature_enabled", _f)
+
+
+class _FakeSession:
+    """Liefert nur die Branche, die der Endpunkt nachschlägt."""
+
+    def __init__(self, branche):
+        self._branche = branche
+
+    async def __aenter__(self): return self
+    async def __aexit__(self, *e): return False
+
+    async def execute(self, stmt):
+        return SimpleNamespace(scalar_one_or_none=lambda: self._branche)
 
 
 @pytest.mark.asyncio
@@ -149,13 +222,7 @@ async def test_endpunkt_waehlt_kaufmodus(monkeypatch):
 
     monkeypatch.setattr(gemini, "objekt_kaufen", _kaufen)
     monkeypatch.setattr(gemini, "objekt_erkennen", _doku)
-
-    class _S:
-        async def __aenter__(self): return self
-        async def __aexit__(self, *e): return False
-        async def execute(self, stmt):
-            return SimpleNamespace(scalar_one_or_none=lambda: "Schreinerei")
-    monkeypatch.setattr(app_screens, "get_session", lambda: _S())
+    monkeypatch.setattr(app_screens, "get_session", lambda: _FakeSession("Schreinerei"))
 
     r = await app_screens.api_objekt_frage(
         request=_Req(b"x" * 200, query={"modus": "kaufen"}), _e=None, _c=None)
@@ -166,6 +233,57 @@ async def test_endpunkt_waehlt_kaufmodus(monkeypatch):
         request=_Req(b"x" * 200, query={"frage": "was ist das"}), _e=None, _c=None)
     assert gesehen["modus"] == "doku"
     assert _body(r)["modus"] == "doku"
+
+
+@pytest.mark.asyncio
+async def test_endpunkt_waehlt_anleitungsmodus(monkeypatch):
+    """?modus=anleitung landet in der Anleitungs-Suche, nicht im Doku-Text.
+
+    Das ist der Schritt, den der Handwerker nach „was ist das" geht. Fiele er
+    still auf objekt_erkennen zurück, bekäme er wieder eine Erklärung statt
+    des Dokuments — und der Fehler wäre von außen unsichtbar.
+    """
+    _feature(monkeypatch)
+    gesehen = {}
+
+    def _mach(name):
+        async def _f(bild, mime, frage, **kw):
+            gesehen["modus"] = name
+            return {"ok": True, "text": "…", "quellen": [], "suchanfragen": []}
+        return _f
+
+    monkeypatch.setattr(gemini, "objekt_anleitung", _mach("anleitung"))
+    monkeypatch.setattr(gemini, "objekt_erkennen", _mach("doku"))
+    monkeypatch.setattr(gemini, "objekt_kaufen", _mach("kaufen"))
+    monkeypatch.setattr(app_screens, "get_session", lambda: _FakeSession("Heizungsbau"))
+
+    r = await app_screens.api_objekt_frage(
+        request=_Req(b"x" * 200, query={"modus": "anleitung"}), _e=None, _c=None)
+    assert gesehen["modus"] == "anleitung"
+    assert _body(r)["modus"] == "anleitung"
+
+
+@pytest.mark.asyncio
+async def test_unbekannter_modus_faellt_auf_doku(monkeypatch):
+    """Ein unbekannter Modus darf nicht in einer leeren Antwort enden."""
+    _feature(monkeypatch)
+    gesehen = {}
+
+    async def _doku(bild, mime, frage, **kw):
+        gesehen["modus"] = "doku"
+        return {"ok": True, "text": "…", "quellen": [], "suchanfragen": []}
+
+    monkeypatch.setattr(gemini, "objekt_erkennen", _doku)
+    monkeypatch.setattr(app_screens, "get_session", lambda: _FakeSession(None))
+
+    await app_screens.api_objekt_frage(
+        request=_Req(b"x" * 200, query={"modus": "quatsch"}), _e=None, _c=None)
+    assert gesehen["modus"] == "doku"
+
+
+@pytest.mark.asyncio
+async def test_anleitung_ohne_bild_und_ohne_text():
+    assert (await gemini.objekt_anleitung(b"", "image/jpeg", ""))["ok"] is False
 
 
 # ===================== Als Material merken =====================

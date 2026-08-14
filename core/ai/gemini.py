@@ -305,6 +305,8 @@ async def route_image_intent(
       * {"type": "action", "action": "visualisieren", "beschreibung": str}
       * {"type": "action", "action": "archiv", "kunde_name": str}
       * {"type": "action", "action": "beleg"}
+      * {"type": "action", "action": "objekt_frage", "frage": str}
+      * {"type": "action", "action": "objekt_kaufen", "beschreibung": str}
 
     Die Aktion fuehrt das Frontend mit den vorhandenen Endpunkten aus.
     Verarbeitung in europe-west3 (Frankfurt) — DSGVO-konform.
@@ -473,6 +475,17 @@ async def route_image_intent(
             return {"type": "action", "action": "archiv", "kunde_name": kunde[:200]}
         if fc.name == "beleg":
             return {"type": "action", "action": "beleg"}
+        if fc.name == "objekt_frage":
+            # Ohne eigene Frage trotzdem weiterreichen — das Foto allein ist
+            # schon die Frage. Anders als beim Archiv fehlt hier nichts, was
+            # man erst erfragen muesste.
+            frage = (args.get("frage") or text).strip()
+            return {"type": "action", "action": "objekt_frage",
+                    "frage": (frage or "Was ist das genau?")[:500]}
+        if fc.name == "objekt_kaufen":
+            beschreibung = (args.get("beschreibung") or text).strip()
+            return {"type": "action", "action": "objekt_kaufen",
+                    "beschreibung": (beschreibung or "Wo bekomme ich genau das?")[:500]}
 
     return {"type": "message",
             "text": say or "Was soll ich mit dem Bild machen?"}
@@ -3066,5 +3079,81 @@ async def objekt_kaufen(
         text=(beschreibung.strip() or "Wo bekomme ich genau das zu kaufen?")))
     contents.append(types.Content(role="user", parts=teile))
 
-    return await _geerdet_fragen(
+    ergebnis = await _geerdet_fragen(
         contents, system_text=system_text, tenant_id=tenant_id)
+    if ergebnis.get("ok"):
+        logger.info("objekt_kaufen OK: %d Quellen, Anfragen=%s",
+                    len(ergebnis.get("quellen") or []),
+                    (ergebnis.get("suchanfragen") or [])[:2])
+    return ergebnis
+
+
+async def objekt_anleitung(
+    image_bytes: bytes | None,
+    mime_type: str | None,
+    frage: str = "",
+    *,
+    tenant_id: str | None = None,
+    verlauf: list | None = None,
+) -> dict:
+    """Foto eines Geraets → die Anleitung dazu, als Link.
+
+    Eigener Modus neben ``objekt_erkennen``, weil es eine andere Frage ist:
+    dort geht es um „was ist das und was muss ich wissen", hier um „gib mir
+    das Dokument". Das Modell soll deshalb nicht erklaeren, sondern die
+    Hersteller-PDF finden und sagen, in welchem Abschnitt das steht, was der
+    Handwerker gerade braucht.
+
+    Bewusst ohne Umweg ueber eine Erklaerung: wer auf der Leiter steht, will
+    die Seitenzahl, nicht einen Aufsatz.
+    """
+    from google.genai import types
+
+    if not image_bytes and not frage.strip():
+        return {"ok": False, "error": "Kein Bild und keine Beschreibung."}
+
+    system_text = (
+        "Du suchst fuer einen deutschen Handwerker die Original-Anleitung zu "
+        "dem Geraet, das er fotografiert hat.\n\n"
+        "So gehst du vor:\n"
+        "1. Bestimme Hersteller und genaue Typenbezeichnung. Ein lesbares "
+        "Typenschild ist die zuverlaessigste Quelle — lies es Zeichen fuer "
+        "Zeichen ab.\n"
+        "2. Suche gezielt nach der Hersteller-Dokumentation: "
+        "Bedienungsanleitung, Installations- und Wartungsanleitung, "
+        "Datenblatt. Bevorzuge die Seite des Herstellers und PDF-Dateien.\n\n"
+        "Antworte so:\n"
+        "- Erste Zeile: welches Geraet du bestimmt hast (fett).\n"
+        "- Dann die gefundenen Dokumente als kurze Aufzaehlung: welche Art "
+        "von Anleitung, und fuer wen sie ist (Betreiber oder Fachkraft).\n"
+        "- Hat der Handwerker eine konkrete Frage gestellt, nenne den "
+        "Abschnitt oder die Seite, wo die Antwort steht — und die Antwort in "
+        "einem Satz.\n"
+        "- Findest du keine echte Anleitung, sage das klar. Erfinde niemals "
+        "einen Link oder eine Dokumentnummer.\n"
+        "- Keine Quellenliste im Text, die haengt das System an.\n"
+        "- Deutsch, Du-Form, kurz."
+    )
+
+    contents: list = []
+    for turn in (verlauf or [])[-6:]:
+        rolle = "model" if (turn or {}).get("role") == "model" else "user"
+        t = ((turn or {}).get("text") or "").strip()
+        if t:
+            contents.append(types.Content(
+                role=rolle, parts=[types.Part.from_text(text=t)]))
+    teile = []
+    if image_bytes:
+        teile.append(types.Part.from_bytes(
+            data=image_bytes, mime_type=mime_type or "image/jpeg"))
+    teile.append(types.Part.from_text(
+        text=(frage.strip() or "Gibt es dazu eine Anleitung?")))
+    contents.append(types.Content(role="user", parts=teile))
+
+    ergebnis = await _geerdet_fragen(
+        contents, system_text=system_text, tenant_id=tenant_id)
+    if ergebnis.get("ok"):
+        logger.info("objekt_anleitung OK: %d Quellen, Anfragen=%s",
+                    len(ergebnis.get("quellen") or []),
+                    (ergebnis.get("suchanfragen") or [])[:2])
+    return ergebnis
