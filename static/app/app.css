@@ -79,7 +79,10 @@ button:disabled { opacity: .6; }
 .pill.warn { background: #fdf3da; color: var(--warn); }
 .pill.danger { background: #fce6e5; color: var(--danger); }
 .empty { color: var(--muted); text-align: center; padding: 28px 0; }
-.btn-sm { display: inline-block; padding: 8px 14px; font-size: 14px; border-radius: 8px; width: auto; }
+/* min-height 44px = empfohlenes Touch-Ziel. Wichtig fuer Zeilen-Aktionen wie
+   „Stornieren"/„Erledigt" — Danebentippen loeste dort z.B. eine Storno-Mail
+   an den Kunden aus. inline-flex zentriert den Text bei groesserer Hoehe. */
+.btn-sm { display: inline-flex; align-items: center; justify-content: center; min-height: 44px; padding: 8px 14px; font-size: 14px; border-radius: 8px; width: auto; }
 .btn-ghost { background: #eef2f7; color: var(--primary); }
 .section-title { font-size: 13px; text-transform: uppercase; letter-spacing: .04em;
   color: var(--muted); margin: 18px 4px 8px; }

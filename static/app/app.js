@@ -468,7 +468,7 @@ const SCREENS = {
       ? `<button class="btn-sm btn-ghost" id="auf-neu" style="width:100%;margin-bottom:12px;padding:14px 10px">➕ Auftrag von Hand anlegen</button>`
       : "";
     App.view.innerHTML =
-      `<button class="btn-sm btn-ghost" id="back-db" style="margin-bottom:10px">← Übersicht</button>` +
+      `<button class="btn-sm btn-ghost" id="back-db" style="margin-bottom:10px">← Aktionen</button>` +
       `<h1 style="font-size:22px;margin:4px 4px 14px">Aufträge</h1>` +
       neu +
       (list || `<div class="card">${emptyRow("Keine laufenden Aufträge")}</div>`) +
@@ -647,7 +647,7 @@ const SCREENS = {
       const j = r ? await r.json().catch(() => null) : null;
       pBtn.disabled = false; pBtn.textContent = orig;
       if (j && j.ok) {
-        if ((j.bezahlt || 0) > 0) { alert(`✓ ${j.bezahlt} Rechnung(en) als bezahlt markiert (${j.geprueft} geprüft).`); navigate("rechnungen_page"); }
+        if ((j.bezahlt || 0) > 0) { toast(`✓ ${j.bezahlt} Rechnung(en) als bezahlt markiert`); navigate("rechnungen_page"); }
         else { alert(`Geprüft: ${j.geprueft || 0} offene Rechnung(en) — keine neuen Zahlungen.`); }
       } else { alert((j && j.error) || "Konnte nicht prüfen."); }
     });
@@ -684,7 +684,7 @@ const SCREENS = {
     const d = res && res.ok ? await res.json() : { rueckrufe: [] };
     const rueckrufe = d.rueckrufe || [];
     App.view.innerHTML =
-      `<button class="btn-sm btn-ghost" id="back-db" style="margin-bottom:10px">← Übersicht</button>` +
+      `<button class="btn-sm btn-ghost" id="back-db" style="margin-bottom:10px">← Aktionen</button>` +
       `<div style="display:flex;align-items:center;justify-content:space-between;margin:4px 4px 14px">
          <h1 style="font-size:22px;margin:0">Offene Rückrufe</h1>
          <button class="btn-sm btn-ghost" id="rr-new-btn" style="padding:8px 12px">+ Rückruf</button>
@@ -706,7 +706,7 @@ const SCREENS = {
     const list = d.termine || [];
     const aufnahmen = ad.aufnahmen || [];
     App.view.innerHTML =
-      `<button class="btn-sm btn-ghost" id="back-db" style="margin-bottom:10px">← Übersicht</button>` +
+      `<button class="btn-sm btn-ghost" id="back-db" style="margin-bottom:10px">← Aktionen</button>` +
       `<div style="display:flex;align-items:center;justify-content:space-between;margin:4px 4px 14px">
         <h1 style="font-size:22px;margin:0">Termine</h1>
         <button class="btn-sm" id="termin-new-btn" style="padding:8px 14px">+ Neu</button>
@@ -733,7 +733,7 @@ const SCREENS = {
     const ad = a && a.ok ? await a.json() : { gespraeche: [] };
     const liste = ad.gespraeche || [];
     App.view.innerHTML =
-      `<button class="btn-sm btn-ghost" id="back-db" style="margin-bottom:10px">← Übersicht</button>` +
+      `<button class="btn-sm btn-ghost" id="back-db" style="margin-bottom:10px">← Aktionen</button>` +
       `<h1 style="font-size:22px;margin:4px 4px 14px">Kundengespräche</h1>` +
       `<button class="btn-sm" id="gespr-neu" style="width:100%;margin-bottom:12px;padding:14px 10px">➕ Neues Kundengespräch</button>` +
       // Platzhalter: der Kalender-Abruf geht über den Provider und dauert
@@ -831,7 +831,7 @@ const SCREENS = {
     const d = res && res.ok ? await res.json() : null;
     if (!d || !d.ok) {
       App.view.innerHTML =
-        `<button class="btn-sm btn-ghost" id="back-db" style="margin-bottom:10px">← Übersicht</button>` +
+        `<button class="btn-sm btn-ghost" id="back-db" style="margin-bottom:10px">← Aktionen</button>` +
         `<div class="card">${emptyRow((d && d.error) || "Buchhaltung nicht erreichbar.")}</div>`;
       document.getElementById("back-db").addEventListener("click", () => navigate("aktuelles"));
       return;
@@ -846,7 +846,7 @@ const SCREENS = {
 
     const parts = [];
     parts.push(
-      `<button class="btn-sm btn-ghost" id="back-db" style="margin-bottom:10px">← Übersicht</button>` +
+      `<button class="btn-sm btn-ghost" id="back-db" style="margin-bottom:10px">← Aktionen</button>` +
       `<div style="display:flex;align-items:center;justify-content:space-between;margin:4px 4px 14px">
          <h1 style="font-size:22px;margin:0">Buchhaltung</h1>
          ${isInhaber ? `<button class="btn-sm btn-ghost" id="bu-pruefen" style="padding:8px 12px">🔄 Zahlungen</button>` : ""}
@@ -937,7 +937,7 @@ const SCREENS = {
       btn.disabled = false; btn.textContent = orig;
       if (j && j.ok) {
         if ((j.bezahlt || 0) > 0) {
-          alert(`✓ ${j.bezahlt} Rechnung(en) als bezahlt markiert (${j.geprueft} geprüft).`);
+          toast(`✓ ${j.bezahlt} Rechnung(en) als bezahlt markiert`);
           navigate("buchhaltung", { mode: "none" });
         } else {
           alert(`Geprüft: ${j.geprueft || 0} offene Rechnung(en) — keine neuen Zahlungen.`);
@@ -1096,7 +1096,7 @@ const SCREENS = {
     };
 
     let html =
-      `<button class="btn-sm btn-ghost" id="back-db" style="margin-bottom:10px">← Übersicht</button>` +
+      `<button class="btn-sm btn-ghost" id="back-db" style="margin-bottom:10px">← Aktionen</button>` +
       `<h1 style="font-size:22px;margin:4px 4px 14px">Anfragen</h1>` +
       `<div class="card"><h2>Offen (${open.length})</h2>` +
       (open.length ? open.map(renderItem).join("") : emptyRow("Keine offenen Anfragen.")) +
@@ -1778,7 +1778,7 @@ const SCREENS = {
             { method: "POST", body: "{}" });
           const j = r ? await r.json().catch(() => null) : null;
           b.disabled = false; b.textContent = orig;
-          if (j && j.ok) alert("✓ " + (j.detail || "Verbindung funktioniert."));
+          if (j && j.ok) toast("✓ " + (j.detail || "Verbindung funktioniert."));
           else alert("✗ " + ((j && j.error) || "Test fehlgeschlagen."));
         }));
       mount.querySelectorAll("[data-lexware]").forEach((b) =>
@@ -2218,7 +2218,7 @@ const SCREENS = {
       `</div>`;
 
     const tagesarbeit = [
-      { icon: "📋", label: "Übersicht", go: "aktuelles", hint: "Alle Bereiche auf einen Blick" },
+      { icon: "📋", label: "Aktionen", go: "aktuelles", hint: "Alle Bereiche auf einen Blick" },
       { icon: "📅", label: "Termine", go: "termine", hint: "Termine anschauen + neu anlegen" },
       { icon: "📞", label: "Rückrufe", go: "rueckrufe_page", hint: "Offene Rückrufe abhaken oder neu anlegen" },
       { icon: "✉️", label: "Anfragen", go: "anfragen", hint: "Mail-Anfragen lesen + direkt antworten" },
@@ -3803,6 +3803,30 @@ function errorScreen(txt) {
     <p class="empty">${esc(txt || "Konnte gerade nicht laden.")}</p>
     <button class="btn" onclick="navigate(App.current)" style="margin-top:8px">Erneut versuchen</button>
   </div>`;
+}
+
+// Kurzer, nicht-blockierender Hinweis unten am Bildschirm — ersetzt native
+// alert()-Dialoge fuer Erfolgs-/Info-Meldungen. In der installierten iOS-PWA
+// erscheinen alert()s ohne App-Namen und wirken wie Systemfehler; ein Toast
+// unterbricht ausserdem nicht den Ablauf. Fehler bleiben bei alert()/confirm().
+let _toastTimer = null;
+function toast(msg, kind) {
+  let host = document.getElementById("app-toast");
+  if (!host) {
+    host = document.createElement("div");
+    host.id = "app-toast";
+    host.style.cssText =
+      "position:fixed;left:50%;bottom:calc(72px + env(safe-area-inset-bottom,0px));" +
+      "transform:translateX(-50%);z-index:9999;max-width:88%;padding:12px 18px;" +
+      "border-radius:12px;font-size:15px;font-weight:600;color:#fff;text-align:center;" +
+      "box-shadow:0 6px 24px rgba(0,0,0,.25);opacity:0;transition:opacity .18s;pointer-events:none";
+    document.body.appendChild(host);
+  }
+  host.style.background = kind === "err" ? "#c0392b" : "#1e8e4e";
+  host.textContent = msg;
+  requestAnimationFrame(() => { host.style.opacity = "1"; });
+  clearTimeout(_toastTimer);
+  _toastTimer = setTimeout(() => { host.style.opacity = "0"; }, 2600);
 }
 
 // Vorschlags-Chips fuer den leeren Q-Chat. Machen die haeufigsten ERSTELLEN-
@@ -6062,7 +6086,7 @@ async function showAnfrage(id) {
       if (res && res.ok) {
         const okJson = await res.json();
         if (okJson.ok) {
-          alert(close ? "Antwort gesendet. Anfrage als erledigt markiert." : "Antwort gesendet.");
+          toast(close ? "Antwort gesendet · Anfrage erledigt" : "Antwort gesendet");
           navigate("aktuelles");
           return;
         }
@@ -6975,6 +6999,31 @@ function initQOverlay() {
 }
 
 // ---------- Boot ----------
+// Q-Verlauf ueber einen Reload retten (nur sessionStorage — nicht persistent,
+// wahrt die Datensparsamkeit). Bild-Vorschauen (Blob-URLs) ueberleben einen
+// Reload ohnehin nicht und werden beim Sichern verworfen.
+function saveQState() {
+  try {
+    const slim = (App.qchat || []).map((m) => {
+      const c = { ...m };
+      delete c.previewUrl; delete c.file; delete c.fileBlob;
+      return c;
+    });
+    sessionStorage.setItem("q_state", JSON.stringify({ chat: slim, hist: App.qhistory || [] }));
+  } catch (e) { /* Storage voll/blockiert — dann halt nicht */ }
+}
+function restoreQState() {
+  try {
+    const raw = sessionStorage.getItem("q_state");
+    if (!raw) return;
+    const s = JSON.parse(raw);
+    if (s && Array.isArray(s.chat) && s.chat.length) App.qchat = s.chat;
+    if (s && Array.isArray(s.hist)) App.qhistory = s.hist;
+  } catch (e) { /* defekter Eintrag — ignorieren */ }
+}
+// Auch bei manuellem Reload / Tab-Schliessen sichern (Best effort).
+window.addEventListener("pagehide", saveQState);
+
 async function boot() {
   if ("serviceWorker" in navigator) {
     try {
@@ -6986,6 +7035,9 @@ async function boot() {
       navigator.serviceWorker.addEventListener("controllerchange", () => {
         if (reloaded || !hadController) return;
         reloaded = true;
+        // Vor dem selbst ausgeloesten Update-Reload den Q-Verlauf sichern,
+        // sonst sind laufende Chats + unbestaetigte Entwuerfe weg (nur RAM).
+        saveQState();
         location.reload();
       });
       const reg = await navigator.serviceWorker.register("/app/sw.js", { scope: "/app" });
@@ -7007,6 +7059,9 @@ async function boot() {
   // Neue Nutzer: Q führt durch die Ersteinrichtung (Flag wird im
   // Assistent-Screen ausgewertet, der den Onboarding-Chat startet).
   if (!App.me.onboarding_done) App.startOnboarding = true;
+  // Q-Verlauf aus einem vorangegangenen Reload wiederherstellen (falls vorhanden).
+  // Nur wenn kein Onboarding laeuft — das startet bewusst mit leerem Chat.
+  if (!App.startOnboarding) restoreQState();
   // Kam die App aus einer Push-Benachrichtigung ("/app#anfragen"), direkt
   // dorthin. Sonst der normale Start-Screen. mode:"replace", damit der erste
   // Zurueck-Druck die App verlaesst statt auf einen leeren Eintrag zu fallen.
