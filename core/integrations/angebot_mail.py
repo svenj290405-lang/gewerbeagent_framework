@@ -441,7 +441,53 @@ async def send_rechnung_to_customer(
         }],
     )
     if not result.get("success"):
+        # Die Rechnung liegt hier bereits FINALISIERT in Lexware — steuerlich
+        # gezogen, beim Kunden aber nie angekommen. Bisher war der Versand
+        # damit verloren (nur die Angebots-Mail hatte eine Wiederholung).
+        # Jetzt geht auch sie in die Retry-Schlange: 5 min, 30 min, 2 h.
         out["error"] = result.get("error") or "Mail-Versand fehlgeschlagen"
+        try:
+            from core.integrations.mail_retry_cron import enqueue_failed_mail
+            from core.models import MAIL_TYPE_RECHNUNG
+            from core.models.rechnung import Rechnung
+
+            # Die gespiegelte Rechnungszeile mitgeben: nur mit ihr setzt der
+            # Retry-Cron nach erfolgreichem zweiten Versuch `mail_sent` — und
+            # erst damit landet die Rechnung in der Bezahl-Ueberwachung.
+            rechnung_id = None
+            async with AsyncSessionLocal() as session:
+                r = (await session.execute(
+                    select(Rechnung)
+                    .where(Rechnung.tenant_id == tenant.id)
+                    .where(Rechnung.lexware_invoice_id == ang.lexware_invoice_id)
+                )).scalar_one_or_none()
+                if r is not None:
+                    rechnung_id = r.id
+
+            await enqueue_failed_mail(
+                tenant_id=tenant.id,
+                mail_type=MAIL_TYPE_RECHNUNG,
+                recipient_email=to_email,
+                subject=subject,
+                html_body=body_html,
+                attachments=[{
+                    "filename": filename,
+                    "mime_type": "application/pdf",
+                    "content_bytes": pdf_bytes,
+                }],
+                from_name=tenant.company_name,
+                angebot_id=str(angebot_id),
+                rechnung_id=rechnung_id,
+                mail_backend="microsoft_graph",
+                last_error=out["error"],
+            )
+            out["queued"] = True
+            logger.info(
+                "send_rechnung_to_customer queued angebot=%s to=%s reason=%s",
+                angebot_id, to_email, out["error"][:120],
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("enqueue_failed_mail (rechnung) crashed: %s", exc)
         return out
 
     # 6) Tracking-IDs persistieren — nutzen wir die Angebots-Felder fuer

@@ -356,6 +356,19 @@ async def create_rechnung(
             s, tid, kunde_name, email=kunde_email,
             adresse=compose_adresse(kunde_strasse, kunde_plz, kunde_ort),
         )
+        await s.flush()
+        # Positionen mitschreiben. Bisher blieb nur die Summe uebrig — die
+        # Rechnung liess sich damit spaeter nicht originalgetreu in Lexware
+        # ausstellen, und in der App war nie zu sehen, woraus sie besteht.
+        from core.models.rechnung_position import RechnungPosition
+        for nr, li in enumerate(line_items, start=1):
+            s.add(RechnungPosition(
+                rechnung_id=r.id, position_nr=nr, name=li.name,
+                beschreibung=li.description,
+                menge=Decimal(str(li.quantity)),
+                einheit=li.unit_name or "Stueck",
+                preis_brutto_eur=Decimal(str(li.unit_price_gross)),
+                mwst_prozent=int(li.tax_rate_percent or 19)))
         await s.commit()
         await s.refresh(r)
         rid = r.id
@@ -398,6 +411,102 @@ async def create_rechnung(
 # Angebot versenden
 # ---------------------------------------------------------------------------
 
+async def _angebot_finalisieren(tid: uuid.UUID, *, angebot_id: uuid.UUID) -> dict:
+    """Macht aus dem Lexware-Entwurf ein ausgestelltes Angebot.
+
+    Lexware kennt keine Umwandlung 'draft -> ausgestellt'; wie beim
+    Rechnungsweg legen wir das Dokument deshalb neu und direkt finalisiert
+    an — und loeschen den Entwurf danach selbst, statt ihn liegen zu lassen.
+
+    Ist das Angebot schon ausgestellt, passiert nichts (idempotent). Ohne
+    Lexware-Entwurf ebenfalls nicht — dann laeuft der bisherige Weg.
+    """
+    from sqlalchemy import select
+
+    from core.database.connection import get_session
+    from core.integrations.accounting_base import InvoiceLineItem
+    from core.models.angebot import Angebot
+    from core.models.angebot_position import AngebotPosition
+
+    provider = await _lexware_provider(tid)
+    if provider is None:
+        return {"ok": False, "error": "Lexware ist nicht eingerichtet."}
+
+    async with get_session() as s:
+        ang = (await s.execute(
+            select(Angebot).where(Angebot.id == angebot_id)
+            .where(Angebot.tenant_id == tid))).scalar_one_or_none()
+        if ang is None:
+            return {"ok": False, "error": "Angebot nicht gefunden."}
+        if not ang.lexware_quotation_id:
+            return {"ok": True, "unveraendert": True}
+        positions = (await s.execute(
+            select(AngebotPosition)
+            .where(AngebotPosition.angebot_id == angebot_id)
+            .order_by(AngebotPosition.position_nr))).scalars().all()
+        alter_entwurf = ang.lexware_quotation_id
+        kunde_name = ang.kunde_name or ""
+        kunde_strasse, kunde_plz, kunde_ort = (
+            ang.kunde_strasse, ang.kunde_plz, ang.kunde_ort)
+        intro = ang.introduction_text or None
+        schluss = ang.remark_text or None
+
+    try:
+        quote = await provider.get_quotation(alter_entwurf)
+        if "draft" not in (quote.get("voucherStatus") or "").lower():
+            return {"ok": True, "unveraendert": True}
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Angebot-Finalisierung: get_quotation fehlgeschlagen: %s", exc)
+        return {"ok": True, "unveraendert": True}   # bisherigen Weg gehen lassen
+
+    if not positions:
+        return {"ok": False, "error": "Angebot hat keine Positionen."}
+
+    line_items = [
+        InvoiceLineItem(
+            name=p.name, quantity=float(p.menge), unit_name=p.einheit or "Stueck",
+            unit_price_gross=float(p.preis_brutto_eur), description=p.beschreibung,
+            tax_rate_percent=int(p.mwst_prozent or 19))
+        for p in positions]
+    one_time_address = {"name": kunde_name, "countryCode": "DE"}
+    if kunde_strasse:
+        one_time_address["street"] = kunde_strasse
+    if kunde_plz:
+        one_time_address["zip"] = kunde_plz
+    if kunde_ort:
+        one_time_address["city"] = kunde_ort
+
+    try:
+        neu = await provider.create_quotation_draft(
+            line_items=line_items, one_time_address=one_time_address,
+            title=f"Angebot {kunde_name}".strip(),
+            introduction=intro, remark=schluss,
+            tax_type="gross", finalize=True)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Angebot-Finalisierung fehlgeschlagen: %s", exc)
+        return {"ok": False,
+                "error": "Angebot konnte in Lexware nicht ausgestellt werden."}
+
+    async with get_session() as s:
+        a = (await s.execute(
+            select(Angebot).where(Angebot.id == angebot_id))).scalar_one_or_none()
+        if a is not None:
+            a.lexware_quotation_id = neu.quotation_id
+            if getattr(neu, "voucher_number", None):
+                a.lexware_voucher_number = neu.voucher_number
+            await s.commit()
+
+    try:
+        await provider.delete_voucher(alter_entwurf)
+        logger.info("Angebot-Finalisierung: Entwurf %s geloescht", alter_entwurf)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Angebot-Finalisierung: Entwurf %s nicht loeschbar (%s)",
+                       alter_entwurf, exc)
+
+    return {"ok": True, "unveraendert": False,
+            "quotation_id": str(neu.quotation_id)}
+
+
 async def send_angebot(
     tid: uuid.UUID, *, angebot_id: uuid.UUID,
     to_email: str | None = None, cc: list[str] | None = None,
@@ -418,6 +527,14 @@ async def send_angebot(
     if not ziel:
         return {"ok": False, "error": "Keine Empfaenger-Mail vorhanden."}
 
+    # Angebote lagen bisher als Entwurf in Lexware, und der Versand brach mit
+    # „bitte im Lexware-Web finalisieren" ab — ein Medienbruch bei JEDEM
+    # Angebot. Wir machen es jetzt selbst fertig, in dem Moment, in dem der
+    # Inhaber den Versand freigibt.
+    fin = await _angebot_finalisieren(tid, angebot_id=angebot_id)
+    if not fin.get("ok"):
+        return {"ok": False, "error": fin.get("error") or "Angebot konnte nicht finalisiert werden."}
+
     try:
         result = await send_angebot_to_customer(angebot_id=angebot_id, to_email=ziel, cc=cc)
     except Exception as exc:  # noqa: BLE001
@@ -432,6 +549,293 @@ async def send_angebot(
 # ---------------------------------------------------------------------------
 # Rechnung finalisieren + versenden (Auftrag abrechnen)
 # ---------------------------------------------------------------------------
+
+async def finalize_and_send_rechnung(
+    tid: uuid.UUID,
+    *,
+    rechnung_id: uuid.UUID,
+    to_email: str | None = None,
+    cc: list[str] | None = None,
+) -> dict:
+    """Stellt eine im App-Formular erfasste Rechnung aus und schickt sie.
+
+    Dieser Weg war strukturell tot: ``/rechnungen/anlegen`` erzeugte einen
+    Lexware-Entwurf, und der Versand rief eine Funktion, die es fuer diesen
+    Datentyp gar nicht gab — jeder Klick endete in „Bitte erst in Lexware
+    finalisieren". Jetzt macht der Versand dasselbe wie beim Auftragsweg:
+    finalisiert in Lexware (Lexware kennt kein 'Entwurf -> ausgestellt',
+    also neu anlegen), raeumt den Entwurf weg, holt das PDF und mailt es.
+    """
+    import datetime as _dt
+
+    from sqlalchemy import select
+
+    from core.database.connection import get_session
+    from core.integrations.accounting_base import InvoiceLineItem
+    from core.models.rechnung import (
+        Rechnung, RECHNUNG_STATUS_DRAFTED, RECHNUNG_STATUS_MAIL_SENT)
+    from core.models.rechnung_position import RechnungPosition
+    from core.models.tenant import Tenant
+
+    async with get_session() as s:
+        r = (await s.execute(
+            select(Rechnung).where(Rechnung.id == rechnung_id)
+            .where(Rechnung.tenant_id == tid))).scalar_one_or_none()
+        if r is None:
+            return {"ok": False, "error": "Rechnung nicht gefunden."}
+        positions = (await s.execute(
+            select(RechnungPosition)
+            .where(RechnungPosition.rechnung_id == rechnung_id)
+            .order_by(RechnungPosition.position_nr))).scalars().all()
+        tenant = (await s.execute(
+            select(Tenant).where(Tenant.id == tid))).scalar_one_or_none()
+        ziel = (to_email or "").strip() or r.kunde_email
+        daten = {
+            "kunde_name": r.kunde_name or "", "betrag": r.betrag_brutto_eur,
+            "titel": r.leistung_titel or "Leistung",
+            "beschreibung": r.leistung_beschreibung,
+            "strasse": r.kunde_strasse, "plz": r.kunde_plz, "ort": r.kunde_ort,
+            "alter_entwurf": r.lexware_invoice_id,
+            "bezahlt_am": r.bezahlt_am,
+        }
+
+    if not ziel:
+        return {"ok": False, "error": "Keine Empfaenger-Mail hinterlegt."}
+    if daten["bezahlt_am"] is not None:
+        return {"ok": False, "error": "Diese Rechnung ist bereits bezahlt."}
+
+    provider = await _lexware_provider(tid)
+    if provider is None:
+        return {"ok": False, "error": "Lexware ist nicht eingerichtet."}
+
+    if positions:
+        line_items = [
+            InvoiceLineItem(
+                name=p.name, quantity=float(p.menge),
+                unit_name=p.einheit or "Stueck",
+                unit_price_gross=float(p.preis_brutto_eur),
+                description=p.beschreibung,
+                tax_rate_percent=int(p.mwst_prozent or 19))
+            for p in positions]
+    elif daten["betrag"]:
+        # Aeltere Rechnungen haben keine gespeicherten Positionen — dann
+        # eine Sammelposition aus Titel und Betrag.
+        line_items = [InvoiceLineItem(
+            name=daten["titel"], quantity=1.0, unit_name="Stueck",
+            unit_price_gross=float(daten["betrag"]),
+            description=daten["beschreibung"], tax_rate_percent=19)]
+    else:
+        return {"ok": False, "error": "Rechnung hat weder Positionen noch Betrag."}
+
+    one_time_address = {"name": daten["kunde_name"], "countryCode": "DE"}
+    if daten["strasse"]:
+        one_time_address["street"] = daten["strasse"]
+    if daten["plz"]:
+        one_time_address["zip"] = daten["plz"]
+    if daten["ort"]:
+        one_time_address["city"] = daten["ort"]
+
+    try:
+        invoice = await provider.create_invoice_draft(
+            line_items=line_items, one_time_address=one_time_address,
+            title=f"Rechnung {daten['kunde_name']}".strip(),
+            introduction=(
+                f"Sehr geehrte/r {daten['kunde_name']},\n\nvielen Dank fuer "
+                f"Ihren Auftrag."),
+            remark="Bitte begleichen Sie den Rechnungsbetrag fristgerecht.",
+            tax_type="gross", finalize=True)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("finalize_and_send_rechnung: Lexware: %s", exc)
+        return {"ok": False,
+                "error": "Rechnung konnte in Lexware nicht ausgestellt werden."}
+
+    if daten["alter_entwurf"] and daten["alter_entwurf"] != invoice.invoice_id:
+        try:
+            await provider.delete_voucher(daten["alter_entwurf"])
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Alten Rechnungs-Entwurf nicht loeschbar (%s)", exc)
+
+    async with get_session() as s:
+        rr = (await s.execute(
+            select(Rechnung).where(Rechnung.id == rechnung_id))).scalar_one_or_none()
+        if rr is not None:
+            rr.lexware_invoice_id = invoice.invoice_id
+            if getattr(invoice, "voucher_number", None):
+                rr.lexware_voucher_number = invoice.voucher_number
+            rr.status = RECHNUNG_STATUS_DRAFTED
+            await s.commit()
+
+    # PDF holen und verschicken
+    from core.integrations.angebot_mail import _build_rechnung_mail_html
+    from core.integrations.microsoft import send_tracked_mail
+
+    try:
+        pdf_bytes = await provider.download_invoice_pdf(invoice.invoice_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("finalize_and_send_rechnung: PDF: %s", exc)
+        return {"ok": False, "error": "Rechnungs-PDF konnte nicht geladen werden.",
+                "lexware_ausgestellt": True}
+
+    nummer = getattr(invoice, "voucher_number", None) or ""
+    body_html = _build_rechnung_mail_html(
+        kunde_anrede=daten["kunde_name"],
+        rechnung_nummer=nummer,
+        gesamtbetrag_brutto_eur=daten["betrag"],
+        company_name=(tenant.company_name if tenant else "") or "",
+        contact_name=(getattr(tenant, "contact_name", "") or ""),
+        contact_email=(getattr(tenant, "contact_email", "") or ""),
+        contact_phone=(getattr(tenant, "contact_phone", "") or ""))
+    betreff = f"Ihre Rechnung{(' ' + nummer) if nummer else ''} von {(tenant.company_name if tenant else '') or 'uns'}"
+    dateiname = f"Rechnung{('-' + nummer) if nummer else ''}.pdf"
+
+    res = await send_tracked_mail(
+        tenant_id=tid, to_email=ziel, subject=betreff, body_html=body_html,
+        cc=cc, attachments=[{"filename": dateiname, "bytes": pdf_bytes,
+                             "content_type": "application/pdf"}])
+
+    if not res.get("success"):
+        # Die Rechnung ist ausgestellt (steuerlich gezogen) — der Versand
+        # darf nicht einfach verloren gehen.
+        try:
+            from core.integrations.mail_retry_cron import enqueue_failed_mail
+            from core.models import MAIL_TYPE_RECHNUNG
+            await enqueue_failed_mail(
+                tenant_id=tid, mail_type=MAIL_TYPE_RECHNUNG,
+                recipient_email=ziel, subject=betreff, html_body=body_html,
+                attachments=[{"filename": dateiname,
+                              "mime_type": "application/pdf",
+                              "content_bytes": pdf_bytes}],
+                from_name=(tenant.company_name if tenant else None),
+                rechnung_id=rechnung_id, mail_backend="microsoft_graph",
+                last_error=res.get("error") or "Mail-Versand fehlgeschlagen")
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("enqueue_failed_mail (formular-rechnung): %s", exc)
+        return {"ok": False, "error": res.get("error") or "Mail-Versand fehlgeschlagen.",
+                "lexware_ausgestellt": True, "queued": True}
+
+    async with get_session() as s:
+        rr = (await s.execute(
+            select(Rechnung).where(Rechnung.id == rechnung_id))).scalar_one_or_none()
+        if rr is not None:
+            rr.status = RECHNUNG_STATUS_MAIL_SENT
+            rr.mail_sent_at = _dt.datetime.now(_dt.timezone.utc)
+            rr.mail_sent_to = ziel
+            await s.commit()
+
+    return {"ok": True, "to_email": ziel, "nummer": nummer,
+            "deeplink": getattr(invoice, "deeplink_view", None),
+            "kunde": daten["kunde_name"]}
+
+
+async def _spiegle_rechnung(
+    tid: uuid.UUID,
+    *,
+    angebot_id: uuid.UUID,
+    invoice,
+    kunde_name: str | None,
+    kunde_email: str | None,
+    kunde_strasse: str | None,
+    kunde_plz: str | None,
+    kunde_ort: str | None,
+    positions,
+) -> uuid.UUID | None:
+    """Legt zu einer finalisierten Lexware-Rechnung die Zeile in `rechnungen` an.
+
+    Hintergrund: es gab zwei Rechnungswelten. Der Weg ueber den fertigen
+    Auftrag (dieser hier) schrieb nur das Angebot fort, die Auswertungen
+    lesen aber `rechnungen` — verschickte Rechnungen tauchten deshalb weder
+    in den offenen Posten noch in der Bezahl-Ueberwachung auf.
+
+    Natuerlicher Schluessel ist `lexware_invoice_id`: ein zweiter Aufruf zur
+    selben Lexware-Rechnung aktualisiert die Zeile, statt eine zweite
+    anzulegen. Fehler hier duerfen den Rechnungsversand nicht kippen — die
+    Rechnung liegt zu diesem Zeitpunkt bereits finalisiert in Lexware.
+    """
+    from sqlalchemy import select
+
+    from core.database.connection import get_session
+    from core.models.angebot import Angebot
+    from core.models.rechnung import Rechnung, RECHNUNG_STATUS_DRAFTED
+
+    try:
+        betrag = sum(
+            float(p.menge or 0) * float(p.preis_brutto_eur or 0)
+            for p in positions)
+    except Exception:  # noqa: BLE001
+        betrag = None
+
+    try:
+        async with get_session() as s:
+            vorhanden = (await s.execute(
+                select(Rechnung)
+                .where(Rechnung.tenant_id == tid)
+                .where(Rechnung.lexware_invoice_id == invoice.invoice_id)
+            )).scalar_one_or_none()
+
+            r = vorhanden or Rechnung(
+                tenant_id=tid,
+                input_type="auftrag",   # entstanden aus einem fertigen Auftrag
+                status=RECHNUNG_STATUS_DRAFTED,
+            )
+            r.kunde_name = kunde_name
+            r.kunde_email = kunde_email
+            r.kunde_strasse = kunde_strasse
+            r.kunde_plz = kunde_plz
+            r.kunde_ort = kunde_ort
+            if betrag:
+                r.betrag_brutto_eur = round(betrag, 2)
+            r.lexware_invoice_id = invoice.invoice_id
+            if getattr(invoice, "voucher_number", None):
+                r.lexware_voucher_number = invoice.voucher_number
+            r.leistung_titel = f"Auftrag {kunde_name}" if kunde_name else "Auftrag"
+            r.raw_input_text = f"aus Auftrag {angebot_id}"
+            if vorhanden is None:
+                s.add(r)
+            await s.flush()
+            # `Angebot.rechnung_id` gab es im Modell schon, wurde aber nie
+            # beschrieben. Ab jetzt haengen Auftrag und Rechnung aneinander —
+            # sonst waeren es weiterhin zwei Welten ohne Verbindung.
+            a = (await s.execute(
+                select(Angebot).where(Angebot.id == angebot_id))).scalar_one_or_none()
+            if a is not None:
+                a.rechnung_id = r.id
+            await s.commit()
+            return r.id
+    except Exception as exc:  # noqa: BLE001
+        logger.exception(
+            "Rechnungs-Spiegel fehlgeschlagen (tenant=%s angebot=%s): %s",
+            tid, angebot_id, exc)
+        return None
+
+
+async def _rechnung_als_versendet_markieren(
+    rechnung_id: uuid.UUID | None, kunde_email: str | None,
+) -> None:
+    """Setzt die gespiegelte Rechnung auf `mail_sent` — erst damit greift die
+    Bezahl-Ueberwachung (sie pollt genau diesen Status)."""
+    if rechnung_id is None:
+        return
+    import datetime as _dt
+
+    from sqlalchemy import select
+
+    from core.database.connection import get_session
+    from core.models.rechnung import Rechnung, RECHNUNG_STATUS_MAIL_SENT
+
+    try:
+        async with get_session() as s:
+            r = (await s.execute(
+                select(Rechnung).where(Rechnung.id == rechnung_id)
+            )).scalar_one_or_none()
+            if r is None:
+                return
+            r.status = RECHNUNG_STATUS_MAIL_SENT
+            r.mail_sent_at = _dt.datetime.now(_dt.timezone.utc)
+            r.mail_sent_to = kunde_email
+            await s.commit()
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Rechnungs-Spiegel auf mail_sent setzen: %s", exc)
+
 
 async def finalize_and_send_invoice(
     tid: uuid.UUID,
@@ -519,9 +923,35 @@ async def finalize_and_send_invoice(
 
     async with get_session() as s:
         a = (await s.execute(select(Angebot).where(Angebot.id == angebot_id))).scalar_one()
+        alter_draft = a.lexware_invoice_id
         a.lexware_invoice_id = invoice.invoice_id
         a.status = ANGEBOT_STATUS_WORK_DONE
         await s.commit()
+
+    # Der alte, nie versendete Entwurf aus der Angebots-Pipeline lag bisher
+    # als Leiche in Lexware und musste von Hand geloescht werden. Lexware
+    # kennt kein 'draft -> offen', wir legen also weiterhin neu an — raeumen
+    # den Vorgaenger aber selbst weg. Scheitert das, ist es kein Grund, den
+    # Versand abzubrechen: dann liegt dort eben ein Entwurf zu viel.
+    if alter_draft and alter_draft != invoice.invoice_id:
+        try:
+            await provider.delete_voucher(alter_draft)
+            logger.info("finalize_and_send_invoice: alten Entwurf %s geloescht",
+                        alter_draft)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "finalize_and_send_invoice: alter Entwurf %s nicht loeschbar "
+                "(%s) — bitte in Lexware pruefen", alter_draft, exc)
+
+    # Ab hier gibt es die Rechnung auch als eigene Zeile. Vorher lebte sie
+    # ausschliesslich am Angebot, und damit sah KEINE der Geld-Auswertungen
+    # sie je: offene Posten, Ueberfaelligkeit, Bezahl-Monitor, Tagesbericht
+    # und Zahlungserinnerung lesen alle die Tabelle `rechnungen`.
+    rechnung_id = await _spiegle_rechnung(
+        tid, angebot_id=angebot_id, invoice=invoice,
+        kunde_name=kunde_name, kunde_email=kunde_email,
+        kunde_strasse=kunde_strasse, kunde_plz=kunde_plz, kunde_ort=kunde_ort,
+        positions=positions)
 
     # Email-Fallback aus Lexware-Kontakten
     email_from_lexware = False
@@ -572,6 +1002,9 @@ async def finalize_and_send_invoice(
             a.status = ANGEBOT_STATUS_RECHNUNG_GESENDET
             a.abgeschlossen_am = _dt.datetime.now(_dt.timezone.utc)
             await s.commit()
+        # Erst `mail_sent` bringt die Rechnung in die Bezahl-Ueberwachung
+        # (rechnung_payment_monitor pollt genau diesen Status).
+        await _rechnung_als_versendet_markieren(rechnung_id, kunde_email)
         # Rechnung raus = Auftrag abgeschlossen -> Drive-Archiv. Bewusst als
         # Hintergrund-Task: der Handwerker soll nicht auf ein Dutzend Drive-
         # Requests warten, und ein Drive-Problem darf einen erfolgreichen

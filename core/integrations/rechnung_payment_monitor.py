@@ -35,6 +35,7 @@ from core.models import Tenant, ToolConfig
 from core.models.rechnung import (
     LEXWARE_PAID_STATES,
     RECHNUNG_STATUS_BEZAHLT,
+    RECHNUNG_STATUS_CANCELLED,
     RECHNUNG_STATUS_MAIL_SENT,
     Rechnung,
 )
@@ -184,6 +185,16 @@ async def check_pending_invoices_for_tenant(
                 update_values["bezahlt_am"] = now
                 update_values["status"] = RECHNUNG_STATUS_BEZAHLT
                 summary["paid"] += 1
+            elif voucher_status == "cancelled":
+                # 404 in Lexware = der Beleg ist dort geloescht. Das wurde
+                # bisher nur in lexware_voucher_status vermerkt, waehrend der
+                # Status auf 'mail_sent' stehenblieb. Folge: die Rechnung
+                # wurde entgegen dem Docstring weiter gepollt UND zaehlte in
+                # den offenen Posten als Forderung mit, die es nicht gibt.
+                update_values["status"] = RECHNUNG_STATUS_CANCELLED
+                summary["cancelled"] = summary.get("cancelled", 0) + 1
+                logger.info(
+                    "Rechnung %s: in Lexware geloescht -> Status cancelled", r_id)
             else:
                 summary["no_change"] += 1
 

@@ -3709,33 +3709,31 @@ async def api_rechnung_senden(
     if not to_email:
         return JSONResponse({"ok": False, "error": "Keine Empfaenger-Mail vorhanden."}, status_code=400)
 
-    from core.integrations.angebot_mail import send_rechnung_to_customer
+    # Bis 2026-08-14 rief diese Route eine Funktion, die es fuer eine
+    # Formular-Rechnung gar nicht gab: der Aufruf lief garantiert in einen
+    # TypeError und der Nutzer bekam „Bitte erst in Lexware finalisieren".
+    # Der Weg war damit strukturell tot. Jetzt macht der Versand dasselbe wie
+    # beim Auftragsweg: in Lexware ausstellen, Entwurf wegraeumen, PDF holen,
+    # mailen — und die Rechnung landet danach in der Bezahl-Ueberwachung.
+    from core.services.document_flow import finalize_and_send_rechnung
     try:
-        # send_rechnung_to_customer arbeitet ueber Angebot.lexware_invoice_id —
-        # der Helper unterstuetzt aber auch die Rechnung-direkt-Variante
-        # via rechnung_id-Parameter. Falls die Funktion das in der aktuellen
-        # Version nicht hat, ruft sie eine NotImplementedError → wir geben
-        # eine klare Fehlermeldung zurueck.
-        try:
-            result = await send_rechnung_to_customer(
-                rechnung_id=rid, to_email=to_email, cc=cc,
-            )
-        except TypeError:
-            return JSONResponse({
-                "ok": False,
-                "error": "Rechnungs-Mail erfordert eine in Lexware finalisierte Rechnung. "
-                         "Bitte erst in Lexware finalisieren, dann hier senden.",
-            }, status_code=400)
+        result = await finalize_and_send_rechnung(
+            tid, rechnung_id=rid, to_email=to_email, cc=cc)
     except Exception as exc:  # noqa: BLE001
         logger.exception("send_rechnung crash: %s", exc)
         return JSONResponse({"ok": False, "error": "Mail-Versand fehlgeschlagen."}, status_code=500)
 
-    if not result.get("success"):
+    if not result.get("ok"):
         return JSONResponse({
             "ok": False,
             "error": result.get("error") or "Mail-Versand fehlgeschlagen.",
+            "lexware_ausgestellt": result.get("lexware_ausgestellt", False),
+            "queued": result.get("queued", False),
         }, status_code=502)
-    return JSONResponse({"ok": True, "message_id": result.get("message_id")})
+    return JSONResponse({
+        "ok": True, "nummer": result.get("nummer"),
+        "deeplink": result.get("deeplink"), "to_email": result.get("to_email"),
+    })
 
 
 # =================== Belege (Lexware-Voucher-Upload) ===================

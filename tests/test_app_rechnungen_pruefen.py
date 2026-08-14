@@ -58,3 +58,97 @@ async def test_pruefen_happy_path_mappt_summary(monkeypatch):
     assert b["bezahlt"] == 2
     assert b["unveraendert"] == 2
     assert b["fehler"] == 0
+
+
+# --------------------------------------------------------------------------
+# Bezahl-Monitor: in Lexware geloeschte Rechnungen
+#
+# 404 heisst: den Beleg gibt es dort nicht mehr. Bisher wurde das nur in
+# lexware_voucher_status vermerkt, der Status blieb 'mail_sent' — die
+# Rechnung wurde also ewig weiter gepollt (entgegen dem Docstring) und
+# zaehlte in den offenen Posten als Forderung mit, die es nicht gibt.
+# --------------------------------------------------------------------------
+
+from contextlib import asynccontextmanager  # noqa: E402
+
+import core.integrations.rechnung_payment_monitor as pm  # noqa: E402
+
+
+class _UpdateSession:
+    """Faengt die UPDATE-Werte ab, statt sie in eine DB zu schreiben."""
+
+    def __init__(self, rows):
+        self._rows = rows
+        self.updates = []
+
+    async def execute(self, stmt):
+        # SELECT (Liste offener Rechnungen) vs. UPDATE unterscheiden
+        werte = getattr(stmt, "_values", None)
+        if werte is not None:
+            self.updates.append({
+                (k.name if hasattr(k, "name") else str(k)): getattr(v, "value", v)
+                for k, v in werte.items()
+            })
+            return SimpleNamespace()
+        rows = self._rows
+        return SimpleNamespace(all=lambda: rows)
+
+    async def commit(self):
+        pass
+
+
+def _patch_monitor(monkeypatch, rows, antwort):
+    sess = _UpdateSession(rows)
+
+    @asynccontextmanager
+    async def _sl():
+        yield sess
+
+    monkeypatch.setattr(pm, "AsyncSessionLocal", _sl)
+
+    async def _prov(tid):
+        return object()
+    monkeypatch.setattr(pm, "_build_lexware_provider", _prov)
+
+    async def _check(r_id, lex_id, provider):
+        return antwort
+    monkeypatch.setattr(pm, "_check_one_invoice", _check)
+    return sess
+
+
+@pytest.mark.asyncio
+async def test_geloeschte_rechnung_wird_stillgelegt(monkeypatch):
+    r_id, lex_id = uuid.uuid4(), uuid.uuid4()
+    sess = _patch_monitor(monkeypatch, [(r_id, lex_id)], ("cancelled", False))
+
+    summary = await pm.check_pending_invoices_for_tenant(uuid.uuid4())
+
+    assert summary["checked"] == 1
+    assert summary.get("cancelled") == 1
+    assert summary["paid"] == 0
+    # Status wandert weg von mail_sent -> raus aus Polling UND offenen Posten
+    assert sess.updates[0]["status"] == "cancelled"
+    assert sess.updates[0]["lexware_voucher_status"] == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_bezahlte_rechnung_wird_als_bezahlt_gebucht(monkeypatch):
+    r_id, lex_id = uuid.uuid4(), uuid.uuid4()
+    sess = _patch_monitor(monkeypatch, [(r_id, lex_id)], ("paid", True))
+
+    summary = await pm.check_pending_invoices_for_tenant(uuid.uuid4())
+
+    assert summary["paid"] == 1
+    assert sess.updates[0]["status"] == "bezahlt"
+    assert sess.updates[0]["bezahlt_am"] is not None
+
+
+@pytest.mark.asyncio
+async def test_offene_rechnung_bleibt_unveraendert(monkeypatch):
+    r_id, lex_id = uuid.uuid4(), uuid.uuid4()
+    sess = _patch_monitor(monkeypatch, [(r_id, lex_id)], ("open", False))
+
+    summary = await pm.check_pending_invoices_for_tenant(uuid.uuid4())
+
+    assert summary["no_change"] == 1
+    assert "status" not in sess.updates[0]
