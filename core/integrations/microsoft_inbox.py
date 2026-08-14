@@ -549,6 +549,7 @@ async def poll_microsoft_inbox(
                     ms_conversation_id=msg.get("conversationId"),
                     classification=classification, confidence=confidence,
                     reason=reason, categories=msg.get("categories") or [],
+                    internet_message_id=msg.get("internetMessageId"),
                 )
             except Exception as e:
                 logger.exception(
@@ -567,6 +568,7 @@ async def poll_microsoft_inbox(
                     ms_conversation_id=msg.get("conversationId"),
                     classification=classification, confidence=confidence,
                     reason=reason, categories=msg.get("categories") or [],
+                    internet_message_id=msg.get("internetMessageId"),
                 )
             except Exception as e:
                 logger.exception(
@@ -1178,6 +1180,7 @@ async def _handle_storno_intent(
     ms_conversation_id: str | None,
     classification: str, confidence: str, reason: str,
     categories: list,
+    internet_message_id: str | None = None,
 ) -> dict:
     """Stornier-Intent: Kalender-Cancel + Bestaetigungs-Mail + Push.
 
@@ -1240,6 +1243,7 @@ async def _handle_storno_intent(
             kunde_anrede=kunde_anrede, company_name=company_name,
             original_subject=subject, cancelled_count=len(cancelled),
             employee_id=employee_id,
+            original_message_id=internet_message_id,
         )
     except Exception as e:
         logger.exception(f"storno-intent: send_storno_confirmation: {e}")
@@ -1310,6 +1314,7 @@ async def _handle_verschiebung_intent(
     ms_conversation_id: str | None,
     classification: str, confidence: str, reason: str,
     categories: list,
+    internet_message_id: str | None = None,
 ) -> dict:
     """Verschiebungs-Intent: Termin finden + Rueckfrage-Mail + Push.
     Stornieren tun wir NICHT — der Inhaber muss den neuen Termin
@@ -1374,6 +1379,7 @@ async def _handle_verschiebung_intent(
             kunde_anrede=kunde_anrede, company_name=company_name,
             original_subject=subject, found_termine=found_termine,
             employee_id=employee_id,
+            original_message_id=internet_message_id,
         )
     except Exception as e:
         logger.exception(f"verschiebung-intent: send mail: {e}")
@@ -2175,6 +2181,9 @@ async def process_relevant_kunde_mail(
             body_html=body_html,
             body_text=body_text,
             employee_id=employee_id,
+            # Echte Antwort statt loser Mail mit "Re:" davor — beim Kunden
+            # haengt sie damit im Thread seiner eigenen Anfrage.
+            in_reply_to=internet_message_id,
         )
         result["sent"] = bool(sent_meta.get("success"))
         if not sent_meta.get("success"):

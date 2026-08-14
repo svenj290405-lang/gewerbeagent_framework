@@ -133,12 +133,14 @@ def mail_send_capture(monkeypatch):
     async def fake_send_tracked(
         *, tenant_id, to_email, subject, body_html,
         cc=None, attachments=None, employee_id=None, body_text=None,
+        in_reply_to=None, references=None,
     ):
         calls.append({
             "tenant_id": tenant_id, "to_email": to_email,
             "subject": subject, "body_html": body_html,
             "body_text": body_text,
             "employee_id": employee_id,
+            "in_reply_to": in_reply_to,
         })
         return {
             "success": True,
@@ -487,6 +489,7 @@ async def test_storno_handler_cancels_events_and_sends_confirmation(
         ms_conversation_id="ms-conv-99",
         classification="RELEVANT_KUNDE", confidence="high",
         reason="storno", categories=[],
+        internet_message_id="<storno-in@example.de>",
     )
     assert result["success"] is True
     assert result["intent"] == "termin_stornieren"
@@ -502,6 +505,9 @@ async def test_storno_handler_cancels_events_and_sends_confirmation(
     sent = mail_send_capture[0]
     assert sent["to_email"] == "kunde@example.de"
     assert "storniert" in sent["body_html"]
+    # Die Bestaetigung haengt im Thread der Absage-Mail (In-Reply-To),
+    # nicht bloss "Re:" im Betreff.
+    assert sent["in_reply_to"] == "<storno-in@example.de>"
     # state wurde auf STORNIERT gesetzt
     assert len(persistence_capture["set_conversation_state"]) == 1
     assert (

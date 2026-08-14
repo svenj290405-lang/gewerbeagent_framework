@@ -132,6 +132,72 @@ def test_build_mail_text_haengt_kontakt_an():
 
 
 # --------------------------------------------------------------------------
+# Absender-Konsistenz
+# --------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_footer_zeigt_das_postfach_nicht_die_stammdaten(monkeypatch):
+    """Der Footer muss die Adresse tragen, aus der wirklich gesendet wird.
+
+    Steht dort eine andere als im From-Feld, ist das ein Spamfilter-Merkmal
+    — und eine Kunden-Antwort dorthin liest der Inbox-Poller nie.
+    """
+    tid = uuid.uuid4()
+    _patch_tenant(monkeypatch, SimpleNamespace(
+        id=tid, company_name="Schreiberei Jantos", contact_name="Sven Jantos",
+        contact_email="veraltet@example.com", contact_phone="0201 1234"))
+
+    gesehen = {}
+
+    async def fake_tracked(**kw):
+        gesehen.update(kw)
+        return {"success": True, "internet_message_id": "<x@outlook.de>"}
+
+    async def fake_mailbox(tid_, employee_id=None):
+        return "svenjantos@outlook.de"
+
+    import core.integrations.microsoft as ms
+    import core.utils.mail_absender as absender
+    monkeypatch.setattr(ms, "send_tracked_mail", fake_tracked)
+    monkeypatch.setattr(absender, "mailbox_adresse", fake_mailbox)
+
+    res = await mc.send_freie_mail(
+        tid, to_email="kunde@example.de", betreff="Ihr Angebot",
+        text="Hallo,\n\nanbei das Angebot.")
+
+    assert res["ok"] is True
+    assert "svenjantos@outlook.de" in gesehen["body_html"]
+    assert "svenjantos@outlook.de" in gesehen["body_text"]
+    assert "veraltet@example.com" not in gesehen["body_html"]
+
+
+@pytest.mark.asyncio
+async def test_footer_faellt_ohne_postfach_auf_die_stammdaten_zurueck(monkeypatch):
+    tid = uuid.uuid4()
+    _patch_tenant(monkeypatch, SimpleNamespace(
+        id=tid, company_name="X", contact_name="Sven", contact_phone="",
+        contact_email="kontakt@example.de"))
+
+    gesehen = {}
+
+    async def fake_tracked(**kw):
+        gesehen.update(kw)
+        return {"success": True}
+
+    async def fake_mailbox(tid_, employee_id=None):
+        return None  # Microsoft (noch) nicht verbunden
+
+    import core.integrations.microsoft as ms
+    import core.utils.mail_absender as absender
+    monkeypatch.setattr(ms, "send_tracked_mail", fake_tracked)
+    monkeypatch.setattr(absender, "mailbox_adresse", fake_mailbox)
+
+    await mc.send_freie_mail(
+        tid, to_email="kunde@example.de", betreff="Hi", text="Text")
+    assert "kontakt@example.de" in gesehen["body_html"]
+
+
+# --------------------------------------------------------------------------
 # Versand-Vertrag
 # --------------------------------------------------------------------------
 

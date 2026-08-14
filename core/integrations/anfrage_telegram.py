@@ -282,6 +282,9 @@ async def _send_dank_mail_and_thread(
             original_subject=token_obj.original_subject,
             employee_id=employee_id,
             termin_besteht=termin_besteht,
+            # Thread beim Kunden: Elternteil ist die Mail, mit der die
+            # Anfrage begann (im Token gespeichert).
+            original_message_id=token_obj.original_message_id,
         )
         if not sent_meta.get("success"):
             logger.warning(

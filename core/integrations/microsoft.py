@@ -192,29 +192,88 @@ def _build_attachment_payload(attachments: Optional[list[dict]]) -> list[dict]:
     return out
 
 
-def _build_mime_alternative_b64(
+# Graph nimmt einen MIME-Draft (POST /me/messages mit text/plain) nur bis
+# 4 MB an. Der Anhang-Pfad ueber POST /messages/{id}/attachments kann mehr
+# (3 MB je Anhang, in Summe deutlich darueber) — darum schaetzen wir vor
+# dem Versand ab und fallen bei grossen Anhaengen auf den JSON-Pfad zurueck.
+_MIME_MAX_BYTES = 3_500_000
+
+
+def _mime_vertraegt_anhaenge(attachments: Optional[list[dict]]) -> bool:
+    """Passt die Mail samt Anhaengen noch in einen MIME-Draft?
+
+    Base64 blaeht um 4/3 auf; der Zuschlag deckt Header, Body und
+    MIME-Grenzen ab.
+    """
+    roh = sum(len(a.get("bytes") or b"") for a in (attachments or []))
+    return (roh * 4) // 3 + 60_000 <= _MIME_MAX_BYTES
+
+
+def _build_mime_b64(
     *, subject: str, to_email: str, body_html: str,
     body_text: str, cc: Optional[list[str]] = None,
+    in_reply_to: Optional[str] = None,
+    references: Optional[str] = None,
+    attachments: Optional[list[dict]] = None,
 ) -> str:
-    """Baut eine multipart/alternative-MIME (text/plain + text/html) und
-    gibt sie base64-kodiert zurueck — fuer Graphs MIME-Versand.
+    """Baut die komplette Mail als MIME und gibt sie base64-kodiert zurueck
+    — fuer Graphs MIME-Versand.
 
-    Reihenfolge: text zuerst, html zuletzt (in multipart/alternative gilt
-    der LETZTE Teil als bevorzugt). Clients ohne HTML (oder beim Zitieren,
-    z.B. GMX-Mobile) nehmen den sauberen Text-Teil statt HTML-Muell.
+    Aufbau: multipart/alternative (text/plain + text/html), bei Anhaengen
+    zusaetzlich in ein multipart/mixed gewickelt. Reihenfolge im
+    alternative-Teil: text zuerst, html zuletzt (dort gilt der LETZTE Teil
+    als bevorzugt). Clients ohne HTML (oder beim Zitieren, z.B. GMX-Mobile)
+    nehmen den sauberen Text-Teil statt HTML-Muell.
+
+    ``in_reply_to`` ist die ``Message-ID`` der Mail, auf die wir antworten.
+    Erst dieser Header (samt ``References``-Kette) haengt unsere Antwort
+    beim Kunden IM Thread statt lose daneben — und ein "Re:" mit Referenz
+    ist fuer Spamfilter eine echte Antwort, eines ohne bloss eine
+    Behauptung. Diesen Weg gibt es nur ueber MIME: Graphs JSON-Draft laesst
+    ueber ``internetMessageHeaders`` ausschliesslich eigene ``x-``-Header
+    zu, keine RFC-Standardheader.
+
     Kein From-Header: Graph setzt den Absender automatisch aufs Postfach.
     """
     import base64
+    from email import encoders
+    from email.mime.base import MIMEBase
     from email.mime.multipart import MIMEMultipart
     from email.mime.text import MIMEText
 
-    msg = MIMEMultipart("alternative")
+    alternative = MIMEMultipart("alternative")
+    alternative.attach(MIMEText(body_text or "", "plain", "utf-8"))
+    alternative.attach(MIMEText(body_html or "", "html", "utf-8"))
+
+    if attachments:
+        msg: MIMEMultipart = MIMEMultipart("mixed")
+        msg.attach(alternative)
+        for a in attachments:
+            raw = a.get("bytes")
+            if raw is None:
+                continue
+            ctype = a.get("content_type") or "application/octet-stream"
+            maintype, _, subtype = ctype.partition("/")
+            teil = MIMEBase(maintype or "application", subtype or "octet-stream")
+            teil.set_payload(raw)
+            encoders.encode_base64(teil)
+            teil.add_header(
+                "Content-Disposition", "attachment",
+                filename=a.get("filename") or "anhang.pdf",
+            )
+            msg.attach(teil)
+    else:
+        msg = alternative
+
     msg["Subject"] = subject
     msg["To"] = to_email
     if cc:
         msg["Cc"] = ", ".join(cc)
-    msg.attach(MIMEText(body_text or "", "plain", "utf-8"))
-    msg.attach(MIMEText(body_html or "", "html", "utf-8"))
+    if in_reply_to:
+        msg["In-Reply-To"] = in_reply_to
+        # References ist die ganze Kette; haben wir sie nicht, ist der
+        # direkte Vorgaenger die korrekte einelementige Kette.
+        msg["References"] = references or in_reply_to
     return base64.b64encode(msg.as_bytes()).decode("ascii")
 
 
@@ -228,6 +287,8 @@ async def send_mail_as_user(
     attachments: Optional[list[dict]] = None,
     employee_id: UUID | None = None,
     body_text: str | None = None,
+    in_reply_to: str | None = None,
+    references: str | None = None,
 ) -> bool:
     """Sendet Mail im Namen des verbundenen Microsoft-Users via Graph API.
 
@@ -235,6 +296,7 @@ async def send_mail_as_user(
     eines bestimmten Mitarbeiters (statt nur Tenant-Default).
 
     attachments: [{"filename": "...", "bytes": b"...", "content_type": "application/pdf"}]
+    in_reply_to/references: RFC-Threading, siehe ``_build_mime_b64``.
     Returns: True bei Erfolg, False bei Fehler.
     """
     try:
@@ -246,12 +308,14 @@ async def send_mail_as_user(
         logger.error(f"send_mail_as_user Token-Fehler: {e}")
         return False
 
-    # multipart/alternative (text + html) via MIME — bessere Client-/GMX-
-    # Kompatibilitaet. Nur ohne Attachments (Template-Mails haben keine).
-    if body_text and not attachments:
-        mime_b64 = _build_mime_alternative_b64(
+    # MIME (text + html, optional Anhaenge, optional Threading-Header) —
+    # bessere Client-/GMX-Kompatibilitaet und der einzige Weg, In-Reply-To
+    # zu setzen. Bei zu grossen Anhaengen greift der JSON-Pfad unten.
+    if body_text and _mime_vertraegt_anhaenge(attachments):
+        mime_b64 = _build_mime_b64(
             subject=subject, to_email=to_email, body_html=body_html,
-            body_text=body_text, cc=cc,
+            body_text=body_text, cc=cc, in_reply_to=in_reply_to,
+            references=references, attachments=attachments,
         )
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
@@ -349,6 +413,8 @@ async def send_tracked_mail(
     attachments: Optional[list[dict]] = None,
     employee_id: UUID | None = None,
     body_text: str | None = None,
+    in_reply_to: str | None = None,
+    references: str | None = None,
 ) -> dict:
     """Versendet eine Mail im Two-Step-Modus (Draft-Create + Send) damit wir
     die Microsoft-IDs bekommen, ueber die wir spaeter Antworten zuordnen koennen.
@@ -357,6 +423,10 @@ async def send_tracked_mail(
       1. POST /me/messages           -> Draft anlegen, kriegt id, internetMessageId, conversationId
       2. (optional) PATCH falls cc/etc nachgepflegt werden muessten - hier Step 1 deckt alles
       3. POST /me/messages/{id}/send -> Mail rausgeben (Body: leer, das Draft wird genommen)
+
+    ``in_reply_to`` (Message-ID der Mail, auf die wir antworten) haengt die
+    Antwort beim Kunden in den richtigen Thread — nur ueber den MIME-Pfad
+    setzbar, siehe ``_build_mime_b64``.
 
     Returns: {
         success: bool,
@@ -397,19 +467,28 @@ async def send_tracked_mail(
         "Content-Type": "application/json",
     }
 
-    # MIME-Draft (multipart/alternative text+html) wenn body_text da ist
-    # und keine Attachments — bessere GMX-/Client-Kompatibilitaet. Der
-    # Draft-aus-MIME-Pfad liefert trotzdem internetMessageId + conversationId
-    # (Threading bleibt erhalten).
-    use_mime = bool(body_text) and not attachments
+    # MIME-Draft (text+html, Anhaenge, Threading-Header) wenn body_text da
+    # ist und die Anhaenge unter Graphs 4-MB-Grenze bleiben — bessere
+    # GMX-/Client-Kompatibilitaet. Der Draft-aus-MIME-Pfad liefert trotzdem
+    # internetMessageId + conversationId (unser Threading bleibt erhalten).
+    use_mime = bool(body_text) and _mime_vertraegt_anhaenge(attachments)
+    if in_reply_to and not use_mime:
+        # Kein Drama, aber erwaehnenswert: die Antwort geht dann ohne
+        # In-Reply-To raus und steht beim Kunden neben dem Thread.
+        logger.info(
+            "send_tracked_mail: Threading-Header entfallen (JSON-Pfad, "
+            "body_text=%s anhaenge=%d) tenant=%s",
+            bool(body_text), len(attachments or []), tenant_id,
+        )
 
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             # 1) Draft anlegen
             if use_mime:
-                mime_b64 = _build_mime_alternative_b64(
+                mime_b64 = _build_mime_b64(
                     subject=subject, to_email=to_email, body_html=body_html,
-                    body_text=body_text, cc=cc,
+                    body_text=body_text, cc=cc, in_reply_to=in_reply_to,
+                    references=references, attachments=attachments,
                 )
                 r1 = await client.post(
                     f"{GRAPH_API_BASE}/me/messages",
@@ -434,8 +513,10 @@ async def send_tracked_mail(
             out["internet_message_id"] = draft.get("internetMessageId")
             out["conversation_id"] = draft.get("conversationId")
 
-            # 2) Anhaenge dranbauen (einzeln POSTen, weil das Draft schon existiert)
-            for a in _build_attachment_payload(attachments):
+            # 2) Anhaenge dranbauen (einzeln POSTen, weil das Draft schon
+            # existiert) — nur im JSON-Pfad; im MIME-Draft stecken sie schon
+            # drin, ein zweites POST wuerde sie doppelt anhaengen.
+            for a in _build_attachment_payload(None if use_mime else attachments):
                 ra = await client.post(
                     f"{GRAPH_API_BASE}/me/messages/{msg_id}/attachments",
                     headers=headers,

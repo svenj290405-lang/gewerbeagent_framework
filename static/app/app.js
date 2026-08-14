@@ -1703,6 +1703,12 @@ const SCREENS = {
       if (!m.available) { mSub = "Nicht verfügbar — bitte Support kontaktieren"; mBtns = ""; }
       else if (m.connected) {
         mSub = `✓ ${esc(m.account || "verbunden")}`;
+        // Freemail-Postfach: Mails an neue Kunden landen damit oft im
+        // Spam-Ordner — und zwar lautlos, es kommt keine Fehlermeldung
+        // zurück. Lieber hier einmal warnen als später rätseln.
+        if (m.freemail) {
+          mSub += `<div style="margin-top:6px;padding:8px 10px;border-radius:8px;background:rgba(255,149,0,.12);font-size:12px;line-height:1.45">⚠️ Privates Freemail-Postfach. Mails an <b>neue</b> Kunden (Angebote, Rechnungen) landen damit häufig im Spam — ohne Fehlermeldung. Für den Echtbetrieb ein Postfach auf der <b>eigenen Domain</b> verbinden.</div>`;
+        }
         mBtns = `<button class="btn-sm btn-ghost" data-oauth="microsoft">Neu verbinden</button><button class="btn-sm btn-ghost" data-trennen="microsoft">Trennen</button><button class="btn-sm btn-ghost" data-test="microsoft">Test-Mail</button>`;
       } else {
         mSub = "Outlook-Postfach & Kalender verbinden";

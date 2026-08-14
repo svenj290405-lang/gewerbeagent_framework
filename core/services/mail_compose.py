@@ -301,8 +301,18 @@ async def send_freie_mail(
             return {"ok": False, "error": " ".join(fehler)}
 
     contact_name = getattr(tenant, "contact_name", "") or ""
-    contact_email = getattr(tenant, "contact_email", "") or ""
     contact_phone = getattr(tenant, "contact_phone", "") or ""
+    # Footer-Adresse = das Postfach, aus dem die Mail wirklich rausgeht.
+    # tenant.contact_email ist nur der Rueckfall: weicht sie vom Postfach ab,
+    # zeigt die Mail einen mailto: auf eine ANDERE Adresse als das From-Feld
+    # (Spamfilter-Merkmal), und eine Kunden-Antwort dorthin sieht der
+    # Inbox-Poller nie. Siehe core/utils/mail_absender.py.
+    from core.utils.mail_absender import mailbox_adresse
+
+    contact_email = (
+        await mailbox_adresse(tid, employee_id)
+        or getattr(tenant, "contact_email", "") or ""
+    )
     body_html = build_mail_html(
         text, company_name=tenant.company_name or "",
         contact_name=contact_name, contact_email=contact_email,

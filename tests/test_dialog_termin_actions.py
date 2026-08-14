@@ -147,10 +147,12 @@ def pipeline_mocks(monkeypatch, captured_state):
 
     async def fake_send_tracked(*, tenant_id, to_email, subject, body_html,
                                 cc=None, attachments=None, employee_id=None,
-                                body_text=None):
+                                body_text=None, in_reply_to=None,
+                                references=None):
         captured_state["send_tracked_mail"].append({
             "to_email": to_email, "subject": subject,
             "body_html": body_html, "body_text": body_text,
+            "in_reply_to": in_reply_to,
         })
         return {
             "success": True,
@@ -416,6 +418,10 @@ async def test_propose_slots_calls_kalender_and_persists_slots(
     # Push-Politik: Slot-Vorschlaege pingen NICHT mehr (nur Buchung/Storno)
     pushes = pipeline_mocks["captured"]["telegram_pushes"]
     assert not any("Slots vorgeschlagen" in p["label"] for p in pushes)
+    # Threading: die Antwort referenziert die Kunden-Mail und haengt damit
+    # beim Empfaenger im Thread statt lose daneben ("Re:" allein reicht nicht).
+    assert (pipeline_mocks["captured"]["send_tracked_mail"][0]["in_reply_to"]
+            == "<inbound-1@example.de>")
 
 
 @pytest.mark.asyncio

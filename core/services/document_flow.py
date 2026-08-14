@@ -619,10 +619,16 @@ async def send_anfrage_reply(
     paragraphs = [p.strip() for p in reply_text.split("\n\n") if p.strip()]
     body_html = "".join("<p>" + p.replace("\n", "<br>") + "</p>" for p in paragraphs)
 
+    # Threading: als Elternteil dient unsere letzte Mail in diesem Thread
+    # (last_message_id). Die Message-ID der eingehenden Kunden-Mail halten
+    # wir nicht vor — fuer die Zuordnung beim Empfaenger genuegt ein
+    # gemeinsamer Vorfahre in der References-Kette, danach gruppieren die
+    # gaengigen Clients korrekt.
     try:
         send_result = await send_tracked_mail(
             tenant_id=tid, to_email=conv.kunde_email, subject=reply_subject,
-            body_html=body_html, body_text=reply_text, employee_id=employee_id)
+            body_html=body_html, body_text=reply_text, employee_id=employee_id,
+            in_reply_to=conv.last_message_id or None)
     except Exception as exc:  # noqa: BLE001
         logger.exception("send_anfrage_reply send_tracked_mail crash: %s", exc)
         return {"ok": False, "error": "Mail-Versand fehlgeschlagen."}

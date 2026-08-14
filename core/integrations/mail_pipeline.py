@@ -814,8 +814,13 @@ async def send_storno_confirmation(
     to_email: str, kunde_anrede: str, company_name: str,
     original_subject: str, cancelled_count: int,
     employee_id: uuid.UUID | None = None,
+    original_message_id: str | None = None,
 ) -> dict:
     """Versendet die Storno-Bestaetigung via send_tracked_mail.
+
+    original_message_id ist die Message-ID der Kunden-Mail, auf die wir
+    antworten — damit die Bestaetigung beim Kunden IM Thread haengt statt
+    lose daneben (siehe microsoft._build_mime_b64).
 
     Returns: sent_meta-Dict {success, message_id, internet_message_id,
     conversation_id, error}. Caller persistiert das in
@@ -846,6 +851,7 @@ async def send_storno_confirmation(
         body_html=body_html,
         body_text=body_text,
         employee_id=employee_id,
+        in_reply_to=original_message_id,
     )
 
 
@@ -933,8 +939,12 @@ async def send_verschiebung_request(
     to_email: str, kunde_anrede: str, company_name: str,
     original_subject: str, found_termine: list[dict],
     employee_id: uuid.UUID | None = None,
+    original_message_id: str | None = None,
 ) -> dict:
-    """Versendet die Verschiebungs-Rueckfrage. Returns sent_meta-Dict."""
+    """Versendet die Verschiebungs-Rueckfrage. Returns sent_meta-Dict.
+
+    original_message_id = Message-ID der Kunden-Mail (Thread-Zuordnung
+    beim Empfaenger, siehe send_storno_confirmation)."""
     from core.integrations.microsoft import send_tracked_mail
 
     body_html = _build_verschiebung_html(
@@ -959,6 +969,7 @@ async def send_verschiebung_request(
         body_html=body_html,
         body_text=body_text,
         employee_id=employee_id,
+        in_reply_to=original_message_id,
     )
 
 
@@ -977,6 +988,7 @@ async def send_formular_dank_mail(
     original_subject: str | None,
     employee_id: uuid.UUID | None = None,
     termin_besteht: bool = False,
+    original_message_id: str | None = None,
 ) -> dict:
     """Dankes-Mail nachdem der Kunde das Anfrage-Formular ausgefuellt hat.
 
@@ -1042,6 +1054,7 @@ async def send_formular_dank_mail(
         body_html=body_html,
         body_text=body_text,
         employee_id=employee_id,
+        in_reply_to=original_message_id,
     )
 
 

@@ -121,6 +121,37 @@ async def test_status_google_connected_kalender_und_drive(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("adresse,warnt", [
+    ("svenjantos@outlook.de", True),        # geteilte Freemail-Domain
+    ("info@schreiberei-jantos.de", False),  # eigene Domain
+])
+async def test_status_warnt_bei_freemail_postfach(monkeypatch, adresse, warnt):
+    """Aus einem Freemail-Postfach landen Erstkontakt-Mails ueberdurch-
+    schnittlich oft im Spam — ohne Bounce. Die App muss das anzeigen,
+    sonst merkt es niemand."""
+    m = SimpleNamespace(account_email=adresse, scopes="mail.send")
+
+    async def fake_find(tid, provider, eid):
+        return m if provider == "microsoft" else None
+
+    monkeypatch.setattr("core.security.oauth_token_lookup.find_oauth_token", fake_find)
+    monkeypatch.setattr(
+        "core.integrations.google_drive.is_drive_configured", lambda t: False
+    )
+
+    async def fake_ms():
+        return True
+
+    monkeypatch.setattr(app_screens, "_microsoft_oauth_available", fake_ms)
+    monkeypatch.setattr(app_screens, "get_session", lambda: _FakeSession(scalar=None))
+
+    res = await app_screens.api_verbindungen_get(_req(), _e=None)
+    b = _body(res)
+    assert b["microsoft"]["connected"] is True
+    assert b["microsoft"]["freemail"] is warnt
+
+
+@pytest.mark.asyncio
 async def test_status_alles_getrennt(monkeypatch):
     async def fake_find(tid, provider, eid):
         return None

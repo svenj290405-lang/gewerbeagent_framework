@@ -14,7 +14,7 @@ from core.integrations.mail_template import build_kunde_reply_text
 from core.integrations.mail_pipeline import (
     _build_storno_text, _build_verschiebung_text, _build_buche_confirmation_text,
 )
-from core.integrations.microsoft import _build_mime_alternative_b64
+from core.integrations.microsoft import _build_mime_b64
 from core.utils.mail_reply import trim_quoted_reply
 
 
@@ -107,7 +107,7 @@ def test_buche_confirmation_text():
 # ===================================================================
 
 def test_mime_alternative_structure():
-    b64 = _build_mime_alternative_b64(
+    b64 = _build_mime_b64(
         subject="Re: Test", to_email="kunde@gmx.de",
         body_html="<p>Hallo</p>", body_text="Hallo", cc=None,
     )
@@ -123,7 +123,7 @@ def test_mime_alternative_structure():
 
 
 def test_mime_alternative_contents_and_cc():
-    b64 = _build_mime_alternative_b64(
+    b64 = _build_mime_b64(
         subject="Hi", to_email="a@b.de", body_html="<p>HTML-Teil</p>",
         body_text="Text-Teil", cc=["c@d.de"],
     )

@@ -4680,11 +4680,22 @@ async def _verbindungen_status(tid: uuid.UUID, employee_id: uuid.UUID) -> dict:
     }
 
     # Microsoft / Outlook — eigener Token
+    #
+    # freemail: das verbundene Postfach liegt auf einer geteilten
+    # Freemail-Domain (@outlook.de, @gmx.de …). Dann signiert DKIM auf die
+    # Domain des Anbieters statt auf die des Betriebs — es gibt keine
+    # eigene Reputation, und Erstkontakt-Mails (ein Angebot an eine neue
+    # Adresse) landen ueberdurchschnittlich oft im Spam-Ordner. Und zwar
+    # ohne Bounce: ohne diese Warnung wuerde es schlicht niemand merken.
+    from core.utils.mail_absender import ist_freemail_adresse
+
     m = await find_oauth_token(tid, "microsoft", employee_id)
+    m_account = getattr(m, "account_email", None) if m else None
     microsoft = {
         "connected": m is not None,
-        "account": getattr(m, "account_email", None) if m else None,
+        "account": m_account,
         "available": await _microsoft_oauth_available(),
+        "freemail": ist_freemail_adresse(m_account),
     }
 
     # Lexware — API-Key in ToolConfig (kein OAuth)
