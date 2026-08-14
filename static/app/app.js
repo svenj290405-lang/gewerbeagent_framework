@@ -394,6 +394,14 @@ const SCREENS = {
       count: aufnahmenCount ? `${aufnahmenCount} Gespräche` : "Keine Gespräche",
       badge: null,
     });
+    // Das Kunden-Formular gehoert zur taeglichen Arbeit (es haengt an jeder
+    // Anfrage-Mail), nicht in die Einstellungen — darum hier statt in „Mehr".
+    if (feats.has("anfrage_formular") && App.me.employee.is_inhaber) {
+      tiles.push({
+        ico: "📝", label: "Anfrage-Formular", screen: "formulare",
+        count: "Was Kunden ausfüllen", badge: null,
+      });
+    }
     // Tiles mit Badge (= Handlungsbedarf) nach oben sortieren
     tiles.sort((a, b) => (b.badge || 0) - (a.badge || 0));
     parts.push(`<div class="homescreen-grid">`);
@@ -1764,10 +1772,15 @@ const SCREENS = {
     // Text-Inputs schreiben live in state -> ein struktureller Re-Render
     // (Feld hinzufügen/löschen/verschieben/Typwechsel) verliert nichts.
     const state = {
-      typ: (App.formular && App.formular.typ) || "allgemein",
+      // "auto": der Server liefert den Typ, den die Kunden dieses Betriebs
+      // wirklich bekommen (Branche entscheidet). Sonst saesse ein Tischler
+      // im Allgemein-Formular und wunderte sich, warum seine Aenderungen
+      // beim Kunden nicht ankommen.
+      typ: (App.formular && App.formular.typ) || "auto",
       title: "", subtitle: "", fields: [],
       fieldTypes: [], optionTypes: [], typen: [], dirty: false,
-      previewUrl: "",
+      previewUrl: "", aktivTyp: "",
+      vorschlag: null,  // von Q gebauter Entwurf, noch nicht uebernommen
     };
     App.formular = state;
 
@@ -1782,6 +1795,109 @@ const SCREENS = {
       if (m) { m.textContent = t; m.style.color = ok ? "var(--ok,#1a7f37)" : "var(--err,#b42318)"; }
     };
     const inputStyle = "width:100%;padding:10px;border:1px solid var(--line);border-radius:10px;margin:4px 0 8px;font-size:16px";
+
+    // ---- Vorschau -----------------------------------------------------
+    // Gerendert wird auf dem Server mit DERSELBEN Funktion, die der Kunde
+    // spaeter sieht (render_anfrage_form_html). Ein zweiter Renderer hier
+    // wuerde vom Original wegdriften — und dann taeuscht die Vorschau.
+    let vorschauTimer = null;
+    const entwurf = () => ({
+      title: (state.title || "").trim(),
+      subtitle: (state.subtitle || "").trim(),
+      fields: state.fields.map((f) => ({
+        name: f.name || "", label: (f.label || "").trim(), type: f.type,
+        required: !!f.required, placeholder: f.placeholder || "",
+        options: f.options || [],
+      })),
+    });
+
+    const setVorschauHinweis = (text) => {
+      const box = document.getElementById("f-preview-note");
+      if (box) box.textContent = text || "";
+    };
+
+    const renderVorschau = async (daten) => {
+      const frame = document.getElementById("f-preview");
+      if (!frame) return;
+      const body = daten || entwurf();
+      // Ein Feld ohne Bezeichnung wuerde der Server (zu Recht) ablehnen —
+      // waehrend des Tippens ist das der Normalfall, kein Fehler.
+      if (!body.fields.length || body.fields.some((f) => !f.label)) {
+        setVorschauHinweis("Vorschau wartet — jedes Feld braucht noch eine Bezeichnung.");
+        return;
+      }
+      setVorschauHinweis("Aktualisiere …");
+      const r = await api(`/app/api/formulare/${encodeURIComponent(state.typ)}/vorschau`,
+        { method: "POST", body: JSON.stringify(body) });
+      const j = r ? await r.json().catch(() => null) : null;
+      if (j && j.ok) { frame.srcdoc = j.html; setVorschauHinweis(""); }
+      else setVorschauHinweis((j && j.error) || "Vorschau konnte nicht geladen werden.");
+    };
+
+    const vorschauSpaeter = () => {
+      clearTimeout(vorschauTimer);
+      vorschauTimer = setTimeout(() => renderVorschau(), 600);
+    };
+
+    // Jede Aenderung im Editor: merken, dass ungespeichert ist, und die
+    // Vorschau nachziehen (gebuendelt, sonst ein Request je Tastendruck).
+    const touch = () => { state.dirty = true; vorschauSpaeter(); };
+
+    // ---- Q-Zeile ------------------------------------------------------
+    const qErgebnis = () => document.getElementById("f-q-result");
+
+    const qVerwerfen = () => {
+      state.vorschlag = null;
+      const box = qErgebnis();
+      if (box) box.innerHTML = "";
+      renderVorschau();
+    };
+
+    const qUebernehmen = () => {
+      if (!state.vorschlag) return;
+      state.title = state.vorschlag.title || state.title;
+      state.subtitle = state.vorschlag.subtitle || "";
+      state.fields = (state.vorschlag.fields || []).map(normField);
+      state.vorschlag = null;
+      state.dirty = true;   // Vorschau zieht shell() gleich selbst nach
+      shell();  // Titel/Untertitel-Inputs neu befuellen
+      setMsg("Übernommen — noch nicht gespeichert.", true);
+    };
+
+    const qFragen = async () => {
+      const inp = document.getElementById("f-q-input");
+      const btn = document.getElementById("f-q-go");
+      const auftrag = ((inp && inp.value) || "").trim();
+      if (auftrag.length < 3) { inp && inp.focus(); return; }
+      const box = qErgebnis();
+      btn.disabled = true; btn.textContent = "Q denkt nach …";
+      if (box) box.innerHTML = `<p class="muted" style="font-size:13px;margin:8px 0 0">Q baut dein Formular um …</p>`;
+      const r = await api(`/app/api/formulare/${encodeURIComponent(state.typ)}/q`,
+        { method: "POST", body: JSON.stringify({ auftrag, ...entwurf() }) });
+      const j = r ? await r.json().catch(() => null) : null;
+      btn.disabled = false; btn.textContent = "Ändern lassen";
+      if (!j || !j.ok) {
+        if (box) box.innerHTML = `<p class="muted" style="font-size:13px;margin:8px 0 0;color:var(--err,#b42318)">${esc((j && j.error) || "Q konnte das nicht umbauen.")}</p>`;
+        return;
+      }
+      state.vorschlag = { title: j.title || "", subtitle: j.subtitle || "", fields: j.fields || [] };
+      if (inp) inp.value = "";
+      if (box) {
+        box.innerHTML =
+          `<div style="margin-top:10px;padding:10px 12px;border-radius:10px;background:rgba(10,132,255,.10)">
+             <p style="margin:0 0 8px;font-size:14px;line-height:1.45">${esc(j.erklaerung || "Vorschlag steht in der Vorschau.")}</p>
+             <p class="muted" style="margin:0 0 10px;font-size:12px">Oben siehst du den Vorschlag. Übernehmen ändert nur den Entwurf — gespeichert wird erst mit „Speichern".</p>
+             <div style="display:flex;gap:8px;flex-wrap:wrap">
+               <button class="btn-sm" id="f-q-ok">Übernehmen</button>
+               <button class="btn-sm btn-ghost" id="f-q-no">Verwerfen</button>
+             </div>
+           </div>`;
+        document.getElementById("f-q-ok").addEventListener("click", qUebernehmen);
+        document.getElementById("f-q-no").addEventListener("click", qVerwerfen);
+      }
+      // Vorschau zeigt sofort den Vorschlag — sehen statt lesen.
+      renderVorschau(state.vorschlag);
+    };
 
     const renderFields = () => {
       const wrap = document.getElementById("f-fields");
@@ -1821,27 +1937,27 @@ const SCREENS = {
       }).join("");
 
       const idx = (e) => +e.currentTarget.dataset.i;
-      wrap.querySelectorAll(".f-label").forEach((el) => el.addEventListener("input", (e) => { state.fields[idx(e)].label = e.target.value; state.dirty = true; }));
-      wrap.querySelectorAll(".f-ph").forEach((el) => el.addEventListener("input", (e) => { state.fields[idx(e)].placeholder = e.target.value; state.dirty = true; }));
-      wrap.querySelectorAll(".f-opts").forEach((el) => el.addEventListener("input", (e) => { state.fields[idx(e)].options = e.target.value.split("\n").map((s) => s.trim()).filter(Boolean); state.dirty = true; }));
-      wrap.querySelectorAll(".f-req").forEach((el) => el.addEventListener("change", (e) => { state.fields[idx(e)].required = e.target.checked; state.dirty = true; }));
+      wrap.querySelectorAll(".f-label").forEach((el) => el.addEventListener("input", (e) => { state.fields[idx(e)].label = e.target.value; touch(); }));
+      wrap.querySelectorAll(".f-ph").forEach((el) => el.addEventListener("input", (e) => { state.fields[idx(e)].placeholder = e.target.value; touch(); }));
+      wrap.querySelectorAll(".f-opts").forEach((el) => el.addEventListener("input", (e) => { state.fields[idx(e)].options = e.target.value.split("\n").map((s) => s.trim()).filter(Boolean); touch(); }));
+      wrap.querySelectorAll(".f-req").forEach((el) => el.addEventListener("change", (e) => { state.fields[idx(e)].required = e.target.checked; touch(); }));
       wrap.querySelectorAll(".f-type").forEach((el) => el.addEventListener("change", (e) => {
         const i = idx(e); state.fields[i].type = e.target.value;
         if (isOptionType(e.target.value) && !(state.fields[i].options || []).length) state.fields[i].options = [];
-        state.dirty = true; renderFields();
+        touch(); renderFields();
       }));
-      wrap.querySelectorAll(".f-up").forEach((el) => el.addEventListener("click", (e) => { const i = idx(e); if (i > 0) { const a = state.fields; const t = a[i - 1]; a[i - 1] = a[i]; a[i] = t; state.dirty = true; renderFields(); } }));
-      wrap.querySelectorAll(".f-down").forEach((el) => el.addEventListener("click", (e) => { const i = idx(e); const a = state.fields; if (i < a.length - 1) { const t = a[i + 1]; a[i + 1] = a[i]; a[i] = t; state.dirty = true; renderFields(); } }));
+      wrap.querySelectorAll(".f-up").forEach((el) => el.addEventListener("click", (e) => { const i = idx(e); if (i > 0) { const a = state.fields; const t = a[i - 1]; a[i - 1] = a[i]; a[i] = t; touch(); renderFields(); } }));
+      wrap.querySelectorAll(".f-down").forEach((el) => el.addEventListener("click", (e) => { const i = idx(e); const a = state.fields; if (i < a.length - 1) { const t = a[i + 1]; a[i + 1] = a[i]; a[i] = t; touch(); renderFields(); } }));
       wrap.querySelectorAll(".f-del").forEach((el) => el.addEventListener("click", (e) => {
         const i = idx(e);
         if (state.fields.length <= 1) { alert("Mindestens ein Feld muss bleiben."); return; }
-        if (confirm("Dieses Feld löschen?")) { state.fields.splice(i, 1); state.dirty = true; renderFields(); }
+        if (confirm("Dieses Feld löschen?")) { state.fields.splice(i, 1); touch(); renderFields(); }
       }));
     };
 
     const addField = () => {
       state.fields.push({ name: "", label: "", type: "text", required: false, placeholder: "", options: [] });
-      state.dirty = true; renderFields();
+      touch(); renderFields();
       const labels = document.querySelectorAll("#f-fields .f-label");
       if (labels.length) labels[labels.length - 1].focus();
     };
@@ -1885,13 +2001,41 @@ const SCREENS = {
     };
 
     const shell = () => {
+      // Am aktiven Typ steht dran, dass DIESES Formular rausgeht — sonst
+      // sieht man zwei gleichberechtigte Knoepfe und raet.
       const typPills = state.typen.map((t) =>
-        `<button class="btn-sm ${t.value === state.typ ? "" : "btn-ghost"}" data-typ="${t.value}">${esc(t.label)}</button>`).join(" ");
+        `<button class="btn-sm ${t.value === state.typ ? "" : "btn-ghost"}" data-typ="${t.value}">${esc(t.label)}${t.value === state.aktivTyp ? " ✓" : ""}</button>`).join(" ");
       App.view.innerHTML =
         `<button class="btn-sm btn-ghost" id="back-mehr" style="margin-bottom:10px">← Zurück</button>` +
         `<h1 style="font-size:22px;margin:4px 4px 10px">Anfrage-Formular</h1>` +
-        `<p class="muted" style="font-size:12px;margin:0 4px 12px">So sieht das Formular aus, das deine Kunden über den Anfrage-Link ausfüllen. Änderungen gelten für neue Anfragen.</p>` +
-        (state.typen.length > 1 ? `<div class="card"><h2>Formular-Typ</h2><div style="display:flex;gap:8px;flex-wrap:wrap">${typPills}</div></div>` : "") +
+        `<p class="muted" style="font-size:12px;margin:0 4px 12px">Das Formular, das deine Kunden per Mail bekommen. Oben siehst du es genau so, wie es bei ihnen ankommt — Änderungen gelten für neue Anfragen.</p>` +
+        (state.typen.length > 1
+          ? `<div class="card"><h2>Formular-Typ</h2>
+               <div style="display:flex;gap:8px;flex-wrap:wrap">${typPills}</div>
+               <p class="sub" style="margin:8px 0 0">${
+                 state.typ === state.aktivTyp
+                   ? "✓ Dieses Formular bekommen deine Kunden."
+                   : "Dieses Formular wird aktuell <b>nicht</b> verschickt — deine Kunden bekommen das mit ✓ markierte (richtet sich nach deiner Branche)."
+               }</p>
+             </div>`
+          : "") +
+        // Vorschau zuerst: das Ergebnis steht vor den Reglern, nicht dahinter.
+        `<div class="card">
+           <div class="row" style="margin:0 0 8px"><h2 style="margin:0">So sieht es der Kunde</h2>
+             <button class="btn-sm btn-ghost" id="f-preview-reload" style="padding:6px 10px">↻</button></div>
+           <iframe id="f-preview" title="Vorschau des Kundenformulars" sandbox="allow-scripts"
+             style="width:100%;height:460px;border:1px solid var(--line);border-radius:12px;background:#fff"></iframe>
+           <p class="muted" id="f-preview-note" style="font-size:12px;margin:8px 0 0"></p>
+         </div>` +
+        // Q direkt unter der Vorschau: sagen, sehen, uebernehmen.
+        `<div class="card">
+           <h2 style="margin-top:0">Q ändern lassen</h2>
+           <p class="sub" style="margin:0 0 8px">Sag in einem Satz, was anders sein soll — z.B. „frag noch nach der Raumgröße und mach Telefon zur Pflicht".</p>
+           <textarea id="f-q-input" rows="2" placeholder="Was soll sich ändern?"
+             style="${inputStyle};font-size:15px;resize:vertical"></textarea>
+           <button class="btn-sm" id="f-q-go" style="width:100%">Ändern lassen</button>
+           <div id="f-q-result"></div>
+         </div>` +
         `<div class="card"><h2>Überschrift</h2>
           <label class="sub">Titel</label>
           <input id="f-title" value="${esc(state.title)}" style="${inputStyle}">
@@ -1906,34 +2050,44 @@ const SCREENS = {
         `<div class="card" style="margin-top:14px">
            <h2 style="margin-top:0">Formular teilen</h2>
            <p class="sub" style="margin:0 0 8px">Vorschau-Link — zeigt das Formular, ohne dass etwas abgeschickt wird:</p>
-           <div style="display:flex;gap:6px;align-items:center;margin-bottom:12px">
-             <input id="f-preview-url" readonly value="${esc(state.previewUrl)}"
-               style="flex:1;padding:9px 10px;border:1px solid var(--line);border-radius:10px;font-size:14px;background:var(--bg2,#f8f8f8);color:var(--text)">
-             <button class="btn-sm btn-ghost" id="f-copy-preview" style="white-space:nowrap">Kopieren</button>
+           <!-- Die Adresse steht als umbrechender Text statt in einem
+                schmalen readonly-Feld: auf Handybreite war von der URL nur
+                ein Bruchteil lesbar. Farben ueber echte Theme-Tokens —
+                vorher stand hier var(--bg2,#f8f8f8), und --bg2 gibt es im
+                Stylesheet nicht: im Dunkelmodus hellgrauer Kasten mit
+                fast weisser Schrift, also unlesbar. -->
+           <div style="border:1px solid var(--line);border-radius:10px;background:var(--bg);padding:10px 12px;margin-bottom:8px">
+             <span id="f-preview-url" style="display:block;color:var(--text);font-size:14px;line-height:1.5;word-break:break-all;font-family:ui-monospace,SFMono-Regular,Menlo,monospace">${esc(state.previewUrl)}</span>
+           </div>
+           <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px">
+             <button class="btn-sm btn-ghost" id="f-copy-preview" style="flex:1">📋 Kopieren</button>
+             <a class="btn-sm btn-ghost" id="f-open-preview" href="${esc(state.previewUrl)}" target="_blank" rel="noopener"
+                style="flex:1;text-align:center;text-decoration:none;line-height:2.2">↗ Öffnen</a>
            </div>
            <button class="btn-sm btn-ghost" id="f-gen-link" style="width:100%">Kunden-Link generieren …</button>
            <p class="muted" style="font-size:12px;margin:8px 0 0">Generiert einen persönlichen Ausfüll-Link mit Ablaufdatum für einen bestimmten Kunden.</p>
          </div>`;
-      document.getElementById("back-mehr").addEventListener("click", () => {
-        if (state.dirty && !confirm("Ungespeicherte Änderungen verwerfen?")) return;
-        navigate("mehr");
-      });
+      document.getElementById("back-mehr").addEventListener("click", () => history.back());
+      document.getElementById("f-preview-reload").addEventListener("click", () => renderVorschau());
+      document.getElementById("f-q-go").addEventListener("click", qFragen);
       document.querySelectorAll("[data-typ]").forEach((b) => b.addEventListener("click", () => switchTyp(b.dataset.typ)));
-      document.getElementById("f-title").addEventListener("input", (e) => { state.title = e.target.value; state.dirty = true; });
-      document.getElementById("f-subtitle").addEventListener("input", (e) => { state.subtitle = e.target.value; state.dirty = true; });
+      document.getElementById("f-title").addEventListener("input", (e) => { state.title = e.target.value; touch(); });
+      document.getElementById("f-subtitle").addEventListener("input", (e) => { state.subtitle = e.target.value; touch(); });
       document.getElementById("f-add").addEventListener("click", addField);
       document.getElementById("f-save").addEventListener("click", save);
       document.getElementById("f-reset").addEventListener("click", reset);
       document.getElementById("f-copy-preview").addEventListener("click", () => {
-        const inp = document.getElementById("f-preview-url");
-        if (!inp || !inp.value) return;
-        navigator.clipboard.writeText(inp.value).then(() => {
+        const feld = document.getElementById("f-preview-url");
+        const url = feld ? feld.textContent.trim() : "";
+        if (!url) return;
+        navigator.clipboard.writeText(url).then(() => {
           const btn = document.getElementById("f-copy-preview");
-          if (btn) { btn.textContent = "Kopiert!"; setTimeout(() => { btn.textContent = "Kopieren"; }, 2000); }
+          if (btn) { btn.textContent = "✓ Kopiert"; setTimeout(() => { btn.textContent = "📋 Kopieren"; }, 2000); }
         });
       });
       document.getElementById("f-gen-link").addEventListener("click", () => showFormularLinkModal(state.typ));
       renderFields();
+      renderVorschau(state.vorschlag || undefined);
     };
 
     const load = async () => {
@@ -1951,9 +2105,15 @@ const SCREENS = {
       state.fields = (j.fields || []).map(normField);
       state.fieldTypes = j.field_types || []; state.optionTypes = j.option_types || [];
       state.typen = j.anfrage_typen || []; state.typ = j.anfrage_typ || state.typ;
+      state.aktivTyp = j.aktiv_typ || "";
       state.previewUrl = j.preview_url || ""; state.dirty = false;
       shell();
     };
+
+    // Verlaesst der Inhaber den Screen mit ungespeichertem Entwurf, fragt
+    // navigate() nach (globaler Guard, greift auch bei der Zurueck-Taste).
+    App.dirtyGuard = () => !state.dirty
+      || confirm("Das geänderte Formular ist noch nicht gespeichert. Trotzdem verlassen?");
 
     await load();
   },
@@ -2078,7 +2238,6 @@ const SCREENS = {
     schnell.push(`<button class="row menu-item" data-go="wissen"><span>📚 Wissensdatenbank</span><span class="sub">›</span></button>`);
     const einst = [];
     if (feats.has("mitarbeiter")) einst.push(`<button class="row menu-item" data-go="team"><span>👥 Team</span><span class="sub">›</span></button>`);
-    if (feats.has("anfrage_formular") && m.employee.is_inhaber) einst.push(`<button class="row menu-item" data-go="formulare"><span>📝 Anfrage-Formular</span><span class="sub">›</span></button>`);
     einst.push(`<button class="row menu-item" data-go="einstellungen"><span>⚙️ Einstellungen</span><span class="sub">›</span></button>`);
     einst.push(`<button class="row menu-item" data-go="diagnose"><span>🩺 Status</span><span class="sub">›</span></button>`);
     einst.push(`<button class="row menu-item" data-go="hilfe"><span>❓ Hilfe &amp; Tour</span><span class="sub">›</span></button>`);

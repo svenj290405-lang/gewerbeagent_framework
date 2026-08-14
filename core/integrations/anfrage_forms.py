@@ -135,6 +135,21 @@ def get_default_schema(anfrage_typ: str) -> dict:
     return ANFRAGE_SCHEMAS.get(anfrage_typ) or ANFRAGE_SCHEMAS[ANFRAGE_TYP_ALLGEMEIN]
 
 
+def anfrage_typ_fuer_tenant(branche: str | None) -> str:
+    """Welchen Formular-Typ bekommen die Kunden DIESES Betriebs?
+
+    Die Mail-Pipeline entscheidet das an der Branche; der Formular-Editor
+    muss dieselbe Antwort geben, sonst bearbeitet der Inhaber ein Formular,
+    das nie verschickt wird. Darum steht die Regel hier einmal zentral und
+    nicht mehr als Ausdruck mitten im Inbox-Poller.
+    """
+    return (
+        ANFRAGE_TYP_TISCHLER
+        if "tischler" in (branche or "").lower()
+        else ANFRAGE_TYP_ALLGEMEIN
+    )
+
+
 async def get_schema_for_tenant(
     tenant_id: "UUID | None",
     anfrage_typ: str,

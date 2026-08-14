@@ -364,3 +364,249 @@ async def test_link_valid_days_wird_geclampt(monkeypatch):
     )
     assert res.status_code == 200
     assert seen["days"] == 30
+
+
+# --------------------------------------------------------------------------
+# Vorschau: rendert den (auch ungespeicherten) Entwurf mit der echten
+# Kunden-Template-Funktion — deshalb wird hier nur geprueft, DASS sie mit dem
+# normalisierten Schema und preview_mode gerufen wird.
+# --------------------------------------------------------------------------
+
+def _req_tenant(body=None):
+    req = _req(body)
+    req.state.app_tenant = SimpleNamespace(
+        id=req.state.app_tenant.id, slug="pilot",
+        company_name="Schreiberei Jantos", branche="Tischler",
+    )
+    return req
+
+
+@pytest.mark.asyncio
+async def test_vorschau_rendert_mit_kunden_template(monkeypatch):
+    _feature(monkeypatch, True)
+    gesehen = {}
+
+    def fake_render(*, schema, token, company_name, branche, preview_mode):
+        gesehen.update(schema=schema, token=token, company_name=company_name,
+                       preview_mode=preview_mode)
+        return "<html>Formular</html>"
+
+    monkeypatch.setattr(
+        "core.integrations.anfrage_form_template.render_anfrage_form_html",
+        fake_render)
+
+    res = await app_screens.api_formular_vorschau(
+        "allgemein",
+        _req_tenant({
+            "title": "Deine Anfrage", "subtitle": "Kurz beschreiben",
+            "fields": [{"label": "Worum geht es?", "type": "textarea", "required": True}],
+        }),
+        _e=None, _c=None,
+    )
+    assert res.status_code == 200
+    b = _body(res)
+    assert b["ok"] is True
+    assert b["html"] == "<html>Formular</html>"
+    # Submit muss in der Vorschau tot sein, sonst legt ein Testklick Daten an.
+    assert gesehen["preview_mode"] is True
+    assert gesehen["company_name"] == "Schreiberei Jantos"
+    # Feldname wurde erzeugt, obwohl der Client keinen mitschickt.
+    assert gesehen["schema"]["fields"][0]["name"] == "worum_geht_es"
+
+
+@pytest.mark.asyncio
+async def test_vorschau_speichert_nichts(monkeypatch):
+    """Der Editor ruft die Vorschau bei jedem Tastendruck — sie darf das
+    gespeicherte Formular unter keinen Umstaenden anfassen."""
+    _feature(monkeypatch, True)
+    monkeypatch.setattr(
+        "core.integrations.anfrage_form_template.render_anfrage_form_html",
+        lambda **kw: "<html></html>")
+
+    async def boom(**kw):
+        raise AssertionError("Vorschau darf nicht speichern")
+
+    monkeypatch.setattr("core.integrations.anfrage_forms.upsert_tenant_schema", boom)
+
+    res = await app_screens.api_formular_vorschau(
+        "allgemein",
+        _req_tenant({"fields": [{"label": "Frage", "type": "text"}]}),
+        _e=None, _c=None,
+    )
+    assert res.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_vorschau_ohne_feature_ist_zu(monkeypatch):
+    _feature(monkeypatch, False)
+    res = await app_screens.api_formular_vorschau(
+        "allgemein", _req_tenant({"fields": []}), _e=None, _c=None)
+    assert res.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_vorschau_ohne_felder_meldet_fehler(monkeypatch):
+    _feature(monkeypatch, True)
+    res = await app_screens.api_formular_vorschau(
+        "allgemein", _req_tenant({"title": "X"}), _e=None, _c=None)
+    assert res.status_code == 400
+
+
+# --------------------------------------------------------------------------
+# Q-Zeile: Gemini-Vorschlag wird wie eine Nutzereingabe behandelt
+# --------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_q_liefert_vorschlag_ohne_zu_speichern(monkeypatch):
+    _feature(monkeypatch, True)
+    gesehen = {}
+
+    async def fake_umbau(*, schema, auftrag, branche="", company_name=""):
+        gesehen.update(schema=schema, auftrag=auftrag, branche=branche)
+        return {
+            "ok": True, "title": "Deine Anfrage", "subtitle": "",
+            "fields": [
+                {"name": "worum_geht_es", "label": "Worum geht es?", "type": "textarea", "required": True},
+                {"label": "Wie groß ist der Raum?", "type": "text", "required": False},
+            ],
+            "erklaerung": "Ich habe nach der Raumgröße gefragt.",
+        }
+
+    monkeypatch.setattr("core.ai.gemini.formular_umbauen", fake_umbau)
+
+    async def boom(**kw):
+        raise AssertionError("Q-Vorschlag darf nicht gespeichert werden")
+
+    monkeypatch.setattr("core.integrations.anfrage_forms.upsert_tenant_schema", boom)
+
+    res = await app_screens.api_formular_q(
+        "allgemein",
+        _req_tenant({
+            "auftrag": "frag noch nach der Raumgröße",
+            "fields": [{"name": "worum_geht_es", "label": "Worum geht es?", "type": "textarea"}],
+        }),
+        _e=None, _c=None,
+    )
+    assert res.status_code == 200
+    b = _body(res)
+    assert b["ok"] is True
+    assert b["erklaerung"].startswith("Ich habe")
+    assert [f["label"] for f in b["fields"]] == ["Worum geht es?", "Wie groß ist der Raum?"]
+    # Bestehendes Feld behaelt seinen technischen Namen, neues bekommt einen.
+    assert b["fields"][0]["name"] == "worum_geht_es"
+    assert b["fields"][1]["name"] == "wie_gross_ist_der_raum"
+    # Q arbeitet auf dem Stand im Editor, nicht auf dem gespeicherten.
+    assert gesehen["auftrag"] == "frag noch nach der Raumgröße"
+    assert gesehen["branche"] == "Tischler"
+
+
+@pytest.mark.asyncio
+async def test_q_lehnt_unbrauchbaren_vorschlag_ab(monkeypatch):
+    """Ein Auswahlfeld mit nur einer Option ist ungueltig — der Nutzer soll
+    eine Meldung sehen und nicht ein kaputtes Formular in der Vorschau."""
+    _feature(monkeypatch, True)
+
+    async def fake_umbau(**kw):
+        return {
+            "ok": True, "title": "", "subtitle": "",
+            "fields": [{"label": "Material", "type": "radio", "options": ["Eiche"]}],
+            "erklaerung": "…",
+        }
+
+    monkeypatch.setattr("core.ai.gemini.formular_umbauen", fake_umbau)
+
+    res = await app_screens.api_formular_q(
+        "allgemein",
+        _req_tenant({"auftrag": "mach was", "fields": [{"label": "Frage", "type": "text"}]}),
+        _e=None, _c=None,
+    )
+    assert res.status_code == 502
+    assert "ungültig" in _body(res)["error"].lower()
+
+
+@pytest.mark.asyncio
+async def test_q_reicht_gemini_fehler_durch(monkeypatch):
+    _feature(monkeypatch, True)
+
+    async def fake_umbau(**kw):
+        return {"ok": False, "error": "Q ist gerade nicht erreichbar."}
+
+    monkeypatch.setattr("core.ai.gemini.formular_umbauen", fake_umbau)
+
+    res = await app_screens.api_formular_q(
+        "allgemein",
+        _req_tenant({"auftrag": "mach was", "fields": [{"label": "Frage", "type": "text"}]}),
+        _e=None, _c=None,
+    )
+    assert res.status_code == 502
+    assert "nicht erreichbar" in _body(res)["error"]
+
+
+@pytest.mark.asyncio
+async def test_q_braucht_einen_auftrag(monkeypatch):
+    _feature(monkeypatch, True)
+    res = await app_screens.api_formular_q(
+        "allgemein",
+        _req_tenant({"auftrag": " ", "fields": [{"label": "Frage", "type": "text"}]}),
+        _e=None, _c=None,
+    )
+    assert res.status_code == 400
+
+
+# --------------------------------------------------------------------------
+# Welcher Formular-Typ ist fuer diesen Betrieb der scharfe?
+# --------------------------------------------------------------------------
+
+def test_typ_folgt_der_branche():
+    """Dieselbe Regel wie im Inbox-Poller — sonst bearbeitet der Inhaber ein
+    Formular, das seine Kunden nie zu sehen bekommen."""
+    from core.integrations.anfrage_forms import anfrage_typ_fuer_tenant
+    assert anfrage_typ_fuer_tenant("tischler") == "tischler"
+    assert anfrage_typ_fuer_tenant("Tischlerei / Schreinerei") == "tischler"
+    assert anfrage_typ_fuer_tenant("Elektro") == "allgemein"
+    assert anfrage_typ_fuer_tenant("") == "allgemein"
+    assert anfrage_typ_fuer_tenant(None) == "allgemein"
+
+
+@pytest.mark.asyncio
+async def test_get_auto_loest_den_aktiven_typ_auf(monkeypatch):
+    _feature(monkeypatch, True)
+
+    async def fake_schema(tid, typ):
+        return {"title": "T", "subtitle": "", "fields": [
+            {"name": "a", "label": "A", "type": "text", "required": False}]}
+
+    monkeypatch.setattr("core.integrations.anfrage_forms.get_schema_for_tenant", fake_schema)
+
+    req = _req()
+    req.state.app_tenant = SimpleNamespace(
+        id=req.state.app_tenant.id, slug="pilot",
+        company_name="Schreiberei Jantos", branche="tischler")
+
+    res = await app_screens.api_formular_get("auto", req, _e=None)
+    assert res.status_code == 200
+    b = _body(res)
+    assert b["anfrage_typ"] == "tischler"
+    assert b["aktiv_typ"] == "tischler"
+
+
+@pytest.mark.asyncio
+async def test_get_meldet_aktiven_typ_auch_beim_anderen(monkeypatch):
+    """Oeffnet der Inhaber bewusst den anderen Typ, muss die App sagen
+    koennen, dass dieser nicht verschickt wird."""
+    _feature(monkeypatch, True)
+
+    async def fake_schema(tid, typ):
+        return {"title": "T", "subtitle": "", "fields": []}
+
+    monkeypatch.setattr("core.integrations.anfrage_forms.get_schema_for_tenant", fake_schema)
+
+    req = _req()
+    req.state.app_tenant = SimpleNamespace(
+        id=req.state.app_tenant.id, slug="pilot",
+        company_name="X", branche="tischler")
+
+    res = await app_screens.api_formular_get("allgemein", req, _e=None)
+    b = _body(res)
+    assert b["anfrage_typ"] == "allgemein"
+    assert b["aktiv_typ"] == "tischler"

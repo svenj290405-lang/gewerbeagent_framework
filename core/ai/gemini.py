@@ -3068,3 +3068,156 @@ async def objekt_kaufen(
 
     return await _geerdet_fragen(
         contents, system_text=system_text, tenant_id=tenant_id)
+
+
+# =====================================================================
+# Anfrage-Formular per Sprache umbauen (PWA: Formular-Screen, Q-Zeile)
+# =====================================================================
+#
+# Der Handwerker sagt "frag noch nach der Raumgroesse und mach Telefon zur
+# Pflicht"; Gemini liefert das KOMPLETTE neue Formular zurueck, nicht ein
+# Diff. Das ist Absicht: ein Patch-Format ("feld 3 aendern") faellt bei
+# jeder Umsortierung auseinander, und das Formular ist klein genug, dass
+# das Modell es in einem Rutsch ausgeben kann. Der Aufrufer validiert das
+# Ergebnis anschliessend wie eine Nutzereingabe (_normalize_formular_fields
+# + validate_schema_fields) — was hier rauskommt, ist ein VORSCHLAG, den
+# der Inhaber in der Vorschau sieht und annimmt oder verwirft.
+
+FORMULAR_UMBAU_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "title": {"type": "STRING"},
+        "subtitle": {"type": "STRING"},
+        "fields": {
+            "type": "ARRAY",
+            "items": {
+                "type": "OBJECT",
+                "properties": {
+                    "name": {"type": "STRING"},
+                    "label": {"type": "STRING"},
+                    "type": {"type": "STRING"},
+                    "required": {"type": "BOOLEAN"},
+                    "placeholder": {"type": "STRING"},
+                    "options": {"type": "ARRAY", "items": {"type": "STRING"}},
+                },
+                "required": ["label", "type"],
+            },
+        },
+        "erklaerung": {"type": "STRING"},
+    },
+    "required": ["fields", "erklaerung"],
+}
+
+
+async def formular_umbauen(
+    *,
+    schema: dict,
+    auftrag: str,
+    branche: str = "",
+    company_name: str = "",
+) -> dict:
+    """Baut das Anfrage-Formular nach einer Anweisung in Alltagssprache um.
+
+    Returns:
+        {"ok": True, "title", "subtitle", "fields", "erklaerung"} oder
+        {"ok": False, "error": "..."} — nie eine Exception nach oben.
+    """
+    import json as _json
+
+    from google.genai.types import GenerateContentConfig
+
+    auftrag = (auftrag or "").strip()
+    if len(auftrag) < 3:
+        return {"ok": False, "error": "Sag mir kurz, was sich ändern soll."}
+
+    felder_jetzt = _json.dumps(
+        {
+            "title": schema.get("title") or "",
+            "subtitle": schema.get("subtitle") or "",
+            "fields": schema.get("fields") or [],
+        },
+        ensure_ascii=False, indent=1,
+    )
+
+    system_text = (
+        "Du baust das Web-Formular um, das ein Handwerksbetrieb seinen "
+        "Kunden schickt, damit sie ihre Anfrage beschreiben.\n\n"
+        f"Betrieb: {company_name or 'Handwerksbetrieb'}"
+        f"{f' ({branche})' if branche else ''}.\n\n"
+        "REGELN:\n"
+        "1. Gib IMMER das vollstaendige Formular zurueck — alle Felder, "
+        "auch die unveraenderten, in der gewuenschten Reihenfolge. Kein Diff.\n"
+        "2. Ein unveraendertes Feld behaelt seinen technischen `name` "
+        "EXAKT. Neue Felder lassen `name` leer, den vergibt das System.\n"
+        "3. Erlaubte `type`-Werte, nichts anderes: text (eine Zeile), "
+        "textarea (mehrzeilig), tel (Telefon), date (Datum), radio "
+        "(eine Auswahl), checkbox_multi (Mehrfachauswahl), select "
+        "(Dropdown), masse (Hoehe/Breite/Tiefe), file (Datei-Upload).\n"
+        "4. radio, checkbox_multi und select brauchen mindestens 2 "
+        "`options`. Bei allen anderen Typen `options` weglassen.\n"
+        "5. Name und E-Mail des Kunden werden separat abgefragt — lege "
+        "dafuer KEINE Felder an.\n"
+        "6. Halte das Formular kurz. Jedes Feld kostet Ausfuellquote; "
+        "frag nur, was der Betrieb fuer ein Angebot wirklich braucht.\n"
+        "7. Labels in der Sprache des bestehenden Formulars (i.d.R. "
+        "Deutsch), als klare Frage an den Kunden.\n"
+        "8. Kommt der Auftrag mit dem Formular nicht zusammen (z.B. "
+        "voellig unverstaendlich), gib das Formular UNVERAENDERT zurueck "
+        "und schreib in `erklaerung`, was du nicht verstanden hast.\n\n"
+        "`erklaerung`: ein bis zwei Saetze in Du-Form, was du geaendert "
+        "hast — so wie du es dem Handwerker sagen wuerdest."
+    )
+
+    prompt = (
+        f"So sieht das Formular aktuell aus:\n{felder_jetzt}\n\n"
+        f"Auftrag des Handwerkers:\n{auftrag}"
+    )
+
+    try:
+        client = _get_genai_client(location=GENAI_TEXT_LOCATION)
+        config = GenerateContentConfig(
+            temperature=0.2,
+            # Grosszuegig: das komplette Formular plus Thinking-Budget.
+            # Zu knapp -> leere Response (finish_reason=MAX_TOKENS).
+            max_output_tokens=8192,
+            response_mime_type="application/json",
+            response_schema=FORMULAR_UMBAU_SCHEMA,
+            system_instruction=system_text,
+        )
+
+        def _sync_call():
+            return client.models.generate_content(
+                model="gemini-2.5-flash", contents=prompt, config=config)
+
+        loop = asyncio.get_event_loop()
+        response = await loop.run_in_executor(None, _sync_call)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("formular_umbauen: Gemini-Call fehlgeschlagen: %s", exc)
+        return {"ok": False, "error": "Q ist gerade nicht erreichbar."}
+
+    raw_text = ""
+    for cand in (response.candidates or [])[:1]:
+        for part in ((cand.content.parts if cand.content else None) or []):
+            if getattr(part, "text", None):
+                raw_text += part.text
+    if not raw_text.strip():
+        logger.warning("formular_umbauen: leere Antwort")
+        return {"ok": False, "error": "Q hat nichts zurückgegeben. Nochmal versuchen?"}
+
+    try:
+        daten = _json.loads(raw_text)
+    except Exception:  # noqa: BLE001
+        logger.warning("formular_umbauen: Antwort ist kein JSON: %s", raw_text[:200])
+        return {"ok": False, "error": "Q hat nichts Brauchbares zurückgegeben."}
+
+    felder = daten.get("fields")
+    if not isinstance(felder, list) or not felder:
+        return {"ok": False, "error": "Q hat kein Formular zurückgegeben."}
+
+    return {
+        "ok": True,
+        "title": (daten.get("title") or "").strip(),
+        "subtitle": (daten.get("subtitle") or "").strip(),
+        "fields": felder,
+        "erklaerung": (daten.get("erklaerung") or "").strip(),
+    }

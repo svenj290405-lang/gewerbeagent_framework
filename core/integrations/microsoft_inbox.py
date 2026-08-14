@@ -2108,7 +2108,8 @@ async def process_relevant_kunde_mail(
     form_url = ""
     with_button = next_action == "SEND_FORMULAR" or send_form_after_booking
     if with_button:
-        anfrage_typ = ANFRAGE_TYP_TISCHLER if "tischler" in tenant_branche.lower() else ANFRAGE_TYP_ALLGEMEIN
+        from core.integrations.anfrage_forms import anfrage_typ_fuer_tenant
+        anfrage_typ = anfrage_typ_fuer_tenant(tenant_branche)
         try:
             token_obj = await create_anfrage_token(
                 tenant_id=tenant_id,

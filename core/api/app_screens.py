@@ -4892,6 +4892,31 @@ _ANFRAGE_TYP_CHOICES = [
 ]
 
 
+# Kostenbremse fuer die Q-Zeile im Formular-Screen: je Betrieb 30 Gemini-
+# Aufrufe pro Stunde. In-Memory reicht (ein Container, und das Limit ist
+# eine Notbremse, keine Abrechnung).
+_FORMULAR_Q_HITS: dict[str, list] = {}
+_FORMULAR_Q_MAX_H = 30
+
+
+def _formular_q_limit_ok(tenant_id) -> bool:
+    """True wenn noch ein Q-Formular-Umbau erlaubt ist."""
+    import datetime as _dt2
+    now = _dt2.datetime.now(_dt2.timezone.utc)
+    cutoff = now - _dt2.timedelta(hours=1)
+    key = str(tenant_id)
+    hits = [h for h in _FORMULAR_Q_HITS.get(key, []) if h >= cutoff]
+    if len(hits) >= _FORMULAR_Q_MAX_H:
+        _FORMULAR_Q_HITS[key] = hits
+        logger.warning("Formular-Q: Stundenlimit erreicht (tenant=%s)", tenant_id)
+        return False
+    hits.append(now)
+    _FORMULAR_Q_HITS[key] = hits
+    if len(_FORMULAR_Q_HITS) > 2000:
+        _FORMULAR_Q_HITS.clear()
+    return True
+
+
 def _slug_field_name(label: str, fallback: str, seen: set, reserved: set) -> str:
     """Erzeugt einen technischen Feldnamen (^[a-z][a-z0-9_]*$) aus dem Label,
     eindeutig gegen `seen` und nicht in `reserved`."""
@@ -4957,12 +4982,24 @@ async def api_formular_get(
     anfrage_typ: str, request: Request, _e=Depends(require_app_inhaber),
 ) -> JSONResponse:
     """Aktuelles Formular-Schema (Tenant-Override oder Default) + Metadaten
-    fuer den Editor. Nur Inhaber, feature-gegated."""
-    from core.integrations.anfrage_forms import get_schema_for_tenant, RESERVED_FIELD_NAMES
+    fuer den Editor. Nur Inhaber, feature-gegated.
+
+    `anfrage_typ="auto"` liefert den Typ, den die Kunden dieses Betriebs
+    tatsaechlich bekommen (Branche entscheidet). Der Editor oeffnet damit
+    nie ein Formular, das gar nicht verschickt wird — das war vorher der
+    Fall: er startete immer auf 'allgemein', waehrend ein Tischlerbetrieb
+    seinen Kunden das Tischler-Formular schickt.
+    """
+    from core.integrations.anfrage_forms import (
+        get_schema_for_tenant, RESERVED_FIELD_NAMES, anfrage_typ_fuer_tenant)
     from core.models.anfrage import ANFRAGE_TYP_TISCHLER, ANFRAGE_TYP_ALLGEMEIN
     from core.features.check import is_feature_enabled
     from config.settings import settings
     tid = current_tenant_id(request)
+    aktiv_typ = anfrage_typ_fuer_tenant(
+        getattr(request.state.app_tenant, "branche", "") or "")
+    if anfrage_typ == "auto":
+        anfrage_typ = aktiv_typ
     if anfrage_typ not in (ANFRAGE_TYP_TISCHLER, ANFRAGE_TYP_ALLGEMEIN):
         return JSONResponse({"ok": False, "error": "Unbekannter Formular-Typ."}, status_code=400)
     if not await is_feature_enabled(tid, _ANFRAGE_FORMULAR_FEATURE):
@@ -4982,6 +5019,7 @@ async def api_formular_get(
         "field_types": _FIELD_TYPE_CHOICES,
         "option_types": sorted(_OPTION_FIELD_TYPES),
         "anfrage_typen": _ANFRAGE_TYP_CHOICES,
+        "aktiv_typ": aktiv_typ,
         "reserved_names": sorted(RESERVED_FIELD_NAMES),
         "preview_url": preview_url,
     })
@@ -5043,6 +5081,133 @@ async def api_formular_reset(
         "title": schema.get("title") or "",
         "subtitle": schema.get("subtitle") or "",
         "fields": schema.get("fields") or [],
+    })
+
+
+@router.post("/formulare/{anfrage_typ}/vorschau")
+async def api_formular_vorschau(
+    anfrage_typ: str, request: Request,
+    _e=Depends(require_app_inhaber), _c=Depends(require_app_csrf),
+) -> JSONResponse:
+    """Rendert einen (auch ungespeicherten) Formular-Entwurf als HTML.
+
+    Bewusst dieselbe Funktion, die der Kunde spaeter sieht
+    (``render_anfrage_form_html``, preview_mode) — eine zweite Vorschau-
+    Implementierung im Frontend wuerde vom Original wegdriften, und genau
+    dann taeuscht sie. Body: { fields, title?, subtitle? }.
+
+    Speichert NICHTS. Der Editor ruft das bei jeder Aenderung.
+    """
+    from core.integrations.anfrage_form_template import render_anfrage_form_html
+    from core.models.anfrage import ANFRAGE_TYP_TISCHLER, ANFRAGE_TYP_ALLGEMEIN
+    from core.features.check import is_feature_enabled
+    tid = current_tenant_id(request)
+    if anfrage_typ not in (ANFRAGE_TYP_TISCHLER, ANFRAGE_TYP_ALLGEMEIN):
+        return JSONResponse({"ok": False, "error": "Unbekannter Formular-Typ."}, status_code=400)
+    if not await is_feature_enabled(tid, _ANFRAGE_FORMULAR_FEATURE):
+        return JSONResponse({"ok": False, "error": "Die Anfrage-Formular-Funktion ist nicht aktiv."}, status_code=403)
+    body = await request.json()
+    raw_fields = body.get("fields")
+    if not isinstance(raw_fields, list):
+        return JSONResponse({"ok": False, "error": "Es fehlen Felder."}, status_code=400)
+    fields, err = _normalize_formular_fields(raw_fields)
+    if err:
+        return JSONResponse({"ok": False, "error": err}, status_code=400)
+    tenant = request.state.app_tenant
+    schema = {
+        "title": (body.get("title") or "").strip() or "Anfrage",
+        "subtitle": (body.get("subtitle") or "").strip(),
+        "fields": fields,
+    }
+    html = render_anfrage_form_html(
+        schema=schema, token="vorschau",
+        company_name=tenant.company_name or "",
+        branche=getattr(tenant, "branche", "") or "",
+        preview_mode=True,
+    )
+    return JSONResponse({"ok": True, "html": html})
+
+
+@router.post("/formulare/{anfrage_typ}/q")
+async def api_formular_q(
+    anfrage_typ: str, request: Request,
+    _e=Depends(require_app_inhaber), _c=Depends(require_app_csrf),
+) -> JSONResponse:
+    """Baut den Formular-Entwurf nach einer Anweisung in Alltagssprache um.
+
+    Body: { auftrag, fields, title?, subtitle? } — `fields` ist der Stand
+    im Editor (ggf. ungespeichert), damit Q auf dem arbeitet, was der
+    Inhaber gerade vor sich sieht.
+
+    Der Vorschlag wird durch dieselbe Normalisierung geschickt wie eine
+    Handeingabe und dann NUR zurueckgegeben — gespeichert wird nichts.
+    Uebernehmen heisst: der Inhaber sieht die Vorschau und tippt auf
+    Speichern.
+    """
+    from core.ai.gemini import formular_umbauen
+    from core.integrations.anfrage_forms import validate_schema_fields
+    from core.models.anfrage import ANFRAGE_TYP_TISCHLER, ANFRAGE_TYP_ALLGEMEIN
+    from core.features.check import is_feature_enabled
+    tid = current_tenant_id(request)
+    if anfrage_typ not in (ANFRAGE_TYP_TISCHLER, ANFRAGE_TYP_ALLGEMEIN):
+        return JSONResponse({"ok": False, "error": "Unbekannter Formular-Typ."}, status_code=400)
+    if not await is_feature_enabled(tid, _ANFRAGE_FORMULAR_FEATURE):
+        return JSONResponse({"ok": False, "error": "Die Anfrage-Formular-Funktion ist nicht aktiv."}, status_code=403)
+    body = await request.json()
+    auftrag = (body.get("auftrag") or "").strip()[:1000]
+    if len(auftrag) < 3:
+        return JSONResponse({"ok": False, "error": "Sag mir kurz, was sich ändern soll."}, status_code=400)
+    # Jeder Aufruf ist ein Gemini-Call und kostet. Der Endpunkt ist zwar nur
+    # fuer den Inhaber offen, aber ein haengendes Skript (oder ein zu
+    # eifriger Finger) soll das Kontingent nicht leerlaufen lassen.
+    if not _formular_q_limit_ok(tid):
+        return JSONResponse(
+            {"ok": False, "error": "Zu viele Änderungen in kurzer Zeit — "
+                                   "bitte kurz durchatmen."},
+            status_code=429)
+    raw_fields = body.get("fields")
+    if not isinstance(raw_fields, list):
+        return JSONResponse({"ok": False, "error": "Es fehlen Felder."}, status_code=400)
+    ist_fields, err = _normalize_formular_fields(raw_fields)
+    if err:
+        return JSONResponse({"ok": False, "error": err}, status_code=400)
+
+    tenant = request.state.app_tenant
+    vorschlag = await formular_umbauen(
+        schema={
+            "title": (body.get("title") or "").strip(),
+            "subtitle": (body.get("subtitle") or "").strip(),
+            "fields": ist_fields,
+        },
+        auftrag=auftrag,
+        branche=getattr(tenant, "branche", "") or "",
+        company_name=tenant.company_name or "",
+    )
+    if not vorschlag.get("ok"):
+        return JSONResponse(
+            {"ok": False, "error": vorschlag.get("error") or "Q konnte das nicht umbauen."},
+            status_code=502)
+
+    # Modell-Ausgabe wie eine Nutzereingabe behandeln: erst saeubern,
+    # dann fachlich pruefen. Faellt sie durch, kriegt der Inhaber eine
+    # Meldung statt eines kaputten Formulars in der Vorschau.
+    neu_fields, err = _normalize_formular_fields(vorschlag.get("fields") or [])
+    if err:
+        logger.warning("Formular-Q: Vorschlag unbrauchbar (tenant=%s): %s", tid, err)
+        return JSONResponse({"ok": False, "error": f"Q-Vorschlag war unbrauchbar: {err}"}, status_code=502)
+    ok, msg = validate_schema_fields(neu_fields)
+    if not ok:
+        logger.warning("Formular-Q: Vorschlag ungueltig (tenant=%s): %s", tid, msg)
+        return JSONResponse({"ok": False, "error": f"Q-Vorschlag war ungültig: {msg}"}, status_code=502)
+
+    logger.info("Formular-Q: Vorschlag fuer tenant=%s typ=%s felder=%d",
+                tid, anfrage_typ, len(neu_fields))
+    return JSONResponse({
+        "ok": True,
+        "title": vorschlag.get("title") or "",
+        "subtitle": vorschlag.get("subtitle") or "",
+        "fields": neu_fields,
+        "erklaerung": vorschlag.get("erklaerung") or "",
     })
 
 
