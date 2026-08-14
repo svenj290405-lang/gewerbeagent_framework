@@ -290,3 +290,53 @@ async def test_listen_bekommen_stunden_nur_fuer_laufende(monkeypatch):
     assert zeilen[0]["stunden_text"] == "Sven 8 h"
     assert zeilen[1]["stunden_text"] == ""         # noch nichts gebucht
     assert "stunden_text" not in zeilen[2]         # gar nicht erst gefragt
+
+
+# ---------------------------------------------------------------------------
+# stunden_abgleich — gebuchte vs. angebotene Stunden (nur Hinweis)
+# ---------------------------------------------------------------------------
+
+def _pos(menge, einheit):
+    return SimpleNamespace(menge=Decimal(str(menge)), einheit=einheit)
+
+
+def test_abgleich_ohne_stundenposition_ist_none():
+    from core.services.auftrag_stunden import stunden_abgleich
+    # Angebot nur mit Stueck-Positionen -> nichts zu vergleichen
+    assert stunden_abgleich([_pos(3, "Stueck"), _pos(1, "Pauschale")], 5) is None
+
+
+def test_abgleich_mehr_gebucht_warnt():
+    from core.services.auftrag_stunden import stunden_abgleich
+    r = stunden_abgleich([_pos(8, "Std")], 11)
+    assert r is not None
+    assert r["mehr"] is True
+    assert r["hinweis"] is not None
+    assert "11" in r["gebucht"] and "8" in r["angeboten"]
+
+
+def test_abgleich_gleichstand_kein_hinweis():
+    from core.services.auftrag_stunden import stunden_abgleich
+    r = stunden_abgleich([_pos(8, "Stunden")], 8)
+    assert r is not None
+    assert r["hinweis"] is None       # Werte da, aber kein Handlungsbedarf
+
+
+def test_abgleich_kleine_rundung_kein_hinweis():
+    from core.services.auftrag_stunden import stunden_abgleich
+    r = stunden_abgleich([_pos(8, "h")], 8.1)   # 0,1 h Differenz < 0,25
+    assert r["hinweis"] is None
+
+
+def test_abgleich_weniger_gebucht_meldet_neutral():
+    from core.services.auftrag_stunden import stunden_abgleich
+    r = stunden_abgleich([_pos(10, "Stunde")], 6)
+    assert r["mehr"] is False
+    assert r["hinweis"] is not None
+
+
+def test_abgleich_summiert_mehrere_stundenpositionen():
+    from core.services.auftrag_stunden import stunden_abgleich
+    r = stunden_abgleich([_pos(4, "Std"), _pos(4, "Stunden"), _pos(2, "Stueck")], 8)
+    # 4 + 4 Stunden angeboten (Stueck zaehlt nicht), 8 gebucht -> Gleichstand
+    assert r["hinweis"] is None

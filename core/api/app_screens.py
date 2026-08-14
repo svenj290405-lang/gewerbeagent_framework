@@ -1094,7 +1094,7 @@ async def api_auftrag_detail(
     eigene Schritte mit Erledigt-Zustand)."""
     from core.models.angebot_position import AngebotPosition
     from core.services.auftrag_prozess import lade_auftrag_schritte
-    from core.services.auftrag_stunden import stunden_uebersicht
+    from core.services.auftrag_stunden import stunden_uebersicht, stunden_abgleich
 
     tid = current_tenant_id(request)
     try:
@@ -1127,6 +1127,8 @@ async def api_auftrag_detail(
         " ".join(y for y in [a.kunde_plz, a.kunde_ort] if y),
     ] if x).strip()
 
+    stunden_daten = await stunden_uebersicht(tid, aid)
+
     return JSONResponse({
         "ok": True,
         **_auftrag_zeile(a),
@@ -1137,7 +1139,10 @@ async def api_auftrag_detail(
         "angenommen_am": _fmt_dt(a.accepted_at) if a.accepted_at else "",
         "positionen": pos_out,
         "schritte": await lade_auftrag_schritte(tid, a),
-        "stunden": await stunden_uebersicht(tid, aid),
+        "stunden": stunden_daten,
+        # Abgleich gebuchte vs. angebotene Stunden — nur Hinweis, kein Eingriff
+        # in die Rechnung. None, wenn das Angebot keine Stunden-Position hat.
+        "stunden_abgleich": stunden_abgleich(positionen, (stunden_daten or {}).get("gesamt")),
     })
 
 

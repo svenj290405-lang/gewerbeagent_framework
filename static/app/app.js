@@ -5605,7 +5605,18 @@ function stundenKarteHtml(d) {
       }).join("") + `</div>`
     : "";
 
-  return `<div class="card" id="stunden-karte"><h2>Arbeitsstunden</h2>${summen}${
+  // Abgleich gebuchte vs. angebotene Stunden — nur ein Hinweis. Warnt vor dem
+  // klassischen Geldverlust (mehr gearbeitet als abgerechnet). Q entscheidet
+  // nichts; der Betrieb sieht die Zahlen und rechnet ggf. nach.
+  const ab = d.stunden_abgleich;
+  const abgleich = (ab && ab.hinweis)
+    ? `<div class="banner" style="margin-top:12px;${ab.mehr ? "background:#fff4e0;border-color:#f0c674" : ""}">
+         ⏱️ ${esc(ab.hinweis)}
+         <div class="sub" style="margin-top:4px">Angebot: ${esc(ab.angeboten)} · Gebucht: ${esc(ab.gebucht)}</div>
+       </div>`
+    : "";
+
+  return `<div class="card" id="stunden-karte"><h2>Arbeitsstunden</h2>${summen}${abgleich}${
     buchbar ? stundenFeld(d, true) : ""}${liste}</div>`;
 }
 

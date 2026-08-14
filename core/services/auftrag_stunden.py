@@ -65,6 +65,70 @@ def fmt_stunden(wert) -> str:
     return f"{text.replace('.', ',')} h"
 
 
+def _ist_stunden_einheit(einheit: str | None) -> bool:
+    """Erkennt Stunden-Einheiten aus dem Angebot: „Std", „Stunde(n)", „h"."""
+    e = (einheit or "").strip().lower().rstrip(".")
+    return e in ("std", "stunde", "stunden", "h", "std") or e.startswith("stunde") or e.startswith("std")
+
+
+def stunden_abgleich(positionen, gebucht_gesamt) -> dict | None:
+    """Vergleicht die im Angebot kalkulierten Stunden mit den real gebuchten.
+
+    Der klassische Handwerker-Geldverlust: das Angebot nennt 8 Stunden, real
+    gebucht sind 11, die Rechnung geht mit 8 raus. Q kennt beide Zahlen — hier
+    stellt es sie gegenueber. NUR ein Hinweis, kein automatischer Eingriff in
+    die Rechnung; die Entscheidung (Mehrstunden abrechnen, ggf. mit
+    Kundenzustimmung) bleibt beim Betrieb.
+
+    ``positionen``: iterierbar mit ``.menge`` und ``.einheit`` (AngebotPosition).
+    ``gebucht_gesamt``: Summe der gebuchten Stunden (Decimal/float).
+
+    Returns ``None``, wenn das Angebot keine Stunden-Position hat (dann gibt es
+    nichts zu vergleichen) — sonst ein Dict mit den beiden Werten, der Differenz
+    und einem fertigen Hinweistext (oder ``hinweis=None``, wenn alles passt).
+    """
+    angeboten = Decimal(0)
+    hat_stunden_position = False
+    for p in positionen or []:
+        if _ist_stunden_einheit(getattr(p, "einheit", None)):
+            hat_stunden_position = True
+            try:
+                angeboten += Decimal(str(getattr(p, "menge", 0) or 0))
+            except (InvalidOperation, ValueError):
+                continue
+    if not hat_stunden_position:
+        return None
+
+    try:
+        gebucht = Decimal(str(gebucht_gesamt or 0))
+    except (InvalidOperation, ValueError):
+        gebucht = Decimal(0)
+
+    differenz = gebucht - angeboten
+    # Kleine Rundungsreste (< 0,25 h) sind kein Handlungsbedarf.
+    if abs(differenz) < Decimal("0.25"):
+        hinweis = None
+    elif differenz > 0:
+        hinweis = (
+            f"Es wurden {fmt_stunden(gebucht)} gearbeitet, im Angebot stehen "
+            f"aber nur {fmt_stunden(angeboten)}. Prüfe, ob du die "
+            f"{fmt_stunden(differenz)} Mehr abrechnest."
+        )
+    else:
+        hinweis = (
+            f"Im Angebot stehen {fmt_stunden(angeboten)}, gebucht sind erst "
+            f"{fmt_stunden(gebucht)}."
+        )
+
+    return {
+        "angeboten": fmt_stunden(angeboten),
+        "gebucht": fmt_stunden(gebucht),
+        "differenz": fmt_stunden(differenz),
+        "mehr": differenz > 0,
+        "hinweis": hinweis,
+    }
+
+
 async def buche_stunden(
     tenant_id: uuid.UUID,
     angebot_id: uuid.UUID,
