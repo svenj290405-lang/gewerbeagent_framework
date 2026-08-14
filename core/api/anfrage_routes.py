@@ -40,6 +40,34 @@ _ANFRAGE_HITS: dict[tuple[str, str], list[_dt.datetime]] = {}
 _ANFRAGE_HITS_GUARD = _Lock()
 
 
+# Obergrenzen fuer den oeffentlichen Submit. 3 Dateien x 5 MB plus Text und
+# MIME-Overhead passen bequem in 18 MB; alles darueber ist kein Kunde mehr.
+_SUBMIT_MAX_BODY_BYTES = 18 * 1024 * 1024
+_SUBMIT_MAX_FORM_FIELDS = 80
+# Zweite Bremse neben dem IP-Limit: selbst wenn die Anfragen aus vielen
+# Netzen kommen (Botnetz, geleakter Link), soll ein einzelner Betrieb nicht
+# mit Anfragen und Push-Meldungen zugeschuettet werden.
+_SUBMIT_MAX_PRO_BETRIEB_H = 30
+
+
+def _check_tenant_submit_limit(tenant_id, max_per_hour: int) -> bool:
+    """Wie _check_anfrage_rate_limit, aber pro Betrieb statt pro IP."""
+    now = _dt.datetime.now(_dt.timezone.utc)
+    cutoff = now - _dt.timedelta(hours=1)
+    key = (f"tenant:{tenant_id}", "submit")
+    with _ANFRAGE_HITS_GUARD:
+        hits = [h for h in _ANFRAGE_HITS.get(key, []) if h >= cutoff]
+        if len(hits) >= max_per_hour:
+            _ANFRAGE_HITS[key] = hits
+            logger.warning(
+                "anfrage: Betriebs-Limit erreicht tenant=%s (%d/h)",
+                tenant_id, max_per_hour)
+            return False
+        hits.append(now)
+        _ANFRAGE_HITS[key] = hits
+    return True
+
+
 def _client_ip_anfrage(request: Request) -> str:
     xri = request.headers.get("x-real-ip")
     if xri:
@@ -195,11 +223,58 @@ async def submit_anfrage_form(token: str, request: Request):
         ANFRAGE_FILE_MAX_BYTES,
         ANFRAGE_FILE_MAX_COUNT,
         ANFRAGE_FILE_ALLOWED_MIME,
+        HONEYPOT_FIELD,
+        filter_antworten_gegen_schema,
         verify_magic_bytes,
+        zeitstempel_plausibel,
     )
     import base64 as _b64
 
-    form_data = await request.form()
+    # Groesse begrenzen, BEVOR irgendwas geparst wird. Vorher las Starlette
+    # erst den kompletten Body (und lagerte ihn auf Platte aus), und erst
+    # danach griffen die Per-Datei-Limits — ein einzelner POST durfte also
+    # beliebig gross sein.
+    content_length = request.headers.get("content-length")
+    if content_length is None:
+        # Browser senden bei Formularen immer Content-Length. Fehlt sie
+        # (chunked), koennten wir die Groesse vorher nicht kennen.
+        return HTMLResponse(
+            content=render_submit_error_page("Ungültige Anfrage."),
+            status_code=411,
+        )
+    try:
+        if int(content_length) > _SUBMIT_MAX_BODY_BYTES:
+            logger.info(
+                "submit_anfrage: Body zu gross (%s bytes) ip=%s",
+                content_length, _client_ip_anfrage(request),
+            )
+            return HTMLResponse(
+                content=render_submit_error_page(
+                    "Die Anfrage ist zu groß. Bitte weniger oder kleinere "
+                    "Dateien anhängen (max. 5 MB pro Datei)."),
+                status_code=413,
+            )
+    except ValueError:
+        return HTMLResponse(
+            content=render_submit_error_page("Ungültige Anfrage."),
+            status_code=400)
+
+    # Auch der Parser bekommt harte Grenzen (Feldzahl, Dateien, Teilgroesse).
+    try:
+        form_data = await request.form(
+            max_files=ANFRAGE_FILE_MAX_COUNT + 2,
+            max_fields=_SUBMIT_MAX_FORM_FIELDS,
+            max_part_size=ANFRAGE_FILE_MAX_BYTES,
+        )
+    except Exception as e:  # noqa: BLE001 — Starlette wirft bei Limit-Bruch
+        logger.info("submit_anfrage: Formular abgewiesen (%s) ip=%s",
+                    type(e).__name__, _client_ip_anfrage(request))
+        return HTMLResponse(
+            content=render_submit_error_page(
+                "Die Anfrage konnte nicht verarbeitet werden. Bitte mit "
+                "weniger Angaben erneut versuchen."),
+            status_code=413,
+        )
     antworten: dict = {}
     file_count_total = 0
 
@@ -257,6 +332,52 @@ async def submit_anfrage_form(token: str, request: Request):
                     antworten[key] = [antworten[key], value]
             else:
                 antworten[key] = value
+
+    # ---- Bot-Bremse ---------------------------------------------------
+    # Honeypot: ein unsichtbares Feld, das nur ein Skript ausfuellt. Wir
+    # antworten mit der normalen Erfolgsseite — ein Bot soll nicht lernen,
+    # woran er gescheitert ist. Gespeichert wird nichts.
+    if (antworten.get(HONEYPOT_FIELD) or "").strip():
+        logger.warning(
+            "submit_anfrage: Honeypot ausgefuellt (Bot) ip=%s token=%s…",
+            _client_ip_anfrage(request), token[:10])
+        return HTMLResponse(content=render_success_page(), status_code=200)
+
+    # Zeitfalle: unter 3 Sekunden fuellt kein Mensch ein mehrstufiges
+    # Formular aus. Fehlt der Zeitstempel (Formular von vor dieser
+    # Aenderung), gilt er als in Ordnung.
+    if not zeitstempel_plausibel(antworten.get("_ts") or ""):
+        logger.warning(
+            "submit_anfrage: Zeitstempel unplausibel ip=%s token=%s…",
+            _client_ip_anfrage(request), token[:10])
+        return HTMLResponse(content=render_success_page(), status_code=200)
+
+    # ---- Nur Felder, die es im Schema wirklich gibt ---------------------
+    # Vorher landete JEDER mitgeschickte Schluessel in der DB und (unge-
+    # kuerzt) im Prompt der automatischen Mail-Antwort.
+    token_obj, _tenant = await get_token_with_tenant(token)
+    if token_obj is None:
+        return HTMLResponse(
+            content=render_submit_error_page("Der Link ist nicht mehr gültig."),
+            status_code=400)
+
+    if not _check_tenant_submit_limit(
+            token_obj.tenant_id, _SUBMIT_MAX_PRO_BETRIEB_H):
+        return HTMLResponse(
+            content="<h1>Zu viele Anfragen</h1>"
+                    "<p>Bitte später erneut versuchen.</p>",
+            status_code=429,
+        )
+
+    schema = await get_schema_for_tenant(
+        token_obj.tenant_id, token_obj.anfrage_typ)
+    antworten, verworfen = filter_antworten_gegen_schema(schema, antworten)
+    if verworfen:
+        logger.warning(
+            "submit_anfrage: %d unbekannte/zu grosse Felder verworfen "
+            "(token=%s… ip=%s): %s",
+            len(verworfen), token[:10], _client_ip_anfrage(request),
+            verworfen[:10])
 
     # DSGVO: Einwilligung ist Pflicht (Art. 6/7). Der Browser sendet
     # `_consent` nur, wenn die Checkbox angehakt ist — fehlt sie, brechen

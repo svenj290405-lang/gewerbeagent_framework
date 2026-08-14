@@ -161,7 +161,36 @@
 // v79: Objekt erkennen — Foto vom Geraet/Typenschild/Bauteil, Q bestimmt das
 // Modell, schlaegt in der Hersteller-Doku nach (Google-Suche als Werkzeug) und
 // antwortet mit Quellen; im Kauf-Modus mit Bezugsquellen + "als Material merken".
-const CACHE = "ga-app-v79";
+// v82: Zustellbarkeit — Antworten tragen jetzt In-Reply-To/References und
+// haengen beim Kunden IM Thread statt lose daneben; der Mail-Footer zeigt
+// die Adresse des Postfachs, aus dem wirklich gesendet wird (vorher konnte
+// dort eine abweichende Adresse stehen: Spam-Merkmal, und eine Antwort
+// dorthin sah der Inbox-Poller nie). Einstellungen > Verbindungen warnt,
+// wenn ein privates Freemail-Postfach verbunden ist.
+// (v80/v81 waren die Objekt-Suche — die bleibt vorerst draussen, siehe
+// git stash "objekt-suche WIP 2026-08-13"; darum springt die Nummer.)
+// v83: „Aktionen" ohne Schnellstart-Knoepfe im Kopf — „🎤 Gespräch" und
+// „+ Rückruf" waren doppelt gemoppelt (beides steht in der jeweiligen
+// Kachel, dort mit der vollen Liste dahinter).
+// v84: Anfrage-Formular als eigener Arbeitsbereich — eigene Kachel in
+// „Aktionen", oben die echte Kundenansicht als Live-Vorschau (serverseitig
+// mit derselben Funktion gerendert, die der Kunde bekommt), darunter eine
+// Q-Zeile: sagen, was anders sein soll, Vorschlag in der Vorschau sehen,
+// übernehmen oder verwerfen. Der Eintrag unter „Mehr" ist dafür raus.
+// v85: Fix zu v84 — im Formular-Screen riefen „Feld hinzufügen", „Löschen"
+// und jede Eingabe eine Hilfsfunktion auf, die sich selbst aufrief
+// (Endlosschleife). Die Liste baute sich danach nicht neu auf, und
+// ungespeicherte Änderungen wurden nicht als solche vermerkt.
+// v86: Der Formular-Screen oeffnet jetzt den Typ, den die Kunden wirklich
+// bekommen (Branche entscheidet, „auto") statt immer „Allgemein" — ein
+// Tischlerbetrieb bearbeitete sonst ein Formular, das nie rausgeht. Der
+// scharfe Typ ist mit ✓ markiert, beim anderen steht es dabei.
+// v87: Der Vorschau-Link im Formular-Screen war praktisch unlesbar — er lag
+// in einem schmalen readonly-Feld mit `var(--bg2,#f8f8f8)` als Hintergrund,
+// und --bg2 gibt es im Stylesheet gar nicht: im Dunkelmodus helles Grau mit
+// fast weisser Schrift. Jetzt umbrechender Monospace-Text auf --bg mit
+// --text, dazu „Kopieren" und „Öffnen ↗" nebeneinander.
+const CACHE = "ga-app-v87";
 const SHELL = [
   "/app",
   "/app/static/app-beta.css",

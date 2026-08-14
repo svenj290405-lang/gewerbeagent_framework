@@ -894,6 +894,24 @@ def render_anfrage_form_html(
             </div>
         </div>''')
 
+    # Bot-Bremse, zwei Teile (siehe anfrage_forms.py):
+    #  - Honeypot: fuer Menschen unsichtbar und per aria-hidden/tabindex
+    #    auch fuer Screenreader und Tab-Reihenfolge weg. Wer ihn ausfuellt,
+    #    ist ein Skript, das stumpf jedes Feld befuellt.
+    #  - signierter Zeitstempel: unter 3 Sekunden Ausfuellzeit ist kein
+    #    Mensch (das Formular hat mehrere Schritte).
+    from core.integrations.anfrage_forms import (
+        HONEYPOT_FIELD, formular_zeitstempel)
+
+    bot_html = (
+        f'<div aria-hidden="true" style="position:absolute;left:-9999px;'
+        f'top:auto;width:1px;height:1px;overflow:hidden">'
+        f'<label>Website (bitte frei lassen)'
+        f'<input type="text" name="{HONEYPOT_FIELD}" tabindex="-1" '
+        f'autocomplete="off" value=""></label></div>'
+        f'<input type="hidden" name="_ts" value="{_html.escape(formular_zeitstempel())}">'
+    )
+
     # Im Preview-Modus zeigt das Form-Action nicht auf /submit — verhindert
     # versehentliches Absenden auch wenn jemand JS deaktiviert.
     form_action = (
@@ -934,6 +952,8 @@ def render_anfrage_form_html(
 <form class="page" method="POST" action="{form_action}" autocomplete="off" novalidate enctype="multipart/form-data">
 
     <div class="brand">{company}</div>
+
+    {bot_html}
 
     {"".join(steps_html)}
 

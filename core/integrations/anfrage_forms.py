@@ -224,6 +224,144 @@ ANFRAGE_FILE_ALLOWED_MIME = (
 RESERVED_FIELD_NAMES = {"name", "email", "token"}
 
 
+# =====================================================================
+# Haerten des oeffentlichen Submits
+# =====================================================================
+#
+# Der Submit war bis 2026-08-14 vollstaendig offen: er uebernahm JEDEN
+# Schluessel aus dem POST in beliebiger Laenge in die DB. Wer die
+# Formularseite kannte, konnte per curl beliebige Felder anlegen — die
+# landeten in der Anfrage des Betriebs UND (Schluessel ungekuerzt) im
+# Prompt der automatischen Mail-Antwort. Ab hier gilt: nur Felder aus dem
+# Schema, harte Laengen, feste Obergrenzen.
+
+# Technische Felder, die kein Schema-Feld sind, aber gespeichert werden.
+# `_consent` ist der Einwilligungs-Nachweis (Art. 7); `_ts` und der
+# Honeypot werden nur geprueft und dann verworfen.
+SUBMIT_META_FIELDS = {"_consent"}
+# Honeypot: im Formular unsichtbar, fuer Menschen unerreichbar. Ist es
+# ausgefuellt, war es ein Bot, der stumpf alle Felder befuellt.
+HONEYPOT_FIELD = "_website"
+
+SUBMIT_MAX_FIELDS = 60          # mehr Felder hat kein Anfrage-Formular
+SUBMIT_MAX_VALUE_LEN = 4000     # je Textantwort
+SUBMIT_MAX_LIST_ITEMS = 30      # Mehrfachauswahl
+SUBMIT_MAX_TOTAL_CHARS = 20_000  # Summe aller Textantworten
+
+
+def formular_zeitstempel() -> str:
+    """Signierter Zeitstempel, der beim Rendern ins Formular wandert.
+
+    Zusammen mit der Pruefung unten eine Zeitfalle: ein Mensch braucht fuer
+    ein mehrstufiges Formular Sekunden bis Minuten, ein Bot fuellt es in
+    Millisekunden aus. Signiert, damit niemand den Zeitstempel einfach
+    passend faelscht.
+    """
+    import hashlib
+    import hmac
+    import time
+
+    from config.settings import settings
+
+    ts = str(int(time.time()))
+    sig = hmac.new(
+        settings.secret_key.encode(), ts.encode(), hashlib.sha256,
+    ).hexdigest()[:16]
+    return f"{ts}.{sig}"
+
+
+def zeitstempel_plausibel(
+    wert: str, *, min_sekunden: int = 3, max_sekunden: int = 14 * 24 * 3600,
+) -> bool:
+    """Prueft den signierten Zeitstempel aus dem Formular.
+
+    Fehlt er ganz, sagen wir True: alte Formular-Links (schon verschickte
+    Mails) tragen ihn noch nicht, und die duerfen nicht kaputtgehen.
+    """
+    import hashlib
+    import hmac
+    import time
+
+    from config.settings import settings
+
+    wert = (wert or "").strip()
+    if not wert:
+        return True  # Formular von vor dieser Aenderung
+    ts_str, _, sig = wert.partition(".")
+    if not ts_str.isdigit() or not sig:
+        return False
+    erwartet = hmac.new(
+        settings.secret_key.encode(), ts_str.encode(), hashlib.sha256,
+    ).hexdigest()[:16]
+    if not hmac.compare_digest(sig, erwartet):
+        return False
+    alter = int(time.time()) - int(ts_str)
+    return min_sekunden <= alter <= max_sekunden
+
+
+def filter_antworten_gegen_schema(
+    schema: dict, antworten: dict,
+) -> tuple[dict, list[str]]:
+    """Wirft alles raus, was nicht im Formular-Schema steht, und kuerzt.
+
+    Returns (saubere_antworten, verworfene_schluessel). Verworfenes wird
+    NUR geloggt, nicht dem Absender gemeldet — ein Angreifer soll nicht
+    erfahren, welche Feldnamen es gibt.
+    """
+    erlaubt = {
+        (f.get("name") or "").strip()
+        for f in (schema.get("fields") or [])
+        if (f.get("name") or "").strip()
+    } | SUBMIT_META_FIELDS
+
+    # Der Typ `masse` rendert DREI Eingaben mit festen Namen
+    # (anfrage_form_template.render_field), unabhaengig vom Feldnamen im
+    # Schema. Ohne diese Ausnahme wuerde die Whitelist die Maße des Kunden
+    # stillschweigend wegwerfen.
+    if any((f.get("type") or "") == "masse"
+           for f in (schema.get("fields") or [])):
+        erlaubt |= {"masse_hoehe", "masse_breite", "masse_tiefe"}
+
+    sauber: dict = {}
+    verworfen: list[str] = []
+    gesamt = 0
+
+    for key, value in list(antworten.items())[:SUBMIT_MAX_FIELDS * 2]:
+        k = (key or "").strip()
+        if k not in erlaubt:
+            verworfen.append(k[:40])
+            continue
+        if len(sauber) >= SUBMIT_MAX_FIELDS:
+            verworfen.append(k[:40])
+            continue
+
+        if isinstance(value, list):
+            neu_liste = []
+            for item in value[:SUBMIT_MAX_LIST_ITEMS]:
+                # Datei-Uploads sind Dicts und schon durch die Upload-
+                # Pruefung gegangen (Groesse, MIME, Magic-Bytes).
+                if isinstance(item, dict):
+                    neu_liste.append(item)
+                    continue
+                s = str(item)[:SUBMIT_MAX_VALUE_LEN]
+                gesamt += len(s)
+                if gesamt > SUBMIT_MAX_TOTAL_CHARS:
+                    break
+                neu_liste.append(s)
+            sauber[k] = neu_liste
+        elif isinstance(value, dict):
+            sauber[k] = value
+        else:
+            s = str(value)[:SUBMIT_MAX_VALUE_LEN]
+            gesamt += len(s)
+            if gesamt > SUBMIT_MAX_TOTAL_CHARS:
+                verworfen.append(k[:40])
+                continue
+            sauber[k] = s
+
+    return sauber, verworfen
+
+
 # Phase B8: Magic-Bytes-Check. Verhindert dass ein Angreifer mit
 # umgebogenem content-type-Header eine .exe als "image/jpeg" hochlaedt.
 # Die Erkennung ist inline (kein python-magic-Dep — das brauchte

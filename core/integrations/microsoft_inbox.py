@@ -348,16 +348,16 @@ async def poll_microsoft_inbox(
         # ---- PRE-FILTER 2: Spam-Throttle pro Sender ----
         # Wenn derselbe Absender in 24h schon >= 10 Mails geschickt hat:
         # Klassifizieren und Kategorie setzen, aber NICHT auto-antworten.
+        # should_throttle_reply prueft BEIDE Deckel: pro Absender (10/24h)
+        # und pro Betrieb (60/1h). Der zweite fehlte hier — er ist genau
+        # fuer den Fall gebaut, dass viele verschiedene Absender parallel
+        # feuern (Botnetz), und war bis dahin toter Code.
+        throttle_grund = None
         try:
-            from core.integrations.mail_throttle import (
-                count_recent_replies_to,
-                MAX_REPLIES_PER_SENDER_PER_DAY,
+            from core.integrations.mail_throttle import should_throttle_reply
+            spam_throttled, throttle_grund = await should_throttle_reply(
+                tenant_id=tenant_id, recipient_email=sender_email,
             )
-            recent_reply_count = await count_recent_replies_to(
-                tenant_id=tenant_id, sender_email=sender_email,
-                window_hours=24,
-            )
-            spam_throttled = recent_reply_count >= MAX_REPLIES_PER_SENDER_PER_DAY
         except Exception as e:
             logger.debug(f"spam-throttle Check failed (egal): {e}")
             spam_throttled = False
@@ -370,14 +370,34 @@ async def poll_microsoft_inbox(
         # Teil geht in die Klassifikation/Intent-Erkennung.
         from core.utils.mail_reply import trim_quoted_reply as _trim_quote
         body_preview_for_ai = _trim_quote(body_preview)
+
         try:
-            cls_result = await classify_mail_subject(
-                subject=subject,
-                sender=sender_email,
-                tenant_company=tenant_company,
-                tenant_branche=tenant_branche,
-                body_preview=body_preview_for_ai,
-            )
+            if spam_throttled:
+                # Steht der Throttle, sparen wir uns die Klassifikation
+                # KOMPLETT. Vorher lief sie auch fuer durchgethrottelte
+                # Absender weiter — bei einem Mail-Bombing waren das 1000
+                # Mails = 1000 Gemini-Calls, nur um am Ende doch nicht zu
+                # antworten. Die Mail nimmt denselben Weg wie bisher
+                # (Outlook-Kategorie UNSICHER, keine Auto-Antwort), nur
+                # ohne das Modell zu fragen.
+                logger.warning(
+                    "poll: Throttle (%s) fuer %s — Klassifikation "
+                    "uebersprungen", throttle_grund, sender_email,
+                )
+                cls_result = {
+                    "classification": "RELEVANT_KUNDE",
+                    "confidence": "high",
+                    "reason": f"nicht klassifiziert (Throttle: {throttle_grund})",
+                    "intent": "sonstiges",
+                }
+            else:
+                cls_result = await classify_mail_subject(
+                    subject=subject,
+                    sender=sender_email,
+                    tenant_company=tenant_company,
+                    tenant_branche=tenant_branche,
+                    body_preview=body_preview_for_ai,
+                )
             classification = cls_result.get("classification") or "UNSICHER"
             confidence = cls_result.get("confidence") or "low"
             reason = cls_result.get("reason") or ""
@@ -531,6 +551,7 @@ async def poll_microsoft_inbox(
                     ms_conversation_id=msg.get("conversationId"),
                     classification=classification, confidence=confidence,
                     reason=reason, categories=msg.get("categories") or [],
+                    internet_message_id=msg.get("internetMessageId"),
                 )
             except Exception as e:
                 logger.exception(
@@ -568,7 +589,6 @@ async def poll_microsoft_inbox(
                     ms_conversation_id=msg.get("conversationId"),
                     classification=classification, confidence=confidence,
                     reason=reason, categories=msg.get("categories") or [],
-                    internet_message_id=msg.get("internetMessageId"),
                 )
             except Exception as e:
                 logger.exception(
@@ -679,7 +699,7 @@ async def poll_microsoft_inbox(
             if spam_throttled:
                 logger.warning(
                     f"poll: Spam-Throttle greift fuer {sender_email} "
-                    f"(>= {recent_reply_count} Antworten in 24h) - keine Auto-Reply"
+                    f"(Grund: {throttle_grund}) - keine Auto-Reply"
                 )
                 process_result = {
                     "success": False, "skipped": True, "reason": "spam-throttle",
