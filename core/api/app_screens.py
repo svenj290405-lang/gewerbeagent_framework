@@ -3245,7 +3245,9 @@ async def api_archiv_datei_proxy(
 
     Authentifizierung via Session (require_app_user) — kein direkter
     Drive-Link im Browser noetig. Cache-Control: private, 1h."""
-    from core.integrations.google_drive import get_file_bytes, get_thumbnail_bytes
+    from core.integrations.google_drive import (
+        DriveScopeError, get_file_bytes, get_thumbnail_bytes,
+    )
     tid = current_tenant_id(request)
     if not await _archiv_feature_ok(tid):
         return JSONResponse({"ok": False}, status_code=403)
@@ -3259,6 +3261,10 @@ async def api_archiv_datei_proxy(
                 data, mime = got
         if data is None:
             data, mime = await get_file_bytes(tid, file_id)
+    except DriveScopeError:
+        # Datei gehoert einem anderen Betrieb (geteiltes Google-Konto) —
+        # 404 statt 403, damit der Proxy nicht verraet, dass es sie gibt.
+        return JSONResponse({"ok": False, "error": "nicht gefunden"}, status_code=404)
     except ValueError:
         return JSONResponse(
             {"ok": False, "error": "Drive nicht verbunden."},

@@ -746,6 +746,78 @@ _PROXY_MAX_BYTES = 10 * 1024 * 1024  # 10 MB
 _THUMB_SIZE_PX = 400
 
 
+# =====================================================================
+# Tenant-Scope-Pruefung fuer den Datei-Proxy
+# =====================================================================
+#
+# Der drive.file-Scope gilt pro OAuth-CLIENT, nicht pro Grant: alle Dateien,
+# die Gewerbeagent je in einem Google-Konto angelegt hat, sind fuer jeden
+# Token desselben Clients lesbar. Teilen sich zwei Betriebe ein Google-Konto
+# (Inhaber mit zwei Firmen, Demo-/Testbetrieb, Migration), koennte Betrieb A
+# ueber eine geratene/bekannte file_id an die Archiv-Dateien von Betrieb B.
+# Google kann das nicht unterscheiden — also pruefen wir selbst, ob die Datei
+# unterhalb der Ordner DIESES Tenants haengt.
+
+_ANCESTOR_MAX_DEPTH = 6
+
+
+class DriveScopeError(PermissionError):
+    """Datei liegt nicht im Drive-Bereich dieses Tenants."""
+
+
+async def _allowed_folder_ids(tenant_id: uuid.UUID) -> set[str]:
+    """Root-Ordner + alle bekannten Kunden-Ordner dieses Tenants."""
+    async with AsyncSessionLocal() as s:
+        tenant = (await s.execute(
+            select(Tenant).where(Tenant.id == tenant_id)
+        )).scalar_one_or_none()
+        root = getattr(tenant, "drive_root_folder_id", None) if tenant else None
+        kunde_ids = (await s.execute(
+            select(TenantKundeDrive.drive_folder_id)
+            .where(TenantKundeDrive.tenant_id == tenant_id)
+        )).scalars().all()
+    return {fid for fid in ([root] + list(kunde_ids)) if fid}
+
+
+async def assert_file_in_tenant_scope(
+    service: Any, tenant_id: uuid.UUID, file_id: str,
+) -> None:
+    """Wirft DriveScopeError, wenn file_id nicht unter einem Ordner dieses
+    Tenants haengt. Laeuft die Parent-Kette hoch (Drive kennt keinen
+    'ist Nachfahre von'-Filter), begrenzt auf _ANCESTOR_MAX_DEPTH."""
+    allowed = await _allowed_folder_ids(tenant_id)
+    if not allowed:
+        raise DriveScopeError("Kein Drive-Ordner fuer diesen Betrieb bekannt.")
+
+    def _walk() -> bool:
+        current = file_id
+        for _ in range(_ANCESTOR_MAX_DEPTH):
+            try:
+                meta = service.files().get(
+                    fileId=current, fields="id,parents",
+                ).execute()
+            except Exception:
+                # Beim Hochlaufen verlaesst die Kette irgendwann den Bereich,
+                # den der drive.file-Scope sichtbar macht (spaetestens bei
+                # "Meine Ablage") — Google antwortet dann 404/403. Das ist
+                # kein Fehler, sondern heisst: nicht unter unseren Ordnern.
+                return False
+            parents = meta.get("parents") or []
+            if any(pid in allowed for pid in parents):
+                return True
+            if not parents:
+                return False
+            current = parents[0]
+        return False
+
+    if not await asyncio.to_thread(_walk):
+        logger.warning(
+            "Drive-Proxy abgelehnt: file=%s liegt nicht im Bereich von tenant=%s",
+            file_id, tenant_id,
+        )
+        raise DriveScopeError("Datei gehoert nicht zu diesem Betrieb.")
+
+
 async def get_thumbnail_bytes(
     tenant_id: uuid.UUID,
     file_id: str,
@@ -761,6 +833,7 @@ async def get_thumbnail_bytes(
     Raises ValueError wenn Drive nicht verbunden ist (wie get_file_bytes).
     """
     service = await get_drive_service(tenant_id, employee_id)
+    await assert_file_in_tenant_scope(service, tenant_id, file_id)
 
     def _sync_thumb() -> tuple[bytes, str] | None:
         meta = service.files().get(
@@ -804,6 +877,7 @@ async def get_file_bytes(
     Raises RuntimeError wenn Datei > 10 MB.
     """
     service = await get_drive_service(tenant_id, employee_id)
+    await assert_file_in_tenant_scope(service, tenant_id, file_id)
 
     def _sync_download() -> tuple[bytes, str]:
         from googleapiclient.http import MediaIoBaseDownload
