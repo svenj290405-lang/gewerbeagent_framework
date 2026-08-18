@@ -62,6 +62,9 @@ from core.models.rueckruf import (
     Rueckruf,
 )
 from core.plugin_system import get_plugin_for_tenant
+from core.features.permission_check import (
+    rolle_oder_default as _rolle_oder_default,
+)
 from core.security.app_auth import (
     current_tenant_id,
     require_app_csrf,
@@ -1356,6 +1359,7 @@ async def api_team(request: Request, _e=Depends(require_app_user)) -> JSONRespon
             "name": e.name,
             "is_inhaber": bool(e.is_default),
             "is_active": bool(e.is_active),
+            "rolle": _rolle_oder_default(e),
             "job_title": e.job_title or "",
             "skills": list(e.skills or []),
             "kalender_verbunden": bool(e.calendar_provider),
@@ -1436,6 +1440,167 @@ async def api_team_set_profile(
             if isinstance(skills, str):
                 skills = [x.strip() for x in skills.split(",") if x.strip()]
             emp.skills = [str(x)[:50] for x in skills][:20] or None
+    return JSONResponse({"ok": True})
+
+
+# =====================================================================
+# Rechte eines Mitarbeiters (Rolle + Abweichungen)
+# =====================================================================
+#
+# Die Oberflaeche zeigt pro Recht drei Zustaende: aus der Rolle geerbt,
+# einzeln gewaehrt, einzeln entzogen. Darum liefert das GET sowohl den
+# effektiven Stand als auch die Herkunft.
+
+@router.get("/team/{slug}/rechte")
+async def api_team_rechte(
+    slug: str,
+    request: Request,
+    _e=Depends(require_app_inhaber),
+) -> JSONResponse:
+    """Rolle + effektive Rechte eines Mitarbeiters, inkl. Herkunft."""
+    from core.features.permission_check import (
+        overrides_fuer_employee, rechte_fuer_employee, rolle_oder_default,
+    )
+    from core.features.permissions import (
+        ALLE_ROLLEN, RECHTE, ROLLEN_BESCHREIBUNG, ROLLEN_LABELS,
+        rechte_fuer_rolle,
+    )
+
+    tid = current_tenant_id(request)
+    emp = await _get_employee_by_slug(tid, slug)
+    if emp is None:
+        return JSONResponse({"ok": False, "error": "nicht gefunden"}, status_code=404)
+
+    rolle = rolle_oder_default(emp)
+    aus_rolle = rechte_fuer_rolle(rolle)
+    effektiv = await rechte_fuer_employee(emp)
+    overrides = await overrides_fuer_employee(emp.id)
+
+    return JSONResponse({
+        "ok": True,
+        "slug": emp.slug,
+        "name": emp.name,
+        "is_inhaber": bool(emp.is_default),
+        "rolle": rolle,
+        "rollen": [
+            {
+                "key": r,
+                "label": ROLLEN_LABELS[r],
+                "beschreibung": ROLLEN_BESCHREIBUNG[r],
+            }
+            for r in ALLE_ROLLEN
+        ],
+        "rechte": [
+            {
+                "key": key,
+                "label": recht.label,
+                "beschreibung": recht.description,
+                "gruppe": recht.gruppe,
+                "aus_rolle": key in aus_rolle,
+                "effektiv": key in effektiv,
+                # None = kein Override gesetzt, folgt also der Rolle
+                "override": overrides.get(key),
+                "delegierbar": not recht.nicht_delegierbar,
+            }
+            for key, recht in RECHTE.items()
+        ],
+    })
+
+
+@router.post("/team/{slug}/rolle")
+async def api_team_set_rolle(
+    slug: str,
+    request: Request,
+    _e=Depends(require_app_inhaber),
+    _c=Depends(require_app_csrf),
+) -> JSONResponse:
+    """Rollen-Vorlage eines Mitarbeiters setzen."""
+    from core.features.permission_check import set_rolle
+    from core.features.permissions import ROLLE_INHABER, ist_gueltige_rolle
+
+    tid = current_tenant_id(request)
+    body = await request.json() or {}
+    rolle = (body.get("rolle") or "").strip()
+    if not ist_gueltige_rolle(rolle):
+        return JSONResponse({"ok": False, "error": "Unbekannte Rolle."}, status_code=400)
+
+    emp = await _get_employee_by_slug(tid, slug)
+    if emp is None:
+        return JSONResponse({"ok": False, "error": "nicht gefunden"}, status_code=404)
+
+    # Selbstschutz: der Inhaber darf sich nicht selbst herunterstufen und
+    # den Inhaber-Account nicht umwidmen — sonst sperrt er sich aus seinem
+    # eigenen Betrieb aus und niemand kann es zurueckdrehen.
+    aktueller = request.state.app_employee
+    if emp.id == aktueller.id:
+        return JSONResponse(
+            {"ok": False, "error": "Die eigene Rolle kannst du nicht ändern."},
+            status_code=400,
+        )
+    if emp.is_default:
+        return JSONResponse(
+            {"ok": False, "error": "Der Inhaber-Account behält die Inhaber-Rolle."},
+            status_code=400,
+        )
+    if rolle == ROLLE_INHABER:
+        return JSONResponse(
+            {"ok": False,
+             "error": "Die Inhaber-Rolle kann nicht vergeben werden."},
+            status_code=400,
+        )
+
+    if not await set_rolle(emp.id, rolle):
+        return JSONResponse({"ok": False, "error": "Konnte nicht speichern."}, status_code=500)
+    return JSONResponse({"ok": True, "rolle": rolle})
+
+
+@router.post("/team/{slug}/recht")
+async def api_team_set_recht(
+    slug: str,
+    request: Request,
+    _e=Depends(require_app_inhaber),
+    _c=Depends(require_app_csrf),
+) -> JSONResponse:
+    """Einzelnes Recht abweichend setzen.
+
+    Body: { key, allowed: true | false | null }  (null = zurueck auf Rolle)
+    """
+    from core.features.permission_check import set_override
+    from core.features.permissions import RECHTE, ist_delegierbar
+
+    tid = current_tenant_id(request)
+    body = await request.json() or {}
+    key = (body.get("key") or "").strip()
+    allowed = body.get("allowed")
+
+    if key not in RECHTE:
+        return JSONResponse({"ok": False, "error": "Unbekanntes Recht."}, status_code=400)
+    if allowed is not None and not isinstance(allowed, bool):
+        return JSONResponse({"ok": False, "error": "allowed muss true, false oder null sein."},
+                            status_code=400)
+    if allowed and not ist_delegierbar(key):
+        return JSONResponse(
+            {"ok": False,
+             "error": "Dieses Recht bleibt beim Inhaber und kann nicht vergeben werden."},
+            status_code=400,
+        )
+
+    emp = await _get_employee_by_slug(tid, slug)
+    if emp is None:
+        return JSONResponse({"ok": False, "error": "nicht gefunden"}, status_code=404)
+    if emp.id == request.state.app_employee.id:
+        return JSONResponse(
+            {"ok": False, "error": "Die eigenen Rechte kannst du nicht ändern."},
+            status_code=400,
+        )
+    if emp.is_default:
+        return JSONResponse(
+            {"ok": False, "error": "Der Inhaber hat immer alle Rechte."},
+            status_code=400,
+        )
+
+    if not await set_override(emp.id, tid, key, allowed):
+        return JSONResponse({"ok": False, "error": "Konnte nicht speichern."}, status_code=500)
     return JSONResponse({"ok": True})
 
 

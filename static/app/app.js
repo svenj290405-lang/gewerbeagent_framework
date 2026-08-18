@@ -969,6 +969,13 @@ const SCREENS = {
       if (isInhaber && !e.is_inhaber) {
         actions = `<button class="btn-sm btn-ghost" data-act="toggle" data-slug="${esc(e.slug)}" data-active="${e.is_active ? "1" : "0"}">${e.is_active ? "Deaktivieren" : "Aktivieren"}</button>`;
       }
+      // Rolle als Chip + Einstieg in die Feinjustierung.
+      const rechteLine = (isInhaber && !e.is_inhaber)
+        ? `<div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+             <span class="pill">${esc(ROLLEN_LABEL[e.rolle] || e.rolle || "")}</span>
+             <button class="btn-sm btn-ghost" data-act="rechte" data-slug="${esc(e.slug)}" style="padding:6px 10px">Rechte</button>
+           </div>`
+        : "";
       // Inhaber-Aktions-Zeile: Krank/Urlaub melden, oder bei laufender
       // Abwesenheit "Wieder da". Aktiv nur fuer aktive Mitarbeiter.
       let absenceActions = "";
@@ -984,6 +991,7 @@ const SCREENS = {
       return `<div class="card">
         <div class="row"><div><div><b>${esc(e.name)}</b>${e.is_inhaber ? " · Inhaber" : (e.job_title ? " · " + esc(e.job_title) : "")}</div>${skills}${up}${aktLine}</div><div>${actions}</div></div>
         <div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap">${tags.join("")}</div>
+        ${rechteLine}
         ${absenceActions ? `<div style="margin-top:8px;display:flex;gap:6px;flex-wrap:wrap">${absenceActions}</div>` : ""}
       </div>`;
     }).join("");
@@ -1004,6 +1012,8 @@ const SCREENS = {
           { method: "POST", body: JSON.stringify({ active: b.dataset.active !== "1" }) });
         if (res && res.ok) navigate("team"); else { b.disabled = false; alert("Aktion fehlgeschlagen."); }
       }));
+    document.querySelectorAll('[data-act="rechte"]').forEach((b) =>
+      b.addEventListener("click", () => showTeamRechte(b.dataset.slug)));
     // Krank/Urlaub-Buttons → kleines Date-Picker-Dialog
     document.querySelectorAll('[data-act="absence"]').forEach((b) =>
       b.addEventListener("click", () => showAbsenceDialog(b.dataset.slug, b.dataset.name, b.dataset.typ)));
@@ -4329,10 +4339,34 @@ async function showNewEmployeeForm() {
        <input type="email" id="emp-mail" style="width:100%;padding:12px;border:1px solid var(--line);border-radius:10px;margin:4px 0 10px;font-size:16px" />
        <label class="sub">Skills (komma-getrennt, optional)</label>
        <input type="text" id="emp-skills" placeholder="z.B. Heizung, Sanitär, Elektro" style="width:100%;padding:12px;border:1px solid var(--line);border-radius:10px;margin:4px 0 10px;font-size:16px" />
+       <label class="sub" style="display:block;margin-top:6px">Rolle</label>
+       <div id="emp-rolle-wahl" style="display:flex;gap:8px;flex-wrap:wrap;margin:6px 0 4px">
+         <button type="button" class="btn-sm btn-ghost" data-rolle="buero" style="padding:8px 14px">Büro</button>
+         <button type="button" class="btn-sm" data-rolle="monteur" style="padding:8px 14px">Monteur</button>
+       </div>
+       <p class="muted" id="emp-rolle-hint" style="margin:0 0 10px;font-size:12px"></p>
        <button class="btn-sm" id="emp-save" style="margin-top:12px;width:100%">Mitarbeiter anlegen</button>
-       <p class="muted" style="margin-top:8px;font-size:12px">Nach dem Anlegen bekommst du einen einmaligen Aktivierungs-Link zum Weitergeben.</p>
+       <p class="muted" style="margin-top:8px;font-size:12px">Nach dem Anlegen bekommst du einen einmaligen Aktivierungs-Link zum Weitergeben. Einzelne Rechte kannst du danach über „Rechte" anpassen.</p>
     </div>`;
   document.getElementById("back-team").addEventListener("click", () => navigate("team"));
+
+  // Rollen-Auswahl. Default ist die restriktivste Rolle — niemand startet
+  // versehentlich mit Zugriff auf die Buchhaltung.
+  const ROLLE_HINT = {
+    buero: "Sieht Aufträge, Kunden und Anfragen — nicht die Buchhaltung.",
+    monteur: "Sieht nur die eigenen Aufträge, Termine und Material.",
+  };
+  let gewaehlteRolle = "monteur";
+  const hint = document.getElementById("emp-rolle-hint");
+  const malen = () => {
+    document.querySelectorAll("#emp-rolle-wahl [data-rolle]").forEach((b) => {
+      b.className = b.dataset.rolle === gewaehlteRolle ? "btn-sm" : "btn-sm btn-ghost";
+    });
+    hint.textContent = ROLLE_HINT[gewaehlteRolle] || "";
+  };
+  document.querySelectorAll("#emp-rolle-wahl [data-rolle]").forEach((b) =>
+    b.addEventListener("click", () => { gewaehlteRolle = b.dataset.rolle; malen(); }));
+  malen();
   document.getElementById("emp-save").addEventListener("click", async () => {
     const name = document.getElementById("emp-name").value.trim();
     if (!name) { alert("Name ist Pflicht."); return; }
@@ -4341,6 +4375,7 @@ async function showNewEmployeeForm() {
       job_title: document.getElementById("emp-job").value.trim() || null,
       contact_email: document.getElementById("emp-mail").value.trim() || null,
       skills: document.getElementById("emp-skills").value.trim() || null,
+      rolle: gewaehlteRolle,
     };
     const btn = document.getElementById("emp-save");
     btn.disabled = true; btn.textContent = "Speichere …";
@@ -4710,6 +4745,129 @@ function primeMicPermissionState() {
 }
 
 // ---------- Kunden-Profil (gebündelte Historie) ----------
+// Anzeigenamen der Rechte-Rollen. Spiegel von ROLLEN_LABELS in
+// core/features/permissions.py — beides zusammen aendern.
+const ROLLEN_LABEL = { inhaber: "Inhaber", buero: "Büro", monteur: "Monteur" };
+
+// Fehlertext aus einer JSON-Antwort ziehen, mit Rueckfall. Die
+// Rechte-Endpunkte liefern sprechende Meldungen ("Die eigene Rolle
+// kannst du nicht ändern") — die sollen beim Nutzer ankommen.
+async function fehlerText(res, fallback) {
+  try {
+    const j = await res.json();
+    if (j && j.error) return j.error;
+  } catch (e) {}
+  return fallback;
+}
+
+// =====================================================================
+// Rechte eines Mitarbeiters (Rolle + Feinjustierung)
+// =====================================================================
+//
+// Die Rolle setzt den Standard, einzelne Schalter weichen davon ab.
+// Darum zeigt jede Zeile, WOHER ihr Zustand kommt: grau = aus der Rolle,
+// hervorgehoben = einzeln gesetzt. Nur so ist spaeter nachvollziehbar,
+// warum jemand etwas sieht oder nicht.
+
+async function showTeamRechte(slug) {
+  App.view.innerHTML = `<div class="loading">Lädt …</div>`;
+  const res = await api(`/app/api/team/${encodeURIComponent(slug)}/rechte`);
+  const d = res && res.ok ? await res.json() : null;
+  if (!d || !d.ok) {
+    App.view.innerHTML =
+      `<button class="btn-sm btn-ghost" id="back-team" style="margin-bottom:10px">← Zurück</button>` +
+      `<div class="card"><p class="empty">Rechte konnten nicht geladen werden.</p></div>`;
+    document.getElementById("back-team").addEventListener("click", () => navigate("team"));
+    return;
+  }
+
+  // Rollen-Auswahl
+  const rollenBtns = (d.rollen || [])
+    .filter((r) => r.key !== "inhaber")
+    .map((r) => `
+      <button class="btn-sm ${r.key === d.rolle ? "" : "btn-ghost"}"
+              data-rolle="${esc(r.key)}" style="padding:8px 14px">
+        ${esc(r.label)}
+      </button>`).join("");
+
+  const aktuelleRolle = (d.rollen || []).find((r) => r.key === d.rolle);
+
+  // Rechte nach Gruppe
+  const gruppen = {};
+  (d.rechte || []).forEach((r) => { (gruppen[r.gruppe] = gruppen[r.gruppe] || []).push(r); });
+
+  const gruppenHtml = Object.keys(gruppen).map((g) => {
+    const zeilen = gruppen[g].map((r) => {
+      const abweichend = r.override !== null && r.override !== undefined;
+      const gesperrt = !r.delegierbar;
+      const status = gesperrt
+        ? `<span class="sub">nur Inhaber</span>`
+        : `<button class="btn-sm ${r.effektiv ? "" : "btn-ghost"}"
+                   data-recht="${esc(r.key)}" data-an="${r.effektiv ? "1" : "0"}"
+                   style="padding:6px 12px;min-width:64px">${r.effektiv ? "An" : "Aus"}</button>`;
+      const herkunft = gesperrt ? ""
+        : abweichend
+          ? `<button class="btn-sm btn-ghost" data-reset="${esc(r.key)}" style="padding:4px 8px;font-size:12px">↺ Standard</button>`
+          : `<span class="sub" style="font-size:12px">aus der Rolle</span>`;
+      return `<div class="row" style="display:block;${abweichend ? "" : "opacity:.85"}">
+        <div style="display:flex;justify-content:space-between;gap:10px;align-items:center">
+          <div><b>${esc(r.label)}</b></div>
+          <div style="flex-shrink:0">${status}</div>
+        </div>
+        <div class="sub" style="word-break:break-word">${esc(r.beschreibung)}</div>
+        <div style="margin-top:4px">${herkunft}</div>
+      </div>`;
+    }).join("");
+    return `<div class="card"><div class="section-title" style="margin:0 0 8px">${esc(g)}</div>${zeilen}</div>`;
+  }).join("");
+
+  App.view.innerHTML =
+    `<button class="btn-sm btn-ghost" id="back-team" style="margin-bottom:10px">← Zurück</button>` +
+    `<h1 style="font-size:22px;margin:4px 4px 4px">Rechte · ${esc(d.name)}</h1>` +
+    `<div class="sub" style="margin:0 4px 14px">Die Rolle setzt den Standard. Einzelne Schalter weichen davon ab.</div>` +
+    `<div class="card">
+       <div class="section-title" style="margin:0 0 8px">Rolle</div>
+       <div style="display:flex;gap:8px;flex-wrap:wrap">${rollenBtns}</div>
+       ${aktuelleRolle ? `<div class="sub" style="margin-top:8px">${esc(aktuelleRolle.beschreibung)}</div>` : ""}
+     </div>` +
+    gruppenHtml;
+
+  document.getElementById("back-team").addEventListener("click", () => navigate("team"));
+
+  const neuLaden = () => showTeamRechte(slug);
+
+  document.querySelectorAll("[data-rolle]").forEach((b) =>
+    b.addEventListener("click", async () => {
+      if (b.dataset.rolle === d.rolle) return;
+      b.disabled = true;
+      const r = await api(`/app/api/team/${encodeURIComponent(slug)}/rolle`,
+        { method: "POST", body: JSON.stringify({ rolle: b.dataset.rolle }) });
+      if (r && r.ok) { toast("Rolle geändert"); neuLaden(); }
+      else { b.disabled = false; toast(await fehlerText(r, "Rolle konnte nicht geändert werden.")); }
+    }));
+
+  document.querySelectorAll("[data-recht]").forEach((b) =>
+    b.addEventListener("click", async () => {
+      b.disabled = true;
+      const r = await api(`/app/api/team/${encodeURIComponent(slug)}/recht`,
+        { method: "POST", body: JSON.stringify({
+            key: b.dataset.recht, allowed: b.dataset.an !== "1",
+          }) });
+      if (r && r.ok) neuLaden();
+      else { b.disabled = false; toast(await fehlerText(r, "Konnte nicht speichern.")); }
+    }));
+
+  document.querySelectorAll("[data-reset]").forEach((b) =>
+    b.addEventListener("click", async () => {
+      b.disabled = true;
+      const r = await api(`/app/api/team/${encodeURIComponent(slug)}/recht`,
+        { method: "POST", body: JSON.stringify({ key: b.dataset.reset, allowed: null }) });
+      if (r && r.ok) neuLaden();
+      else { b.disabled = false; toast(await fehlerText(r, "Konnte nicht zurücksetzen.")); }
+    }));
+}
+
+
 async function showKundenProfil(name, kundeId) {
   App.screenContext = { screen: "kunden_profil", kunde: name };
   App.view.innerHTML = `<div class="loading">Lädt …</div>`;
