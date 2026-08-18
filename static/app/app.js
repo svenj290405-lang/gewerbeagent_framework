@@ -4851,12 +4851,23 @@ const ROLLEN_LABEL = { inhaber: "Inhaber", buero: "Büro", monteur: "Monteur" };
 // Die Schluessel spiegeln core/features/permissions.py.
 
 let _perms = new Set();
+// Liefert der Server noch keine Rechte? Dann laeuft eine aeltere
+// Version — Static ist ueber den Bind-Mount SOFORT live, der
+// Python-Code erst nach dem Container-Neustart. In diesem Fenster darf
+// die App nicht plotzlich halb leer sein, also faellt sie auf das alte
+// Verhalten zurueck: Inhaber darf alles, Mitarbeiter das Uebliche.
+let _permsUnbekannt = true;
 
 function setPermissions(liste) {
+  _permsUnbekannt = !Array.isArray(liste);
   _perms = new Set(liste || []);
 }
 
 function can(key) {
+  if (_permsUnbekannt) {
+    // Alt-Verhalten: alles, was frueher an is_inhaber hing.
+    return !!(App.me && App.me.employee && App.me.employee.is_inhaber);
+  }
   return _perms.has(key);
 }
 
