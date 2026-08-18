@@ -36,6 +36,7 @@ async def find_oauth_token(
     tenant_id: UUID,
     provider: str,
     employee_id: UUID | None = None,
+    strict: bool = False,
 ) -> OAuthToken | None:
     """Liefert den passenden OAuthToken oder None.
 
@@ -43,6 +44,14 @@ async def find_oauth_token(
       1. (employee_id, provider) wenn employee_id != None
       2. Default-Employee + provider
       3. Legacy: tenant_id + provider + employee_id IS NULL
+
+    ``strict=True`` schaltet Stufe 2 und 3 ab. Das ist wichtig, seit
+    Termine ueber mehrere Mitarbeiter-Kalender verteilt werden: ohne
+    strikten Modus liefert ein Mitarbeiter OHNE eigenen Token lautlos
+    den Token des Inhabers zurueck — der Termin "fuer Marco" landet
+    dann im Kalender des Chefs, und niemand merkt, dass Marcos
+    Kalender nie verbunden war. Ist ein Mitarbeiter explizit gemeint,
+    ist "kein Token" ein Fehler, kein Rueckfall.
     """
     from core.models.employee import Employee, get_default_employee
 
@@ -62,6 +71,14 @@ async def find_oauth_token(
             )).scalar_one_or_none()
             if tok is not None:
                 return tok
+            if strict:
+                # Explizit dieser Mitarbeiter, aber kein eigener Token:
+                # lieber nichts als still der Kalender eines anderen.
+                logger.info(
+                    "Kein eigener %s-Token fuer employee=%s (strict)",
+                    provider, employee_id,
+                )
+                return None
 
         # 2) Default-Employee-Fallback
         default_emp = await get_default_employee(tenant_id)

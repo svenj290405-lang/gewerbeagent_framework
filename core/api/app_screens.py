@@ -5052,6 +5052,133 @@ async def api_oauth_start(
     return JSONResponse({"ok": True, "auth_url": auth_url})
 
 
+# =====================================================================
+# Mein Kalender — Selbstverbindung fuer Mitarbeiter
+# =====================================================================
+#
+# /verbindungen und /oauth/start sind Betriebs-Sache (Lexware-Key,
+# Betriebspostfach) und bleiben beim Inhaber. Ein Mitarbeiter muss
+# aber seinen EIGENEN Kalender anschliessen koennen — bisher ging das
+# nur ueber Telegram, in der App gar nicht.
+#
+# Der Scope ist dabei enger als beim Inhaber: bei Google sieht Q nur
+# die Belegung und einen selbst angelegten Zweitkalender, private
+# Termininhalte sind technisch unerreichbar. Bei Outlook geht das
+# nicht (Graph kennt keine Entsprechung) — dafuer entfaellt dort jeder
+# Mail-Scope, der Mitarbeiter gibt also nicht sein Postfach mit.
+
+@router.get("/mein-kalender")
+async def api_mein_kalender(
+    request: Request, _e=Depends(require_app_user),
+) -> JSONResponse:
+    """Status der EIGENEN Kalender-Verbindung."""
+    from core.security.oauth_token_lookup import find_oauth_token
+
+    tid = current_tenant_id(request)
+    emp = request.state.app_employee
+
+    status = {}
+    for provider in ("google", "microsoft"):
+        try:
+            tok = await find_oauth_token(
+                tid, provider, employee_id=emp.id, strict=True,
+            )
+        except Exception:  # noqa: BLE001
+            tok = None
+        status[provider] = {
+            "verbunden": tok is not None,
+            "konto": getattr(tok, "account_email", None) if tok else None,
+        }
+    return JSONResponse({
+        "ok": True,
+        "provider": emp.calendar_provider,
+        "status": status,
+        # Ehrlich benennen, was der jeweilige Anbieter hergibt.
+        "hinweis_google": (
+            "Q sieht nur, wann du belegt bist — keine Titel, keine "
+            "Teilnehmer. Termine legt Q in einem eigenen Kalender ab."
+        ),
+        "hinweis_microsoft": (
+            "Outlook lässt keine Beschränkung auf reine Belegung zu: Q "
+            "sieht deinen Kalender vollständig. Dein Postfach bleibt "
+            "unberührt."
+        ),
+    })
+
+
+@router.post("/mein-kalender/verbinden")
+async def api_mein_kalender_verbinden(
+    request: Request,
+    _e=Depends(require_app_user),
+    _c=Depends(require_app_csrf),
+) -> JSONResponse:
+    """Startet den OAuth-Flow fuer den EIGENEN Kalender."""
+    from core.security.oauth_flow import (
+        SCOPE_PROFIL_MITARBEITER, SCOPE_PROFIL_VOLL, generate_auth_url,
+    )
+
+    body = await request.json() or {}
+    provider = (body.get("provider") or "").strip()
+    if provider not in _OAUTH_APP_PROVIDERS:
+        return JSONResponse({"ok": False, "error": "Unbekannter Anbieter."}, status_code=400)
+
+    tenant = request.state.app_tenant
+    emp = request.state.app_employee
+    # Der Inhaber verbindet das Betriebskonto und braucht vollen Zugriff
+    # (Umverteilung bei Krankheit liest fremde Termine, Drive fuer das
+    # Archiv). Alle anderen bekommen das enge Profil.
+    profil = SCOPE_PROFIL_VOLL if emp.is_default else SCOPE_PROFIL_MITARBEITER
+
+    try:
+        # Slug kommt aus der SESSION — niemand kann den Kalender eines
+        # Kollegen an sein eigenes Konto binden.
+        auth_url = await generate_auth_url(
+            tenant_slug=tenant.slug, provider=provider,
+            employee_slug=emp.slug, allow_rebind=True,
+            scope_profil=profil,
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("Mein-Kalender-Start fehlgeschlagen (provider=%s)", provider)
+        return JSONResponse(
+            {"ok": False,
+             "error": "Verbindung konnte nicht gestartet werden."},
+            status_code=500,
+        )
+    return JSONResponse({"ok": True, "auth_url": auth_url})
+
+
+@router.post("/mein-kalender/trennen")
+async def api_mein_kalender_trennen(
+    request: Request,
+    _e=Depends(require_app_user),
+    _c=Depends(require_app_csrf),
+) -> JSONResponse:
+    """Trennt die EIGENE Kalender-Verbindung (nur die eigene)."""
+    from core.models.oauth_token import OAuthToken
+
+    tid = current_tenant_id(request)
+    emp = request.state.app_employee
+    body = await request.json() or {}
+    provider = (body.get("provider") or "").strip()
+    if provider not in _OAUTH_APP_PROVIDERS:
+        return JSONResponse({"ok": False, "error": "Unbekannter Anbieter."}, status_code=400)
+
+    async with get_session() as s:
+        tok = (await s.execute(
+            select(OAuthToken)
+            .where(OAuthToken.tenant_id == tid)
+            .where(OAuthToken.employee_id == emp.id)
+            .where(OAuthToken.provider == provider)
+        )).scalar_one_or_none()
+        if tok is not None:
+            await s.delete(tok)
+        db_emp = await s.get(Employee, emp.id)
+        if db_emp is not None and db_emp.calendar_provider == provider:
+            db_emp.calendar_provider = None
+            db_emp.calendar_id = None
+    return JSONResponse({"ok": True})
+
+
 @router.post("/lexware/verbinden")
 async def api_lexware_verbinden(
     request: Request,

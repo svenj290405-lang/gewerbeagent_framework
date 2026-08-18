@@ -169,6 +169,13 @@ ROUTE_RECHTE: dict[str, str] = {
     # des eigenen Kalenders bekommt eigene Endpunkte (spaetere Stufe).
     "api_oauth_start": "einstellungen.verwalten",
 
+    # Der EIGENE Kalender ist keine Betriebs-Einstellung: den darf
+    # jeder Mitarbeiter selbst anschliessen und wieder trennen.
+    # Der Slug kommt dabei aus der Session, nie vom Client.
+    "api_mein_kalender": OFFEN,
+    "api_mein_kalender_verbinden": OFFEN,
+    "api_mein_kalender_trennen": OFFEN,
+
     "api_formular_get": "einstellungen.verwalten",
     "api_formular_save": "einstellungen.verwalten",
     "api_formular_reset": "einstellungen.verwalten",

@@ -19,6 +19,12 @@ class OAuthState(Base):
     # Phase 1 Multi-OAuth: optional welcher Mitarbeiter den Flow startet
     # (NULL = Tenant-Owner / Default-Employee).
     employee_slug: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Welches Scope-Profil dieser Flow angefordert hat: "voll" (Inhaber)
+    # oder "mitarbeiter" (nur Verfuegbarkeit + App-Kalender). MUSS
+    # mitreisen — die Scope-Liste wird beim Bauen der Auth-URL UND beim
+    # Token-Tausch gebraucht, sonst wirft oauthlib "Scope has changed".
+    # NULL = voll (Bestands-States und der Inhaber-Pfad).
+    scope_profil: Mapped[str | None] = mapped_column(String(20), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),

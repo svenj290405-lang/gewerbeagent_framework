@@ -26,12 +26,52 @@ logger = logging.getLogger(__name__)
 # Bestehende Tokens haben den drive.file-Scope NICHT — Tenant muss
 # einmal /drive_verbinden machen damit Drive-Funktionen greifen.
 # Calendar bleibt davon unbeeinflusst.
+# =====================================================================
+# Scope-Profile
+# =====================================================================
+#
+# Der Inhaber verbindet das Betriebskonto und braucht vollen Zugriff
+# (Kalender lesen/schreiben fuer die Umverteilung bei Krankheit, Drive
+# fuer das Kundenarchiv).
+#
+# Ein MITARBEITER verbindet sein privates Konto. Dort waere voller
+# Kalenderzugriff nicht nur unnoetig, sondern eine Zusage, die wir
+# technisch nicht halten koennen: "wir lesen nichts Privates" haengt
+# sonst allein an unserer Disziplin. Deshalb ein enges Profil:
+#
+#   calendar.freebusy      -> nur "wann ist er belegt", keine Titel,
+#                             keine Teilnehmer, keine Orte
+#   calendar.app.created   -> ein von UNS angelegter Zweitkalender,
+#                             in dem die Auftraege stehen
+#
+# Wichtig: calendar.app.created gibt KEINEN Zugriff auf den
+# Hauptkalender. Q kann dort also gar nicht schreiben — die Termine
+# landen in einem eigenen Kalender "<Betrieb> – Auftraege" im Konto des
+# Mitarbeiters. Privat und dienstlich sind damit auch fuer ihn sichtbar
+# getrennt. Drive gibt es fuer Mitarbeiter gar nicht.
+SCOPE_PROFIL_VOLL = "voll"
+SCOPE_PROFIL_MITARBEITER = "mitarbeiter"
+
 GOOGLE_SCOPES = [
     "https://www.googleapis.com/auth/calendar",
     "https://www.googleapis.com/auth/drive.file",
     "https://www.googleapis.com/auth/userinfo.email",
     "openid",
 ]
+
+GOOGLE_SCOPES_MITARBEITER = [
+    "https://www.googleapis.com/auth/calendar.app.created",
+    "https://www.googleapis.com/auth/calendar.freebusy",
+    "https://www.googleapis.com/auth/userinfo.email",
+    "openid",
+]
+
+
+def google_scopes(scope_profil: str | None) -> list[str]:
+    """Scope-Liste fuer ein Profil. Unbekannt/None -> voll (Bestand)."""
+    if scope_profil == SCOPE_PROFIL_MITARBEITER:
+        return list(GOOGLE_SCOPES_MITARBEITER)
+    return list(GOOGLE_SCOPES)
 
 # State-TTL: zwischen /oauth/start (Klick) und /oauth/callback (Login
 # zurück) liegen Sekunden bis maximal 1-2 Minuten. 10 Min ist großzügig
@@ -59,6 +99,32 @@ MICROSOFT_SCOPES = [
     # verschoben angezeigt werden (siehe _handle_callback_microsoft).
     "MailboxSettings.Read",
 ]
+
+# Mitarbeiter-Profil fuer Outlook.
+#
+# EHRLICHE EINSCHRAENKUNG: Microsoft Graph kennt keine Entsprechung zu
+# Googles calendar.app.created. Zum Anlegen von Terminen braucht es
+# Calendars.ReadWrite, und das ist Vollzugriff auf den Kalender. Die
+# technisch erzwungene Zusage "wir sehen nichts Privates" ist auf Google
+# einloesbar, auf Outlook nicht — das gehoert so in die Verbinden-UI,
+# sonst ist die Zusage falsch.
+#
+# Was hier trotzdem entfaellt und wichtiger ist: JEDER Mail-Scope. Ein
+# Monteur, der bisher seinen Kalender verbunden haette, haette dem
+# Betrieb sein komplettes Postfach mitgegeben (Mail.ReadWrite).
+MICROSOFT_SCOPES_MITARBEITER = [
+    "User.Read",
+    "offline_access",
+    "Calendars.ReadWrite",
+    "MailboxSettings.Read",
+]
+
+
+def microsoft_scopes(scope_profil: str | None) -> list[str]:
+    """Scope-Liste fuer ein Profil. Unbekannt/None -> voll (Bestand)."""
+    if scope_profil == SCOPE_PROFIL_MITARBEITER:
+        return list(MICROSOFT_SCOPES_MITARBEITER)
+    return list(MICROSOFT_SCOPES)
 
 
 async def _load_microsoft_config() -> dict:
@@ -131,7 +197,7 @@ def _state_allows_rebind(state: str) -> bool:
 
 async def _generate_auth_url_microsoft(
     tenant_slug: str, employee_slug: str | None = None,
-    allow_rebind: bool = False,
+    allow_rebind: bool = False, scope_profil: str | None = None,
 ) -> str:
     """Microsoft-OAuth-Autorisierungs-URL mit PKCE."""
     from urllib.parse import urlencode
@@ -147,7 +213,7 @@ async def _generate_auth_url_microsoft(
         "response_type": "code",
         "redirect_uri": redirect_uri,
         "response_mode": "query",
-        "scope": " ".join(MICROSOFT_SCOPES),
+        "scope": " ".join(microsoft_scopes(scope_profil)),
         "state": state,
         "code_challenge": code_challenge,
         "code_challenge_method": "S256",
@@ -166,6 +232,7 @@ async def _generate_auth_url_microsoft(
             provider="microsoft",
             code_verifier=code_verifier,
             employee_slug=employee_slug,
+            scope_profil=scope_profil,
         )
         session.add(oauth_state)
         await session.commit()
@@ -181,6 +248,7 @@ async def generate_auth_url(
     tenant_slug: str, provider: str = "google",
     employee_slug: str | None = None,
     allow_rebind: bool = False,
+    scope_profil: str | None = None,
 ) -> str:
     """Erzeugt OAuth-Autorisierungs-URL und persistiert State in DB.
 
@@ -197,6 +265,7 @@ async def generate_auth_url(
     if provider == "microsoft":
         return await _generate_auth_url_microsoft(
             tenant_slug, employee_slug, allow_rebind=allow_rebind,
+            scope_profil=scope_profil,
         )
     if provider != "google":
         raise NotImplementedError(f"Provider {provider} noch nicht unterstuetzt")
@@ -204,7 +273,7 @@ async def generate_auth_url(
     client_config = _load_client_config()
     flow = Flow.from_client_config(
         client_config,
-        scopes=GOOGLE_SCOPES,
+        scopes=google_scopes(scope_profil),
         redirect_uri=_get_redirect_uri(),
     )
 
@@ -218,7 +287,13 @@ async def generate_auth_url(
     state = _make_state(allow_rebind)
     auth_url, _ = flow.authorization_url(
         access_type="offline",
-        include_granted_scopes="true",
+        # Beim engen Mitarbeiter-Profil KEINE frueheren Grants mitziehen —
+        # sonst haengt Google die breiteren Scopes eines vorherigen
+        # Consents desselben Kontos wieder dran und der Token waere doch
+        # wieder weit.
+        include_granted_scopes=(
+            "false" if scope_profil == SCOPE_PROFIL_MITARBEITER else "true"
+        ),
         prompt="consent",
         state=state,
         code_challenge_method="S256",
@@ -235,6 +310,7 @@ async def generate_auth_url(
             provider=provider,
             code_verifier=flow.code_verifier or "",
             employee_slug=employee_slug,
+            scope_profil=scope_profil,
         )
         session.add(oauth_state)
         await session.commit()
@@ -369,6 +445,7 @@ async def _handle_callback_microsoft(
     tenant_slug: str,
     code_verifier: str,
     employee_slug: str | None = None,
+    scope_profil: str | None = None,
 ) -> OAuthToken:
     """Verarbeitet Microsoft-OAuth-Callback."""
     cfg = await _load_microsoft_config()
@@ -385,7 +462,7 @@ async def _handle_callback_microsoft(
                 "redirect_uri": redirect_uri,
                 "grant_type": "authorization_code",
                 "code_verifier": code_verifier,
-                "scope": " ".join(MICROSOFT_SCOPES),
+                "scope": " ".join(microsoft_scopes(scope_profil)),
             },
             headers={"Accept": "application/json"},
         )
@@ -529,6 +606,9 @@ async def handle_callback(code: str, state: str) -> OAuthToken:
         provider = oauth_state.provider
         code_verifier = oauth_state.code_verifier
         employee_slug = oauth_state.employee_slug
+        # MUSS aus dem State kommen: der Token-Tausch baut den Flow mit
+        # derselben Scope-Liste neu auf, sonst "Scope has changed".
+        scope_profil = getattr(oauth_state, "scope_profil", None)
         await session.delete(oauth_state)
         await session.commit()
 
@@ -536,13 +616,14 @@ async def handle_callback(code: str, state: str) -> OAuthToken:
     if provider == "microsoft":
         return await _handle_callback_microsoft(
             code, state, tenant_slug, code_verifier, employee_slug,
+            scope_profil=scope_profil,
         )
 
     # Token von Google holen
     client_config = _load_client_config()
     flow = Flow.from_client_config(
         client_config,
-        scopes=GOOGLE_SCOPES,
+        scopes=google_scopes(scope_profil),
         redirect_uri=_get_redirect_uri(),
         state=state,
     )

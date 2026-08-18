@@ -1316,6 +1316,79 @@ const SCREENS = {
     });
   },
 
+  async mein_kalender() {
+    const res = await api("/app/api/mein-kalender");
+    const d = res && res.ok ? await res.json() : null;
+    if (!d || !d.ok) {
+      App.view.innerHTML =
+        `<button class="btn-sm btn-ghost" id="back-mehr" style="margin-bottom:10px">← Zurück</button>` +
+        `<div class="card"><p class="empty">Konnte den Status nicht laden.</p></div>`;
+      document.getElementById("back-mehr").addEventListener("click", () => navigate("mehr"));
+      return;
+    }
+
+    const zeile = (key, label, hinweis) => {
+      const st = (d.status || {})[key] || {};
+      const knopf = st.verbunden
+        ? `<button class="btn-sm btn-ghost" data-trennen="${key}" style="padding:6px 12px">Trennen</button>`
+        : `<button class="btn-sm" data-verbinden="${key}" style="padding:6px 12px">Verbinden</button>`;
+      return `<div class="card">
+        <div class="row" style="display:block">
+          <div style="display:flex;justify-content:space-between;align-items:center;gap:10px">
+            <div><b>${esc(label)}</b>${st.verbunden ? ` <span class="pill ok">verbunden</span>` : ""}</div>
+            <div style="flex-shrink:0">${knopf}</div>
+          </div>
+          ${st.konto ? `<div class="sub">${esc(st.konto)}</div>` : ""}
+          <div class="sub" style="margin-top:6px">${esc(hinweis)}</div>
+        </div>
+      </div>`;
+    };
+
+    App.view.innerHTML =
+      `<button class="btn-sm btn-ghost" id="back-mehr" style="margin-bottom:10px">← Zurück</button>` +
+      `<h1 style="font-size:22px;margin:4px 4px 4px">Mein Kalender</h1>` +
+      `<div class="sub" style="margin:0 4px 14px">Verbinde deinen eigenen Kalender, damit Termine bei dir landen und niemand dich doppelt verplant.</div>` +
+      zeile("google", "Google Kalender", d.hinweis_google || "") +
+      zeile("microsoft", "Outlook", d.hinweis_microsoft || "");
+
+    document.getElementById("back-mehr").addEventListener("click", () => navigate("mehr"));
+
+    document.querySelectorAll("[data-verbinden]").forEach((b) =>
+      b.addEventListener("click", () => {
+        // Popup SYNCHRON im Klick oeffnen (sonst Popup-Blocker),
+        // Ziel-URL nachreichen — gleiches Muster wie bei den
+        // Betriebs-Verbindungen.
+        const w = window.open("", "ga_oauth", "width=520,height=720");
+        api("/app/api/mein-kalender/verbinden",
+            { method: "POST", body: JSON.stringify({ provider: b.dataset.verbinden }) })
+          .then((r) => (r && r.ok ? r.json() : null))
+          .then((j) => {
+            if (j && j.ok && j.auth_url) {
+              if (w) {
+                w.location = j.auth_url;
+                const iv = setInterval(() => {
+                  if (w.closed) { clearInterval(iv); navigate("mein_kalender"); }
+                }, 1000);
+                setTimeout(() => clearInterval(iv), 300000);
+              } else { window.location = j.auth_url; }
+            } else {
+              if (w) w.close();
+              toast((j && j.error) || "Verbindung konnte nicht gestartet werden.", "err");
+            }
+          });
+      }));
+
+    document.querySelectorAll("[data-trennen]").forEach((b) =>
+      b.addEventListener("click", async () => {
+        if (!confirm("Kalender wirklich trennen? Q kann dir dann keine Termine mehr eintragen.")) return;
+        b.disabled = true;
+        const r = await api("/app/api/mein-kalender/trennen",
+          { method: "POST", body: JSON.stringify({ provider: b.dataset.trennen }) });
+        if (r && r.ok) { toast("Getrennt"); navigate("mein_kalender"); }
+        else { b.disabled = false; toast("Konnte nicht trennen.", "err"); }
+      }));
+  },
+
   async einstellungen() {
     // Übersicht: die Einstellungen sind thematisch auf Unterseiten
     // verteilt (App / Betrieb / Verbindungen / System) statt auf einer
@@ -2291,6 +2364,9 @@ const SCREENS = {
     // Team-Uebersicht zeigt auch Abwesenheiten und (fuer wer das Team
     // fuehrt) die App-Nutzung der Kollegen — deshalb hinter team.sehen.
     if (feats.has("mitarbeiter") && can("team.sehen")) einst.push(`<button class="row menu-item" data-go="team"><span>👥 Team</span><span class="sub">›</span></button>`);
+    // Der EIGENE Kalender ist keine Betriebs-Einstellung — den darf
+    // jeder selbst anschliessen (und nur den eigenen).
+    if (feats.has("kalender")) einst.push(`<button class="row menu-item" data-go="mein_kalender"><span>📅 Mein Kalender</span><span class="sub">›</span></button>`);
     einst.push(`<button class="row menu-item" data-go="einstellungen"><span>⚙️ Einstellungen</span><span class="sub">›</span></button>`);
     einst.push(`<button class="row menu-item" data-go="diagnose"><span>🩺 Status</span><span class="sub">›</span></button>`);
     einst.push(`<button class="row menu-item" data-go="hilfe"><span>❓ Hilfe &amp; Tour</span><span class="sub">›</span></button>`);
