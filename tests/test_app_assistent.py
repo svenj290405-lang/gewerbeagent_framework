@@ -76,11 +76,27 @@ def _patch_tool(monkeypatch, name, fake_run):
     return spec
 
 
-def _ctx(features=("kalender",), is_inhaber=True):
+def _ctx(features=("kalender",), is_inhaber=True, permissions=None):
+    """Ctx fuer die Tool-Gating-Tests.
+
+    Seit der Einfuehrung der Rechte entscheidet nicht mehr is_default,
+    welche Tools Q anbietet, sondern ``permissions``. Ohne explizite
+    Angabe bekommt der Inhaber alle Rechte und ein Nicht-Inhaber die
+    Monteur-Vorlage — damit bleiben die Tests so lesbar wie vorher.
+    """
+    from core.features.permissions import (
+        ALLE_RECHTE, ROLLE_MONTEUR, rechte_fuer_rolle,
+    )
+
     emp = SimpleNamespace(id=uuid.uuid4(), name="Sven Jantos", slug="sven",
                           is_default=is_inhaber)
     tenant = SimpleNamespace(id=uuid.uuid4(), slug="pilot", company_name="Jantos GmbH")
-    return cc.Ctx(tenant=tenant, employee=emp, tid=tenant.id, features=set(features))
+    if permissions is None:
+        permissions = ALLE_RECHTE if is_inhaber else rechte_fuer_rolle(ROLLE_MONTEUR)
+    return cc.Ctx(
+        tenant=tenant, employee=emp, tid=tenant.id, features=set(features),
+        permissions=frozenset(permissions),
+    )
 
 
 # --------------------------------------------------------------------------

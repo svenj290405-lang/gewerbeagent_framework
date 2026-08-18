@@ -72,6 +72,10 @@ class Ctx:
     # bedeutet "nichts geladen" → mode_for_tool fällt auf die Defaults der
     # Registry zurück, also auf das bisherige Verhalten (Bestätigung).
     automation_modes: dict[str, str] = field(default_factory=dict)
+    # Effektive Rechte dieses Mitarbeiters (core/features/permissions.py).
+    # Leer heißt "nichts geladen" → Tools mit Rechte-Anforderung fallen
+    # raus (fail-closed), rechtefreie Tools bleiben nutzbar.
+    permissions: frozenset[str] = field(default_factory=frozenset)
 
     @property
     def is_inhaber(self) -> bool:
@@ -95,7 +99,12 @@ class ToolSpec:
     parameters: dict                            # JSON-Schema (Vertex-Style, OBJECT/STRING…)
     run: Callable[[Ctx, dict], Awaitable[dict]]  # führt die Aktion aus
     feature: str | None = None                  # benötigtes Feature-Flag (None = immer)
-    requires_inhaber: bool = False
+    # Benötigtes Recht aus core/features/permissions.py (None = jeder).
+    # Q ist ein zweiter Weg zu denselben Daten wie die HTTP-Endpunkte,
+    # deshalb TEILEN sich beide dieselben Keys. Zwei Rechtemodelle würden
+    # garantiert auseinanderlaufen ("Angebot erstellen" im Chat erlaubt,
+    # über den Knopf verboten).
+    permission: str | None = None
     # Baut für Write-Tools die menschenlesbare Bestätigungs-Zeile.
     summarize: Callable[[Ctx, dict], str] | None = None
 
@@ -103,10 +112,14 @@ class ToolSpec:
 def _available_tools(ctx: Ctx) -> list[ToolSpec]:
     """Filtert die Registry auf das, was dieser Mitarbeiter nutzen darf.
 
-    Zusätzlich zum Feature- und Inhaber-Gate fliegen Write-Tools raus,
+    Zusätzlich zum Feature- und Rechte-Gate fliegen Write-Tools raus,
     deren Automatisierung auf ``manuell`` steht — Gemini bekommt sie erst
     gar nicht zu sehen. Read-Tools sind nie betroffen: "manuell" heißt,
     dass Q nicht *handelt*, nicht dass Q nichts mehr nachschauen darf.
+
+    Der Filter greift zweimal: beim Aufbau der Tool-Liste für Gemini und
+    erneut in ``execute_confirmed``. Der Client kann also nichts
+    erzwingen, was hier ausgefiltert wurde.
     """
     from core.features.automations import MODE_MANUELL
 
@@ -114,7 +127,7 @@ def _available_tools(ctx: Ctx) -> list[ToolSpec]:
     for spec in _REGISTRY:
         if spec.feature and spec.feature not in ctx.features:
             continue
-        if spec.requires_inhaber and not ctx.is_inhaber:
+        if spec.permission and spec.permission not in ctx.permissions:
             continue
         if spec.kind == "write" and ctx.mode_for(spec.name) == MODE_MANUELL:
             continue
@@ -1783,7 +1796,7 @@ _REGISTRY: list[ToolSpec] = [
             "menge": {"type": _I, "description": "Bestellmenge (Standard = Standardmenge)."}}},
         run=_run_material_bestellen, summarize=_summary_material),
     ToolSpec(
-        name="abwesenheit_melden", kind="write", requires_inhaber=True,
+        name="abwesenheit_melden", kind="write", permission="team.fuehren",
         description="Meldet einen Mitarbeiter krank, in Urlaub oder sonst "
                     "abwesend. Nur für den Inhaber.",
         parameters={"type": "OBJECT", "properties": {
@@ -1805,7 +1818,7 @@ _REGISTRY: list[ToolSpec] = [
             "tage": {"type": _I, "description": "Vorausschau in Tagen (Standard 14, max 60)."}}},
         run=_run_anstehende_termine),
     ToolSpec(
-        name="team_status", kind="read",
+        name="team_status", kind="read", permission="team.sehen",
         description="Zeigt das Team: wer heute abwesend (krank/Urlaub) ist und "
                     "welche Abwesenheiten anstehen.",
         parameters={"type": "OBJECT", "properties": {}},
@@ -1848,7 +1861,7 @@ _REGISTRY: list[ToolSpec] = [
             "required": ["kunde_name"]},
         run=_run_rueckruf_erledigt, summarize=_summary_rueckruf_erledigt),
     ToolSpec(
-        name="mitarbeiter_zurueck", kind="write", requires_inhaber=True,
+        name="mitarbeiter_zurueck", kind="write", permission="team.fuehren",
         description="Meldet einen Mitarbeiter wieder verfügbar (beendet seine "
                     "laufende Abwesenheit). Nur für den Inhaber.",
         parameters={"type": "OBJECT", "properties": {
@@ -1856,7 +1869,7 @@ _REGISTRY: list[ToolSpec] = [
             "required": ["mitarbeiter"]},
         run=_run_mitarbeiter_zurueck, summarize=_summary_mitarbeiter_zurueck),
     ToolSpec(
-        name="auftrag_status", kind="write", requires_inhaber=True, feature="lexware",
+        name="auftrag_status", kind="write", permission="auftraege.fuehren", feature="lexware",
         description="Setzt den Status eines laufenden Auftrags (per Kundenname). "
                     "Mögliche Stufen: accepted (angenommen), arbeit_laeuft, "
                     "arbeit_fertig, abgebrochen. Der Rechnungsversand läuft separat.",
@@ -1867,7 +1880,7 @@ _REGISTRY: list[ToolSpec] = [
             "required": ["kunde_name", "status"]},
         run=_run_auftrag_status, summarize=_summary_auftrag_status),
     ToolSpec(
-        name="material_anlegen", kind="write", requires_inhaber=True,
+        name="material_anlegen", kind="write", permission="material.verwalten",
         description="Legt einen neuen Material-Eintrag im Bestell-Katalog an "
                     "(braucht Name und Bestell-Link). Nur für den Inhaber.",
         parameters={"type": "OBJECT", "properties": {
@@ -1887,13 +1900,13 @@ _REGISTRY: list[ToolSpec] = [
             "kunde_name": {"type": _S, "description": "Kundenname (optional)."}}},
         run=_run_archiv_suchen),
     ToolSpec(
-        name="rechnungen_pruefen", kind="read", feature="lexware",
+        name="rechnungen_pruefen", kind="read", permission="buchhaltung.sehen", feature="lexware",
         description="Gleicht den Bezahl-Status offener Rechnungen mit Lexware ab "
                     "und markiert bezahlte. Verschickt nichts.",
         parameters={"type": "OBJECT", "properties": {}},
         run=_run_rechnungen_pruefen),
     ToolSpec(
-        name="offene_posten", kind="read", feature="lexware",
+        name="offene_posten", kind="read", permission="buchhaltung.sehen", feature="lexware",
         description="Zeigt, welches Geld noch aussteht: unbezahlte und "
                     "überfällige Rechnungen mit Summe, Rechnungs-Entwürfe die "
                     "noch nicht raus sind, und versendete Angebote ohne "
@@ -1931,7 +1944,7 @@ _REGISTRY: list[ToolSpec] = [
 
     # ---- WRITE (Kundenzyklus / Beleg-Fluss) ----
     ToolSpec(
-        name="angebot_erstellen", kind="write", requires_inhaber=True, feature="lexware",
+        name="angebot_erstellen", kind="write", permission="buchhaltung.fuehren", feature="lexware",
         description="Erstellt ein Angebot für einen Kunden aus einer freien "
                     "Beschreibung der Leistung (KI wandelt sie in Positionen um) "
                     "und legt einen Lexware-Entwurf an. Versendet noch nichts.",
@@ -1942,7 +1955,7 @@ _REGISTRY: list[ToolSpec] = [
             "required": ["kunde_name", "beschreibung"]},
         run=_run_angebot_erstellen, summarize=_summary_angebot_erstellen),
     ToolSpec(
-        name="angebot_senden", kind="write", requires_inhaber=True, feature="lexware",
+        name="angebot_senden", kind="write", permission="buchhaltung.fuehren", feature="lexware",
         description="Verschickt ein bereits erstelltes Angebot per Mail an den "
                     "Kunden (findet das jüngste offene Angebot des Kunden).",
         parameters={"type": "OBJECT", "properties": {
@@ -1951,7 +1964,7 @@ _REGISTRY: list[ToolSpec] = [
             "required": ["kunde_name"]},
         run=_run_angebot_senden, summarize=_summary_angebot_senden),
     ToolSpec(
-        name="rechnung_erstellen", kind="write", requires_inhaber=True, feature="lexware",
+        name="rechnung_erstellen", kind="write", permission="buchhaltung.fuehren", feature="lexware",
         description="Erstellt eine Rechnung für einen Kunden aus einer freien "
                     "Beschreibung der Leistung (Lexware-Entwurf). Versendet noch nichts.",
         parameters={"type": "OBJECT", "properties": {
@@ -1961,7 +1974,7 @@ _REGISTRY: list[ToolSpec] = [
             "required": ["kunde_name", "beschreibung"]},
         run=_run_rechnung_erstellen, summarize=_summary_rechnung_erstellen),
     ToolSpec(
-        name="rechnung_abrechnen", kind="write", requires_inhaber=True, feature="lexware",
+        name="rechnung_abrechnen", kind="write", permission="buchhaltung.fuehren", feature="lexware",
         description="Schliesst einen fertigen Auftrag ab: finalisiert die Rechnung "
                     "in Lexware und schickt sie als PDF per Mail an den Kunden. "
                     "Nur wenn der Auftrag auf 'fertig' steht.",

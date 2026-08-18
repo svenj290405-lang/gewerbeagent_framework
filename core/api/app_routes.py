@@ -38,6 +38,7 @@ from core.security.app_auth import (
     create_app_session,
     create_login_token,
     current_tenant_id,
+    enforce_app_permission,
     find_employee_by_email,
     require_app_csrf,
     require_app_user,
@@ -52,7 +53,14 @@ logger = logging.getLogger(__name__)
 
 STATIC_DIR = settings.project_root / "static" / "app"
 
-router = APIRouter(prefix="/app", tags=["app"])
+# Dasselbe Rechte-Gate wie in app_screens.py. Hier haengen auch die
+# oeffentlichen Endpunkte (Login, Aktivierung, Manifest, Service Worker) —
+# die stehen namentlich in OEFFENTLICHE_ENDPUNKTE und werden
+# durchgelassen, ohne dass eine Session verlangt wird.
+router = APIRouter(
+    prefix="/app", tags=["app"],
+    dependencies=[Depends(enforce_app_permission)],
+)
 
 
 def mount_app_static(app) -> None:

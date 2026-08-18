@@ -23,7 +23,7 @@ import secrets
 import uuid
 from typing import Optional
 
-from fastapi import HTTPException, Request, Response
+from fastapi import Depends, HTTPException, Request, Response
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -291,7 +291,17 @@ async def require_app_user(request: Request) -> Employee:
 
     Stasht Session/Employee/Tenant/CSRF in request.state fuer Handler +
     Template. Bei fehlender Session: 303 Redirect zu /app/login.
+
+    Idempotent innerhalb eines Requests: das Router-Gate
+    (enforce_app_permission) ruft die Funktion direkt auf, der Endpunkt
+    danach nochmal per Depends. FastAPIs Dependency-Cache greift bei dem
+    direkten Aufruf nicht — deshalb hier ein eigener Kurzschluss, sonst
+    liefe pro Request eine zweite Session-Query.
     """
+    vorhanden = getattr(request.state, "app_employee", None)
+    if vorhanden is not None:
+        return vorhanden
+
     token = request.cookies.get(APP_SESSION_COOKIE_NAME)
     async with get_session() as s:
         result = await get_active_app_session(token, session=s)
@@ -329,6 +339,84 @@ def current_permissions(request: Request) -> frozenset[str]:
     falsch verdrahteter Handler nichts durchlaesst.
     """
     return getattr(request.state, "app_permissions", frozenset())
+
+
+# Trockenlauf-Schalter fuer die Rechte-Durchsetzung.
+#
+# False = es wird nur geloggt, nichts geblockt. So laesst sich in den
+# Logs ablesen, welche Endpunkte die Mitarbeiter real anfassen, BEVOR
+# ihnen etwas weggenommen wird:
+#
+#   docker logs gewerbeagent_framework | grep "Recht fehlt" | sort | uniq -c
+#
+# Scharfschalten ist danach diese eine Zeile plus Restart, und der
+# Rueckweg genauso kurz.
+PERMISSIONS_DURCHSETZEN = False
+
+
+async def enforce_app_permission(request: Request) -> None:
+    """Router-weites Rechte-Gate fuer /app und /app/api.
+
+    Bewusst OHNE ``Depends(require_app_user)`` in der Signatur: eine
+    solche Dependency liefe VOR dem Funktionskoerper und wuerde damit
+    auch fuer die oeffentlichen Endpunkte (Login, Aktivierung, Manifest)
+    eine Session verlangen — die Login-Seite waere unerreichbar. Die
+    Session wird darum erst geholt, wenn feststeht, dass der Endpunkt
+    eine braucht. ``require_app_user`` ist innerhalb eines Requests
+    idempotent, es entsteht also keine zweite Query.
+
+    Fail-closed: ein Endpunkt, der nicht in ROUTE_RECHTE steht, wird
+    abgelehnt. Eine neue Route ist damit tot, bis sie eingetragen ist —
+    das merkt man in Sekunden. Ein stilles Loch merkt man nie.
+    """
+    from core.security.app_permission_routes import (
+        OEFFENTLICHE_ENDPUNKTE, OFFEN, recht_fuer_endpunkt,
+    )
+
+    endpoint = request.scope.get("endpoint")
+    name = getattr(endpoint, "__name__", None)
+    # Kein aufloesbarer Endpunkt (z.B. StaticFiles-Mount) oder bewusst
+    # oeffentlich -> das Gate ist nicht zustaendig.
+    if name is None or name in OEFFENTLICHE_ENDPUNKTE:
+        return
+
+    # Ab hier ist eine Session Pflicht (auch fuer OFFEN-Endpunkte —
+    # "offen" heisst "jeder EINGELOGGTE", nicht "jeder").
+    emp = await require_app_user(request)
+    emp_slug = getattr(emp, "slug", "?")
+
+    recht = recht_fuer_endpunkt(name)
+    if recht == OFFEN:
+        return
+
+    if recht is None:
+        logger.error(
+            "Endpunkt %r fehlt in ROUTE_RECHTE — %s. "
+            "Eintrag in core/security/app_permission_routes.py ergaenzen.",
+            name,
+            "abgelehnt" if PERMISSIONS_DURCHSETZEN else "im Trockenlauf durchgelassen",
+        )
+        if PERMISSIONS_DURCHSETZEN:
+            raise HTTPException(403, "Diese Funktion ist nicht freigegeben.")
+        return
+
+    if recht in current_permissions(request):
+        return
+
+    if not PERMISSIONS_DURCHSETZEN:
+        logger.warning(
+            "Recht fehlt (Trockenlauf): emp=%s route=%s recht=%s",
+            emp_slug, name, recht,
+        )
+        return
+
+    logger.info(
+        "Recht fehlt: emp=%s route=%s recht=%s", emp_slug, name, recht,
+    )
+    raise HTTPException(
+        403,
+        "Dafür fehlt dir die Berechtigung. Der Inhaber kann sie freigeben.",
+    )
 
 
 def require_app_permission(key: str):

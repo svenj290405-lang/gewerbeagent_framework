@@ -67,6 +67,7 @@ from core.features.permission_check import (
 )
 from core.security.app_auth import (
     current_tenant_id,
+    enforce_app_permission,
     require_app_csrf,
     require_app_inhaber,
     require_app_user,
@@ -74,7 +75,15 @@ from core.security.app_auth import (
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/app/api", tags=["app-screens"])
+# Das Rechte-Gate haengt am ROUTER, nicht an 108 einzelnen Dekoratoren.
+# Router-Dependencies laufen vor den Endpoint-Dependencies; welches Recht
+# eine Route braucht, steht in core/security/app_permission_routes.py.
+# Ein Endpunkt, der dort fehlt, wird abgelehnt (fail-closed) — und
+# tests/test_permission_coverage.py macht daraus einen roten Test.
+router = APIRouter(
+    prefix="/app/api", tags=["app-screens"],
+    dependencies=[Depends(enforce_app_permission)],
+)
 
 
 def _fmt_dt(d: dt.datetime | None) -> str:
@@ -1342,13 +1351,21 @@ async def api_team(request: Request, _e=Depends(require_app_user)) -> JSONRespon
         })
 
     # Pro-Mitarbeiter-Aktivitaet der letzten 30 Tage (Logins, Diktate,
-    # Assistent-Befehle) — fuer den Inhaber sichtbar, wer die App nutzt.
+    # Assistent-Befehle). Das ist Mitarbeiter-Monitoring — es geht nur an
+    # wen, der das Team auch fuehrt, und wird sonst gar nicht erst
+    # geladen. Frueher lieferte der Endpunkt es an JEDEN Mitarbeiter aus
+    # und nur das Frontend blendete es aus.
+    from core.features.permission_check import hat_recht
     from core.models.app_usage_event import (
         usage_counts_by_employee, USAGE_LOGIN, USAGE_DIKTAT,
         USAGE_ASSISTENT_BEFEHL, USAGE_ASSISTENT_AKTION,
     )
-    since = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=30)
-    aktivitaet = await usage_counts_by_employee(tid, since=since)
+    darf_monitoring = await hat_recht(request.state.app_employee, "team.fuehren")
+    if darf_monitoring:
+        since = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=30)
+        aktivitaet = await usage_counts_by_employee(tid, since=since)
+    else:
+        aktivitaet = {}
 
     out = []
     for e in employees:
@@ -5751,6 +5768,11 @@ async def _build_command_ctx(request: Request):
         tid=tid,
         features=set(feats),
         automation_modes=modes,
+        # Dieselben Rechte wie die HTTP-Endpunkte — sonst waere Q der
+        # bequeme Weg um das Rechtesystem herum.
+        permissions=frozenset(
+            getattr(request.state, "app_permissions", frozenset())
+        ),
     )
 
 

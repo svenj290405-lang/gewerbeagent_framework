@@ -381,7 +381,9 @@ const SCREENS = {
     // (bzw. gar nicht) herum — alles Geld steckt jetzt hinter EINER Kachel.
     // Das Abzeichen zeigt, was Geld kostet: ueberfaellige Rechnungen, sonst
     // die offenen. Zahlen kommen aus /app/api/buchhaltung (eine Quelle).
-    if (hasLex) {
+    // Geld-Kachel nur fuer wen die Buchhaltung sehen darf — sonst
+    // fuehrt sie auf einen Screen, der mit 403 antwortet.
+    if (hasLex && can("buchhaltung.sehen")) {
       const bk = (buch && buch.kennzahlen) || {};
       const ueberfaellig = bk.ueberfaellig_anzahl || 0;
       const offen = bk.offen_anzahl || 0;
@@ -411,7 +413,7 @@ const SCREENS = {
     });
     // Das Kunden-Formular gehoert zur taeglichen Arbeit (es haengt an jeder
     // Anfrage-Mail), nicht in die Einstellungen — darum hier statt in „Mehr".
-    if (feats.has("anfrage_formular") && App.me.employee.is_inhaber) {
+    if (feats.has("anfrage_formular") && can("einstellungen.verwalten")) {
       tiles.push({
         ico: "📝", label: "Anfrage-Formular", screen: "formulare",
         count: "Was Kunden ausfüllen", badge: null,
@@ -450,7 +452,8 @@ const SCREENS = {
     const res = await api("/app/api/auftraege");
     if (res && !res.ok) { App.view.innerHTML = errorScreen("Auftraege konnten nicht geladen werden."); return; }
     const d = res && res.ok ? await res.json() : { auftraege: [] };
-    const isInhaber = App.me.employee.is_inhaber;
+    // Auftraege anlegen/steuern — serverseitig durchgesetzt, hier nur Anzeige.
+    const isInhaber = can("auftraege.fuehren");
     const list = (d.auftraege || []).map((a) => auftragCard(a, isInhaber)).join("");
     // Unten die Sammel-Funktionen: das Archiv der abgerechneten Aufträge,
     // die vollständige Historie (abgerechnet UND abgebrochen) und der Editor
@@ -617,7 +620,8 @@ const SCREENS = {
     // Weiterleitung (z.B. via veraltetem Deep-Link) darf keinen eigenen
     // Zurueck-Schritt erzeugen, sonst landet man in einer Schleife.
     if (!feats.has("lexware")) { navigate("aktuelles", { mode: "replace" }); return; }
-    const isInhaber = App.me.employee.is_inhaber;
+    // Rechnungen schreiben — serverseitig durchgesetzt, hier nur Anzeige.
+    const isInhaber = can("buchhaltung.fuehren");
     const res = await api("/app/api/rechnungen");
     if (res && !res.ok) { App.view.innerHTML = errorScreen("Rechnungen konnten nicht geladen werden."); return; }
     const d = res && res.ok ? await res.json() : { rechnungen: [] };
@@ -658,7 +662,8 @@ const SCREENS = {
     // Weiterleitung (z.B. via veraltetem Deep-Link) darf keinen eigenen
     // Zurueck-Schritt erzeugen, sonst landet man in einer Schleife.
     if (!feats.has("lexware")) { navigate("aktuelles", { mode: "replace" }); return; }
-    const isInhaber = App.me.employee.is_inhaber;
+    // Angebote schreiben — serverseitig durchgesetzt, hier nur Anzeige.
+    const isInhaber = can("buchhaltung.fuehren");
     const res = await api("/app/api/angebote");
     if (res && !res.ok) { App.view.innerHTML = errorScreen("Angebote konnten nicht geladen werden."); return; }
     const d = res && res.ok ? await res.json() : { angebote: [] };
@@ -825,7 +830,8 @@ const SCREENS = {
   async buchhaltung() {
     const feats = new Set(App.me.features || []);
     if (!feats.has("lexware")) { navigate("aktuelles", { mode: "replace" }); return; }
-    const isInhaber = App.me.employee.is_inhaber;
+    // Mahnen, Zahlungsabgleich, Neu — serverseitig durchgesetzt, hier nur Anzeige.
+    const isInhaber = can("buchhaltung.fuehren");
     App.view.innerHTML = `<div class="loading">Lädt …</div>`;
     const res = await api("/app/api/buchhaltung");
     const d = res && res.ok ? await res.json() : null;
@@ -950,7 +956,10 @@ const SCREENS = {
     const res = await api("/app/api/team");
     if (res && !res.ok) { App.view.innerHTML = errorScreen("Team konnte nicht geladen werden."); return; }
     const d = res && res.ok ? await res.json() : { team: [] };
-    const isInhaber = App.me.employee.is_inhaber;
+    // Team verwalten (aktivieren, krank/Urlaub) und Rechte vergeben
+    // sind getrennte Rechte — Anzeige folgt dem Server.
+    const isInhaber = can("team.fuehren");
+    const darfRechte = can("team.rechte");
     const cards = (d.team || []).map((e) => {
       const tags = [];
       if (e.abwesend_heute) tags.push(`<span class="pill danger">${e.abwesend_heute === "krank" ? "krank" : "abwesend"}</span>`);
@@ -970,7 +979,7 @@ const SCREENS = {
         actions = `<button class="btn-sm btn-ghost" data-act="toggle" data-slug="${esc(e.slug)}" data-active="${e.is_active ? "1" : "0"}">${e.is_active ? "Deaktivieren" : "Aktivieren"}</button>`;
       }
       // Rolle als Chip + Einstieg in die Feinjustierung.
-      const rechteLine = (isInhaber && !e.is_inhaber)
+      const rechteLine = (darfRechte && !e.is_inhaber)
         ? `<div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
              <span class="pill">${esc(ROLLEN_LABEL[e.rolle] || e.rolle || "")}</span>
              <button class="btn-sm btn-ghost" data-act="rechte" data-slug="${esc(e.slug)}" style="padding:6px 10px">Rechte</button>
@@ -1126,7 +1135,8 @@ const SCREENS = {
     const res = await api("/app/api/wissen");
     if (res && !res.ok) { App.view.innerHTML = errorScreen("Wissen konnte nicht geladen werden."); return; }
     const d = res && res.ok ? await res.json() : { eintraege: [], kategorien: [] };
-    const isInhaber = App.me.employee.is_inhaber;
+    // Wissen anlegen/loeschen — serverseitig durchgesetzt, hier nur Anzeige.
+    const isInhaber = can("wissen.pflegen");
     // nach Kategorie gruppieren
     const byCat = {};
     (d.eintraege || []).forEach((e) => { (byCat[e.kategorie_label] = byCat[e.kategorie_label] || []).push(e); });
@@ -1160,7 +1170,8 @@ const SCREENS = {
   async material() {
     const res = await api("/app/api/material");
     const d = res && res.ok ? await res.json() : { items: [] };
-    const isInhaber = App.me.employee.is_inhaber;
+    // Materialkatalog pflegen — serverseitig durchgesetzt, hier nur Anzeige.
+    const isInhaber = can("material.verwalten");
     const items = d.items || [];
     const active = items.filter((m) => m.aktiv);
     const inactive = items.filter((m) => !m.aktiv);
@@ -1309,7 +1320,8 @@ const SCREENS = {
     // Übersicht: die Einstellungen sind thematisch auf Unterseiten
     // verteilt (App / Betrieb / Verbindungen / System) statt auf einer
     // langen Sammelseite zu liegen.
-    const isInhaber = !!(App.me && App.me.employee && App.me.employee.is_inhaber);
+    // Einstellungen schreiben — serverseitig durchgesetzt, hier nur Anzeige.
+    const isInhaber = can("einstellungen.verwalten");
     const item = (go, ico, label, sub) =>
       `<button class="row menu-item" data-go="${go}"><span>${ico} ${esc(label)}<span class="sub" style="display:block">${esc(sub)}</span></span><span class="sub">›</span></button>`;
     App.view.innerHTML =
@@ -1335,7 +1347,8 @@ const SCREENS = {
     // direkt). Registry + Semantik liegen im Backend
     // (core/features/automations.py) — hier wird nur gerendert, was
     // /app/api/automatisierung liefert. Kein Feature-Wissen im Frontend.
-    const isInhaber = !!(App.me && App.me.employee && App.me.employee.is_inhaber);
+    // Automatisierung schreiben — serverseitig durchgesetzt, hier nur Anzeige.
+    const isInhaber = can("einstellungen.verwalten");
     const res = await api("/app/api/automatisierung");
     const d = res && res.ok ? await res.json() : null;
     const back =
@@ -1646,7 +1659,8 @@ const SCREENS = {
   async einstellungen_verbindungen() {
     // OAuth + Lexware (nur Inhaber) — Logik unverändert von der alten
     // Sammelseite hierher verschoben.
-    const isInhaber = !!(App.me && App.me.employee && App.me.employee.is_inhaber);
+    // Verbindungen des Betriebs — serverseitig durchgesetzt, hier nur Anzeige.
+    const isInhaber = can("einstellungen.verwalten");
     App.view.innerHTML =
       `<button class="btn-sm btn-ghost" id="back-einst" style="margin-bottom:10px">← Einstellungen</button>` +
       `<h1 style="font-size:22px;margin:4px 4px 14px">Verbindungen</h1>` +
@@ -2274,14 +2288,16 @@ const SCREENS = {
     if (feats.has("visualisierung")) schnell.push(`<button class="row menu-item" data-go="visualisierung"><span>🎨 Visualisierung</span><span class="sub">›</span></button>`);
     schnell.push(`<button class="row menu-item" data-go="wissen"><span>📚 Wissensdatenbank</span><span class="sub">›</span></button>`);
     const einst = [];
-    if (feats.has("mitarbeiter")) einst.push(`<button class="row menu-item" data-go="team"><span>👥 Team</span><span class="sub">›</span></button>`);
+    // Team-Uebersicht zeigt auch Abwesenheiten und (fuer wer das Team
+    // fuehrt) die App-Nutzung der Kollegen — deshalb hinter team.sehen.
+    if (feats.has("mitarbeiter") && can("team.sehen")) einst.push(`<button class="row menu-item" data-go="team"><span>👥 Team</span><span class="sub">›</span></button>`);
     einst.push(`<button class="row menu-item" data-go="einstellungen"><span>⚙️ Einstellungen</span><span class="sub">›</span></button>`);
     einst.push(`<button class="row menu-item" data-go="diagnose"><span>🩺 Status</span><span class="sub">›</span></button>`);
     einst.push(`<button class="row menu-item" data-go="hilfe"><span>❓ Hilfe &amp; Tour</span><span class="sub">›</span></button>`);
     einst.push(`<button class="row menu-item" data-tour="1"><span>🚀 Einrichtung starten</span><span class="sub">›</span></button>`);
     App.view.innerHTML =
       `<div class="card"><h2>${esc(m.tenant.company_name || "Mein Betrieb")}</h2>
-        <div class="row"><span>Angemeldet als</span><span class="sub">${esc(m.employee.name)}${m.employee.is_inhaber ? " (Inhaber)" : ""}</span></div>
+        <div class="row"><span>Angemeldet als</span><span class="sub">${esc(m.employee.name)}${m.employee.rolle ? " (" + esc(ROLLEN_LABEL[m.employee.rolle] || m.employee.rolle) + ")" : ""}</span></div>
         <div class="row"><span>Freigeschaltete Funktionen</span><span class="sub">${(m.features || []).length}</span></div>
       </div>` +
       `<div class="card"><h2>Schnellzugriff</h2>${schnell.join("")}</div>` +
@@ -3215,7 +3231,6 @@ const SCREENS = {
     const actionsBtn = document.getElementById("q-actions");
     const menuEl = document.getElementById("q-menu");
     const feats = new Set(App.me.features || []);
-    const isInhaber = !!(App.me.employee && App.me.employee.is_inhaber);
     // `intent` = vollständiger Starter-Satz. Q (Gemini) übernimmt damit den Flow
     // und fragt fehlende Angaben selbst nach — wir tippen nichts vor.
     const QACTIONS = [
@@ -3229,10 +3244,10 @@ const SCREENS = {
       { ico: "🔍", label: "Kunde nachschlagen",  intent: "Ich möchte einen Kunden nachschlagen." },
       { ico: "✉️", label: "Anfrage beantworten", intent: "Ich möchte eine Kundenanfrage beantworten.",  feature: "mail_intake" },
       { ico: "📧", label: "E-Mail schreiben",    intent: "Ich möchte eine E-Mail schreiben." },
-      { ico: "📄", label: "Angebot erstellen",   intent: "Ich möchte ein Angebot erstellen.",           feature: "lexware", inhaber: true },
-      { ico: "🧾", label: "Rechnung erstellen",  intent: "Ich möchte eine Rechnung schreiben.",          feature: "lexware", inhaber: true },
+      { ico: "📄", label: "Angebot erstellen",   intent: "Ich möchte ein Angebot erstellen.",           feature: "lexware", perm: "buchhaltung.fuehren" },
+      { ico: "🧾", label: "Rechnung erstellen",  intent: "Ich möchte eine Rechnung schreiben.",          feature: "lexware", perm: "buchhaltung.fuehren" },
       { ico: "🎨", label: "Visualisierung",      viz: true,                                              feature: "visualisierung" },
-    ].filter((a) => (!a.feature || feats.has(a.feature)) && (!a.inhaber || isInhaber));
+    ].filter((a) => (!a.feature || feats.has(a.feature)) && (!a.perm || can(a.perm)));
 
     menuEl.innerHTML = QACTIONS.map((a, i) =>
       `<button data-qa="${i}"><span class="qm-ico">${a.ico}</span>${esc(a.label)}</button>`).join("");
@@ -4749,6 +4764,26 @@ function primeMicPermissionState() {
 // core/features/permissions.py — beides zusammen aendern.
 const ROLLEN_LABEL = { inhaber: "Inhaber", buero: "Büro", monteur: "Monteur" };
 
+// ---------------------------------------------------------------------
+// Rechte im Frontend
+// ---------------------------------------------------------------------
+//
+// Das ist KOSMETIK: durchgesetzt wird serverseitig (Router-Gate in
+// core/security/app_auth.py). Hier geht es nur darum, niemandem Knoepfe
+// zu zeigen, die ohnehin mit 403 antworten wuerden.
+//
+// Die Schluessel spiegeln core/features/permissions.py.
+
+let _perms = new Set();
+
+function setPermissions(liste) {
+  _perms = new Set(liste || []);
+}
+
+function can(key) {
+  return _perms.has(key);
+}
+
 // Fehlertext aus einer JSON-Antwort ziehen, mit Rueckfall. Die
 // Rechte-Endpunkte liefern sprechende Meldungen ("Die eigene Rolle
 // kannst du nicht ändern") — die sollen beim Nutzer ankommen.
@@ -4894,7 +4929,7 @@ async function showKundenProfil(name, kundeId) {
   // Kunden mit exakt diesem Namen. Dieses Profil ist das ZIEL (bleibt),
   // die gewählte Dublette die Quelle — Regeln wie scripts/merge_kunden.py.
   // Nur im präzisen Modus (kunde_id): sonst gäbe es keine klare Richtung.
-  const istInhaber = !!(App.me && App.me.employee && App.me.employee.is_inhaber);
+  const istInhaber = can("kunden.pflegen");
   if (istInhaber && d.kunde_id && (d.dubletten || []).length) {
     const n = d.dubletten.length;
     parts.push(`<div class="card" id="merge-card"><h2>⚠️ Doppelte Kunden?</h2>
@@ -5673,7 +5708,7 @@ function stundenKarteHtml(d) {
   const buchbar = !!(d.in_arbeit || d.fertig);
   if (!je.length && !buchbar) return "";
   const meineId = (App.me && App.me.employee && App.me.employee.id) || "";
-  const isInhaber = !!(App.me && App.me.employee && App.me.employee.is_inhaber);
+  const isInhaber = can("auftraege.fuehren");
 
   const summen = je.length
     ? je.map((x) => `<div class="row"><span>${esc(x.name)}</span><span class="sub">${esc(x.text)}</span></div>`).join("")
@@ -5718,7 +5753,7 @@ async function showAuftragDetail(id, zurueck) {
     return;
   }
   const d = await res.json();
-  const isInhaber = App.me.employee.is_inhaber;
+  const isInhaber = can("auftraege.fuehren");
   // Q darf mitreden können, worüber der Nutzer gerade schaut.
   App.screenContext = { screen: "auftrag_detail", kunde: d.kunde || "" };
 
@@ -7335,6 +7370,7 @@ async function boot() {
   const res = await api("/app/api/me");
   if (!res) return;
   App.me = await res.json();
+  setPermissions(App.me.permissions);
   applyBrandColor(App.me.tenant.brand_color);
   document.getElementById("hdr-title").textContent = App.me.tenant.company_name || "Gewerbeagent";
   const nb = document.getElementById("notif-btn");
