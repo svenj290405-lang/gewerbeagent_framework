@@ -28,6 +28,7 @@ from sqlalchemy import select
 from core.database import AsyncSessionLocal
 from core.features.catalog import FEATURES
 from core.features.check import GLOBALLY_DISABLED_FEATURES
+from core.features.permissions import ROLLE_INHABER
 from core.models import (
     ALLE_KATEGORIEN,
     Tenant,
@@ -195,6 +196,9 @@ async def create_tenant_record(
             name=contact,
             contact_email=email,
             is_default=True,
+            # Rechte-Rolle explizit, nicht nur ueber is_default: der
+            # server_default der Spalte waere 'monteur'.
+            role=ROLLE_INHABER,
         )
         session.add(default_emp)
         await session.flush()

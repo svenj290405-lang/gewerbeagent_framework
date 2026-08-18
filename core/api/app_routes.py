@@ -354,6 +354,8 @@ async def app_shell_beta(_emp=Depends(require_app_user)) -> FileResponse:
 
 @router.get("/api/me")
 async def app_api_me(request: Request, _emp=Depends(require_app_user)) -> JSONResponse:
+    from core.features.permission_check import rolle_oder_default
+
     emp = request.state.app_employee
     tenant = request.state.app_tenant
     features = sorted(await enabled_features_for_tenant(tenant.id))
@@ -362,6 +364,7 @@ async def app_api_me(request: Request, _emp=Depends(require_app_user)) -> JSONRe
             "id": str(emp.id),
             "name": emp.name,
             "is_inhaber": bool(emp.is_default),
+            "rolle": rolle_oder_default(emp),
         },
         "tenant": {
             "slug": tenant.slug,
@@ -373,6 +376,12 @@ async def app_api_me(request: Request, _emp=Depends(require_app_user)) -> JSONRe
             "has_logo": bool(tenant.logo_data),
         },
         "features": features,
+        # Rechte reisen wie die Features als Liste von Strings zum Client;
+        # dort `const can = k => perms.has(k)`. Das Frontend-Gate ist reine
+        # Kosmetik — durchgesetzt wird serverseitig.
+        "permissions": sorted(
+            getattr(request.state, "app_permissions", frozenset())
+        ),
         "onboarding_done": emp.app_onboarding_completed_at is not None,
         "csrf": request.state.app_csrf,
         "vapid_public_key": settings.vapid_public_key,

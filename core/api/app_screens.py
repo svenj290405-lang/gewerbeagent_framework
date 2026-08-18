@@ -5309,13 +5309,27 @@ async def api_team_anlegen(
     Aktivierungs-Link. Der Link wird zurueckgegeben — Inhaber kopiert
     ihn aus dem Browser und schickt ihn dem Mitarbeiter (per WhatsApp/SMS).
 
-    Body: { name, contact_email?, job_title?, skills?: list[str] }
+    Body: { name, contact_email?, job_title?, skills?: list[str], rolle? }
     """
+    from core.features.permissions import (
+        ROLLE_DEFAULT, ROLLE_INHABER, ist_gueltige_rolle,
+    )
+
     tid = current_tenant_id(request)
     body = await request.json()
     name = (body.get("name") or "").strip()
     if not name:
         return JSONResponse({"ok": False, "error": "Name ist Pflicht."}, status_code=400)
+
+    # Rechte-Rolle. Ohne Angabe die restriktivste — ein neuer Mitarbeiter
+    # startet nie versehentlich mit weitreichenden Rechten. 'inhaber' ist
+    # hier nicht vergebbar: der Inhaber-Account entsteht beim Onboarding
+    # und wird nicht ueber die Team-Anlage dupliziert.
+    rolle = (body.get("rolle") or "").strip() or ROLLE_DEFAULT
+    if not ist_gueltige_rolle(rolle) or rolle == ROLLE_INHABER:
+        return JSONResponse(
+            {"ok": False, "error": "Unbekannte Rolle."}, status_code=400,
+        )
 
     contact_email = (body.get("contact_email") or "").strip() or None
     job_title = (body.get("job_title") or "").strip() or None
@@ -5353,6 +5367,7 @@ async def api_team_anlegen(
             contact_email=contact_email,
             job_title=job_title,
             skills=skills,
+            role=rolle,
             is_default=False,
             is_active=True,
         )

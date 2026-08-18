@@ -135,11 +135,26 @@ class Employee(Base):
     )
     notes: Mapped[str | None] = mapped_column(String(2000), nullable=True)
 
-    # Phase 6 — Freitext-Rolle (z.B. "Inhaber", "Geselle", "Lehrling",
+    # Phase 6 — Freitext-Berufsbezeichnung (z.B. "Geselle", "Lehrling",
     # "Subunternehmer"). Reiner Anzeige-Wert in /team + /mitarbeiter-
-    # Detail. KEIN Permission-Effekt; Permissions laufen weiter nur
-    # ueber is_default. Setzen via /mitarbeiter <slug> job_title <text>.
+    # Detail, KEIN Permission-Effekt — die Rechte haengen an `role`.
+    # Setzen via /mitarbeiter <slug> job_title <text>.
     job_title: Mapped[str | None] = mapped_column(String(100), nullable=True)
+
+    # Rechte-Rolle: 'inhaber' | 'buero' | 'monteur'. Vorlage fuer die
+    # effektiven Rechte; Abweichungen liegen als einzelne Zeilen in
+    # `employee_permissions`. Beides aufgeloest in
+    # core/features/permission_check.py.
+    #
+    # Abgrenzung zu is_default: das Flag traegt drei Bedeutungen —
+    # (a) Rolle Inhaber, (b) Anker fuer die gespiegelten Legacy-Tenant-
+    # Felder, (c) Fallback-Empfaenger fuer Notifications/Routing. `role`
+    # loest nur (a) ab; (b) und (c) lesen weiter is_default. Nebeneffekt:
+    # role='inhaber' darf mehrfach vorkommen (z.B. Prokurist), waehrend
+    # is_default per partial unique index einmalig bleibt.
+    role: Mapped[str] = mapped_column(
+        String(20), nullable=False, server_default="monteur", default="monteur",
+    )
 
     # Phase 2 — Telegram-Identitaet
     telegram_chat_id: Mapped[int | None] = mapped_column(

@@ -172,6 +172,7 @@ from core.models.rechnung import (
 from core.models.rechnung_position import RechnungPosition
 from core.models.tool_config import ToolConfig
 from core.models.automation_setting import AutomationSetting
+from core.models.employee_permission import EmployeePermission
 from core.models.geocode_cache import GeocodeCache
 
 __all__ = [
@@ -239,6 +240,7 @@ __all__ = [
     "RechnungPosition",
     "ToolConfig",
     "AutomationSetting",
+    "EmployeePermission",
     "GeocodeCache",
     "OAuthToken",
     "OAuthState",

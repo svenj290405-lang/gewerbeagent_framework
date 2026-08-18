@@ -306,6 +306,11 @@ async def require_app_user(request: Request) -> Employee:
         request.state.app_tenant = tenant
         request.state.app_csrf = sess.csrf_token
         request.state.app_is_inhaber = bool(emp.is_default)
+
+    # Effektive Rechte einmal pro Request aufloesen (60s-Cache dahinter),
+    # damit Handler, Router-Gate und /api/me dieselbe Menge sehen.
+    from core.features.permission_check import rechte_fuer_employee
+    request.state.app_permissions = await rechte_fuer_employee(emp)
     return emp
 
 
@@ -315,6 +320,35 @@ async def require_app_inhaber(request: Request) -> Employee:
     if not emp.is_default:
         raise HTTPException(403, "Nur der Inhaber darf das.")
     return emp
+
+
+def current_permissions(request: Request) -> frozenset[str]:
+    """Effektive Rechte der laufenden Session.
+
+    Leer, wenn require_app_user noch nicht lief — fail-closed, damit ein
+    falsch verdrahteter Handler nichts durchlaesst.
+    """
+    return getattr(request.state, "app_permissions", frozenset())
+
+
+def require_app_permission(key: str):
+    """Dependency-Factory: verlangt ein einzelnes Recht.
+
+    Wird ab der Durchsetzungs-Stufe von der zentralen Routen-Tabelle
+    genutzt; einzeln einsetzbar fuer Endpunkte ausserhalb von
+    /app/api (z.B. in app_routes.py).
+    """
+    async def _dep(request: Request) -> Employee:
+        emp = await require_app_user(request)
+        if key not in current_permissions(request):
+            raise HTTPException(
+                403,
+                "Dafür fehlt dir die Berechtigung. "
+                "Der Inhaber kann sie freigeben.",
+            )
+        return emp
+
+    return _dep
 
 
 async def require_app_csrf(request: Request) -> None:
