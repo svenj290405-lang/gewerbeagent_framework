@@ -85,6 +85,8 @@ class CalendarAdapter(ABC):
         kunde_telefon_normalized: str | None = None,
         kunde_email: str | None = None,
         idempotency_key: str | None = None,
+        transparent: bool = False,
+        zusatz_props: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         """Anlegen. Returns: {"id": ..., "html_link": ...}.
 
@@ -245,7 +247,7 @@ class GoogleCalendarAdapter(CalendarAdapter):
     async def create_event(
         self, *, summary, description, location, start, end, timezone,
         kunde_telefon_normalized=None, kunde_email=None,
-        idempotency_key=None,
+        idempotency_key=None, transparent=False, zusatz_props=None,
     ):
         service = await self._get_service()
         body = {
@@ -273,8 +275,14 @@ class GoogleCalendarAdapter(CalendarAdapter):
             private_props["kunde_email"] = kunde_email
         if idempotency_key:
             private_props["ga_ref"] = idempotency_key
+        private_props.update(zusatz_props or {})
         if private_props:
             body["extendedProperties"] = {"private": private_props}
+        # "transparent" = zeigt NICHT als beschaeftigt. Der Spiegel im
+        # Inhaber-Kalender darf dessen eigene Slot-Suche nicht blockieren,
+        # sonst waere er rechnerisch permanent ausgebucht.
+        if transparent:
+            body["transparency"] = "transparent" 
 
         result = service.events().insert(
             calendarId=self.calendar_id, body=body,
@@ -528,7 +536,7 @@ class MicrosoftCalendarAdapter(CalendarAdapter):
     async def create_event(
         self, *, summary, description, location, start, end, timezone,
         kunde_telefon_normalized=None, kunde_email=None,
-        idempotency_key=None,
+        idempotency_key=None, transparent=False, zusatz_props=None,
     ):
         # Microsoft nutzt fixe Tenant-Default-TZ via Helper; timezone-
         # Param wird in zukuenftiger Version genutzt.
@@ -542,6 +550,7 @@ class MicrosoftCalendarAdapter(CalendarAdapter):
             kunde_telefon_normalized=kunde_telefon_normalized,
             kunde_email=kunde_email,
             idempotency_key=idempotency_key,
+            transparent=transparent, zusatz_props=zusatz_props,
         )
 
     async def delete_event(self, event_id):

@@ -689,6 +689,35 @@ async def _run_offene_rueckrufe(ctx: Ctx, args: dict) -> dict:
 
 # ---- WRITE ----------------------------------------------------------------
 
+async def _employee_aus_text(ctx: Ctx, text: str):
+    """Findet einen aktiven Mitarbeiter des Betriebs per Slug oder Name.
+
+    Gemini nennt mal "marco", mal "Marco Jantos" — beides soll treffen.
+    Immer tenant-gescoped.
+    """
+    from core.database.connection import get_session
+    from core.models.employee import Employee
+
+    such = (text or "").strip().lower()
+    if len(such) < 2:
+        return None
+    async with get_session() as s:
+        kandidaten = (await s.execute(
+            select(Employee)
+            .where(Employee.tenant_id == ctx.tid)
+            .where(Employee.is_active.is_(True))
+        )).scalars().all()
+        for e in kandidaten:
+            if e.slug.lower() == such or (e.name or "").lower() == such:
+                s.expunge(e)
+                return e
+        for e in kandidaten:
+            if such in (e.name or "").lower() or such in e.slug.lower():
+                s.expunge(e)
+                return e
+    return None
+
+
 async def _run_termin_anlegen(ctx: Ctx, args: dict) -> dict:
     name = (args.get("name") or "").strip()
     datum = (args.get("datum") or "").strip()
@@ -709,7 +738,15 @@ async def _run_termin_anlegen(ctx: Ctx, args: dict) -> dict:
         "adresse": (args.get("adresse") or "").strip() or None,
         "telefon": (args.get("telefon") or "").strip() or None,
         "kunde_email": (args.get("kunde_email") or "").strip() or None,
+        # Standardmaessig traegt sich ein, wer es sagt. Nennt Gemini
+        # einen anderen Mitarbeiter, gewinnt der (siehe unten).
+        "employee_id": ctx.employee.id,
     }
+    ziel_slug = (args.get("mitarbeiter") or "").strip()
+    if ziel_slug:
+        ziel = await _employee_aus_text(ctx, ziel_slug)
+        if ziel is not None:
+            payload["employee_id"] = ziel.id
     res = await kalender.on_webhook("book_appointment", payload)
     if (res or {}).get("error"):
         return {"ok": False, "error": res.get("error")}
@@ -1769,7 +1806,10 @@ _REGISTRY: list[ToolSpec] = [
             "dauer_minuten": {"type": _I, "description": "Dauer in Minuten (Standard 60)."},
             "anliegen": {"type": _S, "description": "Worum geht es (z.B. Heizungswartung)."},
             "adresse": {"type": _S}, "telefon": {"type": _S},
-            "kunde_email": {"type": _S}},
+            "kunde_email": {"type": _S},
+            "mitarbeiter": {"type": _S, "description":
+                "Wer den Termin uebernimmt (Name oder Kuerzel). Weglassen, "
+                "wenn der Nutzer selbst hingeht."}},
             "required": ["name", "datum", "uhrzeit"]},
         run=_run_termin_anlegen, summarize=_summary_termin),
     ToolSpec(

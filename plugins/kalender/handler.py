@@ -335,6 +335,24 @@ class Plugin(BasePlugin):
                     idempotency_key=idempotency_key,
                 )
 
+            # Spiegel-Termin im Kalender des Inhabers: der Chef soll die
+            # Betriebslage im eigenen Kalender sehen, ohne dass jemand die
+            # App aufmachen muss. Nur wenn der Termin NICHT ohnehin bei ihm
+            # liegt.
+            #
+            # Zwei Details, ohne die es schadet:
+            #  - showAs/transparency "frei": sonst blockiert die
+            #    Betriebsuebersicht die eigene Slot-Suche des Inhabers und
+            #    er ist rechnerisch dauerhaft ausgebucht.
+            #  - ga_mirror-Marker: damit find_events den Spiegel aus der
+            #    Trefferliste filtert (sonst doppelte Storno-Vorschlaege)
+            #    und der Storno ihn gezielt mitloeschen kann.
+            await self._spiegel_termin(
+                employee_id=employee_id, summary=summary,
+                description=description, location=adresse,
+                start=start, ende=ende, idempotency_key=idempotency_key,
+            )
+
             # Telegram-Push an den fuer den Termin zustaendigen Mitarbeiter
             # (silent fail, blockiert nie den Termin). Wenn employee_id im
             # Payload fehlt (Legacy-Caller), faellt send_for_employee mit
@@ -459,12 +477,55 @@ class Plugin(BasePlugin):
                     )
                 anker_zeit = None
 
+            # --- Kandidaten bestimmen -------------------------------
+            # Ein explizit angefragter Mitarbeiter schraenkt auf genau
+            # den ein. Sonst Fan-Out ueber alle, die am Zieltag arbeiten
+            # (get_available_employees prueft Abwesenheit UND
+            # Arbeitszeit) — bisher filterten Krankmeldungen nur den
+            # Router, nicht die Slot-Suche.
+            kandidaten_emps = await self._slot_kandidaten(
+                employee_id, wunsch,
+            )
+
+            slots: list[dict] = []
+
+            if kandidaten_emps:
+                slots = await self._slots_ueber_mitarbeiter(
+                    kandidaten_emps, wunsch, anker_zeit, dauer,
+                    days_ahead_raw if not wunsch_datum else None,
+                )
+                # Smart-Filter braucht einen Adapter nur, wenn er auch
+                # laeuft (Kundenadresse vorhanden). Sonst waere es ein
+                # DB- und Token-Roundtrip fuer nichts.
+                adapter = None
+                if kunde_adresse:
+                    adapter = await get_calendar_adapter(
+                        self.tenant_id, employee_id=employee_id,
+                        fallback_calendar_id=self.config["calendar_id"],
+                    )
+                smart_meta = {"applied": False, "reason": None, "removed": 0}
+                if adapter is not None:
+                    try:
+                        slots, smart_meta = await self._smart_filter_slots(
+                            slots, kunde_adresse, dauer, adapter,
+                            employee_id=employee_id,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(f"Smart-Filter crashed, using raw slots: {exc}")
+                        smart_meta = {"applied": False, "reason": "filter-error", "removed": 0}
+                return {
+                    "erfolg": True,
+                    "slots": slots,
+                    "anzahl": len(slots),
+                    "smart_routing": smart_meta,
+                }
+
+            # --- Rueckfall: kein Mitarbeiter mit eigenem Kalender ----
+            # Dann wie bisher der Tenant-Default-Kalender.
             adapter = await get_calendar_adapter(
                 self.tenant_id, employee_id=employee_id,
                 fallback_calendar_id=self.config["calendar_id"],
             )
-
-            slots: list[dict] = []
 
             if days_ahead_raw is not None and not wunsch_datum:
                 # Tage-Modus: Arbeitstage durchgehen bis MAX_SLOTS voll sind.
@@ -534,6 +595,211 @@ class Plugin(BasePlugin):
                 "slots": [],
                 "anzahl": 0,
             }
+
+    async def _spiegel_termin(
+        self, *, employee_id, summary, description, location,
+        start, ende, idempotency_key,
+    ) -> None:
+        """Legt eine Kopie des Termins im Kalender des Inhabers ab.
+
+        Best-effort: schlaegt es fehl, bleibt die Hauptbuchung gueltig —
+        eine fehlende Betriebsuebersicht ist aergerlich, ein verlorener
+        Kundentermin waere schlimm.
+        """
+        from core.models.employee import get_default_employee
+
+        try:
+            chef = await get_default_employee(self.tenant_id)
+            if chef is None or not getattr(chef, "calendar_provider", None):
+                return
+            if employee_id and str(chef.id) == str(employee_id):
+                return  # liegt ohnehin schon bei ihm
+            if not employee_id:
+                return  # ohne Mitarbeiter-Bezug landet der Termin eh beim Chef
+
+            adapter = await get_calendar_adapter(
+                self.tenant_id, employee_id=chef.id,
+                fallback_calendar_id=self.config["calendar_id"],
+            )
+            await adapter.create_event(
+                summary=f"[Team] {summary}",
+                description=description,
+                location=location,
+                start=start, end=ende,
+                timezone=self.config["zeitzone"],
+                idempotency_key=idempotency_key,
+                transparent=True,
+                zusatz_props={"ga_mirror": "1"},
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Spiegel-Termin im Inhaber-Kalender fehlgeschlagen: %s", exc,
+            )
+
+    async def _spiegel_loeschen(self, employee_id, event_id, payload) -> None:
+        """Entfernt den Spiegel-Termin aus dem Kalender des Inhabers.
+
+        Gefunden wird er ueber den Kunden (Telefon/Mail/Name) im selben
+        Zeitfenster; die Event-ID des Originals gilt im fremden Kalender
+        nicht. Best-effort — schlaegt es fehl, ist der Haupttermin
+        trotzdem storniert.
+        """
+        from core.models.employee import get_default_employee
+
+        try:
+            chef = await get_default_employee(self.tenant_id)
+            if chef is None or not getattr(chef, "calendar_provider", None):
+                return
+            if not employee_id or str(chef.id) == str(employee_id):
+                return
+
+            telefon = normalize_phone(payload.get("kunde_telefon") or "") or None
+            email = (payload.get("kunde_email") or "").strip().lower() or None
+            name = (payload.get("kunde_name") or "").strip() or None
+            if not (telefon or email or name):
+                return
+
+            adapter = await get_calendar_adapter(
+                self.tenant_id, employee_id=chef.id,
+                fallback_calendar_id=self.config["calendar_id"],
+            )
+            now = datetime.now()
+            treffer = await adapter.find_events(
+                time_min=now - timedelta(days=1),
+                time_max=now + timedelta(days=365),
+                kunde_telefon_normalized=telefon,
+                kunde_email=email,
+                kunde_name=name,
+            )
+            for ev in treffer:
+                if (ev.get("summary") or "").startswith("[Team] "):
+                    await adapter.delete_event(ev.get("event_id"))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Spiegel-Termin konnte nicht entfernt werden: %s", exc)
+
+    # ------------------------------------------------------------------
+    # FAN-OUT ueber Mitarbeiter-Kalender
+    # ------------------------------------------------------------------
+
+    async def _slot_kandidaten(self, employee_id, anker_dt):
+        """Welche Mitarbeiter kommen fuer die Slot-Suche in Frage?
+
+        Leere Liste = kein Fan-Out moeglich, der Aufrufer faellt auf den
+        Tenant-Default-Kalender zurueck (Verhalten wie vor dem Fan-Out).
+
+        Bedingungen:
+          - eigener Kalender verbunden (calendar_provider gesetzt) —
+            ohne den wuerde der stille Token-Fallback die Termine
+            im Kalender des Inhabers landen lassen
+          - arbeitet zum Zielzeitpunkt (Abwesenheit + Arbeitszeit)
+        """
+        from core.models.employee import Employee
+        from core.models.employee_absence import get_available_employees
+
+        if employee_id:
+            # Tenant-Filter mit in die Query: eine employee_id aus einem
+            # fremden Betrieb darf nie einen Kalender aufmachen.
+            async with AsyncSessionLocal() as session:
+                emp = (await session.execute(
+                    select(Employee)
+                    .where(Employee.id == employee_id)
+                    .where(Employee.tenant_id == self.tenant_id)
+                )).scalar_one_or_none()
+                if emp is not None:
+                    session.expunge(emp)
+            return [emp] if emp is not None else []
+
+        try:
+            verfuegbar = await get_available_employees(self.tenant_id, anker_dt)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Kandidaten-Ermittlung fehlgeschlagen: %s", exc)
+            return []
+        return [e for e in verfuegbar if getattr(e, "calendar_provider", None)]
+
+    async def _slots_ueber_mitarbeiter(
+        self, employees, wunsch, anker_zeit, dauer, days_ahead_raw,
+    ) -> list[dict]:
+        """Sucht Slots parallel in mehreren Mitarbeiter-Kalendern.
+
+        Entdoppelt nach Zeitpunkt: bei drei freien Mitarbeitern soll der
+        Kunde nicht dreimal "Di 10:00" angeboten bekommen, sondern
+        einmal — mit einem davon. Wer den Slot bekommt, entscheidet die
+        Reihenfolge der Kandidaten (Nicht-Inhaber zuerst, der Chef
+        springt nur ein).
+        """
+        tage = self._slot_tage(wunsch, days_ahead_raw)
+
+        async def _fuer(emp):
+            try:
+                adapter = await get_calendar_adapter(
+                    self.tenant_id, employee_id=emp.id,
+                    fallback_calendar_id=self.config["calendar_id"],
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Kalender fuer %s nicht nutzbar: %s", emp.slug, exc)
+                return []
+            raus: list[dict] = []
+            for i, tag in enumerate(tage):
+                if len(raus) >= MAX_SLOTS:
+                    break
+                try:
+                    raus.extend(await self._suche_slots_am_tag(
+                        adapter, tag,
+                        wunsch_uhrzeit_anker=anker_zeit if i == 0 else None,
+                        max_count=MAX_SLOTS - len(raus), dauer=dauer,
+                        employee=emp,
+                    ))
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "Slot-Suche %s am %s: %s", emp.slug, tag, exc,
+                    )
+            return raus
+
+        # Parallel — seriell waeren es bei zehn Mitarbeitern zehnmal
+        # die FreeBusy-Latenz hintereinander.
+        ergebnisse = await asyncio.gather(
+            *(_fuer(e) for e in employees), return_exceptions=True,
+        )
+
+        # Inhaber ans Ende: er soll nur einspringen, wenn sonst niemand
+        # kann. Die Reihenfolge entscheidet bei der Entdopplung.
+        sortiert: list[dict] = []
+        for emp, res in zip(employees, ergebnisse):
+            if isinstance(res, Exception):
+                logger.warning("Slot-Suche %s abgebrochen: %s", emp.slug, res)
+                continue
+            sortiert.append((getattr(emp, "is_default", False), res))
+        sortiert.sort(key=lambda x: x[0])
+
+        gesehen: set[tuple[str, str]] = set()
+        zusammen: list[dict] = []
+        for _, slots in sortiert:
+            for slot in slots:
+                key = (slot["datum"], slot["uhrzeit"])
+                if key in gesehen:
+                    continue
+                gesehen.add(key)
+                zusammen.append(slot)
+
+        zusammen.sort(key=lambda s: (
+            datetime.strptime(s["datum"], "%d.%m.%Y"), s["uhrzeit"],
+        ))
+        return zusammen[:MAX_SLOTS]
+
+    def _slot_tage(self, wunsch, days_ahead_raw) -> list:
+        """Welche Tage abgesucht werden — beide Aufruf-Modi."""
+        if days_ahead_raw is not None:
+            try:
+                n = int(days_ahead_raw)
+            except (TypeError, ValueError):
+                n = 7
+            n = max(1, min(n, MAX_DAYS_AHEAD))
+            return [wunsch.date() + timedelta(days=i) for i in range(n)]
+        # Wunschtermin-Modus: Wunschtag + die zwei folgenden Werktage.
+        t0 = wunsch.date()
+        t1 = self._naechster_werktag(t0)
+        t2 = self._naechster_werktag(t1)
+        return [t0, t1, t2]
 
     # ------------------------------------------------------------------
     # SMART-SLOT-FILTER (Travel-Time aware)
@@ -831,6 +1097,12 @@ class Plugin(BasePlugin):
                     eid = ev.get("event_id") or ""
                     if not eid or eid in seen_event_ids:
                         continue
+                    # Spiegel-Termine (Kopie im Inhaber-Kalender) sind
+                    # keine eigenstaendigen Termine. Ohne diesen Filter
+                    # bekaeme der Storno-Wizard denselben Termin zweimal
+                    # zur Auswahl.
+                    if (ev.get("summary") or "").startswith("[Team] "):
+                        continue
                     seen_event_ids.add(eid)
                     termine.append({
                         "event_id": eid,
@@ -871,6 +1143,10 @@ class Plugin(BasePlugin):
             if not ok:
                 return {"erfolg": False, "nachricht": "Loeschen fehlgeschlagen"}
 
+            # Spiegel im Inhaber-Kalender mitnehmen — sonst bleibt dort
+            # ein Geistertermin stehen, den niemand mehr zuordnen kann.
+            await self._spiegel_loeschen(employee_id, event_id, payload)
+
             return {
                 "erfolg": True,
                 "nachricht": "Termin geloescht.",
@@ -887,6 +1163,7 @@ class Plugin(BasePlugin):
         wunsch_uhrzeit_anker,
         max_count: int,
         dauer: int,
+        employee=None,
     ) -> list[dict]:
         """
         Sucht freie Slots an einem konkreten Tag.
@@ -896,13 +1173,27 @@ class Plugin(BasePlugin):
         """
         from datetime import datetime, time, timedelta
 
+        # Arbeitstage/-zeiten: der Mitarbeiter schlaegt den Tenant-Default.
+        # Employee.arbeitszeiten/-tage wurden bisher NUR vom Router
+        # gelesen — die Slot-Suche bot dem Fruehschichtler trotzdem
+        # Termine bis 17 Uhr an.
+        arbeitstage = self.config["arbeitstage"]
+        start_str = self.config["arbeitszeiten_start"]
+        ende_str = self.config["arbeitszeiten_ende"]
+        if employee is not None:
+            if getattr(employee, "arbeitstage", None):
+                arbeitstage = employee.arbeitstage
+            zeiten = getattr(employee, "arbeitszeiten", None) or {}
+            start_str = zeiten.get("start") or start_str
+            ende_str = zeiten.get("end") or zeiten.get("ende") or ende_str
+
         # Wochentag-Filter (z.B. Mo-Fr)
-        if target_date.weekday() not in self.config["arbeitstage"]:
+        if target_date.weekday() not in arbeitstage:
             return []
 
         # Arbeitszeiten parsen
-        h_start, m_start = self._parse_zeit(self.config["arbeitszeiten_start"])
-        h_ende, m_ende = self._parse_zeit(self.config["arbeitszeiten_ende"])
+        h_start, m_start = self._parse_zeit(start_str)
+        h_ende, m_ende = self._parse_zeit(ende_str)
 
         slot_start_dt = datetime.combine(
             target_date, time(hour=h_start, minute=m_start)
@@ -971,6 +1262,13 @@ class Plugin(BasePlugin):
                     "wochentag": [
                         "Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"
                     ][kandidat.weekday()],
+                    # Wessen Kalender dieser Slot ist. Ohne dieses Feld
+                    # kann kein Aufrufer den Slot spaeter auf einen
+                    # Kalender zurueckbilden — genau daran lief der
+                    # Mail-Pfad ins Leere, der es schon abfragt.
+                    "employee_id": str(employee.id) if employee is not None else None,
+                    "employee_slug": getattr(employee, "slug", None) if employee is not None else None,
+                    "employee_name": getattr(employee, "name", None) if employee is not None else None,
                 })
 
         # Sortiere zur Ausgabe wieder chronologisch

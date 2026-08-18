@@ -288,6 +288,8 @@ async def create_event(
     kunde_telefon_normalized: str | None = None,
     kunde_email: str | None = None,
     idempotency_key: str | None = None,
+    transparent: bool = False,
+    zusatz_props: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Erstellt einen Termin. Returns: {"id": ..., "html_link": ...}.
 
@@ -302,6 +304,9 @@ async def create_event(
         "start": {"dateTime": _iso_no_tz(start), "timeZone": DEFAULT_TIMEZONE},
         "end": {"dateTime": _iso_no_tz(end), "timeZone": DEFAULT_TIMEZONE},
         "location": {"displayName": location} if location else None,
+        # "free" = zeigt NICHT als beschaeftigt. Der Spiegel im Kalender
+        # des Inhabers darf dessen eigene Slot-Suche nicht blockieren.
+        "showAs": "free" if transparent else None,
     }
     body = {k: v for k, v in body.items() if v is not None}
 
@@ -314,6 +319,9 @@ async def create_event(
         ext_props.append({"id": ga_prop_id("kunde_email"), "value": kunde_email})
     if idempotency_key:
         ext_props.append({"id": ga_prop_id("ga_ref"), "value": idempotency_key})
+    for k, v in (zusatz_props or {}).items():
+        if v:
+            ext_props.append({"id": ga_prop_id(k), "value": v})
     if ext_props:
         body["singleValueExtendedProperties"] = ext_props
 

@@ -5787,6 +5787,15 @@ async def api_termin_anlegen(
         "telefon": (body.get("telefon") or "").strip() or None,
         "kunde_email": (body.get("kunde_email") or "").strip() or None,
     }
+    # In wessen Kalender der Termin landet. Ohne das buchte die PWA
+    # immer beim Inhaber, egal wem der Slot gehoert.
+    ziel_slug = (body.get("employee_slug") or "").strip()
+    if ziel_slug:
+        ziel = await _get_employee_by_slug(tid, ziel_slug)
+        if ziel is not None:
+            payload["employee_id"] = ziel.id
+    else:
+        payload["employee_id"] = request.state.app_employee.id
     try:
         res = await kalender.on_webhook("book_appointment", payload)
     except Exception as exc:  # noqa: BLE001
