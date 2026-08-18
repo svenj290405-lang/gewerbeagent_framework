@@ -1331,7 +1331,10 @@ async def _run_angebot_erstellen(ctx: Ctx, args: dict) -> dict:
         ctx.tid, kunde_name=kunde, positionen=positionen,
         kunde_email=(args.get("kunde_email") or "").strip() or ex.get("kunde_email"),
         kunde_strasse=ex.get("kunde_strasse"), kunde_plz=ex.get("kunde_plz"),
-        kunde_ort=ex.get("kunde_ort"), quelle="assistent")
+        kunde_ort=ex.get("kunde_ort"), quelle="assistent",
+        # Wer es per Q anlegt, bekommt den Auftrag zugewiesen — sonst
+        # waere er "niemandem zugewiesen" und sofort unsichtbar.
+        assigned_employee_id=ctx.employee.id)
 
 
 def _summary_angebot_erstellen(ctx: Ctx, args: dict) -> str:

@@ -75,6 +75,7 @@ async def create_angebot(
     kunde_ort: str | None = None, kunde_email: str | None = None,
     intro_text: str | None = None, remark_text: str | None = None,
     quelle: str = "web",
+    assigned_employee_id: uuid.UUID | None = None,
 ) -> dict:
     """Legt Angebot + Positionen in der DB an und erstellt einen
     Lexware-Quotation-Draft. Spiegelt die fruehere Inline-Logik der Route."""
@@ -106,6 +107,7 @@ async def create_angebot(
             introduction_text=(intro_text or "").strip() or None,
             remark_text=(remark_text or "").strip() or None,
             status=ANGEBOT_STATUS_ERSTELLT,
+            assigned_employee_id=assigned_employee_id,
         )
         s.add(ang)
         await s.flush()
@@ -199,6 +201,7 @@ async def create_auftrag_manuell(
     kunde_strasse: str | None = None, kunde_plz: str | None = None,
     kunde_ort: str | None = None, kunde_email: str | None = None,
     quelle: str = "manuell",
+    assigned_employee_id: uuid.UUID | None = None,
 ) -> dict:
     """Legt einen Auftrag direkt in der Auftragsliste an — ohne Angebot und
     ohne Lexware-Draft. Fuer Arbeit, die am Telefon oder auf der Baustelle
@@ -247,6 +250,7 @@ async def create_auftrag_manuell(
             kunde_email=_kurz(kunde_email, _MAX_EMAIL),
             status=status,
             gesamtbetrag_brutto_eur=gesamt,
+            assigned_employee_id=assigned_employee_id,
         )
         # Ab "angenommen" gehoert die Zusage des Kunden zur Geschichte des
         # Auftrags — die Detailansicht zeigt sie als "angenommen am" an.

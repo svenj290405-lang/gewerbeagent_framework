@@ -68,13 +68,26 @@ class _FakeListSession:
         )
 
 
-def _req(body=None, tenant_id=None):
+def _req(body=None, tenant_id=None, permissions=None, emp_id=None):
+    """Fake-Request.
+
+    app_employee/app_permissions setzt im Echtbetrieb require_app_user;
+    der Auftrags-Scope (core/security/app_scope.py) liest beides. Default
+    hier: darf alles sehen — die Sichtbarkeitsgrenze hat ihre eigenen
+    Tests in test_auftraege_scope.py.
+    """
     req = SimpleNamespace()
 
     async def _json():
         return body or {}
     req.json = _json
-    req.state = SimpleNamespace(app_tenant=SimpleNamespace(id=tenant_id or uuid.uuid4()))
+    if permissions is None:
+        permissions = {"auftraege.alle_sehen", "auftraege.fuehren"}
+    req.state = SimpleNamespace(
+        app_tenant=SimpleNamespace(id=tenant_id or uuid.uuid4()),
+        app_employee=SimpleNamespace(id=emp_id or uuid.uuid4(), slug="sven"),
+        app_permissions=frozenset(permissions),
+    )
     return req
 
 
@@ -93,6 +106,7 @@ def _ang(**kw):
         status="accepted", created_at=None, updated_at=None,
         arbeit_fortschritt=0,
         abgeschlossen_am=None, archiv_drive_folder_url=None,
+        assigned_employee_id=None,
     )
     basis.update(kw)
     return SimpleNamespace(**basis)

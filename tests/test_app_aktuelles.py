@@ -47,7 +47,13 @@ def _req(body=None, tenant_id=None, query=None):
     async def _json():
         return body or {}
     req.json = _json
-    req.state = SimpleNamespace(app_tenant=SimpleNamespace(id=tenant_id or uuid.uuid4()))
+    # app_employee/app_permissions setzt im Echtbetrieb require_app_user;
+    # der Auftrags-Scope (core/security/app_scope.py) liest beides.
+    req.state = SimpleNamespace(
+        app_tenant=SimpleNamespace(id=tenant_id or uuid.uuid4()),
+        app_employee=SimpleNamespace(id=uuid.uuid4(), slug="sven"),
+        app_permissions=frozenset({"auftraege.alle_sehen", "auftraege.fuehren"}),
+    )
     req.query_params = query or {}
     return req
 
@@ -66,7 +72,7 @@ async def test_aktuelles_aggregates(monkeypatch):
     async def _ber(tid):
         return [{"id": "2", "kunde": "B", "briefing": "", "termin": "", "termin_iso": None}]
 
-    async def _auf(tid):
+    async def _auf(tid, scope=None):
         return [{"id": "3", "kunde": "C", "status": "arbeit_laeuft", "in_arbeit": True}]
     monkeypatch.setattr(app_screens, "_open_rueckrufe", _rr)
     monkeypatch.setattr(app_screens, "_beratung_leads", _ber)

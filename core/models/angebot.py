@@ -139,6 +139,18 @@ class Angebot(Base):
         UUID(as_uuid=True), nullable=True
     )
 
+    # Wer fuehrt diesen Auftrag aus. Traegt die Sichtbarkeitsgrenze:
+    # ohne das Recht `auftraege.alle_sehen` sieht ein Mitarbeiter nur
+    # Auftraege, die auf ihn zugewiesen sind (Filter in
+    # core/security/app_scope.py). NULL = niemandem zugewiesen und damit
+    # fuer eingeschraenkte Nutzer NICHT sichtbar (fail-closed).
+    # SET NULL beim Loeschen des Mitarbeiters — der Auftrag bleibt.
+    assigned_employee_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("employees.id", ondelete="SET NULL"),
+        nullable=True, index=True,
+    )
+
     # Arbeits-Fortschritt 0-100 % (Regler im "Aktuelles"-Tab fuer laufende
     # Auftraege im Status arbeit_laeuft). Bei 100 % wird der Auftrag
     # fertiggemeldet und der Handwerker in Q zur Rechnung gefuehrt.

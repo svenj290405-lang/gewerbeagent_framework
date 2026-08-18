@@ -65,6 +65,7 @@ from core.plugin_system import get_plugin_for_tenant
 from core.features.permission_check import (
     rolle_oder_default as _rolle_oder_default,
 )
+from core.security.app_scope import auftrag_filter, auftrag_scope
 from core.security.app_auth import (
     current_tenant_id,
     enforce_app_permission,
@@ -456,6 +457,21 @@ _AUFTRAG_SETTABLE = {
 }
 
 
+async def _load_auftrag(session, tid, aid, scope):
+    """Einen Auftrag laden — tenant- UND zeilen-gescoped.
+
+    Liefert None, wenn es ihn nicht gibt ODER der Nutzer ihn nicht sehen
+    darf. Die Routen antworten darauf mit 404 statt 403: die Existenz
+    eines fremden Auftrags soll nicht bestaetigt werden (gleiche Linie
+    wie beim Drive-Proxy-Fix 125012f).
+    """
+    return (await session.execute(
+        select(Angebot)
+        .where(Angebot.id == aid, Angebot.tenant_id == tid)
+        .where(*auftrag_filter(scope))
+    )).scalar_one_or_none()
+
+
 @router.get("/auftraege")
 async def api_auftraege(
     request: Request, _e=Depends(require_app_user),
@@ -466,16 +482,19 @@ async def api_auftraege(
     in der Auftragshistorie (``/auftraege/historie``). Sonst waechst die
     Arbeitsliste ewig. Tenant-gescoped."""
     tid = current_tenant_id(request)
+    scope = auftrag_scope(request)
     relevante = set(AUFTRAG_LIFECYCLE) - {ANGEBOT_STATUS_RECHNUNG_GESENDET}
     async with get_session() as s:
         rows = (await s.execute(
             select(Angebot)
             .where(Angebot.tenant_id == tid, Angebot.status.in_(relevante))
+            .where(*auftrag_filter(scope))
             .order_by(Angebot.created_at.desc())
             .limit(50)
         )).scalars().all()
     zeilen = [_auftrag_zeile(a) for a in rows]
     await _stunden_anreichern(tid, zeilen)
+    await _zuweisung_anreichern(tid, zeilen)
     return JSONResponse({"auftraege": zeilen})
 
 
@@ -527,7 +546,30 @@ def _auftrag_zeile(a: Angebot) -> dict:
         "zeit": _fmt_dt(a.created_at),
         "abgeschlossen_am": _fmt_dt(a.abgeschlossen_am) if a.abgeschlossen_am else "",
         "archiv_url": a.archiv_drive_folder_url or "",
+        # Wem der Auftrag gehoert. Nur die ID — den Namen loest die
+        # Liste gesammelt auf (_zuweisung_anreichern), sonst gaebe es
+        # eine Query pro Zeile.
+        "assigned_employee_id": str(a.assigned_employee_id) if a.assigned_employee_id else None,
+        "zugewiesen_an": "",
     }
+
+
+async def _zuweisung_anreichern(tid: uuid.UUID, zeilen: list[dict]) -> None:
+    """Traegt die Mitarbeiter-Namen in die Auftragszeilen nach.
+
+    Eine Query fuer die ganze Liste statt einer pro Zeile.
+    """
+    ids = {z.get("assigned_employee_id") for z in zeilen if z.get("assigned_employee_id")}
+    if not ids:
+        return
+    async with get_session() as s:
+        rows = (await s.execute(
+            select(Employee.id, Employee.name)
+            .where(Employee.tenant_id == tid)
+        )).all()
+    namen = {str(i): n for i, n in rows}
+    for z in zeilen:
+        z["zugewiesen_an"] = namen.get(z.get("assigned_employee_id") or "", "")
 
 
 def _historie_zeile(a: Angebot) -> dict:
@@ -555,11 +597,13 @@ async def api_auftraege_abgeschlossen(
     ``abgeschlossen_am`` (vor Einfuehrung des Archivs versendet) faellt auf
     ``created_at`` zurueck, damit die Liste vollstaendig bleibt."""
     tid = current_tenant_id(request)
+    scope = auftrag_scope(request)
     async with get_session() as s:
         rows = (await s.execute(
             select(Angebot)
             .where(Angebot.tenant_id == tid)
             .where(Angebot.status == ANGEBOT_STATUS_RECHNUNG_GESENDET)
+            .where(*auftrag_filter(scope))
             .order_by(
                 Angebot.abgeschlossen_am.desc().nullslast(),
                 Angebot.created_at.desc(),
@@ -590,11 +634,13 @@ async def api_auftraege_historie(
     zuerst. Altbestand ohne ``abgeschlossen_am`` faellt auf ``updated_at``
     zurueck, damit die Liste vollstaendig bleibt."""
     tid = current_tenant_id(request)
+    scope = auftrag_scope(request)
     async with get_session() as s:
         rows = (await s.execute(
             select(Angebot)
             .where(Angebot.tenant_id == tid)
             .where(Angebot.status.in_(_AUFTRAG_HISTORIE_STATES))
+            .where(*auftrag_filter(scope))
             .order_by(
                 func.coalesce(Angebot.abgeschlossen_am, Angebot.updated_at).desc(),
                 Angebot.created_at.desc(),
@@ -629,9 +675,7 @@ async def api_auftrag_status(
             status_code=400,
         )
     async with get_session() as s:
-        a = (await s.execute(
-            select(Angebot).where(Angebot.id == aid, Angebot.tenant_id == tid)
-        )).scalar_one_or_none()
+        a = await _load_auftrag(s, tid, aid, auftrag_scope(request))
         if a is None:
             return JSONResponse({"ok": False, "error": "Auftrag nicht gefunden."}, status_code=404)
         a.status = new_status
@@ -678,6 +722,13 @@ async def api_auftrag_neu(
     if not all(isinstance(p, dict) for p in positionen):
         return JSONResponse({"ok": False, "error": "Positionen fehlerhaft."}, status_code=400)
 
+    # Zuweisung: entweder explizit ein Mitarbeiter, sonst der Anlegende.
+    # Ohne das waere jeder neue Auftrag "niemandem zugewiesen" und damit
+    # fuer eingeschraenkte Nutzer sofort unsichtbar.
+    ziel_slug = (body.get("employee_slug") or "").strip()
+    ziel = (await _get_employee_by_slug(tid, ziel_slug)) if ziel_slug else None
+    ziel_id = ziel.id if ziel is not None else request.state.app_employee.id
+
     from core.services.document_flow import create_auftrag_manuell
     res = await create_auftrag_manuell(
         tid,
@@ -688,10 +739,56 @@ async def api_auftrag_neu(
         kunde_plz=body.get("kunde_plz"),
         kunde_ort=body.get("kunde_ort"),
         kunde_email=body.get("kunde_email"),
+        assigned_employee_id=ziel_id,
     )
     if not res.get("ok"):
         return JSONResponse(res, status_code=400)
     return JSONResponse(res)
+
+
+@router.post("/auftraege/{angebot_id}/zuweisen")
+async def api_auftrag_zuweisen(
+    angebot_id: str,
+    request: Request,
+    _e=Depends(require_app_user),
+    _c=Depends(require_app_csrf),
+) -> JSONResponse:
+    """Auftrag einem Mitarbeiter zuweisen (oder die Zuweisung loesen).
+
+    Body: { employee_slug }  — leer/fehlend = Zuweisung entfernen.
+    """
+    tid = current_tenant_id(request)
+    try:
+        aid = uuid.UUID(angebot_id)
+    except (ValueError, TypeError):
+        return JSONResponse({"ok": False, "error": "ungueltige id"}, status_code=400)
+
+    body = await request.json() or {}
+    slug = (body.get("employee_slug") or "").strip()
+    ziel = None
+    if slug:
+        ziel = await _get_employee_by_slug(tid, slug)
+        if ziel is None:
+            return JSONResponse(
+                {"ok": False, "error": "Mitarbeiter nicht gefunden."},
+                status_code=404,
+            )
+
+    async with get_session() as s:
+        # Bewusst OHNE Zeilen-Scope geladen: wer Auftraege fuehren darf,
+        # muss auch einen zuweisen koennen, den er selbst (noch) nicht
+        # sieht. Das Recht dafuer prueft das Routen-Gate.
+        a = (await s.execute(
+            select(Angebot).where(Angebot.id == aid, Angebot.tenant_id == tid)
+        )).scalar_one_or_none()
+        if a is None:
+            return JSONResponse({"ok": False, "error": "Auftrag nicht gefunden."}, status_code=404)
+        a.assigned_employee_id = ziel.id if ziel is not None else None
+
+    return JSONResponse({
+        "ok": True,
+        "zugewiesen_an": ziel.name if ziel is not None else None,
+    })
 
 
 # =====================================================================
@@ -722,7 +819,7 @@ async def _beratung_leads(tenant_id: uuid.UUID) -> list[dict]:
         } for k in rows]
 
 
-async def _aktuelle_auftraege(tenant_id: uuid.UUID) -> list[dict]:
+async def _aktuelle_auftraege(tenant_id: uuid.UUID, scope=None) -> list[dict]:
     """Laufende Aufträge für 'Aktuelles': Angebote ab Versand (mail_sent) bis
     Rechnung raus, plus angenommene Beratungs-Leads, für die noch kein Angebot
     existiert ('Angebot erstellen')."""
@@ -732,6 +829,7 @@ async def _aktuelle_auftraege(tenant_id: uuid.UUID) -> list[dict]:
             select(Angebot)
             .where(Angebot.tenant_id == tenant_id)
             .where(Angebot.status.in_(_AKTUELLES_AUFTRAG_STATES))
+            .where(*(auftrag_filter(scope) if scope else []))
             .order_by(Angebot.created_at.desc())
             .limit(50)
         )).scalars().all()
@@ -787,7 +885,7 @@ async def api_aktuelles(request: Request, _e=Depends(require_app_user)) -> JSONR
     return JSONResponse({
         "rueckrufe": await _open_rueckrufe(tid),
         "beratung": await _beratung_leads(tid),
-        "auftraege": await _aktuelle_auftraege(tid),
+        "auftraege": await _aktuelle_auftraege(tid, auftrag_scope(request)),
         "aufnahmen_count": len(aufnahmen),
     })
 
@@ -821,7 +919,13 @@ async def _build_briefing_text(ctx) -> str:
     heute = dt.date.today()
     termine = await _run_anstehende_termine(ctx, {"tage": 1})
     rueckrufe = await _open_rueckrufe(ctx.tid)
-    auftraege = await _aktuelle_auftraege(ctx.tid)
+    # Das Briefing sieht nur, was der Empfaenger auch sehen darf.
+    from core.security.app_scope import AuftragScope
+    briefing_scope = AuftragScope(
+        alle="auftraege.alle_sehen" in (ctx.permissions or frozenset()),
+        employee_id=ctx.employee.id,
+    )
+    auftraege = await _aktuelle_auftraege(ctx.tid, briefing_scope)
     beratung = await _beratung_leads(ctx.tid)
     team = await _run_team_status(ctx, {})
     anfragen = {"anzahl": 0, "anfragen": []}
@@ -961,9 +1065,7 @@ async def api_auftrag_fortschritt(
         return JSONResponse({"ok": False, "error": "fortschritt (0-100) erwartet"}, status_code=400)
     pct = max(0, min(100, pct))
     async with get_session() as s:
-        a = (await s.execute(
-            select(Angebot).where(Angebot.id == aid, Angebot.tenant_id == tid)
-        )).scalar_one_or_none()
+        a = await _load_auftrag(s, tid, aid, auftrag_scope(request))
         if a is None:
             return JSONResponse({"ok": False, "error": "Auftrag nicht gefunden."}, status_code=404)
         a.arbeit_fortschritt = pct
@@ -1115,9 +1217,7 @@ async def api_auftrag_detail(
         return JSONResponse({"ok": False, "error": "ungueltige id"}, status_code=400)
 
     async with get_session() as s:
-        a = (await s.execute(
-            select(Angebot).where(Angebot.id == aid, Angebot.tenant_id == tid)
-        )).scalar_one_or_none()
+        a = await _load_auftrag(s, tid, aid, auftrag_scope(request))
         if a is None:
             return JSONResponse({"ok": False, "error": "Auftrag nicht gefunden."},
                                 status_code=404)
@@ -1249,9 +1349,7 @@ async def api_rechnung_vorbereiten(
 
     from core.models.angebot_position import AngebotPosition
     async with get_session() as s:
-        a = (await s.execute(
-            select(Angebot).where(Angebot.id == aid, Angebot.tenant_id == tid)
-        )).scalar_one_or_none()
+        a = await _load_auftrag(s, tid, aid, auftrag_scope(request))
         if a is None:
             return JSONResponse({"ok": False, "error": "Auftrag nicht gefunden."}, status_code=404)
         positions = (await s.execute(

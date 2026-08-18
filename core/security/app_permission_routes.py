@@ -70,6 +70,7 @@ ROUTE_RECHTE: dict[str, str] = {
 
     "api_auftrag_neu": "auftraege.fuehren",
     "api_auftrag_status": "auftraege.fuehren",
+    "api_auftrag_zuweisen": "auftraege.fuehren",
     "api_auftragsprozess_speichern": "auftraege.fuehren",
 
     # =================================================================
