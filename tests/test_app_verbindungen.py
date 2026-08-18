@@ -190,10 +190,14 @@ async def test_oauth_start_unbekannter_provider():
 async def test_oauth_start_happy_path_session_scoped(monkeypatch):
     seen = {}
 
-    async def fake_gen(tenant_slug, provider, employee_slug):
+    # allow_rebind kam spaeter dazu (Confused-Deputy-Schutz): der
+    # authentifizierte PWA-Pfad darf den Account neu binden. Der Fake muss
+    # den Parameter kennen, sonst schlaegt der Aufruf mit TypeError fehl.
+    async def fake_gen(tenant_slug, provider, employee_slug, allow_rebind=False):
         seen["tenant_slug"] = tenant_slug
         seen["provider"] = provider
         seen["employee_slug"] = employee_slug
+        seen["allow_rebind"] = allow_rebind
         return "https://accounts.google.com/o/oauth2/auth?state=xyz"
 
     monkeypatch.setattr("core.security.oauth_flow.generate_auth_url", fake_gen)
@@ -206,7 +210,10 @@ async def test_oauth_start_happy_path_session_scoped(monkeypatch):
     assert b["ok"] is True
     assert b["auth_url"].startswith("https://accounts.google.com")
     # tenant_slug + employee_slug muessen aus der SESSION kommen, nicht aus dem Body
-    assert seen == {"tenant_slug": "pilot", "provider": "google", "employee_slug": "inhaber"}
+    assert seen == {
+        "tenant_slug": "pilot", "provider": "google",
+        "employee_slug": "inhaber", "allow_rebind": True,
+    }
 
 
 @pytest.mark.asyncio

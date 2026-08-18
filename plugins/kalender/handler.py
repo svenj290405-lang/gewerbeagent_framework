@@ -50,6 +50,15 @@ _SLOT_LOCKS: dict[tuple[UUID, datetime], asyncio.Lock] = {}
 # gleichem Key (z.B. Mail-Message-ID) gibt es das vorherige Resultat
 # zurueck statt eine zweite Buchung zu machen.
 # TTL: 24h (genug fuer Container-Restart-Recovery).
+# Obergrenzen der Slot-Suche. MAX_SLOTS entspricht der bisherigen
+# 3+2+1-Staffel im Wunschtermin-Modus; MAX_DAYS_AHEAD deckelt den
+# Tage-Modus, damit ein Aufrufer nicht ein Jahr Kalender abfragt.
+MAX_SLOTS = 6
+MAX_DAYS_AHEAD = 14
+# Mindest-Vorlauf fuer Slots am heutigen Tag — niemandem einen Termin
+# in 5 Minuten vorschlagen (und erst recht keinen in der Vergangenheit).
+SLOT_VORLAUF_MINUTEN = 60
+
 _BOOKING_IDEMPOTENCY: dict[tuple[UUID, str], tuple[datetime, dict]] = {}
 _IDEMPOTENCY_TTL_SECONDS = 24 * 3600
 _IDEMPOTENCY_MAX_ENTRIES = 5000  # safety cap
@@ -427,8 +436,29 @@ class Plugin(BasePlugin):
             # Phase-3: optional welcher Mitarbeiter — entscheidet welche
             # Heimat-Adresse fuer Routing-Origin verwendet wird.
             employee_id = payload.get("employee_id")
+            # Zweiter Aufruf-Modus: "die naechsten N Tage" statt eines
+            # konkreten Wunschtermins. So rufen die PWA
+            # (/termine/freie-slots, /verbindungen/kalender/test) und der
+            # Q-Assistent auf. Ohne diesen Zweig lief
+            # _parse_datum_uhrzeit("", "") in einen ValueError und die App
+            # zeigte IMMER eine leere Slot-Liste.
+            days_ahead_raw = payload.get("days_ahead")
 
-            wunsch = self._parse_datum_uhrzeit(wunsch_datum, wunsch_uhrzeit)
+            if wunsch_datum:
+                wunsch = self._parse_datum_uhrzeit(wunsch_datum, wunsch_uhrzeit)
+                anker_zeit = wunsch.time()
+            else:
+                # Kein Wunschtermin: ab heute suchen (bzw. ab dem naechsten
+                # Arbeitstag), ohne Uhrzeit-Anker.
+                heute = datetime.now()
+                if heute.weekday() in self.config["arbeitstage"]:
+                    wunsch = heute
+                else:
+                    wunsch = datetime.combine(
+                        self._naechster_werktag(heute.date()), heute.time(),
+                    )
+                anker_zeit = None
+
             adapter = await get_calendar_adapter(
                 self.tenant_id, employee_id=employee_id,
                 fallback_calendar_id=self.config["calendar_id"],
@@ -436,20 +466,43 @@ class Plugin(BasePlugin):
 
             slots: list[dict] = []
 
-            # Tag 0: selber Tag
-            slots.extend(await self._suche_slots_am_tag(
-                adapter, wunsch.date(), wunsch_uhrzeit_anker=wunsch.time(), max_count=3, dauer=dauer
-            ))
-            # Tag 1: naechster Werktag
-            naechster_tag = self._naechster_werktag(wunsch.date())
-            slots.extend(await self._suche_slots_am_tag(
-                adapter, naechster_tag, wunsch_uhrzeit_anker=None, max_count=2, dauer=dauer
-            ))
-            # Tag 2: uebernaechster Werktag
-            uebernaechster_tag = self._naechster_werktag(naechster_tag)
-            slots.extend(await self._suche_slots_am_tag(
-                adapter, uebernaechster_tag, wunsch_uhrzeit_anker=None, max_count=1, dauer=dauer
-            ))
+            if days_ahead_raw is not None and not wunsch_datum:
+                # Tage-Modus: Arbeitstage durchgehen bis MAX_SLOTS voll sind.
+                # Clamp, damit ein Aufrufer nicht ein Jahr Kalender abfragt —
+                # der PWA-Pfad (app_screens.py) clampt selbst nicht.
+                try:
+                    days_ahead = int(days_ahead_raw)
+                except (TypeError, ValueError):
+                    days_ahead = 7
+                days_ahead = max(1, min(days_ahead, MAX_DAYS_AHEAD))
+
+                tag = wunsch.date()
+                for i in range(days_ahead):
+                    if len(slots) >= MAX_SLOTS:
+                        break
+                    if tag.weekday() in self.config["arbeitstage"]:
+                        slots.extend(await self._suche_slots_am_tag(
+                            adapter, tag,
+                            wunsch_uhrzeit_anker=anker_zeit if i == 0 else None,
+                            max_count=MAX_SLOTS - len(slots), dauer=dauer,
+                        ))
+                    tag = tag + timedelta(days=1)
+                slots = slots[:MAX_SLOTS]
+            else:
+                # Wunschtermin-Modus (unveraendert): 3 Slots am Wunschtag,
+                # 2 am naechsten, 1 am uebernaechsten Werktag.
+                slots.extend(await self._suche_slots_am_tag(
+                    adapter, wunsch.date(), wunsch_uhrzeit_anker=anker_zeit,
+                    max_count=3, dauer=dauer,
+                ))
+                naechster_tag = self._naechster_werktag(wunsch.date())
+                slots.extend(await self._suche_slots_am_tag(
+                    adapter, naechster_tag, wunsch_uhrzeit_anker=None, max_count=2, dauer=dauer
+                ))
+                uebernaechster_tag = self._naechster_werktag(naechster_tag)
+                slots.extend(await self._suche_slots_am_tag(
+                    adapter, uebernaechster_tag, wunsch_uhrzeit_anker=None, max_count=1, dauer=dauer
+                ))
 
             # Smart-Filter (best-effort, schluckt eigene Fehler)
             smart_meta = {"applied": False, "reason": None, "removed": 0}
@@ -470,7 +523,17 @@ class Plugin(BasePlugin):
             }
 
         except Exception as e:
-            return {"erfolg": False, "nachricht": f"Fehler bei Slot-Suche: {str(e)}"}
+            # "slots" MUSS mit raus: alle Aufrufer machen
+            # `out.get("slots") or []` und koennen sonst "nichts frei" nicht
+            # von "Aufruf kaputt" unterscheiden — genau daran hing das
+            # falsche Gruen im Diagnose-Screen.
+            logger.exception("find_free_slots fehlgeschlagen: %s", e)
+            return {
+                "erfolg": False,
+                "nachricht": f"Fehler bei Slot-Suche: {str(e)}",
+                "slots": [],
+                "anzahl": 0,
+            }
 
     # ------------------------------------------------------------------
     # SMART-SLOT-FILTER (Travel-Time aware)
@@ -847,6 +910,21 @@ class Plugin(BasePlugin):
         tag_ende_dt = datetime.combine(
             target_date, time(hour=h_ende, minute=m_ende)
         )
+
+        # Vergangenheit ueberspringen: am heutigen Tag darf der erste Slot
+        # nicht vor "jetzt + Vorlauf" liegen. Faellt erst seit dem
+        # days_ahead-Modus auf — im Wunschtermin-Modus lag der Anker
+        # praktisch immer in der Zukunft.
+        jetzt = datetime.now()
+        if target_date == jetzt.date():
+            frueheste = jetzt + timedelta(minutes=SLOT_VORLAUF_MINUTEN)
+            # auf das naechste 30-Minuten-Raster aufrunden
+            rest = frueheste.minute % 30
+            if rest or frueheste.second or frueheste.microsecond:
+                frueheste += timedelta(minutes=30 - rest)
+            frueheste = frueheste.replace(second=0, microsecond=0)
+            if frueheste > slot_start_dt:
+                slot_start_dt = frueheste
 
         # Liste aller potentiellen Slot-Starts (30-Min-Raster)
         kandidaten: list[datetime] = []

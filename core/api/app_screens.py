@@ -6100,6 +6100,14 @@ async def api_verbindung_test(
         except Exception as exc:  # noqa: BLE001
             logger.exception("kalender test crash: %s", exc)
             return JSONResponse({"ok": False, "error": "Kalender-Aufruf gescheitert."}, status_code=502)
+        # "erfolg" auswerten, nicht nur die Slot-Liste zaehlen: bei einem
+        # gescheiterten Aufruf kommt gar kein Slot zurueck, und ein blosses
+        # len()==0 haette hier faelschlich "ok" gemeldet (falsches Gruen).
+        if not out.get("erfolg"):
+            return JSONResponse({
+                "ok": False,
+                "error": out.get("nachricht") or "Slot-Suche fehlgeschlagen.",
+            }, status_code=502)
         slots = out.get("slots") or []
         return JSONResponse({
             "ok": True,
