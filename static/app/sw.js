@@ -190,7 +190,12 @@
 // und --bg2 gibt es im Stylesheet gar nicht: im Dunkelmodus helles Grau mit
 // fast weisser Schrift. Jetzt umbrechender Monospace-Text auf --bg mit
 // --text, dazu „Kopieren" und „Öffnen ↗" nebeneinander.
-const CACHE = "ga-app-v87";
+// v88: Vorschlags-Chips („Termin eintragen" usw.) unter der Q-Kugel entfernt —
+// redundant zum ✨-Menue am Eingabefeld.
+// v89: Q-Overlay kann Aktionen jetzt selbst bestätigen (Ausführen/Abbrechen)
+// und Mail-Entwürfe direkt redigieren + senden — vorher nur Verweis-Link
+// „Im Assistenten bestätigen".
+const CACHE = "ga-app-v89";
 const SHELL = [
   "/app",
   "/app/static/app-beta.css",

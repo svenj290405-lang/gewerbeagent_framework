@@ -255,6 +255,17 @@ button:disabled { opacity: .6; }
 .bubble.mail .mail-chip-x { border: 0; background: none; color: var(--muted);
   font-size: 13px; line-height: 1; padding: 2px 4px; cursor: pointer; }
 
+/* Aktions-/Mail-Karte im Q-Overlay: gleiche Optik wie im Assistent-Chat.
+   Die .bubble-Regeln oben greifen dort nicht (Overlay nutzt .q-ov-bbl). */
+.q-ov-bbl .q-summary { font-weight: 600; }
+.q-ov-bbl .sub { color: var(--muted); font-size: 13px; }
+.q-ov-bbl label { display: block; margin-bottom: 2px; }
+.q-ov-bbl .rech-input { width: 100%; margin: 0 0 12px; padding: 10px 12px;
+  border: 1px solid var(--line); border-radius: 10px; font-size: 15px; font-family: inherit;
+  background: var(--card); color: var(--text); }
+.q-ov-bbl textarea.rech-input { resize: vertical; min-height: 90px; line-height: 1.4; }
+.q-ov-bbl .confirm-actions { margin-top: 4px; }
+
 /* Tipp-Animation (drei Punkte) */
 .bubble.typing { display: flex; gap: 4px; align-items: center; padding: 14px; }
 .bubble.typing span { width: 7px; height: 7px; border-radius: 50%; background: var(--muted);

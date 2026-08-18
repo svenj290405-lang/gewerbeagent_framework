@@ -2357,44 +2357,10 @@ const SCREENS = {
     function scrollDown() { requestAnimationFrame(() => window.scrollTo(0, document.body.scrollHeight)); }
     function auto() { input.style.height = "auto"; input.style.height = Math.min(input.scrollHeight, 120) + "px"; }
 
-    function resultText(tool, r) {
-      if (tool === "termin_anlegen") return `Termin für ${r.kunde} am ${r.datum} um ${r.uhrzeit} angelegt.`;
-      if (tool === "termin_stornieren") return `Termin von ${r.kunde} storniert${r.mail_sent ? " (Kunde per Mail informiert)" : ""}.`;
-      if (tool === "rueckruf_anlegen") return `Rückruf für ${r.kunde} angelegt.`;
-      if (tool === "material_bestellen") return `${r.menge}× ${r.material} bestellt.`;
-      if (tool === "abwesenheit_melden") return `${r.mitarbeiter} ist als ${r.typ} eingetragen.`;
-      if (tool === "wissen_merken") return `In der Wissensdatenbank gespeichert (${r.kategorie}).`;
-      if (tool === "rueckruf_erledigt") return `Rückruf von ${r.kunde} abgehakt.`;
-      if (tool === "mitarbeiter_zurueck") return `${r.mitarbeiter} ist wieder verfügbar.`;
-      if (tool === "auftrag_status") return `Auftrag von ${r.kunde}: ${r.status_label}.`;
-      if (tool === "material_anlegen") return `Material „${r.name}" im Katalog angelegt.`;
-      if (tool === "wissen_loeschen") return `Wissens-Eintrag gelöscht.`;
-      if (tool === "angebot_erstellen") return `Angebot für ${r.kunde} erstellt${r.lexware_voucher_number ? " (" + r.lexware_voucher_number + ")" : ""}.${r.warning ? " " + r.warning : ""}`;
-      if (tool === "angebot_senden") return `Angebot an ${r.to_email} gesendet.`;
-      if (tool === "rechnung_erstellen") return `Rechnung für ${r.kunde} erstellt${r.lexware_voucher_number ? " (" + r.lexware_voucher_number + ")" : ""}.${r.warning ? " " + r.warning : ""}`;
-      if (tool === "rechnung_abrechnen") return r.mail_sent ? `Rechnung an ${r.email_used} gesendet — Auftrag abgeschlossen.` : `Rechnung in Lexware angelegt${r.mail_error ? " (Mail offen: " + r.mail_error + ")" : ""}.`;
-      if (tool === "anfrage_beantworten") return `Antwort an ${r.kunde} gesendet${r.closed ? " (Anfrage geschlossen)" : ""}.`;
-      if (tool === "termin_verschieben") return `Termin von ${r.kunde} verschoben${r.alter_termin_entfernt === false ? " (alten Termin bitte im Kalender prüfen)" : ""}.`;
-      if (tool === "drive_ordner_anlegen") return `Drive-Ordner für ${r.kunde} bereit${r.link ? ": " + r.link : ""}.`;
-      if (tool === "drive_notiz_anlegen") return `Notiz für ${r.kunde} in Drive abgelegt${r.link ? " (" + r.link + ")" : ""}.`;
-      if (tool === "email_schreiben") return `E-Mail an ${r.to_email} gesendet${r.anhaenge ? " (" + r.anhaenge + " Anhang" + (r.anhaenge > 1 ? "e" : "") + ")" : ""}.`;
-      return "Erledigt.";
-    }
-
-    // Für Drive-Aktionen eine HTML-Antwort mit echtem, klickbarem Link direkt
-    // zum Drive-Ordner. Gibt null zurück, wenn kein (gültiger) Link da ist →
-    // dann greift der normale Text-Pfad (resultText).
-    function resultHtml(tool, r) {
-      const raw = r && r.link;
-      if (!raw || !/^https:\/\//i.test(String(raw))) return null;
-      if (tool !== "drive_ordner_anlegen" && tool !== "drive_notiz_anlegen") return null;
-      const href = String(raw).replace(/&/g, "&amp;").replace(/"/g, "%22");
-      const kunde = esc(r.kunde || "Kunde");
-      const lead = tool === "drive_ordner_anlegen"
-        ? `✓ Drive-Ordner für ${kunde} bereit`
-        : `✓ Notiz für ${kunde} in Drive abgelegt`;
-      return `${lead} — <a href="${href}" target="_blank" rel="noopener noreferrer">in Drive öffnen ↗</a>`;
-    }
+    // resultText/resultHtml leben auf Modul-Ebene (_assistResultText/-Html),
+    // weil auch das Q-Overlay Aktionen ausführt und die Ergebnistexte braucht.
+    const resultText = _assistResultText;
+    const resultHtml = _assistResultHtml;
 
     // Q-Globus: WebGL-Netzwerk-Globus (Drahtgitter-Ikosaeder + Partikelwolke +
     // Energiebögen) wie auf der Website; Three.js wird lokal geladen. Fallback
@@ -2430,12 +2396,7 @@ const SCREENS = {
         App.qWorking = false;
         const miniSphHide = document.getElementById("q-mini-sphere");
         if (miniSphHide) miniSphHide.hidden = true;
-        // Vorschlags-Chips: machen die haeufigsten ERSTELLEN-Funktionen sichtbar.
-        // Ohne sie sind "Termin eintragen", "E-Mail schreiben" usw. nur ueber
-        // das unbeschriftete ⚡-Menue erreichbar — fuer die Zielgruppe unauffindbar.
-        // Ein Tipp befuellt das Eingabefeld (senden entscheidet der Nutzer).
-        const chips = qSuggestChips();
-        chatEl.innerHTML = `<div class="q-hero">${sphereWrap}<p class="q-sphere-hint" id="q-sphere-hint">${SPRECH_TITEL}</p>${chips}</div>`;
+        chatEl.innerHTML = `<div class="q-hero">${sphereWrap}<p class="q-sphere-hint" id="q-sphere-hint">${SPRECH_TITEL}</p></div>`;
         mountQSphere();
         // Laeuft gerade eine Aufnahme, muss der frisch gebaute Globus wieder
         // in den Aufnahme-Zustand (Klasse + Hinweistext gingen sonst verloren).
@@ -3827,35 +3788,6 @@ function toast(msg, kind) {
   requestAnimationFrame(() => { host.style.opacity = "1"; });
   clearTimeout(_toastTimer);
   _toastTimer = setTimeout(() => { host.style.opacity = "0"; }, 2600);
-}
-
-// Vorschlags-Chips fuer den leeren Q-Chat. Machen die haeufigsten ERSTELLEN-
-// Funktionen sichtbar, die sonst nur im unbeschrifteten ⚡-Menue stecken.
-const Q_CHIPS = [
-  { need: "kalender",   ico: "📅", label: "Termin eintragen",  seed: "Trag einen Termin ein: " },
-  { need: "mail_intake", ico: "✉️", label: "E-Mail schreiben",  seed: "Schreib eine E-Mail an " },
-  { need: "lexware",    ico: "🧾", label: "Angebot erstellen", seed: "Erstell ein Angebot für " },
-  { need: null,          ico: "💡", label: "Etwas merken",      seed: "Merk dir: " },
-];
-function qSuggestChips() {
-  const feats = new Set((App.me && App.me.features) || []);
-  const avail = Q_CHIPS.filter((c) => !c.need || feats.has(c.need));
-  if (!avail.length) return "";
-  return `<div class="q-chips" style="display:flex;flex-wrap:wrap;gap:8px;justify-content:center;margin-top:20px;padding:0 12px">` +
-    avail.map((c) =>
-      `<button class="btn-sm btn-ghost" onclick="qSuggest(${Q_CHIPS.indexOf(c)})">${c.ico} ${esc(c.label)}</button>`
-    ).join("") + `</div>`;
-}
-// Chip-Tap: Eingabefeld vorbefuellen (Absenden entscheidet der Nutzer). Das
-// input-Event triggert die Auto-Resize-Logik des Composers.
-function qSuggest(i) {
-  const c = Q_CHIPS[i];
-  const inp = document.getElementById("q-input");
-  if (!c || !inp) return;
-  inp.value = c.seed;
-  inp.focus();
-  inp.setSelectionRange(inp.value.length, inp.value.length);
-  inp.dispatchEvent(new Event("input", { bubbles: true }));
 }
 
 // =================== Angebot / Rechnung Composer ===================
@@ -6799,6 +6731,49 @@ function mountQSphere() {
   }).catch(() => fallback());
 }
 
+// ---------- Q-Aktions-Ergebnistexte ----------
+// Auf Modul-Ebene, weil Assistent-Screen UND Q-Overlay Aktionen ausführen
+// und beide dieselben Bestätigungstexte zeigen sollen.
+
+function _assistResultText(tool, r) {
+  if (tool === "termin_anlegen") return `Termin für ${r.kunde} am ${r.datum} um ${r.uhrzeit} angelegt.`;
+  if (tool === "termin_stornieren") return `Termin von ${r.kunde} storniert${r.mail_sent ? " (Kunde per Mail informiert)" : ""}.`;
+  if (tool === "rueckruf_anlegen") return `Rückruf für ${r.kunde} angelegt.`;
+  if (tool === "material_bestellen") return `${r.menge}× ${r.material} bestellt.`;
+  if (tool === "abwesenheit_melden") return `${r.mitarbeiter} ist als ${r.typ} eingetragen.`;
+  if (tool === "wissen_merken") return `In der Wissensdatenbank gespeichert (${r.kategorie}).`;
+  if (tool === "rueckruf_erledigt") return `Rückruf von ${r.kunde} abgehakt.`;
+  if (tool === "mitarbeiter_zurueck") return `${r.mitarbeiter} ist wieder verfügbar.`;
+  if (tool === "auftrag_status") return `Auftrag von ${r.kunde}: ${r.status_label}.`;
+  if (tool === "material_anlegen") return `Material „${r.name}" im Katalog angelegt.`;
+  if (tool === "wissen_loeschen") return `Wissens-Eintrag gelöscht.`;
+  if (tool === "angebot_erstellen") return `Angebot für ${r.kunde} erstellt${r.lexware_voucher_number ? " (" + r.lexware_voucher_number + ")" : ""}.${r.warning ? " " + r.warning : ""}`;
+  if (tool === "angebot_senden") return `Angebot an ${r.to_email} gesendet.`;
+  if (tool === "rechnung_erstellen") return `Rechnung für ${r.kunde} erstellt${r.lexware_voucher_number ? " (" + r.lexware_voucher_number + ")" : ""}.${r.warning ? " " + r.warning : ""}`;
+  if (tool === "rechnung_abrechnen") return r.mail_sent ? `Rechnung an ${r.email_used} gesendet — Auftrag abgeschlossen.` : `Rechnung in Lexware angelegt${r.mail_error ? " (Mail offen: " + r.mail_error + ")" : ""}.`;
+  if (tool === "anfrage_beantworten") return `Antwort an ${r.kunde} gesendet${r.closed ? " (Anfrage geschlossen)" : ""}.`;
+  if (tool === "termin_verschieben") return `Termin von ${r.kunde} verschoben${r.alter_termin_entfernt === false ? " (alten Termin bitte im Kalender prüfen)" : ""}.`;
+  if (tool === "drive_ordner_anlegen") return `Drive-Ordner für ${r.kunde} bereit${r.link ? ": " + r.link : ""}.`;
+  if (tool === "drive_notiz_anlegen") return `Notiz für ${r.kunde} in Drive abgelegt${r.link ? " (" + r.link + ")" : ""}.`;
+  if (tool === "email_schreiben") return `E-Mail an ${r.to_email} gesendet${r.anhaenge ? " (" + r.anhaenge + " Anhang" + (r.anhaenge > 1 ? "e" : "") + ")" : ""}.`;
+  return "Erledigt.";
+}
+
+// Für Drive-Aktionen eine HTML-Antwort mit echtem, klickbarem Link direkt
+// zum Drive-Ordner. Gibt null zurück, wenn kein (gültiger) Link da ist →
+// dann greift der normale Text-Pfad (_assistResultText).
+function _assistResultHtml(tool, r) {
+  const raw = r && r.link;
+  if (!raw || !/^https:\/\//i.test(String(raw))) return null;
+  if (tool !== "drive_ordner_anlegen" && tool !== "drive_notiz_anlegen") return null;
+  const href = String(raw).replace(/&/g, "&amp;").replace(/"/g, "%22");
+  const kunde = esc(r.kunde || "Kunde");
+  const lead = tool === "drive_ordner_anlegen"
+    ? `✓ Drive-Ordner für ${kunde} bereit`
+    : `✓ Notiz für ${kunde} in Drive abgelegt`;
+  return `${lead} — <a href="${href}" target="_blank" rel="noopener noreferrer">in Drive öffnen ↗</a>`;
+}
+
 // ---------- Q-Overlay ----------
 
 function toggleQOverlay(forceClose) {
@@ -6874,8 +6849,44 @@ function _qOverlayRender() {
       if (lastMe) html += `<div class="q-ov-bbl me">${esc(lastMe.text || "")}</div>`;
       if (lastQMsg.role === "q")      html += `<div class="q-ov-bbl q">${lastQMsg.html ? lastQMsg.text : esc(lastQMsg.text || "")}</div>`;
       else if (lastQMsg.role === "err")  html += `<div class="q-ov-bbl err">${esc(lastQMsg.text || "")}</div>`;
-      else if (lastQMsg.role === "confirm") html += `<div class="q-ov-bbl q">⚡ ${esc(lastQMsg.summary || "Aktion")} — <a href="#" id="q-ov-confirm-link">Im Assistenten bestätigen ›</a></div>`;
-      else if (lastQMsg.role === "mail") html += `<div class="q-ov-bbl q">✉️ Mail-Entwurf „${esc((lastQMsg.data || {}).betreff || "")}" — <a href="#" id="q-ov-confirm-link">im Assistenten prüfen ›</a></div>`;
+      else if (lastQMsg.role === "confirm") {
+        // Aktion direkt hier bestätigen — kein Umweg über den Assistent-Tab.
+        // m lebt in App.qchat: wechselt der Nutzer doch in den Assistenten,
+        // sieht er dort denselben Stand (bestätigt/abgebrochen).
+        if (lastQMsg.resolved) {
+          html += `<div class="q-ov-bbl q"><p class="q-summary" style="margin:0 0 6px">${esc(lastQMsg.summary || "Aktion")}</p><div class="confirm-done">${lastQMsg.cancelled ? "✕ Abgebrochen" : "✓ Bestätigt"}</div></div>`;
+        } else {
+          html += `<div class="q-ov-bbl q" style="max-width:100%">
+             ${lastQMsg.frage ? `<p style="margin:0 0 8px">${esc(lastQMsg.frage)}</p>` : ""}
+             <p class="q-summary" style="margin:0 0 8px">${esc(lastQMsg.summary || "Aktion")}</p>
+             <div class="confirm-actions"><button class="btn-sm" data-ov-cyes="${lastQIdx}">Ausführen</button><button class="btn-sm btn-ghost" data-ov-cno="${lastQIdx}">Abbrechen</button></div>
+           </div>`;
+        }
+      }
+      else if (lastQMsg.role === "mail") {
+        const d = lastQMsg.data || {};
+        if (lastQMsg.resolved) {
+          html += `<div class="q-ov-bbl q"><p class="q-summary" style="margin:0 0 6px">✉️ E-Mail an ${esc(d.empfaenger || d.empfaenger_name || "")}</p><div class="confirm-done">${lastQMsg.sent ? "✓ Gesendet" : "✕ Abgebrochen"}</div></div>`;
+        } else {
+          // Kompakter Mail-Editor: An/Betreff/Text direkt hier redigier- und
+          // sendbar. Anhänge verwalten geht weiterhin im Assistenten (Link).
+          const anh = (d.anhaenge || []).length;
+          html += `<div class="q-ov-bbl q" style="max-width:100%;width:100%">
+             ${lastQMsg.frage ? `<p style="margin:0 0 8px">${esc(lastQMsg.frage)}</p>` : ""}
+             <p class="q-summary" style="margin:0 0 6px">✉️ E-Mail-Entwurf</p>
+             ${d.hinweis ? `<p class="sub" style="margin:0 0 8px">${esc(d.hinweis)}</p>` : ""}
+             <label class="sub">An</label>
+             <input type="email" class="rech-input" data-ov-mmail="${lastQIdx}" value="${esc(d.empfaenger || "")}" placeholder="kunde@example.de" autocomplete="off" autocapitalize="off" spellcheck="false">
+             <label class="sub">Betreff</label>
+             <input type="text" class="rech-input" data-ov-msubj="${lastQIdx}" value="${esc(d.betreff || "")}" placeholder="Betreff">
+             <label class="sub">Text</label>
+             <textarea class="rech-input" data-ov-mtext="${lastQIdx}" rows="5">${esc(d.text || "")}</textarea>
+             ${anh ? `<p class="sub" style="margin:4px 0 0">📎 ${anh} Anhang${anh > 1 ? "e" : ""}</p>` : ""}
+             <div class="confirm-actions"><button class="btn-sm" data-ov-msend="${lastQIdx}">Senden</button><button class="btn-sm btn-ghost" data-ov-mcancel="${lastQIdx}">Abbrechen</button></div>
+             <p class="sub" style="margin:8px 0 0"><a href="#" id="q-ov-confirm-link">Im Assistenten öffnen (Anhänge) ›</a></p>
+           </div>`;
+        }
+      }
     } else {
       html = `<p class="q-ov-hint">Stell mir eine Frage — ich bin auch hier.</p>`;
     }
@@ -6884,8 +6895,116 @@ function _qOverlayRender() {
   msgsEl.innerHTML = html;
   const cl = msgsEl.querySelector("#q-ov-confirm-link");
   if (cl) cl.addEventListener("click", (e) => { e.preventDefault(); toggleQOverlay(true); navigate("assistent"); });
+  // Aktion bestätigen/abbrechen
+  msgsEl.querySelectorAll("[data-ov-cyes]").forEach((b) =>
+    b.addEventListener("click", () => _qOverlayConfirm(parseInt(b.dataset.ovCyes, 10))));
+  msgsEl.querySelectorAll("[data-ov-cno]").forEach((b) =>
+    b.addEventListener("click", () => {
+      const m = App.qchat[parseInt(b.dataset.ovCno, 10)];
+      if (!m || m.resolved) return;
+      m.resolved = true; m.cancelled = true;
+      App.qchat.push({ role: "q", text: "Okay, lasse ich." });
+      _qOverlayRender();
+    }));
+  // Mail-Editor: Eingaben in m.data spiegeln (überleben Re-Render + Tab-Wechsel)
+  msgsEl.querySelectorAll("[data-ov-mmail]").forEach((t) =>
+    t.addEventListener("input", () => { App.qchat[parseInt(t.dataset.ovMmail, 10)].data.empfaenger = t.value; }));
+  msgsEl.querySelectorAll("[data-ov-msubj]").forEach((t) =>
+    t.addEventListener("input", () => { App.qchat[parseInt(t.dataset.ovMsubj, 10)].data.betreff = t.value; }));
+  msgsEl.querySelectorAll("[data-ov-mtext]").forEach((t) =>
+    t.addEventListener("input", () => { App.qchat[parseInt(t.dataset.ovMtext, 10)].data.text = t.value; }));
+  msgsEl.querySelectorAll("[data-ov-msend]").forEach((b) =>
+    b.addEventListener("click", () => _qOverlayMailSenden(parseInt(b.dataset.ovMsend, 10))));
+  msgsEl.querySelectorAll("[data-ov-mcancel]").forEach((b) =>
+    b.addEventListener("click", () => {
+      const m = App.qchat[parseInt(b.dataset.ovMcancel, 10)];
+      if (!m || m.resolved) return;
+      m.resolved = true; m.sent = false;
+      App.qchat.push({ role: "q", text: "Okay, die Mail lasse ich." });
+      _qOverlayRender();
+    }));
   _mountMiniSphere("q-typing-orb-ov", "q-mini-sphere-canvas-ov", "qMiniSphereOvStop");
   msgsEl.scrollTop = msgsEl.scrollHeight;
+}
+
+function _qOvPopTyping() {
+  const i = App.qchat.findIndex((x) => x.role === "typing");
+  if (i >= 0) App.qchat.splice(i, 1);
+}
+
+// Bestätigte Aktion direkt aus dem Overlay ausführen — gleicher Endpunkt und
+// gleiche Ergebnistexte wie doConfirm() im Assistent-Screen.
+async function _qOverlayConfirm(idx) {
+  const m = App.qchat[idx];
+  if (!m || m.resolved) return;
+  m.resolved = true;
+  App.qchat.push({ role: "typing" });
+  _qOverlayRender();
+  let res, j = null;
+  try {
+    res = await fetch("/app/api/assistent/ausfuehren", { method: "POST",
+      headers: { "X-CSRF-Token": App.me.csrf, "Content-Type": "application/json" },
+      body: JSON.stringify({ tool: m.tool, args: m.args }) });
+  } catch (e) {
+    _qOvPopTyping();
+    App.qchat.push({ role: "err", text: "Netzwerkfehler. Bitte erneut." });
+    _qOverlayRender(); return;
+  }
+  if (res.status === 303 || res.status === 401 || res.redirected) { location.href = "/app/login"; return; }
+  try { j = await res.json(); } catch (e) {}
+  _qOvPopTyping();
+  if (j && j.type === "done" && j.result && j.result.ok) {
+    const html = _assistResultHtml(m.tool, j.result);
+    if (html) App.qchat.push({ role: "q", text: html, html: true });
+    else App.qchat.push({ role: "q", text: "✓ " + _assistResultText(m.tool, j.result) });
+  } else {
+    App.qchat.push({ role: "err", text: (j && (j.text || (j.result && j.result.error))) || "Aktion fehlgeschlagen." });
+  }
+  _qOverlayRender();
+}
+
+// Mail-Entwurf direkt aus dem Overlay senden — Spiegel von doMailSenden() im
+// Assistent-Screen (gleiche Validierung, gleicher Endpunkt, Anhänge aus m.data
+// reisen mit).
+async function _qOverlayMailSenden(idx) {
+  const m = App.qchat[idx];
+  if (!m || m.resolved) return;
+  const d = m.data || {};
+  // Fehler als Toast statt Chat-Bubble: das Overlay zeigt nur die letzte
+  // Nachricht — eine Fehler-Bubble würde den Entwurf aus dem Blick schieben.
+  const fail = (t) => { toast(t, "err"); _qOverlayRender(); };
+  if (!/^[^@\s]+@[^@\s]+\.[a-zA-Z]{2,}$/.test((d.empfaenger || "").trim())) { fail("Bitte eine gültige Empfänger-Adresse eintragen."); return; }
+  if ((d.betreff || "").trim().length < 2) { fail("Bitte einen Betreff eintragen."); return; }
+  if ((d.text || "").trim().length < 2) { fail("Der Mail-Text fehlt."); return; }
+  m.resolved = true; m.sent = false;
+  App.qchat.push({ role: "typing" });
+  _qOverlayRender();
+  const args = {
+    empfaenger: (d.empfaenger || "").trim(),
+    empfaenger_name: d.empfaenger_name || "",
+    betreff: (d.betreff || "").trim(),
+    text: (d.text || "").trim(),
+    kunde_name: d.kunde_name || "",
+    anhaenge: d.anhaenge || [],
+  };
+  let res, j = null;
+  try {
+    res = await fetch("/app/api/assistent/ausfuehren", { method: "POST",
+      headers: { "X-CSRF-Token": App.me.csrf, "Content-Type": "application/json" },
+      body: JSON.stringify({ tool: "email_schreiben", args }) });
+  } catch (e) { _qOvPopTyping(); m.resolved = false; fail("Netzwerkfehler beim Senden."); return; }
+  if (res.status === 303 || res.status === 401 || res.redirected) { location.href = "/app/login"; return; }
+  try { j = await res.json(); } catch (e) {}
+  _qOvPopTyping();
+  if (j && j.type === "done" && j.result && j.result.ok) {
+    m.sent = true;
+    App.qchat.push({ role: "q", text: "✓ " + _assistResultText("email_schreiben", j.result) });
+    _qOverlayRender();
+  } else {
+    // Entwurf wieder aufmachen — Adresse/Text korrigieren statt Text verlieren.
+    m.resolved = false;
+    fail((j && (j.text || (j.result && j.result.error))) || "Mail konnte nicht gesendet werden.");
+  }
 }
 
 async function _qOverlaySend(text) {
