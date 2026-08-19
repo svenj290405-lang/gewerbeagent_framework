@@ -135,3 +135,71 @@ def test_nur_login_und_shell_sind_oeffentlich(name):
         f"{name} ist neu in OEFFENTLICHE_ENDPUNKTE. Ohne Login erreichbar "
         f"— ist das wirklich gewollt? Dann hier ergaenzen."
     )
+
+
+def _dependency_calls(route):
+    """Alle Dependency-Funktionen einer Route (nur die eigene Ebene)."""
+    dep = getattr(route, "dependant", None)
+    return [d.call for d in dep.dependencies] if dep is not None else []
+
+
+def test_keine_zweite_rechtequelle_neben_der_tabelle():
+    """``require_app_inhaber`` darf nicht mehr an /app-Endpunkten haengen.
+
+    Es ist das Rechtebit von vorher (is_default ja/nein) und gewinnt gegen
+    ROUTE_RECHTE, weil es als Dependency vor dem Handler laeuft. Wo beides
+    stand, war die Rechte-Oberflaeche eine Luege: sie zeigte einer
+    Buerokraft "Auftraege anlegen und steuern" als vergeben an, der
+    Endpunkt antwortete trotzdem "Nur der Inhaber darf das."
+
+    Gefunden am 2026-08-19 beim Rollen-Durchlauf, an sieben Endpunkten
+    wirksam und an 31 weiteren latent (jeder Einzelrecht-Override waere
+    wirkungslos geblieben).
+    """
+    from core.security.app_auth import require_app_inhaber
+
+    treffer = sorted({
+        f"{getattr(route.endpoint, '__name__', '?')}  ({route.path})"
+        for route in app.routes
+        if getattr(route, "path", "").startswith("/app")
+        and require_app_inhaber in _dependency_calls(route)
+    })
+    assert not treffer, (
+        "Diese Endpunkte pruefen den Inhaber-Status statt eines Rechts. "
+        "Ersetze Depends(require_app_inhaber) durch "
+        'Depends(require_app_permission("<recht aus ROUTE_RECHTE>")):\n  '
+        + "\n  ".join(treffer)
+    )
+
+
+def test_q_schreibtools_ohne_recht_sind_eine_bewusste_liste():
+    """Q ist der zweite Weg zu denselben Daten.
+
+    Ein schreibendes Tool ohne ``permission`` ist damit ein Weg um das
+    Routen-Gate herum — 2026-08-19 genau so gefunden: ein Monteur konnte
+    per Chat eine Kundenanfrage im Namen des Betriebs beantworten und die
+    Wissensdatenbank aendern, waehrend der Knopf dafuer 403 lieferte.
+
+    Rechtefrei bleiben darf nur, was auch als HTTP-Endpunkt OFFEN steht.
+    Ein neues Write-Tool muss hier bewusst eingetragen werden.
+    """
+    from core.ai.command_center import _REGISTRY
+
+    ohne_recht = sorted(
+        spec.name for spec in _REGISTRY
+        if spec.kind == "write" and not spec.permission
+    )
+    erlaubt = {
+        "termin_anlegen", "termin_stornieren", "termin_verschieben",
+        "rueckruf_anlegen", "rueckruf_erledigt",
+        "material_bestellen",
+        "drive_ordner_anlegen", "drive_notiz_anlegen",
+        "email_schreiben",
+    }
+    neu = sorted(set(ohne_recht) - erlaubt)
+    assert not neu, (
+        "Diese schreibenden Q-Tools tragen kein Recht. Entweder ein "
+        "permission= aus core/features/permissions.py setzen (dasselbe, "
+        "das der zugehoerige HTTP-Endpunkt in ROUTE_RECHTE verlangt), "
+        "oder hier bewusst eintragen:\n  " + "\n  ".join(neu)
+    )

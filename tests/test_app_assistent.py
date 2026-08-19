@@ -197,12 +197,20 @@ def test_beleg_fluss_tools_gating():
     assert "angebot_erstellen" not in names2
     assert "rechnung_abrechnen" not in names2
     assert "anfrage_beantworten" in names2
-    # Monteur (kein Inhaber): keine Angebot/Rechnung-Tools, aber Anfrage-Antwort erlaubt
+    # Monteur (kein Inhaber): weder Angebot/Rechnung noch Anfrage-Antwort.
+    # Der HTTP-Endpunkt api_anfrage_reply verlangt `anfragen.bearbeiten`;
+    # boete Q das Tool trotzdem an, waere der Chat der Weg um das Gate
+    # herum — im Namen des Betriebs eine Kundenmail zu schreiben ist
+    # genau die Sorte Aktion, die dieser Weg nicht aufmachen darf.
     monteur = _ctx(features=("lexware", "mail_intake"), is_inhaber=False)
     names3 = {s.name for s in cc._available_tools(monteur)}
     assert "angebot_erstellen" not in names3
     assert "rechnung_abrechnen" not in names3
-    assert "anfrage_beantworten" in names3
+    assert "anfrage_beantworten" not in names3
+    # Mit dem Recht dagegen schon — Rolle egal, das Recht entscheidet.
+    mit_recht = _ctx(features=("mail_intake",), is_inhaber=False,
+                     permissions={"anfragen.bearbeiten"})
+    assert "anfrage_beantworten" in {s.name for s in cc._available_tools(mit_recht)}
 
 
 # Soll-Bestand der Registry. Bewusst eine Namensmenge statt einer Anzahl:

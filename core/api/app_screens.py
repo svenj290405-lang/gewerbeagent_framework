@@ -70,7 +70,7 @@ from core.security.app_auth import (
     current_tenant_id,
     enforce_app_permission,
     require_app_csrf,
-    require_app_inhaber,
+    require_app_permission,
     require_app_user,
 )
 
@@ -358,7 +358,7 @@ async def api_buchhaltung(request: Request, _e=Depends(require_app_user)) -> JSO
 @router.post("/erinnerung/entwurf")
 async def api_erinnerung_entwurf(
     request: Request,
-    _e=Depends(require_app_inhaber),
+    _e=Depends(require_app_permission("buchhaltung.fuehren")),
     _c=Depends(require_app_csrf),
 ) -> JSONResponse:
     """Formuliert eine Zahlungserinnerung oder ein Angebots-Nachfassen.
@@ -395,7 +395,7 @@ async def api_erinnerung_entwurf(
 @router.post("/erinnerung/senden")
 async def api_erinnerung_senden(
     request: Request,
-    emp: Employee = Depends(require_app_inhaber),
+    emp: Employee = Depends(require_app_permission("buchhaltung.fuehren")),
     _c=Depends(require_app_csrf),
 ) -> JSONResponse:
     """Verschickt den freigegebenen Erinnerungs-/Nachfass-Text per Mail."""
@@ -654,13 +654,14 @@ async def api_auftraege_historie(
 async def api_auftrag_status(
     angebot_id: str,
     request: Request,
-    _e=Depends(require_app_inhaber),
+    _e=Depends(require_app_permission("auftraege.fuehren")),
     _c=Depends(require_app_csrf),
 ) -> JSONResponse:
     """Setzt den Auftrags-Status (reines DB-Update, spiegelt
     _handle_auftrag_callback). Erlaubt: accepted, arbeit_laeuft,
     arbeit_fertig, abgebrochen. ``rechnung_gesendet`` ist ausgeschlossen
-    (Geld-Pfad, siehe _AUFTRAG_SETTABLE). Inhaber-only, CSRF, harte
+    (Geld-Pfad, siehe _AUFTRAG_SETTABLE). Braucht `auftraege.fuehren`,
+    CSRF, harte
     Tenant-Isolation."""
     tid = current_tenant_id(request)
     try:
@@ -698,14 +699,14 @@ _AUFTRAG_MAX_POSITIONEN = 50
 @router.post("/auftraege/neu")
 async def api_auftrag_neu(
     request: Request,
-    _e=Depends(require_app_inhaber),
+    _e=Depends(require_app_permission("auftraege.fuehren")),
     _c=Depends(require_app_csrf),
 ) -> JSONResponse:
     """Legt einen Auftrag von Hand an — fuer Arbeit, die nie durch die
     Angebots-Pipeline lief (Telefon, Baustelle, Stammkunde).
 
     Ohne Lexware-Angebot; die Rechnung entsteht am Ende des Flows aus den
-    Positionen. Inhaber-only, CSRF, tenant-gescoped."""
+    Positionen. Braucht `auftraege.fuehren`, CSRF, tenant-gescoped."""
     tid = current_tenant_id(request)
     try:
         body = await request.json()
@@ -1302,10 +1303,11 @@ async def api_auftragsprozess(
 @router.post("/auftragsprozess")
 async def api_auftragsprozess_speichern(
     request: Request,
-    _e=Depends(require_app_inhaber),
+    _e=Depends(require_app_permission("auftraege.fuehren")),
     _c=Depends(require_app_csrf),
 ) -> JSONResponse:
-    """Speichert die eigenen Zwischenschritte. Inhaber-only — der Prozess
+    """Speichert die eigenen Zwischenschritte. Braucht `auftraege.fuehren` —
+    der Prozess
     gilt fuer den ganzen Betrieb."""
     from core.services.auftrag_prozess import ProzessFehler, speichere_prozess
 
@@ -1332,7 +1334,7 @@ _RECHNUNG_DEFAULT_ANSCHREIBEN = (
 
 @router.get("/rechnung/vorbereiten")
 async def api_rechnung_vorbereiten(
-    request: Request, _e=Depends(require_app_inhaber),
+    request: Request, _e=Depends(require_app_permission("buchhaltung.fuehren")),
 ) -> JSONResponse:
     """Baut die Rechnungs-Vorschau eines fertigen Auftrags (Positionen +
     Betrag) und generiert ein KI-Anschreiben — beides wird in Q angezeigt und
@@ -1404,7 +1406,7 @@ async def api_rechnung_vorbereiten(
 @router.post("/rechnung/senden")
 async def api_q_rechnung_senden(
     request: Request,
-    _e=Depends(require_app_inhaber),
+    _e=Depends(require_app_permission("buchhaltung.fuehren")),
     _c=Depends(require_app_csrf),
 ) -> JSONResponse:
     """Finalisiert die Rechnung in Lexware (mit ggf. editiertem Anschreiben)
@@ -1504,7 +1506,7 @@ async def _get_employee_by_slug(tid: uuid.UUID, slug: str) -> Employee | None:
 async def api_team_set_active(
     slug: str,
     request: Request,
-    _e=Depends(require_app_inhaber),
+    _e=Depends(require_app_permission("team.fuehren")),
     _c=Depends(require_app_csrf),
 ) -> JSONResponse:
     """Mitarbeiter aktivieren/deaktivieren (Inhaber-only). Der Inhaber-
@@ -1533,7 +1535,7 @@ async def api_team_set_active(
 async def api_team_set_profile(
     slug: str,
     request: Request,
-    _e=Depends(require_app_inhaber),
+    _e=Depends(require_app_permission("team.fuehren")),
     _c=Depends(require_app_csrf),
 ) -> JSONResponse:
     """Job-Titel und/oder Skills setzen (Inhaber-only)."""
@@ -1570,7 +1572,7 @@ async def api_team_set_profile(
 async def api_team_rechte(
     slug: str,
     request: Request,
-    _e=Depends(require_app_inhaber),
+    _e=Depends(require_app_permission("team.rechte")),
 ) -> JSONResponse:
     """Rolle + effektive Rechte eines Mitarbeiters, inkl. Herkunft."""
     from core.features.permission_check import (
@@ -1626,7 +1628,7 @@ async def api_team_rechte(
 async def api_team_set_rolle(
     slug: str,
     request: Request,
-    _e=Depends(require_app_inhaber),
+    _e=Depends(require_app_permission("team.rechte")),
     _c=Depends(require_app_csrf),
 ) -> JSONResponse:
     """Rollen-Vorlage eines Mitarbeiters setzen."""
@@ -1673,7 +1675,7 @@ async def api_team_set_rolle(
 async def api_team_set_recht(
     slug: str,
     request: Request,
-    _e=Depends(require_app_inhaber),
+    _e=Depends(require_app_permission("team.rechte")),
     _c=Depends(require_app_csrf),
 ) -> JSONResponse:
     """Einzelnes Recht abweichend setzen.
@@ -3250,7 +3252,7 @@ async def api_kunde_profil(
 @router.post("/kunden/merge")
 async def api_kunden_merge(
     request: Request,
-    _e=Depends(require_app_inhaber),
+    _e=Depends(require_app_permission("kunden.pflegen")),
     _c=Depends(require_app_csrf),
 ) -> JSONResponse:
     """Zusammenfuehren-Karte im Kundenprofil: die Quelle geht im Ziel
@@ -3258,7 +3260,7 @@ async def api_kunden_merge(
     core/services/kunde_merge.py — dieselben Regeln wie das CLI-Skript
     scripts/merge_kunden.py (additive-only, Ref-Konflikte brechen ab).
 
-    Inhaber-only: das Zusammenfuehren ist praktisch nicht rueckgaengig
+    Braucht `kunden.pflegen`: das Zusammenfuehren ist praktisch nicht rueckgaengig
     zu machen und gehoert nicht in die Monteur-Sicht.
     """
     from core.models import Kunde
@@ -3611,7 +3613,7 @@ async def api_wissen_add(
 @router.post("/wissen/{wid}/loeschen")
 async def api_wissen_delete(
     wid: str, request: Request,
-    _e=Depends(require_app_inhaber), _c=Depends(require_app_csrf),
+    _e=Depends(require_app_permission("wissen.pflegen")), _c=Depends(require_app_csrf),
 ) -> JSONResponse:
     tid = current_tenant_id(request)
     try:
@@ -3866,7 +3868,7 @@ async def api_angebot_extrahieren(
 @router.post("/angebote/anlegen")
 async def api_angebot_anlegen(
     request: Request,
-    _e=Depends(require_app_inhaber),
+    _e=Depends(require_app_permission("buchhaltung.fuehren")),
     _c=Depends(require_app_csrf),
 ) -> JSONResponse:
     """Legt Angebot + Positionen in DB an UND erstellt ein Lexware-Draft.
@@ -3891,7 +3893,7 @@ async def api_angebot_anlegen(
 @router.post("/angebote/{angebot_id}/senden")
 async def api_angebot_senden(
     angebot_id: str, request: Request,
-    _e=Depends(require_app_inhaber),
+    _e=Depends(require_app_permission("buchhaltung.fuehren")),
     _c=Depends(require_app_csrf),
 ) -> JSONResponse:
     """Verschickt Angebot per Mail an den Kunden. Delegiert an
@@ -3945,7 +3947,7 @@ async def api_rechnung_extrahieren(
 @router.post("/rechnungen/anlegen")
 async def api_rechnung_anlegen(
     request: Request,
-    _e=Depends(require_app_inhaber),
+    _e=Depends(require_app_permission("buchhaltung.fuehren")),
     _c=Depends(require_app_csrf),
 ) -> JSONResponse:
     """Legt eine Rechnung in der DB an UND erstellt ein Lexware-Draft.
@@ -3972,7 +3974,7 @@ async def api_rechnung_anlegen(
 @router.post("/rechnungen/{rechnung_id}/senden")
 async def api_rechnung_senden(
     rechnung_id: str, request: Request,
-    _e=Depends(require_app_inhaber),
+    _e=Depends(require_app_permission("buchhaltung.fuehren")),
     _c=Depends(require_app_csrf),
 ) -> JSONResponse:
     """Wichtig: send_rechnung_to_customer erwartet eine Lexware-Rechnung die
@@ -4303,7 +4305,7 @@ async def api_beleg_upload(
 @router.post("/rechnungen/pruefen")
 async def api_rechnungen_pruefen(
     request: Request,
-    _e=Depends(require_app_inhaber),
+    _e=Depends(require_app_permission("buchhaltung.fuehren")),
     _c=Depends(require_app_csrf),
 ) -> JSONResponse:
     """Gleicht den Bezahl-Status offener Rechnungen mit Lexware ab (spiegelt
@@ -4355,10 +4357,11 @@ async def api_material_list(
 @router.post("/material/anlegen")
 async def api_material_anlegen(
     request: Request,
-    _e=Depends(require_app_inhaber),
+    _e=Depends(require_app_permission("material.verwalten")),
     _c=Depends(require_app_csrf),
 ) -> JSONResponse:
-    """Inhaber legt ein neues Material an. slug-Eindeutigkeit pro Tenant.
+    """Legt ein neues Material an (Recht `material.verwalten`).
+    slug-Eindeutigkeit pro Tenant.
 
     Body: { name, bestell_link, lieferant?, einheit?, standard_menge?, notes? }
     """
@@ -4406,7 +4409,7 @@ async def api_material_anlegen(
 @router.post("/material/{mid}/toggle")
 async def api_material_toggle(
     mid: str, request: Request,
-    _e=Depends(require_app_inhaber),
+    _e=Depends(require_app_permission("material.verwalten")),
     _c=Depends(require_app_csrf),
 ) -> JSONResponse:
     """Toggelt aktiv-Flag. Material wird nicht geloescht — bleibt als
@@ -4526,7 +4529,7 @@ async def api_material_bestellungen(
 @router.post("/team/{slug}/abwesenheit")
 async def api_team_abwesenheit(
     slug: str, request: Request,
-    _e=Depends(require_app_inhaber),
+    _e=Depends(require_app_permission("team.fuehren")),
     _c=Depends(require_app_csrf),
 ) -> JSONResponse:
     """Inhaber meldet einen Mitarbeiter krank / im Urlaub. Spiegel der
@@ -4583,7 +4586,7 @@ async def api_team_abwesenheit(
 @router.post("/team/{slug}/zurueck")
 async def api_team_zurueck(
     slug: str, request: Request,
-    _e=Depends(require_app_inhaber),
+    _e=Depends(require_app_permission("team.fuehren")),
     _c=Depends(require_app_csrf),
 ) -> JSONResponse:
     """Beendet die aktive Abwesenheit eines Mitarbeiters mit heutigem Datum.
@@ -4647,7 +4650,7 @@ async def api_einstellungen_get(
 @router.post("/einstellungen")
 async def api_einstellungen_set(
     request: Request,
-    _e=Depends(require_app_inhaber),
+    _e=Depends(require_app_permission("einstellungen.verwalten")),
     _c=Depends(require_app_csrf),
 ) -> JSONResponse:
     """Schreibt nur die Felder die fuer den Inhaber im Self-Service Sinn
@@ -4746,7 +4749,7 @@ async def api_automatisierung_get(
 @router.post("/automatisierung")
 async def api_automatisierung_set(
     request: Request,
-    _e=Depends(require_app_inhaber),
+    _e=Depends(require_app_permission("einstellungen.verwalten")),
     _c=Depends(require_app_csrf),
 ) -> JSONResponse:
     """Setzt die Stufe einer Automatisierung.
@@ -4843,7 +4846,7 @@ def _normalize_website_url(raw: str) -> str | None:
 @router.post("/branding/logo")
 async def api_branding_logo_upload(
     request: Request,
-    _e=Depends(require_app_inhaber),
+    _e=Depends(require_app_permission("einstellungen.verwalten")),
     _c=Depends(require_app_csrf),
 ) -> JSONResponse:
     """Firmenlogo hochladen. Roh-Bytes im Body, Format wird an den Magic
@@ -4880,7 +4883,7 @@ async def api_branding_logo_upload(
 @router.delete("/branding/logo")
 async def api_branding_logo_delete(
     request: Request,
-    _e=Depends(require_app_inhaber),
+    _e=Depends(require_app_permission("einstellungen.verwalten")),
     _c=Depends(require_app_csrf),
 ) -> JSONResponse:
     """Logo entfernen. Inhaber-only."""
@@ -5006,7 +5009,7 @@ async def _verbindungen_status(tid: uuid.UUID, employee_id: uuid.UUID) -> dict:
 
 @router.get("/verbindungen")
 async def api_verbindungen_get(
-    request: Request, _e=Depends(require_app_inhaber),
+    request: Request, _e=Depends(require_app_permission("einstellungen.verwalten")),
 ) -> JSONResponse:
     """Verbindungs-Status (Google/Microsoft/Lexware) — nur Inhaber."""
     tid = current_tenant_id(request)
@@ -5017,7 +5020,7 @@ async def api_verbindungen_get(
 @router.post("/oauth/start")
 async def api_oauth_start(
     request: Request,
-    _e=Depends(require_app_inhaber),
+    _e=Depends(require_app_permission("einstellungen.verwalten")),
     _c=Depends(require_app_csrf),
 ) -> JSONResponse:
     """Startet einen OAuth-Flow aus der App heraus. Liefert die Authorize-
@@ -5033,9 +5036,9 @@ async def api_oauth_start(
     tenant = request.state.app_tenant
     emp = request.state.app_employee
     try:
-        # allow_rebind=True: dieser Pfad ist per require_app_inhaber
-        # authentifiziert — der Inhaber darf auch auf ein anderes Konto
-        # umstellen. Der oeffentliche GET-Einstieg darf das nicht.
+        # allow_rebind=True: dieser Pfad verlangt `einstellungen.verwalten`
+        # — wer den Betrieb konfigurieren darf, darf auch auf ein anderes
+        # Konto umstellen. Der oeffentliche GET-Einstieg darf das nicht.
         auth_url = await generate_auth_url(
             tenant_slug=tenant.slug, provider=provider, employee_slug=emp.slug,
             allow_rebind=True,
@@ -5182,7 +5185,7 @@ async def api_mein_kalender_trennen(
 @router.post("/lexware/verbinden")
 async def api_lexware_verbinden(
     request: Request,
-    _e=Depends(require_app_inhaber),
+    _e=Depends(require_app_permission("einstellungen.verwalten")),
     _c=Depends(require_app_csrf),
 ) -> JSONResponse:
     """Lexware-API-Key entgegennehmen, gegen Lexware live pruefen
@@ -5234,7 +5237,7 @@ async def api_lexware_verbinden(
 @router.post("/verbindungen/trennen")
 async def api_verbindungen_trennen(
     request: Request,
-    _e=Depends(require_app_inhaber),
+    _e=Depends(require_app_permission("einstellungen.verwalten")),
     _c=Depends(require_app_csrf),
 ) -> JSONResponse:
     """Trennt eine Verbindung. Google/Microsoft: Token loeschen (der Lookup
@@ -5399,7 +5402,7 @@ def _normalize_formular_fields(raw_fields: list) -> tuple[list | None, str]:
 
 @router.get("/formulare/{anfrage_typ}")
 async def api_formular_get(
-    anfrage_typ: str, request: Request, _e=Depends(require_app_inhaber),
+    anfrage_typ: str, request: Request, _e=Depends(require_app_permission("einstellungen.verwalten")),
 ) -> JSONResponse:
     """Aktuelles Formular-Schema (Tenant-Override oder Default) + Metadaten
     fuer den Editor. Nur Inhaber, feature-gegated.
@@ -5448,7 +5451,7 @@ async def api_formular_get(
 @router.post("/formulare/{anfrage_typ}")
 async def api_formular_save(
     anfrage_typ: str, request: Request,
-    _e=Depends(require_app_inhaber), _c=Depends(require_app_csrf),
+    _e=Depends(require_app_permission("einstellungen.verwalten")), _c=Depends(require_app_csrf),
 ) -> JSONResponse:
     """Speichert die Formular-Felder. Body: { fields: list, title?, subtitle? }."""
     from core.integrations.anfrage_forms import upsert_tenant_schema
@@ -5481,7 +5484,7 @@ async def api_formular_save(
 @router.post("/formulare/{anfrage_typ}/reset")
 async def api_formular_reset(
     anfrage_typ: str, request: Request,
-    _e=Depends(require_app_inhaber), _c=Depends(require_app_csrf),
+    _e=Depends(require_app_permission("einstellungen.verwalten")), _c=Depends(require_app_csrf),
 ) -> JSONResponse:
     """Setzt das Formular auf den Branchen-Default zurueck (loescht den Tenant-
     Override) und liefert das Default-Schema zum Neu-Rendern zurueck."""
@@ -5507,7 +5510,7 @@ async def api_formular_reset(
 @router.post("/formulare/{anfrage_typ}/vorschau")
 async def api_formular_vorschau(
     anfrage_typ: str, request: Request,
-    _e=Depends(require_app_inhaber), _c=Depends(require_app_csrf),
+    _e=Depends(require_app_permission("einstellungen.verwalten")), _c=Depends(require_app_csrf),
 ) -> JSONResponse:
     """Rendert einen (auch ungespeicherten) Formular-Entwurf als HTML.
 
@@ -5551,7 +5554,7 @@ async def api_formular_vorschau(
 @router.post("/formulare/{anfrage_typ}/q")
 async def api_formular_q(
     anfrage_typ: str, request: Request,
-    _e=Depends(require_app_inhaber), _c=Depends(require_app_csrf),
+    _e=Depends(require_app_permission("einstellungen.verwalten")), _c=Depends(require_app_csrf),
 ) -> JSONResponse:
     """Baut den Formular-Entwurf nach einer Anweisung in Alltagssprache um.
 
@@ -5709,7 +5712,7 @@ async def api_formular_link_generieren(
 @router.post("/team/anlegen")
 async def api_team_anlegen(
     request: Request,
-    _e=Depends(require_app_inhaber),
+    _e=Depends(require_app_permission("team.fuehren")),
     _c=Depends(require_app_csrf),
 ) -> JSONResponse:
     """Inhaber legt einen neuen Employee an + erzeugt einen einmaligen
@@ -6478,7 +6481,7 @@ async def api_diagnose(
 @router.post("/verbindungen/{dienst}/test")
 async def api_verbindung_test(
     dienst: str, request: Request,
-    _e=Depends(require_app_inhaber),
+    _e=Depends(require_app_permission("einstellungen.verwalten")),
     _c=Depends(require_app_csrf),
 ) -> JSONResponse:
     """Live-Test einer eingerichteten Verbindung. Inhaber-only weil

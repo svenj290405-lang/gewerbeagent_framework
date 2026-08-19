@@ -3316,9 +3316,9 @@ const SCREENS = {
       { ico: "📁", label: "Drive-Ordner anlegen", intent: "Ich möchte einen Drive-Ordner für einen Kunden anlegen.", feature: "drive_archiv" },
       { ico: "📝", label: "Notiz in Drive ablegen", intent: "Ich möchte eine Notiz für einen Kunden in Drive ablegen.", feature: "drive_archiv" },
       { ico: "🧰", label: "Material bestellen",  intent: "Ich möchte Material bestellen." },
-      { ico: "📚", label: "Wissen merken",       intent: "Ich möchte mir etwas in der Wissensdatenbank merken." },
+      { ico: "📚", label: "Wissen merken",       intent: "Ich möchte mir etwas in der Wissensdatenbank merken.", perm: "wissen.pflegen" },
       { ico: "🔍", label: "Kunde nachschlagen",  intent: "Ich möchte einen Kunden nachschlagen." },
-      { ico: "✉️", label: "Anfrage beantworten", intent: "Ich möchte eine Kundenanfrage beantworten.",  feature: "mail_intake" },
+      { ico: "✉️", label: "Anfrage beantworten", intent: "Ich möchte eine Kundenanfrage beantworten.",  feature: "mail_intake", perm: "anfragen.bearbeiten" },
       { ico: "📧", label: "E-Mail schreiben",    intent: "Ich möchte eine E-Mail schreiben." },
       { ico: "📄", label: "Angebot erstellen",   intent: "Ich möchte ein Angebot erstellen.",           feature: "lexware", perm: "buchhaltung.fuehren" },
       { ico: "🧾", label: "Rechnung erstellen",  intent: "Ich möchte eine Rechnung schreiben.",          feature: "lexware", perm: "buchhaltung.fuehren" },
@@ -6285,6 +6285,8 @@ async function showAnfrage(id) {
     reasonHtml +
     (d.closed
       ? `<div class="card"><p class="muted">Diese Anfrage ist als erledigt markiert. Antworten ist nicht mehr möglich.</p></div>`
+      : !can("anfragen.bearbeiten")
+      ? `<div class="card"><p class="muted">Antworten darf, wer das Recht „Auf Anfragen antworten“ hat. Der Inhaber kann es freigeben.</p></div>`
       : `<div class="card"><h2>Antworten</h2>
          <textarea id="reply-body" rows="6" placeholder="Schreibe deine Antwort an den Kunden …"
            style="width:100%;padding:12px;border:1px solid var(--line);border-radius:10px;font-size:16px;font-family:inherit"></textarea>

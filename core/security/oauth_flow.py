@@ -174,7 +174,7 @@ def _get_redirect_uri() -> str:
 
 # State-Praefix kodiert, ob dieser Flow eine bestehende, bereits verbundene
 # Kalender-/Mail-Anbindung auf ein ANDERES Konto umbiegen darf. Nur der
-# authentifizierte PWA-Pfad (require_app_inhaber) setzt "r"; der oeffentliche
+# authentifizierte PWA-Pfad (Recht `einstellungen.verwalten`) setzt "r"; der oeffentliche
 # GET /oauth/start (Telegram-Deeplinks, Reauth-Mails) bleibt "n" und kann so
 # eine verbundene Anbindung nicht fremduebernehmen (Confused-Deputy-Schutz).
 _STATE_PREFIX_REBIND = "r"

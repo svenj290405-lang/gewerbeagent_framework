@@ -1883,7 +1883,7 @@ _REGISTRY: list[ToolSpec] = [
 
     # ---- WRITE (Erweiterung) ----
     ToolSpec(
-        name="wissen_merken", kind="write",
+        name="wissen_merken", kind="write", permission="wissen.pflegen",
         description="Speichert eine Information dauerhaft in der "
                     "Wissensdatenbank (z.B. Preis, Regel, Besonderheit).",
         parameters={"type": "OBJECT", "properties": {
@@ -1977,7 +1977,7 @@ _REGISTRY: list[ToolSpec] = [
 
     # ---- WRITE (Telegram-Paritaet) ----
     ToolSpec(
-        name="wissen_loeschen", kind="write",
+        name="wissen_loeschen", kind="write", permission="wissen.pflegen",
         description="Löscht einen Eintrag aus der Wissensdatenbank (per "
                     "Suchtext, nur bei eindeutigem Treffer).",
         parameters={"type": "OBJECT", "properties": {
@@ -2027,6 +2027,7 @@ _REGISTRY: list[ToolSpec] = [
         run=_run_rechnung_abrechnen, summarize=_summary_rechnung_abrechnen),
     ToolSpec(
         name="anfrage_beantworten", kind="write", feature="mail_intake",
+        permission="anfragen.bearbeiten",
         description="Beantwortet eine offene Kundenanfrage per Mail mit dem "
                     "angegebenen Text (RFC-gethreaded).",
         parameters={"type": "OBJECT", "properties": {
