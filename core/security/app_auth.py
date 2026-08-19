@@ -341,17 +341,18 @@ def current_permissions(request: Request) -> frozenset[str]:
     return getattr(request.state, "app_permissions", frozenset())
 
 
-# Trockenlauf-Schalter fuer die Rechte-Durchsetzung.
+# Schalter fuer die Rechte-Durchsetzung.
 #
-# False = es wird nur geloggt, nichts geblockt. So laesst sich in den
-# Logs ablesen, welche Endpunkte die Mitarbeiter real anfassen, BEVOR
-# ihnen etwas weggenommen wird:
+# False = Trockenlauf: es wird nur geloggt, nichts geblockt. Ablesen mit
 #
 #   docker logs gewerbeagent_framework | grep "Recht fehlt" | sort | uniq -c
 #
-# Scharfschalten ist danach diese eine Zeile plus Restart, und der
-# Rueckweg genauso kurz.
-PERMISSIONS_DURCHSETZEN = False
+# Seit 2026-08-19 auf True. Der Trockenlauf hatte keine einzige Zeile
+# geliefert (ausser dem Inhaber war nie jemand eingeloggt), darum ist die
+# Absicherung stattdessen durchgespielt worden: alle 122 Endpunkte gegen
+# alle drei Rollen, dazu die Zeilen-Sichtbarkeit bei Auftraegen und die
+# Q-Tools. Der Rueckweg bleibt diese eine Zeile plus Restart.
+PERMISSIONS_DURCHSETZEN = True
 
 
 async def enforce_app_permission(request: Request) -> None:
