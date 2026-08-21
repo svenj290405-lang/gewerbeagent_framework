@@ -6,8 +6,8 @@ Was es tut:
 - Einmal pro Kalendertag (Europe/Berlin) gegen 18:00 lokal aufwachen
 - Pro Tenant: alle Rechnungen finden mit
     bezahlt_am::date = heute UND paid_notification_sent = false
-- Wenn N>0: einen Telegram-Push an tenant.telegram_chat_id senden
-  ("Heute bezahlt: 3 Rechnungen, gesamt 1.450 EUR")
+- Wenn N>0: einen Web-Push an den Betrieb senden
+  ("Heute bezahlt: 3 Rechnungen" — Betraege/Namen bleiben in der App)
 - Danach paid_notification_sent=true setzen, damit der naechste Lauf
   (auch nach Container-Restart) keine Doppel-Pushes macht
 
@@ -21,8 +21,7 @@ Robust gegen:
 - Container-Restarts (Loop wacht jede Minute kurz auf, prueft ob die
   18:00-Marke heute schon abgearbeitet wurde — siehe last_run-Marker
   in admin_audit_log oder einfacher: paid_notification_sent als Marker)
-- Tenant ohne telegram_chat_id (silent skip)
-- Telegram-Versand fehlgeschlagen (nicht als gesendet markieren →
+- Betrieb ohne Push-Abo (nicht als gesendet markieren →
   beim naechsten Lauf nochmal probieren)
 """
 from __future__ import annotations
@@ -60,42 +59,6 @@ def _format_eur(value: Decimal | None) -> str:
     return f"{parts[0]},{parts[1]}"
 
 
-def _build_summary_text(rows: list) -> str:
-    """rows ist Liste von (kunde_name, betrag_brutto_eur)."""
-    n = len(rows)
-    total = sum((r[1] or Decimal("0") for r in rows), Decimal("0"))
-    msg = f"💰 <b>Heute bezahlt:</b> {n} "
-    msg += "Rechnung\n" if n == 1 else "Rechnungen\n"
-    msg += f"Gesamt: <b>{_format_eur(total)} €</b>\n\n"
-    # Bis zu 10 Rechnungen einzeln zeigen, dann "+ N weitere"
-    for kunde, betrag in rows[:10]:
-        kunde_str = (kunde or "ohne Namen")[:30]
-        msg += f"  • {kunde_str} — {_format_eur(betrag)} €\n"
-    if n > 10:
-        msg += f"  + {n - 10} weitere\n"
-    return msg.strip()
-
-
-async def _send_telegram_to_tenant(tenant_chat_id, text) -> bool:
-    """Schickt eine Nachricht an einen Tenant-Chat. False bei Fehler.
-
-    Wir importieren _send_to_chat aus dem telegram_notify-Plugin lazy,
-    weil core/integrations/* importiert sonst plugins/* (== Layering-
-    Verletzung). Lazy-Import nur in dieser Funktion ist OK.
-    """
-    try:
-        from plugins.telegram_notify.handler import _send_to_chat
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(f"Telegram-Notify-Plugin nicht ladbar: {exc}")
-        return False
-    try:
-        ok = await _send_to_chat(tenant_chat_id, text)
-        return bool(ok)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(f"Telegram-Send fehlgeschlagen: {exc}")
-        return False
-
-
 async def send_summary_for_tenant(
     tenant_id,
     target_date: date,
@@ -125,10 +88,6 @@ async def send_summary_for_tenant(
         if tenant is None:
             summary["skipped"] = "tenant-not-found"
             return summary
-        if not tenant.telegram_chat_id:
-            summary["skipped"] = "no-telegram-chat"
-            return summary
-
         rows = (await session.execute(
             select(
                 Rechnung.id,
@@ -147,19 +106,26 @@ async def send_summary_for_tenant(
         summary["skipped"] = "nothing-paid-today"
         return summary
 
-    payload = [(r[1], r[2]) for r in rows]
     summary["count"] = len(rows)
     summary["total_eur"] = sum(
         (r[2] or Decimal("0") for r in rows), Decimal("0"),
     )
 
-    text = _build_summary_text(payload)
-    sent_ok = await _send_telegram_to_tenant(
-        tenant.telegram_chat_id, text,
-    )
+    # Kundennamen und Betraege bleiben im Server — der Push nennt nur die
+    # Anzahl, die Liste steht in der App unter Buchhaltung.
+    anzahl = len(rows)
+    from core.integrations.notify import notify_tenant
+    sent_ok = bool(await notify_tenant(
+        tenant_id,
+        title="Heute bezahlt",
+        body=(f"{anzahl} Rechnung als bezahlt gebucht — Details in der App."
+              if anzahl == 1 else
+              f"{anzahl} Rechnungen als bezahlt gebucht — Details in der App."),
+        url="/app#buchhaltung", tag="bezahlt",
+    ))
 
     if not sent_ok:
-        summary["skipped"] = "telegram-failed"
+        summary["skipped"] = "push-failed"
         # paid_notification_sent NICHT setzen → naechster Lauf probiert es
         return summary
 

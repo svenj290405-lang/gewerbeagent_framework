@@ -1,6 +1,6 @@
 """App-Account-Modelle — Auth + Web-Push für die Inhaber-/Mitarbeiter-PWA.
 
-Die PWA (``/app``) loest den Telegram-Bot als Bedien-Oberflaeche ab. Die
+Die PWA (``/app``) ist die Bedien-Oberflaeche des Betriebs. Die
 Identitaet ist NICHT ein eigenes Nutzersystem, sondern das bestehende
 ``Employee`` (is_default==True = Inhaber, sonst Mitarbeiter). Diese Tabellen
 haengen daher direkt an ``employees`` — keine parallele User-Tabelle.

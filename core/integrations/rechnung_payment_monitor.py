@@ -10,7 +10,7 @@ Was es tut:
   damit man auch bei "noch offen" sehen kann wann zuletzt geprueft wurde
 
 Was es nicht tut:
-- Es schickt KEINE Telegram-Pushes. Das macht der separate Daily-Summary-Job
+- Es schickt KEINE Pushes. Das macht der separate Daily-Summary-Job
   um 18:00 (rechnung_paid_daily_summary.py).
 - Es traegt nichts in api_usage_log ein. Lexware ist kostenlos
   (Office Plus Flatrate), Tracking lohnt sich nicht.
@@ -57,7 +57,7 @@ async def _build_lexware_provider(tenant_id) -> LexwareProvider | None:
     """Sucht ToolConfig 'lexware', entschluesselt den API-Key, baut Provider.
 
     Identische Logik wie _get_lexware_provider_for_tenant() im
-    telegram_notify-handler — hier dupliziert weil core/integrations/
+    frueheren Bot-Handler — hier dupliziert weil core/integrations/
     keine plugins/* importieren darf (Plugin-Layer ist hoeher).
     """
     async with AsyncSessionLocal() as session:

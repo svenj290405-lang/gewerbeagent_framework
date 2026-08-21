@@ -14,7 +14,7 @@ import uuid
 from enum import Enum
 from typing import TYPE_CHECKING
 
-from sqlalchemy import BigInteger, DateTime, Integer, LargeBinary, Numeric, String
+from sqlalchemy import Integer, LargeBinary, Numeric, String
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -57,11 +57,6 @@ class Tenant(Base):
 
     # Freitext für interne Notizen
     notes: Mapped[str | None] = mapped_column(String(2000), nullable=True)
-
-    # Telegram-Bot-Chat-ID (wird beim Onboarding via QR-Code gesetzt)
-    telegram_chat_id: Mapped[int | None] = mapped_column(
-        BigInteger, nullable=True, index=True
-    )
 
     # Branche fuer Agent-Mapping (tischler, sanitaer, elektrik, ...)
     branche: Mapped[str | None] = mapped_column(
@@ -108,15 +103,6 @@ class Tenant(Base):
         String(20), nullable=False, server_default="pro", default="pro",
     )
 
-    # Onboarding-Wizard im Telegram-Bot — Tutorial-State.
-    # step 0 = nicht angefangen, completed_at != NULL = fertig.
-    # Steuerung in plugins/telegram_notify/handler.py (_onboarding_*).
-    onboarding_step: Mapped[int] = mapped_column(
-        Integer, nullable=False, server_default="0", default=0,
-    )
-    onboarding_completed_at: Mapped[dt.datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True,
-    )
 
     # DSGVO-Retention in Tagen. Steuert dsgvo_cleanup_cron.
     # Range: 7-365 (sanftes Limit im Admin-Form). Default 90.

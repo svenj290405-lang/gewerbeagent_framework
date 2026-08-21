@@ -17,17 +17,16 @@ from fastapi import APIRouter, Depends, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from sqlalchemy import select
 
+from config.settings import settings
 from core.admin.auth import audit, require_admin, require_csrf
 from core.admin.routes import templates  # gemeinsame Jinja2-Instanz
 from core.database import AsyncSessionLocal
 from core.database.connection import get_session
 from core.models.admin import AdminUser
-from core.models import format_short_code
 from core.onboarding import (
     OnboardingError,
     create_owner_activation,
     create_tenant_record,
-    global_bot_username,
     list_available_branches,
 )
 
@@ -53,53 +52,54 @@ async def _load_central_brevo_config() -> dict | None:
         return (tc.config if tc else None) or None
 
 
-def _onboarding_mail_bodies(company: str, contact: str, code: str,
-                            bot_username: str | None,
+def _onboarding_mail_bodies(company: str, contact: str, activate_url: str,
                             sender_name: str) -> tuple[str, str]:
-    """Liefert (html, text) fuer die Begruessungs-Mail — Code-basiert, OHNE
-    Deep-Link (Links sind in Telegram Web unzuverlaessig). Der Kunde sucht
-    den Bot, drueckt START und tippt den kurzen Code."""
-    bot = f"@{bot_username}" if bot_username else "unseren Telegram-Bot"
-    pretty = format_short_code(code)
+    """Liefert (html, text) fuer die Begruessungs-Mail.
+
+    Ein Link in die App: Passwort setzen, fertig eingeloggt. Frueher lief
+    das ueber einen Telegram-Bot und einen kurzen Code — der Bot ist am
+    2026-08-21 aus DSGVO-Gruenden entfallen.
+    """
     html = (
         f"<p>Hallo {contact or 'und herzlich willkommen'},</p>"
-        f"<p>Ihr Zugang fuer <b>{company}</b> ist eingerichtet. Die "
-        "Verbindung laeuft ueber Telegram — die Einrichtung dauert ca. "
-        "5 Minuten.</p>"
+        f"<p>Ihr Zugang fuer <b>{company}</b> ist eingerichtet — die "
+        "Einrichtung dauert ca. 2 Minuten.</p>"
         "<p><b>So geht's:</b></p>"
         "<ol>"
-        "<li>Telegram am Handy oder PC oeffnen.</li>"
-        f"<li>Oben in die <b>Suche</b> <b>{bot}</b> eingeben und den Bot oeffnen.</li>"
-        "<li>Auf <b>START</b> tippen.</li>"
-        "<li>Diesen <b>Aktivierungs-Code</b> eingeben:</li>"
+        "<li>Auf den Knopf unten tippen (am besten am Handy).</li>"
+        "<li>E-Mail bestaetigen und ein Passwort vergeben.</li>"
+        "<li>Fertig — Sie sind sofort in Ihrer App.</li>"
         "</ol>"
-        "<p style=\"font-size:26px;font-weight:700;letter-spacing:2px;"
-        f"font-family:monospace;margin:18px 0\">{pretty}</p>"
-        "<p style=\"color:#666;font-size:13px\">Der Code ist persoenlich, nur "
+        f"<p style=\"margin:22px 0\"><a href=\"{activate_url}\" "
+        "style=\"background:#111;color:#fff;padding:13px 22px;"
+        "border-radius:8px;text-decoration:none;font-weight:600\">"
+        "Zugang einrichten</a></p>"
+        f"<p style=\"color:#666;font-size:13px\">Falls der Knopf nicht geht: "
+        f"<a href=\"{activate_url}\">{activate_url}</a></p>"
+        "<p style=\"color:#666;font-size:13px\">Der Link ist persoenlich, nur "
         "einmal verwendbar und 14 Tage gueltig. Bitte nicht weitergeben.</p>"
         f"<p>Viele Gruesse<br>{sender_name}</p>"
     )
     text = (
         f"Hallo {contact or ''},\n\n"
-        f"Ihr Zugang fuer {company} ist eingerichtet. Die Verbindung laeuft "
-        "ueber Telegram, die Einrichtung dauert ca. 5 Minuten.\n\n"
-        "1. Telegram oeffnen.\n"
-        f"2. In der Suche {bot} eingeben und den Bot oeffnen.\n"
-        "3. Auf START tippen.\n"
-        f"4. Diesen Aktivierungs-Code eingeben: {pretty}\n\n"
-        "Der Code ist persoenlich, nur einmal verwendbar und 14 Tage "
+        f"Ihr Zugang fuer {company} ist eingerichtet — die Einrichtung "
+        "dauert ca. 2 Minuten.\n\n"
+        "1. Diesen Link oeffnen (am besten am Handy):\n"
+        f"   {activate_url}\n"
+        "2. E-Mail bestaetigen und ein Passwort vergeben.\n"
+        "3. Fertig — Sie sind sofort in Ihrer App.\n\n"
+        "Der Link ist persoenlich, nur einmal verwendbar und 14 Tage "
         f"gueltig. Bitte nicht weitergeben.\n\nViele Gruesse\n{sender_name}"
     )
     return html, text
 
 
 async def _send_onboarding_mail(*, to_email: str, to_name: str,
-                                company: str, code: str,
-                                bot_username: str | None) -> None:
-    """Schickt die Begruessungs-Mail mit dem Aktivierungs-Code.
+                                company: str, activate_url: str) -> None:
+    """Schickt die Begruessungs-Mail mit dem Aktivierungs-Link.
 
     Wirft eine Exception bei Fehler — der Aufrufer faengt sie und meldet,
-    dass der Tenant zwar angelegt, die Mail aber nicht raus ist (der Code
+    dass der Tenant zwar angelegt, die Mail aber nicht raus ist (der Link
     wird im Admin-Ergebnis trotzdem angezeigt und kann manuell geschickt
     werden).
     """
@@ -130,12 +130,12 @@ async def _send_onboarding_mail(*, to_email: str, to_name: str,
         gid, eid = gt.id, tok.employee_id
 
     html, _text = _onboarding_mail_bodies(
-        company, to_name, code, bot_username, "Gewerbeagent",
+        company, to_name, activate_url, "Gewerbeagent",
     )
     res = await send_tracked_mail(
         tenant_id=gid,
         to_email=to_email,
-        subject="Ihr Zugang zu Gewerbeagent — Einrichtung in 5 Minuten",
+        subject="Ihr Zugang zu Gewerbeagent — Einrichtung in 2 Minuten",
         body_html=html,
         employee_id=eid,
     )
@@ -192,20 +192,21 @@ async def tenant_new_submit(
             f"/admin/tenants/new?err={quote(str(e))}", status_code=303,
         )
 
-    # Sicheren Aktivierungs-Token (mit kurzem Code) erzeugen.
+    # Sicheren Aktivierungs-Token erzeugen.
     token_obj = None
-    code_pretty: str | None = None
     try:
         token_obj = await create_owner_activation(
             result.tenant_id, result.default_employee_id,
         )
-        code_pretty = format_short_code(token_obj.short_code)
     except Exception:
         logger.exception("Aktivierungs-Token-Erzeugung fehlgeschlagen")
 
-    bot_username = await global_bot_username()
+    activate_url = (
+        f"{settings.app_url}/app/activate?token={token_obj.token}"
+        if token_obj is not None else ""
+    )
 
-    # Optional: Code-Mail an den Kunden (ohne Deep-Link).
+    # Optional: Einladungs-Mail an den Kunden.
     mail_note = ""
     if (send_mail or "").strip() and token_obj is not None:
         try:
@@ -213,15 +214,14 @@ async def tenant_new_submit(
                 to_email=contact_email.strip(),
                 to_name=contact_name.strip(),
                 company=company_name.strip(),
-                code=token_obj.short_code,
-                bot_username=bot_username,
+                activate_url=activate_url,
             )
             mail_note = f"Begruessungs-Mail an {contact_email.strip()} verschickt."
         except Exception as e:
             logger.exception("Onboarding-Mail-Versand fehlgeschlagen")
             mail_note = (
                 f"ACHTUNG: Mail-Versand fehlgeschlagen ({e}). "
-                "Code bitte manuell schicken."
+                "Link bitte manuell schicken."
             )
 
     # Audit-Eintrag.
@@ -235,7 +235,7 @@ async def tenant_new_submit(
             details={
                 "company": company_name.strip(),
                 "mailed": bool(mail_note and "fehlgeschlagen" not in mail_note),
-                "code_ok": bool(code_pretty),
+                "link_ok": bool(token_obj),
             },
         )
         await s.commit()
@@ -245,14 +245,10 @@ async def tenant_new_submit(
     parts = [f"Betrieb '{slug.strip().lower()}' angelegt."]
     if mail_note:
         parts.append(mail_note)
-    if code_pretty:
-        bot = f"@{bot_username}" if bot_username else "den Bot"
-        parts.append(
-            f"Aktivierungs-Code: {code_pretty}  ({bot} in Telegram suchen "
-            "→ START → Code eingeben)"
-        )
+    if activate_url:
+        parts.append(f"Aktivierungs-Link: {activate_url}")
     else:
-        parts.append("ACHTUNG: Aktivierungs-Code konnte nicht erzeugt werden.")
+        parts.append("ACHTUNG: Aktivierungs-Link konnte nicht erzeugt werden.")
     return RedirectResponse(
         f"/admin/tenants/new?msg={quote('  ·  '.join(parts))}",
         status_code=303,

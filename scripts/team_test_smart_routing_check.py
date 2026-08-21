@@ -42,7 +42,6 @@ async def main():
                     tenant_id=tid, slug=slug, name=name, is_default=False,
                     is_active=True, skills=skills,
                     calendar_provider=None, calendar_id=None,
-                    telegram_chat_id=None,
                 ))
         await s.commit()
 

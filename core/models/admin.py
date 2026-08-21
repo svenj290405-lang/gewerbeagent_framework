@@ -145,7 +145,6 @@ PROVIDER_SIPGATE = "sipgate"
 PROVIDER_MICROSOFT = "microsoft"
 PROVIDER_BREVO = "brevo"
 PROVIDER_LEXWARE = "lexware"
-PROVIDER_TELEGRAM = "telegram"
 
 
 class ApiPricingConfig(Base):
@@ -245,5 +244,4 @@ __all__ = [
     "PROVIDER_MICROSOFT",
     "PROVIDER_BREVO",
     "PROVIDER_LEXWARE",
-    "PROVIDER_TELEGRAM",
 ]

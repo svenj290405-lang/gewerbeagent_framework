@@ -86,7 +86,7 @@ def init_sentry() -> bool:
 def _scrub_sensitive_event(event: dict, hint: dict) -> dict | None:
     """before_send-Hook: scrubbt sensible Felder aus dem Event.
 
-    - Headers: Authorization, Cookie, X-Telegram-Bot-Api-Secret-Token
+    - Headers: Authorization, Cookie, ElevenLabs-Signature
     - QueryParams: code, state, token, password
     - Form: api_key, password, token
 
@@ -95,8 +95,8 @@ def _scrub_sensitive_event(event: dict, hint: dict) -> dict | None:
     request = event.get("request") or {}
     headers = request.get("headers") or {}
     for sensitive in (
-        "authorization", "cookie", "x-telegram-bot-api-secret-token",
-        "elevenlabs-signature", "x-webhook-secret",
+        "authorization", "cookie", "elevenlabs-signature",
+        "x-webhook-secret",
     ):
         for key in list(headers.keys()):
             if key.lower() == sensitive:

@@ -396,7 +396,7 @@ class Plugin(BasePlugin):
         # Raw-Body im 'ElevenLabs-Signature'-Header, wenn beim Webhook-Setup
         # ein Secret gesetzt wurde. Ohne Verifikation kann jeder gefakete
         # Anrufe einschmuggeln (Lexware-Kontakte unter falschen Tenants
-        # anlegen, Telegram-Pushes ausloesen).
+        # anlegen, Pushes ausloesen).
         # Hinweis: wir haben hier nur das geparste Payload, nicht den Raw-
         # Body — strenge HMAC-Verifizierung wuerde einen Raw-Body-Hook im
         # zentralen Dispatcher brauchen. Pragmatischer Mittelweg: Secret
@@ -405,7 +405,7 @@ class Plugin(BasePlugin):
         expected = (settings.elevenlabs_webhook_secret or "").strip()
         # Production-Hard-Veto: ohne gesetztes Secret ist der Webhook offen
         # — jeder koennte gefakete Anrufe einschmuggeln (Termine buchen/
-        # stornieren, Lexware-Kontakte anlegen, Telegram-Pushes faken) und
+        # stornieren, Lexware-Kontakte anlegen, Pushes faken) und
         # via Payload-`tenant_slug` sogar fuer fremde Betriebe. Lieber
         # fail-closed (Voice abgelehnt) als offen. In Dev bleibt es offen
         # fuer lokales Testen.
@@ -1335,7 +1335,7 @@ class Plugin(BasePlugin):
                 pass
         result = await kalender.on_webhook("cancel_appointment", cancel_payload)
 
-        # Benachrichtigung an den zustaendigen Mitarbeiter (Push + Telegram)
+        # Benachrichtigung an den zustaendigen Mitarbeiter
         # (silent fail; loggen aber blockieren nie das Storno-Response).
         try:
             from core.integrations.notify import notify_employee
@@ -1345,19 +1345,11 @@ class Plugin(BasePlugin):
                     emp_uuid = UUID(employee_id_str)
                 except (ValueError, TypeError):
                     emp_uuid = None
-            bestaetigung = (payload.get("kunde_bestaetigung_text") or "").strip()
-            push = (
-                "🚫 <b>Termin storniert (telefonisch)</b>\n"
-                f"<b>Event:</b> <code>{event_id[:12]}…</code>"
-            )
-            if bestaetigung:
-                push += f"\n<b>Aussage Kunde:</b> {bestaetigung}"
             await notify_employee(
                 tenant.id, emp_uuid,
                 title="Termin telefonisch storniert",
                 body="In der App ansehen.",
                 url="/app#termine", tag="storno",
-                telegram_text=push,
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"storniere_termin push failed: {exc}")
@@ -1371,7 +1363,7 @@ class Plugin(BasePlugin):
         # Nur wenn Cancel erfolgreich UND wir die Mail-Adresse aus einer
         # frueheren EmailConversation auflosen koennen (via gcal_event_id).
         # Voice-only Kunden ohne Mail-Adresse zur Buchzeit kriegen keine
-        # Mail — Telegram-Push an MA hat aber schon stattgefunden.
+        # Mail — der Push an den Mitarbeiter ist aber schon raus.
         if isinstance(result, dict) and result.get("erfolg"):
             await self._send_voice_storno_confirmation_mail(
                 tenant=tenant, event_id=event_id, employee_id=emp_uuid,
@@ -1463,7 +1455,7 @@ class Plugin(BasePlugin):
             "tenant_slug": "demo"
           }
 
-        Sucht/legt Kontakt in Lexware an + pingt Tenant via Telegram.
+        Sucht/legt Kontakt in Lexware an + benachrichtigt den Betrieb.
         """
         name = (payload.get("name") or "").strip()
         phone = (payload.get("phone") or "").strip() or None
@@ -1494,17 +1486,15 @@ class Plugin(BasePlugin):
                 f"save_contact: leerer Anruf erkannt name={name!r} - "
                 f"kein Lexware-Eintrag, nur Hinweis-Push"
             )
-            # Tenant-Telegram nachschlagen
             async with AsyncSessionLocal() as s:
                 t = (await s.execute(
                     select(Tenant).where(Tenant.slug == tenant_slug)
                 )).scalar_one_or_none()
-                tg_chat = t.telegram_chat_id if t else None
-            if tg_chat:
-                await self._push_to_tenant(
-                    tg_chat,
-                    f"📞 <b>Kurzer Anruf</b> — Anrufer ohne Anliegen "
-                    f"(Name: {name!r}). Kein Lexware-Eintrag angelegt.",
+            if t is not None:
+                await self._warn_tenant(
+                    t.id, "Kurzer Anruf",
+                    "Anrufer ohne Anliegen — kein Kontakt angelegt.",
+                    url="/app#aufnahmen",
                 )
             return {"success": True, "skipped": True, "reason": "suspicious-name"}
 
@@ -1517,7 +1507,6 @@ class Plugin(BasePlugin):
                 logger.warning(f"save_contact: Tenant {tenant_slug!r} nicht gefunden")
                 return {"success": False, "error": f"Tenant {tenant_slug} unbekannt"}
             tenant_id = tenant.id
-            tenant_telegram = tenant.telegram_chat_id
             tenant_company_name = tenant.company_name
             tenant_contact_name = tenant.contact_name
             tenant_contact_email = tenant.contact_email
@@ -1528,11 +1517,10 @@ class Plugin(BasePlugin):
         provider = await self._get_lexware_provider(tenant_id)
         if provider is None:
             logger.warning(f"save_contact: Lexware nicht verbunden fuer Tenant {tenant_slug}")
-            await self._push_to_tenant(
-                tenant_telegram,
-                f"⚠️ <b>Voice-Anruf:</b> Kontakt erfasst, aber Lexware nicht "
-                f"verbunden. Bitte /lexware_setup ausfuehren.\n\n"
-                f"Daten: {name}, {phone or 'kein Tel.'}, {email or 'keine Mail'}",
+            await self._warn_tenant(
+                tenant_id, "Anruf erfasst — Lexware fehlt",
+                "Der Kontakt ist vorgemerkt, aber Lexware ist nicht "
+                "verbunden. Bitte in der App verbinden.",
             )
             return {"success": True, "message": "Kontakt vorgemerkt, Lexware fehlt"}
 
@@ -1591,12 +1579,11 @@ class Plugin(BasePlugin):
         # Anfrage-Formular-Mail an den Kunden (nur wenn eine E-Mail vorliegt).
         # Der Kontakt ist an dieser Stelle bereits in Lexware gespeichert —
         # ein Mail-Fehler darf das nicht ruecksetzen, er loest nur eine
-        # Telegram-Warnung an den Inhaber aus.
+        # Warnung an den Inhaber aus.
         mail_status = "skipped-no-email"
         if email:
             mail_status = await self._send_anfrage_mail(
                 tenant_id=tenant_id,
-                tenant_telegram=tenant_telegram,
                 company_name=tenant_company_name,
                 contact_name=tenant_contact_name,
                 contact_email=tenant_contact_email,
@@ -1622,30 +1609,15 @@ class Plugin(BasePlugin):
         except Exception as e:
             logger.warning(f"save_contact: choose_employee crashed: {e}")
 
-        # Tenant/Mitarbeiter per Telegram informieren — alle User-Inputs
-        # HTML-escapen, weil parse_mode=HTML in Telegram. Sonst koennte ein
-        # Anrufer mit praepariertem Namen/Anliegen in fremde Bot-Antworten
-        # injizieren.
-        from html import escape as _h
-        anliegen_str = f"\n<b>Anliegen:</b> {_h(anliegen)}" if anliegen else ""
-        phone_str = f"\n<b>Telefon:</b> <code>{_h(phone)}</code>" if phone else ""
-        email_str = f"\n<b>Mail:</b> <code>{_h(email)}</code>" if email else ""
-        deeplink = f"https://app.lexware.de/permalink/contacts/edit/{contact.contact_id}"
-        msg = (
-            f"☎️ <b>Neuer Anruf - Kontakt {action}</b>\n\n"
-            f"<b>Name:</b> {_h(name)}"
-            f"{phone_str}"
-            f"{email_str}"
-            f"{anliegen_str}\n\n"
-            f'<a href="{deeplink}">In Lexware oeffnen</a>'
-        )
+        # Zustaendigen Mitarbeiter informieren. Name/Telefon/Anliegen des
+        # Anrufers bleiben draussen — der Push laeuft ueber FCM/APNs, die
+        # Details holt die App vom EU-Server.
         from core.integrations.notify import notify_employee
         await notify_employee(
             tenant_id, routing.employee_id if routing else None,
             title="Neuer Anruf",
             body=f"Kontakt {action} — Details in der App.",
             url="/app#aufnahmen", tag="anruf",
-            telegram_text=msg,
         )
 
         return {
@@ -1753,35 +1725,9 @@ class Plugin(BasePlugin):
             f"assigned={assigned_employee_id}"
         )
 
-        # Telegram-Push an den zustaendigen Mitarbeiter. Alle User-Inputs
-        # HTML-escapen (parse_mode=HTML) — sonst koennte ein Anrufer mit
-        # praepariertem Namen/Anliegen Markup einschleusen.
-        from html import escape as _h
-        from zoneinfo import ZoneInfo
-        try:
-            now_local = datetime.now(ZoneInfo("Europe/Berlin"))
-        except Exception:
-            now_local = datetime.now(timezone.utc)
-        eingegangen = now_local.strftime("%d.%m.%Y %H:%M")
-        email_str = (
-            f"\n<b>Mail:</b> <code>{_h(kunde_email)}</code>" if kunde_email else ""
-        )
-        msg = (
-            f"📞 <b>Rückrufbitte</b>\n\n"
-            f"<b>{_h(kunde_name)}</b> bittet um Rückruf unter "
-            f"<code>{_h(kunde_telefon)}</code>."
-            f"{email_str}\n"
-            f"<b>Anliegen:</b> {_h(anliegen)}\n"
-            f"<b>Eingegangen:</b> {eingegangen}"
-        )
-        keyboard = {
-            "inline_keyboard": [[
-                {
-                    "text": "✅ Erledigt",
-                    "callback_data": f"rueckruf:erledigt:{rueckruf_id}",
-                }
-            ]]
-        }
+        # Push an den zustaendigen Mitarbeiter. Das Abhaken passiert in der
+        # App (Deeplink /app#rueckrufe) — der frueher mitgeschickte
+        # "Erledigt"-Knopf war eine Inline-Tastatur des alten Bots.
         try:
             from core.integrations.notify import notify_employee
             await notify_employee(
@@ -1789,8 +1735,6 @@ class Plugin(BasePlugin):
                 title="Rückrufbitte",
                 body="Ein Kunde bittet um Rückruf — in der App ansehen.",
                 url="/app#rueckrufe", tag="rueckruf",
-                telegram_text=msg,
-                telegram_keyboard=keyboard,
             )
         except Exception as e:
             logger.exception(f"rueckruf: Push fehlgeschlagen: {e}")
@@ -1804,7 +1748,7 @@ class Plugin(BasePlugin):
         }
 
     async def _send_anfrage_mail(
-        self, *, tenant_id, tenant_telegram, company_name, contact_name,
+        self, *, tenant_id, company_name, contact_name,
         contact_email, contact_phone, branche, kunde_name, kunde_email,
         anliegen, kunde_telefon=None,
     ):
@@ -1812,7 +1756,7 @@ class Plugin(BasePlugin):
 
         Laeuft erst nach erfolgreichem Lexware-Upsert. Bei jedem Fehler
         (Token, Rendering, Versand) bleibt der Kontakt gespeichert; der
-        Inhaber bekommt eine Telegram-Warnung zum manuellen Nachfassen.
+        Inhaber bekommt einen Warn-Push zum manuellen Nachfassen.
 
         Returns einen Status-String fuers Logging/Response:
         'sent' | 'send-failed' | 'error'.
@@ -1878,21 +1822,21 @@ class Plugin(BasePlugin):
             logger.warning(
                 f"save_contact: Anfrage-Mail an {kunde_email} fehlgeschlagen"
             )
-            await self._push_to_tenant(
-                tenant_telegram,
-                f"⚠️ <b>Voice-Anruf:</b> Kontakt gespeichert, aber die "
-                f"Anfrage-Mail an <code>{_h(kunde_email)}</code> konnte "
-                f"nicht gesendet werden. Bitte manuell nachfassen.",
+            await self._warn_tenant(
+                tenant_id, "Anfrage-Mail nicht zugestellt",
+                "Der Kontakt ist gespeichert, die Anfrage-Mail ging nicht "
+                "raus. Bitte in der App nachfassen.",
+                url="/app#aktuelles",
             )
             return "send-failed"
         except Exception as e:
             logger.exception(f"save_contact: Anfrage-Mail-Fehler: {e}")
             try:
-                await self._push_to_tenant(
-                    tenant_telegram,
-                    "⚠️ <b>Voice-Anruf:</b> Kontakt gespeichert, aber beim "
-                    "Versand der Anfrage-Mail gab es einen Fehler. Bitte "
-                    "manuell nachfassen.",
+                await self._warn_tenant(
+                    tenant_id, "Anfrage-Mail fehlgeschlagen",
+                    "Der Kontakt ist gespeichert, beim Mailversand gab es "
+                    "einen Fehler. Bitte in der App nachfassen.",
+                    url="/app#aktuelles",
                 )
             except Exception:
                 pass
@@ -2196,41 +2140,21 @@ class Plugin(BasePlugin):
         return {"success": True, "tracked": True}
 
 
-    async def _push_to_tenant(self, telegram_chat_id, html_message):
-        """Schickt Telegram-Nachricht an Tenant. Silent fail bei Fehler."""
-        if not telegram_chat_id:
-            return False
-        async with AsyncSessionLocal() as s:
-            tc = (await s.execute(
-                select(ToolConfig)
-                .join(Tenant, ToolConfig.tenant_id == Tenant.id)
-                .where(Tenant.slug == "_global", ToolConfig.tool_name == "telegram_notify")
-            )).scalar_one_or_none()
-            if not tc:
-                return False
-            from core.security.encryption import try_decrypt
-            bot_token = try_decrypt((tc.config or {}).get("bot_token"))
-            if not bot_token:
-                return False
+    async def _warn_tenant(self, tenant_id, title, body, url="/app#mehr"):
+        """Betriebs-Warnung an den Inhaber (Web-Push). Silent fail.
 
-        import httpx
-        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-        payload = {
-            "chat_id": telegram_chat_id,
-            "text": html_message,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True,
-        }
-        try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                r = await client.post(url, json=payload)
-                if r.status_code != 200:
-                    logger.warning(
-                        f"_push_to_tenant fehlgeschlagen: HTTP {r.status_code}"
-                    )
-                    return False
-        except Exception as e:
-            logger.warning(f"_push_to_tenant Exception: {e}")
+        Inhalte bleiben PII-frei: der Push laeuft ueber FCM/APNs, die
+        Details holt die App vom EU-Server.
+        """
+        if not tenant_id:
             return False
-        return True
+        try:
+            from core.integrations.notify import notify_tenant
+            return bool(await notify_tenant(
+                tenant_id, title=title, body=body, url=url,
+                inhaber_only=True,
+            ))
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"_warn_tenant fehlgeschlagen: {e}")
+            return False
 

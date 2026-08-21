@@ -3,7 +3,7 @@
 Wenn ein Tenant ein eigenes Schema pflegt, wird es aus DB geladen.
 Sonst Fallback auf hardcoded Default-Schemas in anfrage_forms.py.
 
-Spaeter: Telegram-Wizard /formular_* zur Pflege via Bot.
+Gepflegt in der Formular-Werkstatt der App.
 """
 from __future__ import annotations
 

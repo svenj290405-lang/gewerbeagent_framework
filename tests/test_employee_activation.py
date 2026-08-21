@@ -8,7 +8,6 @@ Deckt:
   ruft session.add + commit
 - consume_activation_token: valid → used_at gesetzt + Row zurueck,
   expired/used/unknown → None
-- _handle_activate_token_start: error-Pfade + Happy-Path
 """
 from __future__ import annotations
 
@@ -21,7 +20,6 @@ from unittest.mock import AsyncMock
 import pytest
 
 from core.models import employee_activation_token as eat
-from plugins.telegram_notify import handler as tn_handler
 
 
 # =====================================================================
@@ -233,141 +231,3 @@ async def test_consume_already_used_token_returns_none(monkeypatch):
 
 # =====================================================================
 # _handle_activate_token_start
-# =====================================================================
-
-
-@pytest.mark.asyncio
-async def test_handle_activate_invalid_token(monkeypatch):
-    """consume_activation_token returnt None → freundliche Fehlermeldung."""
-    monkeypatch.setattr(
-        tn_handler, "consume_activation_token",
-        AsyncMock(return_value=None),
-        raising=False,
-    )
-    # Da der Handler tn_handler.consume_activation_token via
-    # `from core.models import consume_activation_token` IM Funktionskoerper
-    # importiert, muessen wir den Quell-Import patchen:
-    monkeypatch.setattr(
-        "core.models.consume_activation_token",
-        AsyncMock(return_value=None),
-        raising=False,
-    )
-    msg = await tn_handler._handle_activate_token_start(
-        "bad-token", 12345, {"first_name": "Max"},
-    )
-    assert "ungueltig" in msg.lower() or "abgelaufen" in msg.lower()
-
-
-@pytest.mark.asyncio
-async def test_handle_activate_happy_path(monkeypatch):
-    """Token gueltig → Employee chat_id wird gesetzt, Welcome-Nachricht."""
-    tenant_id = uuid.uuid4()
-    emp = SimpleNamespace(
-        id=uuid.uuid4(),
-        tenant_id=tenant_id,
-        slug="daniel",
-        name="Daniel Mueller",
-        telegram_chat_id=None,
-        is_default=False,
-    )
-    tenant = SimpleNamespace(
-        id=tenant_id, slug="demo", company_name="Demo Handwerk GmbH",
-        telegram_chat_id=None, onboarding_completed_at=None,
-    )
-    token_row = SimpleNamespace(
-        employee_id=emp.id, tenant_id=tenant_id,
-    )
-
-    monkeypatch.setattr(
-        "core.models.consume_activation_token",
-        AsyncMock(return_value=token_row),
-        raising=False,
-    )
-
-    # Session: 3 execute-Aufrufe: Employee-Lookup, Tenant-Lookup,
-    # Stale-Lookup (scalars().all() — leer). Wir bauen eine kleine
-    # FIFO-Queue + brauchen .scalars().all() statt scalar_one_or_none()
-    # fuer den dritten Aufruf.
-    class _ScalarsResult:
-        def __init__(self, items):
-            self._items = items
-
-        def scalars(self):
-            return self
-
-        def all(self):
-            return list(self._items)
-
-        def scalar_one_or_none(self):
-            # Erstes Element oder None
-            return self._items[0] if self._items else None
-
-    results = [
-        _ScalarsResult([emp]),     # Employee-Lookup
-        _ScalarsResult([tenant]),  # Tenant-Lookup
-        _ScalarsResult([]),        # Stale-Lookup (keine fremden Bindungen)
-    ]
-
-    class _Session:
-        async def execute(self, stmt):
-            return results.pop(0) if results else _ScalarsResult([])
-
-        async def commit(self):
-            pass
-
-        async def flush(self):
-            pass
-
-    @asynccontextmanager
-    async def cm():
-        yield _Session()
-
-    monkeypatch.setattr(tn_handler, "AsyncSessionLocal", lambda: cm())
-
-    reply = await tn_handler._handle_activate_token_start(
-        "good-token", 99999, {"first_name": "Daniel"},
-    )
-
-    assert emp.telegram_chat_id == 99999
-    assert "Daniel Mueller" in reply
-    assert "Demo Handwerk GmbH" in reply
-    assert "/kalender_verbinden" in reply
-
-
-@pytest.mark.asyncio
-async def test_handle_activate_employee_missing(monkeypatch):
-    """Token valid but Employee weg → klare Fehlermeldung statt Crash."""
-    token_row = SimpleNamespace(employee_id=uuid.uuid4(), tenant_id=uuid.uuid4())
-    monkeypatch.setattr(
-        "core.models.consume_activation_token",
-        AsyncMock(return_value=token_row),
-        raising=False,
-    )
-
-    class _NoneResult:
-        def scalar_one_or_none(self):
-            return None
-
-        def scalars(self):
-            return self
-
-        def all(self):
-            return []
-
-    class _Session:
-        async def execute(self, stmt):
-            return _NoneResult()
-
-        async def commit(self):
-            pass
-
-    @asynccontextmanager
-    async def cm():
-        yield _Session()
-
-    monkeypatch.setattr(tn_handler, "AsyncSessionLocal", lambda: cm())
-
-    reply = await tn_handler._handle_activate_token_start(
-        "good-token", 99999, {"first_name": "X"},
-    )
-    assert "existiert nicht mehr" in reply or "nicht gefunden" in reply

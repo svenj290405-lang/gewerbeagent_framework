@@ -40,8 +40,7 @@ _log_employee_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
 # Voller (NICHT gekuerzter) Tenant-Slug des aktuellen Webhook-Requests.
 # set_log_tenant kuerzt auf 8 Hex-Zeichen (Recon-Schutz) und taugt daher
 # NICHT zur Tenant-Aufloesung. Diese Var traegt den vollen Slug aus dem
-# Webhook-Pfad — z.B. um den richtigen Telegram-Bot-Token pro Betrieb
-# aufzuloesen (eigener Bot pro Betrieb).
+# Webhook-Pfad — z.B. um Zugangsdaten pro Betrieb aufzuloesen.
 _webhook_tenant_slug: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "webhook_tenant_slug", default=None,
 )
@@ -104,16 +103,14 @@ class TenantContextFilter(logging.Filter):
 # =====================================================================
 #
 # Verhindert, dass Geheimnisse im Klartext in den Logs landen. Der
-# httpx-Logger schreibt z.B. jede Anfrage-URL — inklusive
-# `api.telegram.org/bot<TOKEN>/sendMessage`, womit der Bot-Token offen
-# in den App-Logs (und damit 14 Tage in den Caddy-Logs) liegt. Wir
+# httpx-Logger schreibt z.B. jede Anfrage-URL — inklusive Tokens im
+# Pfad, die damit offen in den App-Logs (und 14 Tage in den
+# Caddy-Logs) liegen. Wir
 # daempfen httpx zwar auf WARNING (siehe configure_structured_logging),
 # aber ein zusaetzlicher Redaction-Filter am Formatter faengt auch
 # Token ab, die App-Code versehentlich selbst loggt.
 _REDACTION_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
-    # Telegram-Bot-Token: <bot-id>:<35-Zeichen-Secret>, oft als
-    # "bot12345:AA..."-Pfadsegment in der API-URL.
-    (re.compile(r"bot\d{6,}:[A-Za-z0-9_-]{20,}"), "bot<redacted>"),
+    # Tokens der Form <id>:<Secret> (kommen in mehreren Fremd-APIs vor).
     (re.compile(r"\b\d{6,}:[A-Za-z0-9_-]{30,}\b"), "<redacted-token>"),
     # DSGVO: Endkunden-PII darf nicht im Klartext in den Prod-Logs liegen
     # (StreamHandler -> Container-/Caddy-Logs, 14 Tage). Diverse INFO-Logs
@@ -146,7 +143,7 @@ def _redact_secrets(text: str) -> str:
 
 class RedactingFormatter(logging.Formatter):
     """Formatter, der nach der ueblichen Formatierung bekannte Secrets
-    aus der fertigen Logzeile maskiert (Telegram-Bot-Token etc.)."""
+    aus der fertigen Logzeile maskiert (API-Tokens, Endkunden-PII)."""
 
     def format(self, record: logging.LogRecord) -> str:
         return _redact_secrets(super().format(record))
@@ -174,9 +171,9 @@ def configure_structured_logging(*, level: str = "INFO") -> None:
     root.addHandler(handler)
     root.setLevel(level)
 
-    # httpx/httpcore loggen jede Request-URL auf INFO — inklusive des
-    # Telegram-Bot-Tokens im Pfad (api.telegram.org/bot<TOKEN>/...).
-    # Auf WARNING heben, damit diese URLs gar nicht erst entstehen.
+    # httpx/httpcore loggen jede Request-URL auf INFO — inklusive
+    # Tokens, die manche APIs in den Pfad legen. Auf WARNING heben,
+    # damit diese URLs gar nicht erst entstehen.
     # (Der RedactingFormatter ist die zweite Verteidigungslinie.)
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)

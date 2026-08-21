@@ -1,16 +1,13 @@
-"""Tests fuer das Rueckruf-System (Voice-Tool + Telegram-Abhaken).
+"""Tests fuer das Rueckruf-System (Voice-Tool).
 
 Deckt:
 - _handle_rueckruf_anfordern: Happy-Path, Pflichtfeld-Validierung,
   Name-Default, Tenant-unbekannt, Routing-/Push-Failsafe
-- Security: HTML/Telegram-Injection wird escaped; Push-Keyboard traegt
-  korrektes callback_data
-- _handle_rueckruf_callback: Abhaken setzt Status/Timestamps; Cross-
-  Tenant-Schutz (fremde UUID kann nicht abgehakt werden); Idempotenz;
-  ungueltige Daten
-- _handle_rueckrufe_command: leer vs. Liste
 
-Keine echte DB / HTTP — Sessions, Routing und Telegram werden gemockt
+Abgehakt wird in der App (/app#rueckrufe) — die frueheren Tests des
+Telegram-Callbacks sind mit dem Bot entfallen (2026-08-21).
+
+Keine echte DB / HTTP — Sessions, Routing und Push werden gemockt
 (Muster wie tests/test_voice_email_resolution.py).
 """
 from __future__ import annotations
@@ -24,10 +21,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from plugins.voice_init import handler as voice_handler
-from plugins.telegram_notify import handler as tn
-from core.models.rueckruf import (
-    RUECKRUF_STATUS_OFFEN, RUECKRUF_STATUS_ERLEDIGT,
-)
+from core.models.rueckruf import RUECKRUF_STATUS_OFFEN
 
 
 # =====================================================================
@@ -101,10 +95,9 @@ def _patch_voice(monkeypatch, *, tenant, choose_result=None,
             voice_handler, "choose_employee",
             AsyncMock(return_value=choose_result),
         )
-    push = push_mock or AsyncMock(return_value=True)
-    monkeypatch.setattr(
-        tn.TelegramNotifier, "send_for_employee_with_keyboard", push,
-    )
+    push = push_mock or AsyncMock(return_value=1)
+    import core.integrations.notify as notify_mod
+    monkeypatch.setattr(notify_mod, "notify_employee", push)
     return captured, push
 
 
@@ -144,13 +137,14 @@ async def test_rueckruf_happy_path_persists_and_pushes(monkeypatch):
     assert rr.status == RUECKRUF_STATUS_OFFEN
     assert captured.get("committed") is True
 
-    # Push wurde mit Inline-Keyboard + korrektem callback_data ausgeloest
+    # Push wurde ausgeloest — ohne Kunden-PII, mit Deeplink in die App
     assert push.await_count == 1
     args, kwargs = push.call_args
-    tenant_id_arg, msg, keyboard = args[0], args[1], args[2]
-    assert tenant_id_arg == tenant.id
-    cb = keyboard["inline_keyboard"][0][0]["callback_data"]
-    assert cb == f"rueckruf:erledigt:{result['rueckruf_id']}"
+    assert args[0] == tenant.id
+    assert kwargs["url"] == "/app#rueckrufe"
+    blob = f"{kwargs['title']} {kwargs['body']}"
+    assert "Mueller" not in blob
+    assert "12345" not in blob
 
 
 @pytest.mark.asyncio
@@ -227,10 +221,10 @@ async def test_rueckruf_routing_crash_still_persists(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_rueckruf_push_crash_still_succeeds(monkeypatch):
-    """Telegram-Push-Fehler darf die erfasste Rueckrufbitte nicht
-    ruecksetzen — die Daten sind committet, Erfolg wird gemeldet."""
+    """Push-Fehler darf die erfasste Rueckrufbitte nicht ruecksetzen —
+    die Daten sind committet, Erfolg wird gemeldet."""
     tenant = _make_tenant("pilot")
-    push = AsyncMock(side_effect=RuntimeError("telegram down"))
+    push = AsyncMock(side_effect=RuntimeError("push down"))
     captured, _ = _patch_voice(monkeypatch, tenant=tenant, push_mock=push)
     plugin = _make_plugin()
     result = await plugin._handle_rueckruf_anfordern(_valid_payload())
@@ -253,213 +247,5 @@ async def test_rueckruf_assigned_employee_from_routing(monkeypatch):
     assert result["success"] is True
     assert captured["added"].assigned_employee_id == emp_id
     # Push an genau diesen Mitarbeiter geroutet
-    _, kwargs = push.call_args
-    assert kwargs["employee_id"] == emp_id
-
-
-# =====================================================================
-# Security: HTML/Telegram-Injection
-# =====================================================================
-
-@pytest.mark.asyncio
-async def test_rueckruf_escapes_html_injection(monkeypatch):
-    """Praeparierter Name/Anliegen/Telefon darf kein rohes HTML in die
-    parse_mode=HTML-Telegram-Nachricht schmuggeln."""
-    tenant = _make_tenant("pilot")
-    captured, push = _patch_voice(monkeypatch, tenant=tenant)
-    plugin = _make_plugin()
-    await plugin._handle_rueckruf_anfordern(_valid_payload(
-        kunde_name="<b>Hacker</b>",
-        anliegen="<script>alert(1)</script>",
-        kunde_telefon="<i>+49</i>",
-        kunde_email="<a href=x>m@x.de</a>",
-    ))
-    msg = push.call_args[0][1]
-    # Roh-Markup darf NICHT durchkommen
-    assert "<script>" not in msg
-    assert "<b>Hacker</b>" not in msg
-    # Escaped-Form muss drin sein
-    assert "&lt;script&gt;" in msg
-    assert "&lt;b&gt;Hacker&lt;/b&gt;" in msg
-
-
-# =====================================================================
-# _handle_rueckruf_callback — Funktion + Security
-# =====================================================================
-
-def _cb_session_factory(rueckruf_obj):
-    """Session fuer den Callback-Handler: execute() liefert den Rueckruf,
-    commit() ist no-op. with_for_update() ist Teil des Statements, das die
-    Fake-execute ignoriert."""
-    class _S:
-        async def execute(self, _stmt):
-            return _FakeResult(rueckruf_obj)
-
-        async def commit(self):
-            pass
-
-    @asynccontextmanager
-    async def cm():
-        yield _S()
-
-    return cm
-
-
-def _make_rueckruf_row(tenant_id, status=RUECKRUF_STATUS_OFFEN):
-    return SimpleNamespace(
-        id=uuid.uuid4(),
-        tenant_id=tenant_id,
-        kunde_name="Frau Mueller",
-        status=status,
-        erledigt_at=None,
-        erledigt_by_employee_id=None,
-    )
-
-
-def _patch_callback(monkeypatch, *, tenant, employee, rueckruf_obj):
-    answer = AsyncMock()
-    send = AsyncMock()
-    monkeypatch.setattr(tn, "_answer_callback_query", answer)
-    monkeypatch.setattr(tn, "_send_to_chat", send)
-    monkeypatch.setattr(
-        tn, "_get_current_employee",
-        AsyncMock(return_value=(tenant, employee)),
-    )
-    monkeypatch.setattr(
-        tn, "AsyncSessionLocal", _cb_session_factory(rueckruf_obj),
-    )
-    return answer, send
-
-
-@pytest.mark.asyncio
-async def test_callback_marks_erledigt(monkeypatch):
-    tenant = _make_tenant("pilot")
-    emp = SimpleNamespace(id=uuid.uuid4(), is_default=True)
-    rr = _make_rueckruf_row(tenant.id)
-    answer, send = _patch_callback(
-        monkeypatch, tenant=tenant, employee=emp, rueckruf_obj=rr,
-    )
-    await tn._handle_rueckruf_callback(
-        123, f"rueckruf:erledigt:{rr.id}", "cbid", "bot",
-    )
-    assert rr.status == RUECKRUF_STATUS_ERLEDIGT
-    assert rr.erledigt_at is not None
-    assert rr.erledigt_by_employee_id == emp.id
-    answer.assert_awaited()
-
-
-@pytest.mark.asyncio
-async def test_callback_cross_tenant_rejected(monkeypatch):
-    """SECURITY: ein fremder Chat darf einen Rueckruf eines ANDEREN
-    Betriebs nicht per erratener UUID abhaken."""
-    chat_tenant = _make_tenant("pilot")
-    other_tenant_id = uuid.uuid4()
-    emp = SimpleNamespace(id=uuid.uuid4(), is_default=True)
-    rr = _make_rueckruf_row(other_tenant_id)  # gehoert NICHT dem Chat-Tenant
-    answer, send = _patch_callback(
-        monkeypatch, tenant=chat_tenant, employee=emp, rueckruf_obj=rr,
-    )
-    await tn._handle_rueckruf_callback(
-        123, f"rueckruf:erledigt:{rr.id}", "cbid", "bot",
-    )
-    # Status UNVERAENDERT, Hinweis "nicht gefunden"
-    assert rr.status == RUECKRUF_STATUS_OFFEN
-    assert rr.erledigt_at is None
-    msg = answer.call_args[0][1]
-    assert "nicht gefunden" in msg.lower()
-
-
-@pytest.mark.asyncio
-async def test_callback_already_erledigt_idempotent(monkeypatch):
-    tenant = _make_tenant("pilot")
-    emp = SimpleNamespace(id=uuid.uuid4(), is_default=True)
-    rr = _make_rueckruf_row(tenant.id, status=RUECKRUF_STATUS_ERLEDIGT)
-    rr.erledigt_at = dt.datetime.now(dt.timezone.utc)
-    answer, send = _patch_callback(
-        monkeypatch, tenant=tenant, employee=emp, rueckruf_obj=rr,
-    )
-    await tn._handle_rueckruf_callback(
-        123, f"rueckruf:erledigt:{rr.id}", "cbid", "bot",
-    )
-    msg = answer.call_args[0][1]
-    assert "schon erledigt" in msg.lower()
-
-
-@pytest.mark.asyncio
-async def test_callback_invalid_uuid(monkeypatch):
-    tenant = _make_tenant("pilot")
-    emp = SimpleNamespace(id=uuid.uuid4(), is_default=True)
-    answer, send = _patch_callback(
-        monkeypatch, tenant=tenant, employee=emp, rueckruf_obj=None,
-    )
-    await tn._handle_rueckruf_callback(
-        123, "rueckruf:erledigt:not-a-uuid", "cbid", "bot",
-    )
-    answer.assert_awaited()
-    send.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_callback_bad_action(monkeypatch):
-    tenant = _make_tenant("pilot")
-    emp = SimpleNamespace(id=uuid.uuid4(), is_default=True)
-    answer, send = _patch_callback(
-        monkeypatch, tenant=tenant, employee=emp, rueckruf_obj=None,
-    )
-    await tn._handle_rueckruf_callback(
-        123, "rueckruf:loeschen:" + str(uuid.uuid4()), "cbid", "bot",
-    )
-    msg = answer.call_args[0][1]
-    assert "ungueltig" in msg.lower()
-    send.assert_not_awaited()
-
-
-# =====================================================================
-# _handle_rueckrufe_command
-# =====================================================================
-
-@pytest.mark.asyncio
-async def test_command_empty_returns_text(monkeypatch):
-    tenant = _make_tenant("pilot")
-    emp = SimpleNamespace(id=uuid.uuid4(), is_default=True)
-    monkeypatch.setattr(
-        tn, "_get_current_employee", AsyncMock(return_value=(tenant, emp)),
-    )
-    monkeypatch.setattr(tn, "_load_open_rueckrufe", AsyncMock(return_value=[]))
-    send = AsyncMock()
-    monkeypatch.setattr(tn, "_send_to_chat", send)
-    reply = await tn._handle_rueckrufe_command(123)
-    assert reply is not None
-    assert "keine offenen" in reply.lower()
-
-
-@pytest.mark.asyncio
-async def test_command_lists_with_buttons(monkeypatch):
-    tenant = _make_tenant("pilot")
-    emp = SimpleNamespace(id=uuid.uuid4(), is_default=True)
-    rows = [
-        SimpleNamespace(
-            id=uuid.uuid4(), kunde_name="A", kunde_telefon="+49 1",
-            anliegen="x", created_at=dt.datetime.now(dt.timezone.utc),
-        ),
-        SimpleNamespace(
-            id=uuid.uuid4(), kunde_name="B", kunde_telefon="+49 2",
-            anliegen="y", created_at=dt.datetime.now(dt.timezone.utc),
-        ),
-    ]
-    monkeypatch.setattr(
-        tn, "_get_current_employee", AsyncMock(return_value=(tenant, emp)),
-    )
-    monkeypatch.setattr(tn, "_load_open_rueckrufe", AsyncMock(return_value=rows))
-    monkeypatch.setattr(tn, "_send_to_chat", AsyncMock())
-    kb = AsyncMock()
-    monkeypatch.setattr(tn, "_send_with_keyboard", kb)
-    reply = await tn._handle_rueckrufe_command(123)
-    assert reply is None  # Antwort lief ueber _send_with_keyboard
-    assert kb.await_count == 2
-    # Jeder Button traegt die richtige rueckruf-id
-    sent_cbs = {
-        c.args[2]["inline_keyboard"][0][0]["callback_data"]
-        for c in kb.call_args_list
-    }
-    assert sent_cbs == {f"rueckruf:erledigt:{r.id}" for r in rows}
+    args, _ = push.call_args
+    assert args[1] == emp_id

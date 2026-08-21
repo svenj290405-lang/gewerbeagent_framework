@@ -248,7 +248,7 @@ def route(monkeypatch):
     monkeypatch.setattr(anfrage_routes, "get_schema_for_tenant", fake_schema)
     monkeypatch.setattr(anfrage_routes, "submit_anfrage", fake_submit)
     monkeypatch.setattr(
-        "core.integrations.anfrage_telegram.notify_tenant_anfrage_submitted",
+        "core.integrations.anfrage_eingang.notify_tenant_anfrage_submitted",
         fake_push)
     return gespeichert
 

@@ -2,7 +2,7 @@
 
 Eine kleine Schicht oben auf `tool_configs`. Liest und schreibt
 ToolConfig.enabled per Feature-Key, mit kurzem In-Memory-Cache damit
-der Telegram-Bot nicht pro Update 10x DB-Roundtrips macht.
+die App nicht pro Aufruf 10x DB-Roundtrips macht.
 """
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 # =====================================================================
 # In-Process-Cache (TTL: 60s)
 # =====================================================================
-# Telegram-Updates kommen alle 1-3s — ohne Cache wuerde jeder /help
+# Feature-Checks laufen sehr haeufig — ohne Cache wuerde jeder Aufruf
 # 10 DB-Calls (einer pro Befehl-Filter) ausloesen. 60s-TTL ist OK weil
 # Feature-Toggle fast nie passiert; bei Toggle ruft das Admin-UI
 # invalidate_feature_cache(tenant_id) auf damit User die Aenderung

@@ -92,8 +92,8 @@ async def _refresh_access_token(oauth_token: OAuthToken) -> tuple[str, datetime]
 
         if resp.status_code != 200:
             # 401/400 = refresh_token ungueltig (User hat Zugriff entzogen).
-            # Wir benachrichtigen den Tenant ueber Telegram damit er
-            # /kalender_verbinden erneut macht. Failsafe — Telegram-
+            # Wir benachrichtigen den Tenant per Push damit er die
+            # Verbindung in der App erneuert. Failsafe — ein Push-
             # Fehler bricht den Refresh-Pfad nicht.
             if resp.status_code in (400, 401):
                 try:
@@ -158,7 +158,7 @@ async def get_microsoft_token(
         scope = f"emp={employee_id}" if employee_id else f"tenant={tenant_id}"
         raise MicrosoftNotConnectedError(
             f"Microsoft-Account nicht verbunden ({scope}). "
-            "Mit /kalender_verbinden im Telegram einrichten."
+            "In der App unter Mehr → Verbindungen einrichten."
         )
 
     now = datetime.now(timezone.utc)

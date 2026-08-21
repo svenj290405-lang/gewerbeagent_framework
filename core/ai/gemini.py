@@ -155,7 +155,7 @@ async def generate_image_from_image(
     Bearbeitet ein Eingabe-Bild gemaess Prompt mit Gemini 2.5 Flash Image.
 
     Args:
-        image_bytes: Original-Bild als Bytes (z.B. von Telegram-Download)
+        image_bytes: Original-Bild als Bytes (z.B. aus einem App-Upload)
         prompt: Was im Bild geaendert/eingefuegt werden soll
         mime_type: image/jpeg oder image/png
         model: Modell-Name (Default: gemini-2.5-flash-image)
@@ -201,7 +201,7 @@ async def generate_image_from_image(
 
         for part in candidate.content.parts:
             if getattr(part, "inline_data", None):
-                # PIL um nach PNG zu konvertieren (Telegram bevorzugt PNG)
+                # PIL um nach PNG zu konvertieren
                 img = Image.open(BytesIO(part.inline_data.data))
                 buf = BytesIO()
                 img.save(buf, format="PNG")
@@ -637,7 +637,7 @@ def _normalize_rechnung_extraction(data: dict) -> dict:
 # Kundengespraech-Analyse - lange Audio-Aufnahmen vom Tenant
 # ================================================================
 # Workflow: Tenant nimmt Gespraech beim Kunden auf, schickt Audio
-# an Telegram-Bot. Gemini analysiert Audio und gibt strukturierte
+# aus der App. Gemini analysiert Audio und gibt strukturierte
 # Daten zurueck: Briefing, Positionen, Termin, Todos.
 # Verarbeitung in europe-west3 (Frankfurt) - DSGVO-konform.
 
@@ -832,7 +832,7 @@ async def extract_rechnung_from_audio(
     Gemini transkribiert + extrahiert in einem Call.
     Verarbeitung in europe-west3 (Frankfurt) - DSGVO-konform.
 
-    mime_type: audio/ogg fuer Telegram-Voice-Notes (Opus codec).
+    mime_type: audio/ogg fuer Sprachnotizen (Opus codec).
                audio/mpeg, audio/wav, audio/flac auch unterstuetzt.
     """
     if not audio_bytes:
@@ -852,7 +852,7 @@ async def transcribe_audio(audio_bytes: bytes, mime_type: str = "audio/ogg") -> 
     Schema, kein Task). Fuer Archiv-Sprachnotizen. Verarbeitung in
     europe-west3 (Frankfurt). Leerer String bei leerem Audio/Fehler.
 
-    mime_type: audio/ogg fuer Telegram-Voice-Notes (Opus codec)."""
+    mime_type: audio/ogg fuer Sprachnotizen (Opus codec)."""
     if not audio_bytes:
         return ""
     from google.genai.types import GenerateContentConfig, Part
@@ -1032,7 +1032,7 @@ async def analyse_kundengespraech_from_audio(
 ) -> dict:
     """Analysiert eine Audio-Aufnahme eines Kundengespraechs.
 
-    Workflow: Tenant nimmt Gespraech via Telegram auf, schickt Audio.
+    Workflow: Tenant nimmt das Gespraech in der App auf, schickt Audio.
     Gemini transkribiert + extrahiert in einem Call:
       - Kundendaten
       - Positionen (was zu tun ist, was es kostet)
@@ -1040,7 +1040,7 @@ async def analyse_kundengespraech_from_audio(
       - Briefing-Texte fuer Pre-Termin-Lesung
       - TODOs fuer Vorbereitung
 
-    mime_type: audio/ogg fuer Telegram-Voice (Opus codec).
+    mime_type: audio/ogg fuer Sprachnotizen (Opus codec).
                audio/mpeg, audio/wav, audio/flac auch unterstuetzt.
 
     tenant_id wird aktuell nicht ausgewertet — Parameter bleibt fuer
@@ -1072,7 +1072,7 @@ async def analyse_kundengespraech_from_audio(
 # classification (RELEVANT_KUNDE/...) sagt WER schreibt; intent sagt
 # WAS sie wollen. Verwendet vom Microsoft-Inbox-Handler in Teil D
 # fuer Routing (Storno -> Kalender-Cancel, Verschiebung -> Rueckfrage,
-# Rechnungsanfrage -> nur Telegram-Push, Neuanfrage -> Auto-Reply +
+# Rechnungsanfrage -> nur Push, Neuanfrage -> Auto-Reply +
 # Formular).
 # ----------------------------------------------------------------------
 INTENT_NEU_ANFRAGE = "neu_anfrage"

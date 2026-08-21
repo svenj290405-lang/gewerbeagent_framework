@@ -4,7 +4,7 @@ Workflow:
 1. create_anfrage_token() -> bei RELEVANT_KUNDE Mail aufrufen
 2. URL bauen + an Kunde mailen
 3. Kunde fuellt Formular aus (Web)
-4. submit_anfrage() -> speichert AnfrageResponse + Telegram-Push
+4. submit_anfrage() -> speichert AnfrageResponse + Push an den Betrieb
 """
 from __future__ import annotations
 
@@ -202,7 +202,7 @@ def get_schema(anfrage_typ: str) -> dict:
 
 
 # =====================================================================
-# Schema-Schreibweg fuer Tenant-Editor (Telegram-Wizard)
+# Schema-Schreibweg fuer den Formular-Editor in der App
 # =====================================================================
 
 # Welche Field-Types das Form-Template kennt (vgl. anfrage_form_template.render_field)
@@ -423,7 +423,7 @@ def verify_magic_bytes(
 
 
 def validate_schema_fields(fields: list[dict]) -> tuple[bool, str]:
-    """Strukturpruefung. Returns (ok, error_msg). Fuer Telegram-Wizard + DB-Schreibweg."""
+    """Strukturpruefung. Returns (ok, error_msg). Fuer Editor + DB-Schreibweg."""
     if not isinstance(fields, list) or not fields:
         return False, "Mindestens 1 Feld noetig."
     seen = set()

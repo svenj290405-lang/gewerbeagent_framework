@@ -2,7 +2,7 @@
 Mitarbeiter-Krankmeldung.
 
 Trigger:
-1. Sofort beim /krank-Telegram-Wizard (fire-and-forget via
+1. Sofort bei der Krankmeldung in der App (fire-and-forget via
    schedule_immediate_redistribution).
 2. Taeglich morgens 06:00 Europe/Berlin (cron_loop) — fuer Faelle wo
    eine Krankmeldung mehrere Tage abdeckt: jeden Tag erneut die heutigen
@@ -12,7 +12,7 @@ Algorithmus pro Event:
 1. Skill aus Event-Subject/Description extrahieren
    (extract_skills_from_text).
 2. choose_employee(target_datetime=event.start, exclude=[sick_id]).
-3. Bei reason="no-coverage": Eskalation an Default-Employee per Telegram.
+3. Bei reason="no-coverage": Eskalation an den Default-Employee.
 4. Bei Erfolg: Event im sick-Kalender loeschen + im substitute-Kalender
    anlegen (provider-agnostisch).
 5. Optional: Kunden-Reschedule-Mail wenn wir eine Mail haben (z.B. via
@@ -89,54 +89,6 @@ class RedistributionReport:
     reassigned: list[EventRedistributionResult] = field(default_factory=list)
     no_coverage: list[EventRedistributionResult] = field(default_factory=list)
     errors: list[EventRedistributionResult] = field(default_factory=list)
-
-    def summary(self) -> str:
-        """Markdown-Zusammenfassung fuer Telegram."""
-        lines = [
-            f"🔄 <b>Umverteilung {self.sick_emp_name}</b> "
-            f"({self.date_range[0].strftime('%d.%m.')}"
-            f"–{self.date_range[1].strftime('%d.%m.')}):"
-        ]
-        for r in self.reassigned:
-            ts = r.event_start.strftime("%d.%m. %H:%M")
-            lines.append(
-                f"✅ {ts} {r.event_subject[:40]} → {r.new_emp_slug}"
-            )
-        for r in self.no_coverage:
-            ts = r.event_start.strftime("%d.%m. %H:%M")
-            lines.append(
-                f"⚠️ {ts} {r.event_subject[:40]} → kein Kollege verfuegbar"
-            )
-        for r in self.errors:
-            ts = r.event_start.strftime("%d.%m. %H:%M")
-            lines.append(
-                f"❌ {ts} {r.event_subject[:40]} → Fehler: {r.error}"
-            )
-        if not self.reassigned and not self.no_coverage and not self.errors:
-            lines.append("(keine Termine im Krankheits-Zeitraum)")
-        return "\n".join(lines)
-
-    def telegram_summary(self) -> str:
-        """Datensparsame Variante fuer den Telegram-Push (Welle 0).
-
-        Telegram ist ein Drittland-Transfer (FZ-LLC) — die ausfuehrliche
-        summary() enthaelt Termin-Betreffe (oft Kundennamen) und den Namen
-        des kranken Mitarbeiters. Hier gehen NUR Zaehler raus; die Details
-        holt der Inhaber in der DSGVO-sauberen App (Team-Screen)."""
-        n_ok = len(self.reassigned)
-        n_none = len(self.no_coverage)
-        n_err = len(self.errors)
-        if not (n_ok or n_none or n_err):
-            return "🔄 <b>Umverteilung</b>\n(keine Termine im Zeitraum)"
-        lines = ["🔄 <b>Umverteilung verarbeitet</b>"]
-        if n_ok:
-            lines.append(f"✅ {n_ok} Termin(e) umverteilt")
-        if n_none:
-            lines.append(f"⚠️ {n_none} Termin(e) ohne Kollegen")
-        if n_err:
-            lines.append(f"❌ {n_err} Termin(e) mit Fehler")
-        lines.append("Details in der App.")
-        return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------
@@ -349,23 +301,14 @@ async def _notify_move(
     Silent-fail: Versandfehler werden geloggt aber nicht weitergereicht
     (Umverteilung selbst soll nicht an Push-Problemen scheitern).
     """
-    from html import escape as _h
     from core.integrations.notify import notify_employee
     when = start_dt.strftime("%a %d.%m. %H:%M")
-    subject = (event.get("subject") or "(Termin)")[:80]
     try:
         await notify_employee(
             tenant.id, sick_emp.id,
             title="Termin umgehängt",
             body=f"{when} — ein Kollege übernimmt. Details in der App.",
             url="/app#termine", tag="umverteilung",
-            telegram_text=(
-                f"🔄 <b>Dein Termin wurde umgehaengt</b>\n"
-                f"<b>Wann:</b> {when}\n"
-                f"<b>Was:</b> {_h(subject)}\n"
-                f"<b>Uebernimmt:</b> {_h(new_emp.name)}"
-            ),
-            employee_label=sick_emp.name,
         )
     except Exception as e:  # noqa: BLE001
         logger.warning(f"_notify_move sick push failed: {e}")
@@ -375,13 +318,6 @@ async def _notify_move(
             title="Du übernimmst einen Termin",
             body=f"{when} — Details in der App.",
             url="/app#termine", tag="umverteilung",
-            telegram_text=(
-                f"📥 <b>Du uebernimmst einen Termin</b>\n"
-                f"<b>Wann:</b> {when}\n"
-                f"<b>Was:</b> {_h(subject)}\n"
-                f"<b>Von:</b> {_h(sick_emp.name)} (krank)"
-            ),
-            employee_label=new_emp.name,
         )
     except Exception as e:  # noqa: BLE001
         logger.warning(f"_notify_move new push failed: {e}")
@@ -461,11 +397,10 @@ async def redistribute_for_employee(
 
 
 async def _send_report_to_inhaber(tenant: Tenant, report: RedistributionReport):
-    """Schickt die Zusammenfassung an den Default-Employee (Push + Telegram).
+    """Schickt die Zusammenfassung an den Default-Employee (Web-Push).
 
-    Bewusst NICHT auf telegram_chat_id gegated — sonst bekaeme ein Inhaber
-    ohne Telegram auch keinen Web-Push. Welcher Kanal tatsaechlich greift,
-    entscheidet notify_tenant.
+    Zaehler und Details bleiben im Server — der Push verweist nur auf die
+    App (Team-/Termin-Screen).
     """
     try:
         from core.integrations.notify import notify_tenant
@@ -481,7 +416,6 @@ async def _send_report_to_inhaber(tenant: Tenant, report: RedistributionReport):
             title="Umverteilung abgeschlossen",
             body="Zusammenfassung in der App ansehen.",
             url="/app#termine", tag="umverteilung-report",
-            telegram_text=report.telegram_summary(),
             employee_id=default.id,
         )
     except Exception as e:  # noqa: BLE001
@@ -500,11 +434,11 @@ def schedule_immediate_redistribution(
     sick_employee_id: UUID,
     date_range: tuple[dt.date, dt.date],
 ) -> asyncio.Task:
-    """Fire-and-forget: startet die Umverteilung im Hintergrund + sendet
-    am Ende den Report per Telegram an den Inhaber.
+    """Fire-and-forget: startet die Umverteilung im Hintergrund + schickt
+    dem Inhaber am Ende den Report als Push.
 
-    Wird aus dem /krank-Wizard aufgerufen — der User soll nicht 30s
-    auf Calendar-APIs warten muessen.
+    Wird aus der Krankmeldung in der App aufgerufen — der User soll nicht
+    30s auf Calendar-APIs warten muessen.
     """
     async def _run():
         try:

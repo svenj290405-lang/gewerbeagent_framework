@@ -65,24 +65,18 @@ class Settings(BaseSettings):
     # Google Maps.
     openrouteservice_api_key: str = ""
 
-    admin_telegram_bot_token: str = ""
-    admin_telegram_chat_id: str = ""
-
     # Webhook-Secret-Tokens fuer Signature-Verifikation eingehender Webhooks.
     # Leer = Verifikation deaktiviert (Backward-Compat fuer Legacy-Setups
     # ohne Secret). Sobald gesetzt, weist der Server alles ohne passenden
     # Header ab.
     #
-    # Telegram: setzbar via setWebhook secret_token-Parameter; Telegram
-    #   sendet ihn als 'X-Telegram-Bot-Api-Secret-Token' bei jedem Update.
     # ElevenLabs: HMAC-SHA256 signed via 'ElevenLabs-Signature'-Header
     #   wenn beim Webhook-Setup ein secret konfiguriert wurde.
-    telegram_webhook_secret: str = ""
     elevenlabs_webhook_secret: str = ""
 
     public_url: str = "http://localhost:8000"
 
-    # --- Inhaber-/Mitarbeiter-PWA (loest den Telegram-Bot als Oberflaeche ab) ---
+    # --- Inhaber-/Mitarbeiter-PWA (die Oberflaeche des Betriebs) ---
     # Basis-URL der App (fuer Magic-Link-Mails + Service-Worker-Scope).
     # Leer = public_url verwenden. Prod: https://app.gewerbeagent.de
     app_base_url: str = ""
@@ -94,13 +88,6 @@ class Settings(BaseSettings):
     vapid_private_key: str = ""
     # 'sub'-Claim fuer VAPID — eine Kontakt-Mailadresse des Betreibers.
     vapid_subject: str = "mailto:datenschutz@gewerbeagent.de"
-
-    # Telegram-Ausstieg (Art. 28 / Drittland, siehe LEGAL/Subprozessoren-Liste).
-    # Solange True laufen Benachrichtigungen parallel ueber Web-Push UND
-    # Telegram. Auf False stellen, sobald alle Mitarbeiter ein Push-Abo haben:
-    # dann verstummt Telegram schlagartig, ohne Code-Deploy. Der Bot-Code kann
-    # danach entfernt werden. Siehe core/integrations/notify.py.
-    telegram_enabled: bool = True
 
     @property
     def app_url(self) -> str:
@@ -115,7 +102,7 @@ class Settings(BaseSettings):
     dev_cron_disabled: bool = False
 
     # Taeglicher System-Health-Check (core/integrations/daily_health_check.py).
-    # Prueft morgens, ob DB/Telegram-Bot/Crons laufen, schreibt das Ergebnis
+    # Prueft morgens, ob DB und Crons laufen, schreibt das Ergebnis
     # ins Admin-Tool (/admin/health) und schickt bei einem Problem eine Mail.
     health_check_enabled: bool = True
     health_check_hour: int = 7          # Stunde (Europe/Berlin), morgens

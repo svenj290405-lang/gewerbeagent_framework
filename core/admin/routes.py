@@ -600,7 +600,6 @@ async def health_test_alert(
     from core.integrations.daily_health_check import _send_alert_email
     detail = {
         "db": {"ok": True, "error": None},
-        "telegram": {"ok": True, "info": "Test"},
         "crons": {"status": "ok", "crons": {}},
     }
     try:
@@ -808,21 +807,6 @@ async def tenant_detail(
             .where(FailedMailQueue.status == "dead")
         )).scalar() or 0
 
-        # Eigener Telegram-Bot pro Betrieb: aktueller Token-Status
-        from core.models import ToolConfig
-        tg_tc = (await s.execute(
-            select(ToolConfig).where(
-                ToolConfig.tenant_id == tid,
-                ToolConfig.tool_name == "telegram_notify",
-            )
-        )).scalar_one_or_none()
-        from core.security.encryption import try_decrypt
-        _tg_tok = try_decrypt((tg_tc.config or {}).get("bot_token")) if tg_tc else None
-        telegram_bot_set = bool(_tg_tok)
-        telegram_bot_hint = (
-            f"…{_tg_tok[-6:]}" if _tg_tok and len(_tg_tok) > 6 else ""
-        )
-
         await audit(
             user_id=user.id, action="tenant.view",
             target=tenant.slug, request=request, session=s,
@@ -847,9 +831,6 @@ async def tenant_detail(
             "providers": {"labels": prov_labels, "data": prov_data},
         },
         "usage": usage,
-        "telegram_bot_set": telegram_bot_set,
-        "telegram_bot_hint": telegram_bot_hint,
-        "tgbot_msg": request.query_params.get("tgbot"),
         "csrf_token": request.state.admin_csrf,
     })
 
@@ -957,62 +938,6 @@ async def tenant_set_retention(
         await s.commit()
     return RedirectResponse(
         f"/admin/tenants/{tenant_id}", status_code=303,
-    )
-
-
-@router.post("/tenants/{tenant_id}/telegram-bot")
-async def tenant_set_telegram_bot(
-    request: Request,
-    tenant_id: str,
-    bot_token: str = Form(""),
-    csrf_token: str = Form(...),
-    user: AdminUser = Depends(require_admin),
-):
-    """Eigener Telegram-Bot pro Betrieb (Variante A): bot_token setzen oder
-    leeren. Bei gesetztem Token wird ausserdem der Webhook dieses Bots auf
-    den tenant-spezifischen Pfad registriert, damit eingehende Updates dem
-    Betrieb zugeordnet werden und Antworten ueber diesen Bot rausgehen.
-    Leeres Feld = Token entfernen (Betrieb faellt auf den geteilten globalen
-    Bot zurueck)."""
-    await require_csrf(request)
-    token = (bot_token or "").strip()
-    try:
-        tid = uuid.UUID(tenant_id)
-    except ValueError:
-        raise HTTPException(404, "Tenant nicht gefunden")
-    from core.models import ToolConfig
-    async with get_session() as s:
-        tenant = (await s.execute(
-            select(Tenant).where(Tenant.id == tid)
-        )).scalar_one_or_none()
-        if not tenant:
-            raise HTTPException(404, "Tenant nicht gefunden")
-        slug = tenant.slug
-        tc = (await s.execute(
-            select(ToolConfig).where(
-                ToolConfig.tenant_id == tid,
-                ToolConfig.tool_name == "telegram_notify",
-            )
-        )).scalar_one_or_none()
-        had = bool((tc.config or {}).get("bot_token")) if tc else False
-
-    # Speichern (verschluesselt) + Webhook setzen — gemeinsame Logik mit
-    # dem Self-Service-Chat-Flow (/eigenen_bot).
-    from plugins.telegram_notify.handler import provision_tenant_bot
-    note = await provision_tenant_bot(tid, slug, token)
-
-    async with get_session() as s:
-        await audit(
-            user_id=user.id, action="tenant.telegram_bot.update",
-            target=slug, request=request, session=s,
-            details={"had_token": had, "now_set": bool(token)},
-        )
-        await s.commit()
-    logger.info(f"Tenant-Bot-Update {slug}: {note}")
-
-    from urllib.parse import quote
-    return RedirectResponse(
-        f"/admin/tenants/{tenant_id}?tgbot={quote(note)}", status_code=303,
     )
 
 

@@ -4,7 +4,7 @@ Hier liegt die EINE Implementierung von Angebot/Rechnung anlegen + versenden
 und Anfrage-Antwort. Genutzt von:
   * den PWA-App-Routen (core/api/app_screens.py),
   * dem Gemini-Assistenten (core/ai/command_center.py),
-  * dem Telegram-Rechnungsversand (_run_rechnung_versand_pipeline).
+  * dem Rechnungsversand (_run_rechnung_versand_pipeline).
 
 So existiert die geldkritische Lexware-/Mail-Logik nur an einer Stelle und
 kann nicht zwischen den Oberflaechen auseinanderdriften.
@@ -849,7 +849,7 @@ async def finalize_and_send_invoice(
     kunde_email_override: str | None = None,
 ) -> dict:
     """Finalisiert die Rechnung eines fertigen Auftrags in Lexware und
-    schickt sie als PDF an den Kunden. Faktorisiert aus der Telegram-
+    schickt sie als PDF an den Kunden. Faktorisiert aus der frueheren
     Pipeline ``_run_rechnung_versand_pipeline`` — EINE Quelle der Wahrheit.
 
     ``anschreiben`` (optional): überschreibt die Einleitung auf der Rechnung

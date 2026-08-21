@@ -33,23 +33,6 @@ dig +short dev.gewerbeagent.de
 
 ---
 
-### 2. Dev-Telegram-Bot anlegen
-
-In Telegram bei [@BotFather](https://t.me/BotFather):
-```
-/newbot
-Name:     Q Dev (Gewerbeagent Dev)
-Username: gewerbeagent_dev_bot   (oder ähnlich)
-```
-
-→ BotFather liefert einen Token. **Notieren** — kommt gleich in
-`.env.dev`.
-
-**Wichtig:** der Prod-Bot bleibt unverändert. Der Dev-Bot ist ein
-komplett neuer Bot mit eigenem Token, eigener Webhook-URL.
-
----
-
 ### 3. Google OAuth Client erweitern
 
 In der [Google Cloud Console](https://console.cloud.google.com/apis/credentials):
@@ -90,7 +73,6 @@ Wichtige Werte in `.env.dev`:
   openssl rand -base64 32
   ```
 - `PUBLIC_URL=https://dev.gewerbeagent.de`
-- Telegram-Bot-Token aus Schritt 2 (in `tool_configs.config` nach Seed)
 - `DEV_CRON_DISABLED=true` (verhindert dass Dev-Cron Prod-Quoten verbraucht)
 
 Vertex-Key kopieren (gleiches GCP-Project ist OK):
@@ -225,29 +207,18 @@ async def setup():
         if not gt:
             print('Globaler Tenant fehlt — bitte zuerst seed_dev_tenant')
             return
-        tc = ToolConfig(tenant_id=gt.id, tool_name='telegram_bot', enabled=True,
-                        config={'bot_token': 'DEIN-DEV-BOT-TOKEN-HIER'})
-        s.add(tc)
-        await s.commit()
-        print('Dev-Bot-Token gespeichert')
+        print('Globaler Tenant vorhanden — nichts weiter zu tun')
 
 asyncio.run(setup())
 "
-```
-
-Webhook bei Telegram registrieren:
-```bash
-curl -s -X POST "https://api.telegram.org/bot<DEV-BOT-TOKEN>/setWebhook" \
-    -d "url=https://dev.gewerbeagent.de/webhook/<global-tenant-slug>/telegram_notify/incoming" \
-    -d "secret_token=<DEV_TELEGRAM_WEBHOOK_SECRET>"
 ```
 
 ---
 
 ### 10. End-to-End-Test
 
-1. Telegram öffnen → Dev-Bot anschreiben (`@gewerbeagent_dev_bot`)
-2. `/start sven-dev` → Bot bestätigt Verknüpfung
+1. `https://dev.gewerbeagent.de/app/login` öffnen
+2. Login-Link per `scripts/app_login_link.py sven-dev` erzeugen
 3. `/help` → Befehlsliste
 4. `/status` → "Sven Dev-Tenant — ACTIVE"
 
@@ -290,10 +261,6 @@ Prefix nicht `gewerbeagent_` ist, dann läuft Prod noch mit der alten
 **`alembic upgrade head` schlägt fehl**
 → DATABASE_URL in `.env.dev` zeigt vermutlich auf falsche DB. Sicher
 dass `gewerbeagent_dev` drin steht (nicht nur `gewerbeagent`).
-
-**Telegram-Webhook 401**
-→ `secret_token` beim setWebhook-Call und `TELEGRAM_WEBHOOK_SECRET` in
-`.env.dev` müssen übereinstimmen.
 
 ---
 
@@ -361,42 +328,17 @@ docker exec gewerbeagent_postgres psql -U gewerbeagent \
 
 ---
 
-## 12a. Admin-Telegram-Bot einrichten (Phase A3)
+## 12a. Alarm-Kanal fuer den Betreiber — OFFEN
 
-`.env` enthält schon die zwei Felder, aktuell beide leer:
-```
-ADMIN_TELEGRAM_BOT_TOKEN=
-ADMIN_TELEGRAM_CHAT_ID=
-```
+Bis 2026-08-21 gingen Betreiber-Alarme (`notify_sven_admin_alert`) als
+Telegram-Push an Sven. Mit dem Telegram-Ausbau ist dieser Kanal
+ersatzlos entfallen: `admin_alerts._deliver_to_sven` schreibt den Alarm
+nur noch als ERROR ins Container-Log und gibt `False` zurueck.
 
-Setup:
-1. Bei [@BotFather](https://t.me/BotFather): `/newbot` → "Q Admin"
-2. Token notieren → in `.env` als `ADMIN_TELEGRAM_BOT_TOKEN` eintragen
-3. Bot anschreiben (irgendwas, z.B. /start). Dann:
-   ```bash
-   curl -s "https://api.telegram.org/bot<TOKEN>/getUpdates" | jq '.result[].message.chat.id' | head -1
-   ```
-   Liefert eine numerische ID → als `ADMIN_TELEGRAM_CHAT_ID` in `.env`
-4. Framework restart damit Settings neu gelesen werden:
-   ```bash
-   docker compose -p prod -f docker-compose.prod.yml restart framework
-   ```
-5. Test:
-   ```bash
-   docker exec gewerbeagent_framework /app/.venv/bin/python -c "
-   import asyncio
-   from core.integrations.admin_alerts import notify_sven_admin_alert
-   asyncio.run(notify_sven_admin_alert(
-       kind='setup_test',
-       message='✅ Admin-Bot funktioniert',
-       bypass_cooldown=True,
-   ))
-   "
-   ```
-   → Push muss in Telegram ankommen.
-
-Bevor diese 2 Werte gesetzt sind, geht KEIN A3/A4/A5-Alert raus — die
-Funktionen sind failsafe und loggen nur einen `WARN` ins Container-Log.
+**Das heisst: aktuell bemerkt niemand automatisch, wenn A3/A4/A5-Alarme
+feuern.** Ein Ersatzkanal muss noch gebaut werden. Mail ueber das
+_global-Postfach ist dafuer nur bedingt geeignet — genau die
+Mail-Pipeline ist einer der Alarm-Ausloeser (zirkulaer).
 
 ---
 
@@ -413,7 +355,7 @@ Cron alle 5 min — sitzt auf dem Host, nicht im Framework-Container
 Test:
 ```bash
 docker stop gewerbeagent_framework
-# 5-10 min warten → Sven bekommt Telegram-Push "framework down"
+# 5-10 min warten → ALARM-Zeile in /var/log/gewerbeagent-liveness.log
 docker start gewerbeagent_framework
 # nächster Check → "wieder online"
 ```

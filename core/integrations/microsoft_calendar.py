@@ -94,7 +94,7 @@ async def get_mailbox_timezone(
 
     Wird beim /kalender_verbinden direkt nach erfolgreichem OAuth
     aufgerufen — wenn die TZ nicht Berlin-kompatibel ist, warnt der
-    OAuth-Callback per Telegram dass Termine 2h verschoben angezeigt
+    OAuth-Callback per Push dass Termine 2h verschoben angezeigt
     werden (siehe BERLIN_COMPATIBLE_MAILBOX_TIMEZONES).
 
     Returns: Timezone-String wie Microsoft ihn meldet
@@ -222,7 +222,7 @@ async def list_events_for_day(
 ) -> list[dict[str, Any]]:
     """Alle Events des Tages mit Lokation + Subject. Wird genutzt von:
     - Smart-Filter (Vor-/Nach-Termine fuer Fahrtzeit-Rechnung)
-    - /briefing (Tages-Uebersicht im Telegram-Bot)
+    - Tages-Uebersicht in der App
 
     Returns: Liste von dicts mit Keys:
       - start_dt, end_dt (datetime, naive Lokal-Zeit DEFAULT_TIMEZONE)

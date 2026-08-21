@@ -59,7 +59,7 @@ einer Frist von 1 Monat zum Monatsende.
 
 (3) **Kategorien betroffener Personen:**
 - Privatkunden und Geschaeftskunden des Verantwortlichen
-- Mitarbeiter des Verantwortlichen (Login, Telegram-Chat-ID)
+- Mitarbeiter des Verantwortlichen (Login, App-Zugang)
 
 ## 3. Technische und organisatorische Massnahmen (TOM)
 

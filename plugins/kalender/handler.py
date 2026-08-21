@@ -32,7 +32,6 @@ from core.plugin_system import BasePlugin
 from core.utils.phone import normalize_phone
 from plugins.kalender.adapters import get_calendar_adapter
 from plugins.kalender.manifest import MANIFEST
-from plugins.telegram_notify.handler import TelegramNotifier
 
 logger = logging.getLogger(__name__)
 
@@ -126,7 +125,7 @@ class Plugin(BasePlugin):
     ) -> dict[str, Any]:
         # kalender ist ein INTERNAL-ONLY Plugin (Manifest external_webhook=
         # False): es wird ausschliesslich in-process aufgerufen (voice_init,
-        # mail_pipeline.cancel_kunde_termine, anfrage_telegram) — diese Caller
+        # mail_pipeline.cancel_kunde_termine, anfrage_eingang) — diese Caller
         # rufen on_webhook OHNE `headers` auf (headers=None). Externe
         # HTTP-Aufrufe blockt bereits der zentrale Dispatcher (core/api/app.py)
         # mit 404. Defense-in-depth: sollte uns DOCH je ein HTTP-dispatchter
@@ -353,20 +352,11 @@ class Plugin(BasePlugin):
                 start=start, ende=ende, idempotency_key=idempotency_key,
             )
 
-            # Telegram-Push an den fuer den Termin zustaendigen Mitarbeiter
-            # (silent fail, blockiert nie den Termin). Wenn employee_id im
-            # Payload fehlt (Legacy-Caller), faellt send_for_employee mit
-            # employee_id=None automatisch auf den Default-Employee zurueck.
-            telefon_line = f"\n<b>Telefon:</b> {telefon}" if telefon else ""
-            adresse_line = f"\n<b>Adresse:</b> {adresse}" if adresse and adresse != "Adresse nicht angegeben" else ""
-            push_text = (
-                "📅 <b>Neuer Termin</b>\n"
-                f"<b>Kunde:</b> {name}\n"
-                f"<b>Anliegen:</b> {anliegen}\n"
-                f"<b>Wann:</b> {start.strftime('%a %d.%m.%Y, %H:%M')} Uhr"
-                f"{adresse_line}"
-                f"{telefon_line}"
-            )
+            # Push an den fuer den Termin zustaendigen Mitarbeiter (silent
+            # fail, blockiert nie den Termin). Ohne employee_id geht der
+            # Push an den ganzen Betrieb. Kunde/Anliegen bleiben bewusst
+            # draussen — Push-Inhalte laufen ueber FCM/APNs, die Details
+            # holt die App vom EU-Server.
             from core.integrations.notify import notify_employee
             await notify_employee(
                 self.tenant_id, employee_id,
@@ -376,7 +366,6 @@ class Plugin(BasePlugin):
                     f"Details in der App."
                 ),
                 url="/app#termine", tag="buchung",
-                telegram_text=push_text,
             )
 
             booking_response = {
@@ -1029,7 +1018,7 @@ class Plugin(BasePlugin):
         """Sucht Termine nach Telefon ODER Email ueber ALLE Mitarbeiter-Kalender.
 
         Storno-Pipeline-Eintrittspunkt: Voice-Anrufer / Mail-Storno /
-        Telegram-Wizard rufen das hier auf, kriegen eine deduplizierte
+        App-Ansichten rufen das hier auf, kriegen eine deduplizierte
         Liste passender Events ueber alle aktiven Mitarbeiter zurueck.
 
         Payload:

@@ -53,7 +53,7 @@ die Dauer der Pilotphase zur **Erprobung** bereit. Funktionsumfang
 - Termin-Vorschlag und -Buchung in Outlook-/Google-Kalender
 - Erstellung von Rechnungen und Angeboten via Lexware
 - Telefon-Annahme via Voice-AI
-- Steuerung/Benachrichtigung via Telegram
+- Steuerung/Benachrichtigung ueber die Gewerbeagent-App (Web-Push)
 
 (2) Der konkret freigeschaltete Funktionsumfang ergibt sich aus der
 technischen Einrichtung (Tenant-Konfiguration) und kann waehrend des

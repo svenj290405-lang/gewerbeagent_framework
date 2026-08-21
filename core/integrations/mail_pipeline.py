@@ -2,7 +2,7 @@
 Mail-Pipeline Utilities fuer die Microsoft-Pipeline.
 
 Kapselt EmailConversation-Lookups, State-Uebergaenge und Tenant-
-Telegram-Pushes — die Bausteine fuer Reply-Threading + Follow-up-
+Pushes — die Bausteine fuer Reply-Threading + Follow-up-
 Routing in core/integrations/microsoft_inbox.py.
 
 Historie: dieses Modul ersetzt die fruehere Brevo-Inbound-Pipeline
@@ -517,7 +517,7 @@ async def mark_delivery_failed(
 
 
 # ====================================================================
-# Tenant-Notification (Telegram-Push fuer Follow-ups)
+# Tenant-Notification (Push fuer Follow-ups)
 # ====================================================================
 
 async def push_tenant_followup_mail(
@@ -530,7 +530,7 @@ async def push_tenant_followup_mail(
     conv: EmailConversation,
     employee_id: uuid.UUID | None = None,
 ) -> bool:
-    """Telegram-Push an den Tenant/Mitarbeiter bei Folge-Mail auf
+    """Push an den Tenant/Mitarbeiter bei Folge-Mail auf
     bestehenden Vorgang.
 
     Bewusst KEIN Auto-Reply: der Inhaber soll selber entscheiden ob
@@ -542,20 +542,14 @@ async def push_tenant_followup_mail(
     Schickt an den employee_id wenn gesetzt, sonst an den Konversations-
     Assigned-Employee, sonst an den Tenant-Default.
 
-    Returns: True wenn Push abgeschickt (nicht garantiert dass Telegram
-    es ausgeliefert hat), False bei Fehler.
+    Returns: True wenn Push abgeschickt (nicht garantiert dass das Geraet
+    ihn ausgeliefert hat), False bei Fehler.
     """
     target_employee_id = employee_id or conv.assigned_employee_id
 
-    # Datensparsam (Welle 0): Telegram ist ein Drittland-Transfer (FZ-LLC) →
-    # KEINE Kunden-PII (Name/Mail/Betreff/Inhalt) in den Push. Der Inhaber
-    # holt die Details in der DSGVO-sauberen App bzw. im Outlook.
-    text = (
-        "📬 <b>Neue Nachricht zu einem laufenden Vorgang</b>\n"
-        "Öffne die App oder tippe /anfragen, um sie zu lesen.\n"
-        "<i>(Aus Datenschutzgründen ohne Inhalt.)</i>"
-    )
-
+    # Datensparsam: Push-Inhalte laufen ueber FCM/APNs → KEINE Kunden-PII
+    # (Name/Mail/Betreff/Inhalt) in den Push. Der Inhaber holt die Details
+    # in der App bzw. im Outlook.
     try:
         from core.integrations.notify import notify_tenant
         ok = await notify_tenant(
@@ -563,7 +557,7 @@ async def push_tenant_followup_mail(
             title="Neue Nachricht",
             body="Zu einem laufenden Vorgang — in der App ansehen.",
             url="/app#aktuelles", tag="mail",
-            telegram_text=text, employee_id=target_employee_id,
+            employee_id=target_employee_id,
         )
         return bool(ok)
     except Exception as e:
@@ -874,7 +868,7 @@ async def send_storno_confirmation_for_event(
     Best-effort: faengt alle Fehler ab und loggt nur. Der Storno selbst ist
     zu diesem Zeitpunkt bereits durchgefuehrt; ein Mail-Fehler darf den
     Aufrufer nie blockieren. Wiederverwendbar fuer alle Storno-Eintrittspunkte
-    (z.B. /storno-Telegram-Wizard). Returns True, wenn eine Mail rausging.
+    (Voice, Mail-Intent, App). Returns True, wenn eine Mail rausging.
     """
     from core.integrations.mail_template import extract_first_name
     from core.models import STATE_STORNIERT
@@ -1203,7 +1197,7 @@ async def push_tenant_bounce_notification(
     bounce_reason: str,
     employee_id: uuid.UUID | None = None,
 ) -> bool:
-    """Telegram-Push wenn unsere Q-Antwort gebounced ist (Teil G).
+    """Push wenn unsere Q-Antwort gebounced ist (Teil G).
 
     Format ist bewusst alarmierend (⚠️) — fuer den MA ist das
     Action-Item: er sollte die Mail manuell nochmal versenden, die
@@ -1216,15 +1210,9 @@ async def push_tenant_bounce_notification(
     """
     target_employee_id = employee_id or conv.assigned_employee_id
 
-    # Datensparsam (Welle 0): keine Kunden-Mail/Betreff/Bounce-Details in den
-    # Telegram-Push (Drittland-Transfer). Der Inhaber sieht den Vorgang in der
-    # App und kann dort manuell nachfassen.
-    text = (
-        "⚠️ <b>Eine automatische Antwort konnte nicht zugestellt werden</b>\n"
-        "Bitte in der App prüfen und ggf. manuell antworten.\n"
-        "<i>(Aus Datenschutzgründen ohne Inhalt.)</i>"
-    )
-
+    # Datensparsam: keine Kunden-Mail/Betreff/Bounce-Details in den Push
+    # (FCM/APNs). Der Inhaber sieht den Vorgang in der App und kann dort
+    # manuell nachfassen.
     try:
         from core.integrations.notify import notify_tenant
         ok = await notify_tenant(
@@ -1232,7 +1220,7 @@ async def push_tenant_bounce_notification(
             title="Antwort nicht zugestellt",
             body="Bitte in der App prüfen und ggf. manuell antworten.",
             url="/app#aktuelles", tag="bounce",
-            telegram_text=text, employee_id=target_employee_id,
+            employee_id=target_employee_id,
         )
         return bool(ok)
     except Exception as e:
@@ -1254,7 +1242,7 @@ async def push_tenant_new_anfrage_notification(
     anfrage_url: str | None = None,
     employee_id: uuid.UUID | None = None,
 ) -> bool:
-    """Telegram-Push an MA bei neuer RELEVANT_KUNDE-Anfrage (Teil F.1).
+    """Push an MA bei neuer RELEVANT_KUNDE-Anfrage (Teil F.1).
 
     Schickt eine strukturierte Notification mit:
       - 📧 Header + Sender-Name/-Mail
@@ -1264,25 +1252,15 @@ async def push_tenant_new_anfrage_notification(
         einen Formular-Link in seiner Antwort verschickt, fuer den MA
         ist es trotzdem hilfreich den direkten Link zu sehen)
 
-    Telegram inline-keyboards werden NICHT benutzt — HTML-<a>-Tags im
-    Message-Body sind unter parse_mode=HTML komplett ausreichend und
-    benoetigen kein reply_markup-Plumbing.
-
     Bewusst getrennt von push_tenant_followup_mail (Teil C) — Neuanfrage
     vs Folge-Mail haben sehr unterschiedliche UX-Bedeutung fuer den MA
     (Neuanfrage = "Kunde gewonnen!", Folge = "Bitte schauen, evtl. handeln").
 
     Returns: True wenn Push abgeschickt, False bei Fehler.
     """
-    # Datensparsam (Welle 0): keine Kunden-PII/Links in den Telegram-Push
-    # (Drittland-Transfer). Der Inhaber beantwortet die Anfrage in der App;
+    # Datensparsam: keine Kunden-PII/Links in den Push (FCM/APNs).
+    # Der Inhaber beantwortet die Anfrage in der App;
     # der Formular-Link ist dort (und in Q's bereits versendeter Antwort).
-    text = (
-        "📧 <b>Neue Kundenanfrage</b>\n"
-        "Öffne die App oder tippe /anfragen, um sie zu beantworten.\n"
-        "<i>(Aus Datenschutzgründen ohne Inhalt.)</i>"
-    )
-
     try:
         from core.integrations.notify import notify_tenant
         ok = await notify_tenant(
@@ -1290,7 +1268,7 @@ async def push_tenant_new_anfrage_notification(
             title="Neue Kundenanfrage",
             body="In der App öffnen, um zu antworten.",
             url="/app#aktuelles", tag="anfrage",
-            telegram_text=text, employee_id=employee_id,
+            employee_id=employee_id,
         )
         return bool(ok)
     except Exception as e:
@@ -1312,26 +1290,16 @@ async def push_tenant_intent_event(
     detail: str = "",
     employee_id: uuid.UUID | None = None,
 ) -> bool:
-    """Generischer Tenant-Telegram-Push fuer Intent-Events (Storno
+    """Generischer Tenant-Push fuer Intent-Events (Storno
     verarbeitet, Verschiebung erkannt, Rechnungsanfrage eingegangen).
 
     label: kurzer Status-Header ("Storno verarbeitet" / "Verschiebung
     erkannt" / "Rechnungsanfrage").
     detail: optionaler Detail-Zusatz (z.B. "2 Termine storniert").
     """
-    from html import escape as _h
-
-    # Datensparsam (Welle 0): label + detail sind systemgeneriert (Aktion +
-    # Zähler, KEINE Kunden-Identität) und bleiben drin; Absender/Betreff/
-    # Inhalt der Kundenmail fliegen raus (Drittland-Transfer).
-    extra_line = f"{_h(detail)}\n" if detail else ""
-    text = (
-        f"📧 <b>{_h(label)}</b>\n"
-        f"{extra_line}"
-        "Details in der App.\n"
-        "<i>(Aus Datenschutzgründen ohne Mailinhalt.)</i>"
-    )
-
+    # Datensparsam: label + detail sind systemgeneriert (Aktion +
+    # Zaehler, KEINE Kunden-Identitaet) und duerfen in den Push;
+    # Absender/Betreff/Inhalt der Kundenmail bleiben im Server.
     try:
         from core.integrations.notify import notify_tenant
         ok = await notify_tenant(
@@ -1339,9 +1307,10 @@ async def push_tenant_intent_event(
             # label ist eine feste interne Bezeichnung (Storno/Verschiebung/
             # Rechnungsanfrage), keine Kunden-PII — darf in den Push.
             title=label,
-            body="Details in der App.",
+            body=(f"{detail} — Details in der App." if detail
+                  else "Details in der App."),
             url="/app#aktuelles", tag="intent",
-            telegram_text=text, employee_id=employee_id,
+            employee_id=employee_id,
         )
         return bool(ok)
     except Exception as e:

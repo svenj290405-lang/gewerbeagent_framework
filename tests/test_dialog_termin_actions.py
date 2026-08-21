@@ -107,7 +107,7 @@ def captured_state():
         "record_inbound": [],
         "record_outbound_q_reply": [],
         "send_tracked_mail": [],
-        "telegram_pushes": [],
+        "pushes": [],
     }
 
 
@@ -325,7 +325,7 @@ def pipeline_mocks(monkeypatch, captured_state):
     async def fake_push_intent(*, tenant, sender_email, sender_name,
                                subject, body_preview, label, detail,
                                employee_id=None):
-        captured_state["telegram_pushes"].append({
+        captured_state["pushes"].append({
             "label": label, "detail": detail, "sender_email": sender_email,
         })
     monkeypatch.setattr(
@@ -416,7 +416,7 @@ async def test_propose_slots_calls_kalender_and_persists_slots(
     assert "Mögliche Termine" in body
     assert "22.05.2026" in body
     # Push-Politik: Slot-Vorschlaege pingen NICHT mehr (nur Buchung/Storno)
-    pushes = pipeline_mocks["captured"]["telegram_pushes"]
+    pushes = pipeline_mocks["captured"]["pushes"]
     assert not any("Slots vorgeschlagen" in p["label"] for p in pushes)
     # Threading: die Antwort referenziert die Kunden-Mail und haengt damit
     # beim Empfaenger im Thread statt lose daneben ("Re:" allein reicht nicht).
@@ -524,7 +524,7 @@ async def test_book_slot_uses_previous_proposed_slots(
     assert "23.05.2026" in body
     # Push-Politik: die Buchung meldet der Kalender-Handler ("Neuer
     # Termin"), NICHT der Mail-Dialog -> hier kein Intent-Push.
-    pushes = pipeline_mocks["captured"]["telegram_pushes"]
+    pushes = pipeline_mocks["captured"]["pushes"]
     assert not any("gebucht" in p["label"] for p in pushes)
 
 
@@ -836,7 +836,7 @@ async def test_cancel_termin_calls_cancel_helper_and_renders_storno_box(
     cc2 = pipeline_mocks["captured"]["create_conversation"]
     assert cc2[0]["state"] == "storniert"
     # Push
-    pushes = pipeline_mocks["captured"]["telegram_pushes"]
+    pushes = pipeline_mocks["captured"]["pushes"]
     assert any("Termin storniert" in p["label"] for p in pushes)
 
 

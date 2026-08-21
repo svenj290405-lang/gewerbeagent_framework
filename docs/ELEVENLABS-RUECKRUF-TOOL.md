@@ -135,7 +135,7 @@ curl -s -X POST https://gewerbeagent.de/webhook/_global/voice_init/rueckruf_anfo
   -H "X-Webhook-Secret: DEIN_SECRET" \
   -d '{"kunde_name":"Test Anrufer","kunde_telefon":"+49 651 000","anliegen":"Test-Rückruf","tenant_slug":"pilot"}'
 ```
-**Erwartung:** Antwort `{"success": true, ...}` UND ein Telegram-Push
+**Erwartung:** Antwort `{"success": true, ...}` UND ein Push in die App
 „📞 Rückrufbitte" mit „✅ Erledigt"-Button. Dann im Bot `/rueckrufe` →
 Eintrag erscheint und lässt sich abhaken.
 

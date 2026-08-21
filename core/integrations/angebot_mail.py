@@ -8,7 +8,7 @@ Bündelt:
    spaeter zur Antwort-Zuordnung nutzen koennen)
 5. Tracking-IDs am Angebot persistieren
 
-Wird genutzt vom Telegram-Wizard /angebot und vom microsoft_inbox-Polling
+Wird genutzt vom Angebots-Flow in der App und vom microsoft_inbox-Polling
 (Auto-Rechnung-Pfad nutzt parallel send_tracked_mail mit Rechnungs-PDF).
 """
 from __future__ import annotations
@@ -127,7 +127,7 @@ async def send_angebot_to_customer(
         return out
 
     # 2) Lexware-Provider aus der Tenant-ToolConfig laden (analog
-    # _get_lexware_provider_for_tenant im telegram_notify-Handler — eine
+    # _get_lexware_provider_for_tenant im frueheren Bot-Handler — eine
     # frühere from_global_config()-Factory existierte nie wirklich, der
     # ursprüngliche Stub crashte beim ersten echten Aufruf 2026-05-12).
     provider = None

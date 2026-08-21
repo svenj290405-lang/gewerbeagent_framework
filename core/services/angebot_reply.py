@@ -172,7 +172,7 @@ async def _notify(
     mode: str,
     status_gesetzt: bool,
 ) -> None:
-    """Push an den Betrieb — der lebende Kanal seit dem Telegram-Ausstieg."""
+    """Push an den Betrieb."""
     try:
         from core.integrations.push_notifier import send_push_to_tenant
         wer = kunde_name or "Ein Kunde"

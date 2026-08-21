@@ -1,7 +1,7 @@
 """FastAPI-Routes fuer das oeffentliche Anfrage-Formular.
 
 GET  /anfrage/{token}        -> rendert HTML-Formular
-POST /anfrage/{token}/submit -> speichert Antworten + Telegram-Push
+POST /anfrage/{token}/submit -> speichert Antworten + Push an den Betrieb
 
 Wird von core/api/app.py via app.include_router() eingebunden.
 """
@@ -148,7 +148,7 @@ async def render_anfrage_preview(
 ):
     """Vorschau des aktuellen Schemas — kein Token noetig.
 
-    Aufgerufen aus dem Telegram-Bot via /formular_anzeigen damit der
+    Aufgerufen aus der App (Formular-Werkstatt) damit der
     Handwerker sieht wie sein Web-Formular fuer Kunden aussieht.
     Submit ist im Preview-Modus deaktiviert.
 
@@ -404,11 +404,11 @@ async def submit_anfrage_form(token: str, request: Request):
             content=render_submit_error_page(message), status_code=400
         )
 
-    # Telegram-Push (nicht blockierend)
+    # Push an den Betrieb (nicht blockierend)
     try:
-        from core.integrations.anfrage_telegram import notify_tenant_anfrage_submitted
+        from core.integrations.anfrage_eingang import notify_tenant_anfrage_submitted
         await notify_tenant_anfrage_submitted(token_str=token, antworten=antworten)
     except Exception as e:
-        logger.warning(f"Telegram-Push fehler (non-fatal): {e}")
+        logger.warning(f"Anfrage-Push fehler (non-fatal): {e}")
 
     return HTMLResponse(content=render_success_page(), status_code=200)

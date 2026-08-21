@@ -455,7 +455,7 @@ async def poll_microsoft_inbox(
         # Lookup via Microsoft conversationId (provider-native Thread-
         # Gruppierung) + sender_email-Fallback. Wenn ja: KEIN Auto-Reply
         # mit Formular-Link (waere peinliche Wiederholung), sondern
-        # Telegram-Push an den zustaendigen Mitarbeiter — der entscheidet
+        # Push an den zustaendigen Mitarbeiter — der entscheidet
         # manuell oder die kommende Storno-/Verschiebungs-Erkennung
         # (Teil D) uebernimmt.
         existing_conv = None
@@ -504,7 +504,7 @@ async def poll_microsoft_inbox(
         #      bestehende Konversation: Kunde koennte telefonisch gebucht
         #      und jetzt erstmals gemailt haben)
         #   2. intent == termin_verschieben → Verschiebungs-Handler
-        #   3. intent == rechnungsanfrage   → nur Telegram-Push
+        #   3. intent == rechnungsanfrage   → nur Push
         #   4. existing_conv != None        → Folge-Mail (Teil C)
         #   5. spam_throttled               → Outlook-Kategorie, kein Reply
         #   6. confidence == low            → Outlook-Kategorie, kein Reply
@@ -848,7 +848,7 @@ async def fetch_full_message(
     # conversationId fuer Threading. internetMessageHeaders um In-Reply-To
     # als RFC-Fallback fuer find_open_conversation zu lesen — Graph
     # liefert die nur wenn explizit angefordert. webLink fuer den
-    # "Im Outlook oeffnen"-Deep-Link in der Tenant-Telegram-Push-
+    # "Im Outlook oeffnen"-Deep-Link in der Tenant-Push-
     # Notification (Teil F).
     params = {
         "$select": (
@@ -874,102 +874,6 @@ async def fetch_full_message(
     except Exception as e:
         logger.exception(f"fetch_full_message Exception: {e}")
         return None
-
-
-async def _forward_attachments_to_telegram(
-    *, tenant_id: UUID, message_id: str, sender_label: str,
-    subject: str, employee_id: UUID | None = None,
-) -> int:
-    """Lädt alle relevanten Anhaenge einer Mail und sendet sie als
-    Telegram-Document/Photo an den passenden Mitarbeiter-Chat.
-
-    Returns: Anzahl erfolgreich weitergeleiteter Anhaenge.
-    """
-    attachments = await fetch_attachments(
-        tenant_id, message_id, employee_id=employee_id,
-    )
-    if not attachments:
-        return 0
-
-    # Telegram-Chat + Bot-Token aufloesen. resolve_employee_push_target
-    # liefert (bot_token, chat_id, prefix); das frueher hier genutzte
-    # _resolve_chat_id_for_push hatte eine andere Signatur (session/fallback)
-    # + Rueckgabe (nur chat_id) und warf bei diesem Aufruf still einen
-    # TypeError -> die Anhang-Weiterleitung fiel lautlos komplett aus.
-    try:
-        from plugins.telegram_notify.handler import (
-            TelegramNotifier,  # type: ignore
-        )
-        bot_token, chat_id, _prefix = (
-            await TelegramNotifier.resolve_employee_push_target(
-                tenant_id, employee_id,
-            )
-        )
-    except Exception as e:
-        logger.debug(f"Anhang-Forward: chat_id-Lookup failed: {e}")
-        return 0
-
-    if not chat_id or not bot_token:
-        return 0
-
-    # Pre-Header: was kommt. Absender/Betreff stammen aus einer eingehenden
-    # (angreiferkontrollierten) Mail -> HTML-escapen, damit kein Markup in
-    # die Inhaber-Chat-Nachricht injiziert werden kann (parse_mode=HTML).
-    import html as _html
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            await client.post(
-                f"https://api.telegram.org/bot{bot_token}/sendMessage",
-                json={
-                    "chat_id": chat_id,
-                    "text": (
-                        f"📎 <b>{len(attachments)} Anhang/Anhaenge</b> "
-                        f"von {_html.escape(sender_label)}\n"
-                        f"Subject: {_html.escape(subject[:80])}"
-                    ),
-                    "parse_mode": "HTML",
-                },
-            )
-    except Exception as e:
-        # Preheader ist cosmetic — die eigentlichen Anhang-Uploads folgen
-        # darunter und haben eigene Fehler-Logs. Debug-Level reicht.
-        logger.debug(
-            f"Anhang-Forward: Preheader-Send failed (Anhaenge gehen "
-            f"trotzdem raus): {e}"
-        )
-
-    sent = 0
-    for att in attachments:
-        ct = (att.get("content_type") or "").lower()
-        name = att.get("name") or "anhang"
-        raw = att.get("bytes")
-        if not raw:
-            continue
-        # Bilder via sendPhoto, alles andere via sendDocument
-        is_image = ct.startswith("image/")
-        endpoint = "sendPhoto" if is_image else "sendDocument"
-        field_name = "photo" if is_image else "document"
-        try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                r = await client.post(
-                    f"https://api.telegram.org/bot{bot_token}/{endpoint}",
-                    data={"chat_id": chat_id, "caption": name[:200]},
-                    files={field_name: (name, raw, ct)},
-                )
-                if r.status_code == 200:
-                    sent += 1
-                else:
-                    logger.warning(
-                        f"Telegram-{endpoint} HTTP {r.status_code}: {r.text[:120]}"
-                    )
-        except Exception as e:
-            logger.warning(f"Telegram-{endpoint} crashed: {e}")
-
-    logger.info(
-        f"Anhang-Forward: tenant={tenant_id} {sent}/{len(attachments)} "
-        f"weitergeleitet"
-    )
-    return sent
 
 
 async def fetch_attachments(
@@ -1478,7 +1382,7 @@ async def _handle_rechnungsanfrage_intent(
     classification: str, confidence: str, reason: str,
     categories: list,
 ) -> dict:
-    """Rechnungsanfrage: nur Telegram-Push, keine Auto-Antwort.
+    """Rechnungsanfrage: nur Push, keine Auto-Antwort.
 
     Rechnungen sind heikel (Mahnungen, Zahlungs-Disputes, Skonto,
     Steuer). Q soll hier NICHT halluzinieren. Inhaber kriegt den
@@ -1642,7 +1546,7 @@ async def process_relevant_kunde_mail(
     tenant_owner_first = extract_first_name(tenant.contact_name or "") or None
 
     # Wissensbasis als Text laden (best-effort). Quelle: TenantKnowledge,
-    # gepflegt via Telegram /wissen. Die Freitext-Spalte heisst .text —
+    # gepflegt in der App unter Wissen. Die Freitext-Spalte heisst .text —
     # hier wurde frueher faelschlich .inhalt gelesen, wodurch die Wissens-
     # basis in der Mail-Pipeline IMMER leer blieb (der Voice-Pfad las
     # korrekt .text und antwortete deshalb auf Wissensfragen, die Mail nie).
@@ -2378,7 +2282,7 @@ async def process_relevant_kunde_mail(
                 f"conv nicht angelegt/aktualisiert): {e}"
             )
 
-        # Teil F.1: Tenant-Telegram-Push.
+        # Teil F.1: Tenant-Push.
         # Push-Politik (User-Wunsch): NUR Buchung + Storno pingen, nicht
         # jeder Mail-Verkehr. Konkret heisst das hier:
         #   - SEND_FORMULAR (Formular raus) -> KEIN Push mehr
@@ -2447,21 +2351,6 @@ async def process_relevant_kunde_mail(
                 )
         except Exception as e:
             logger.warning(f"mark_as_read fehler (non-fatal): {e}")
-
-        # 6c) Anhaenge an Telegram weiterleiten (Bilder, PDFs).
-        # Best-effort, schluckt eigene Fehler. Inhaber sieht so direkt
-        # das Foto vom kaputten Heizkessel oder den PDF-Plan.
-        if full.get("hasAttachments"):
-            try:
-                await _forward_attachments_to_telegram(
-                    tenant_id=tenant_id,
-                    message_id=message_id,
-                    sender_label=f"{sender_name} ({sender_email})",
-                    subject=subject,
-                    employee_id=employee_id,
-                )
-            except Exception as e:
-                logger.warning(f"Anhang-Forward fehler (non-fatal): {e}")
 
         try:
             moved = await move_to_gewerbeagent(

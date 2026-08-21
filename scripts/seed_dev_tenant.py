@@ -97,8 +97,6 @@ async def seed() -> None:
         # Wir aktivieren alles damit Sven jedes Feature lokal testen kann.
         # Im Prod-Onboarding entscheidet das die Paket-Auswahl.
         tools_to_enable = [
-            "telegram_bot",
-            "telegram_notify",
             "kalender",
             "lexware",
             "voice_init",
@@ -135,8 +133,7 @@ async def seed() -> None:
     print(f"  Public-URL:  {settings.public_url}")
     print()
     print("  NAECHSTE SCHRITTE (manuell):")
-    print(f"  1. Telegram-Bot @ Q_dev_bot starten (siehe INFRA-MANUAL-STEPS.md)")
-    print(f"  2. /start sven-dev im Dev-Bot → Telegram-Chat verknuepfen")
+    print(f"  1. App oeffnen: {settings.app_url}/app/login")
     print(f"  3. /kalender_verbinden → OAuth via {settings.public_url}/oauth/callback")
     print(f"  4. /help → testen")
     print()

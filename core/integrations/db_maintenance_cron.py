@@ -6,9 +6,7 @@ DSGVO-Cleanup damit beide nicht konkurrieren).
 Was es macht:
   1. admin_audit_log: Eintraege aelter als 180 Tage loeschen
   2. oauth_states: Orphans aelter als 7 Tage (verlassene Halb-Logins)
-  3. telegram_state: Eintraege mit expires_at < now (oder created_at
-     aelter als 24h falls expires_at NULL ist — defensive Cleanup)
-  4. visualisierungen: aelter als 90 Tage → image_bytes auf NULL,
+  3. visualisierungen: aelter als 90 Tage → image_bytes auf NULL,
      Metadaten bleiben fuer Statistik
 
 Wichtige Design-Entscheidung: KEIN Hard-Delete der Visualisierungen,
@@ -42,7 +40,6 @@ TICK_INTERVAL_SECONDS = 60
 # Retention-Konstanten — koennten spaeter konfigurierbar werden.
 AUDIT_LOG_RETENTION_DAYS = 180
 OAUTH_STATE_RETENTION_DAYS = 7
-TELEGRAM_STATE_FALLBACK_DAYS = 1
 VISUALISIERUNG_BLOB_RETENTION_DAYS = 90
 
 _last_run_date: dt.date | None = None
@@ -74,31 +71,6 @@ async def _cleanup_oauth_states() -> int:
         )
         await s.commit()
         return result.rowcount or 0
-
-
-async def _cleanup_telegram_states() -> int:
-    """Expired telegram_state-Eintraege wegraeumen.
-
-    Bevorzugt expires_at, fallback created_at + 24h fuer NULL-Werte.
-    """
-    from core.models import TelegramState
-    now = dt.datetime.now(dt.timezone.utc)
-    cutoff_fallback = now - dt.timedelta(days=TELEGRAM_STATE_FALLBACK_DAYS)
-    async with AsyncSessionLocal() as s:
-        # Variante A: expires_at vorhanden und schon vorbei
-        result_a = await s.execute(
-            delete(TelegramState)
-            .where(TelegramState.expires_at.is_not(None))
-            .where(TelegramState.expires_at < now)
-        )
-        # Variante B: kein expires_at, dafuer alt
-        result_b = await s.execute(
-            delete(TelegramState)
-            .where(TelegramState.expires_at.is_(None))
-            .where(TelegramState.created_at < cutoff_fallback)
-        )
-        await s.commit()
-        return (result_a.rowcount or 0) + (result_b.rowcount or 0)
 
 
 async def _cleanup_visualisierung_blobs() -> int:
@@ -133,7 +105,6 @@ async def _run_maintenance_once() -> dict:
     for label, fn in (
         ("audit_log_deleted", _cleanup_audit_log),
         ("oauth_states_deleted", _cleanup_oauth_states),
-        ("telegram_states_deleted", _cleanup_telegram_states),
         ("visualisierungen_blob_nulled", _cleanup_visualisierung_blobs),
     ):
         try:

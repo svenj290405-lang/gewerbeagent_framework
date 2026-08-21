@@ -36,8 +36,10 @@ docker logs gewerbeagent_framework --tail 80 --since 5m
 
 ## Szenario 1 — Framework-Container ist tot
 
-**Symptom:** Sven kriegt Telegram-Alert `⚠️ Framework antwortet nicht`,
-oder `curl /health` schlaegt fehl.
+**Symptom:** `external_liveness_check` meldet `ALARM: Framework antwortet
+nicht` im Log (`/var/log/gewerbeagent-liveness.log`), oder `curl /health`
+schlaegt fehl. ACHTUNG: seit dem Telegram-Ausbau (2026-08-21) gibt es
+keinen aktiven Alarm-Kanal mehr — der Alarm steht nur im Log.
 
 **Diagnose:**
 ```bash
@@ -193,7 +195,8 @@ dig +short gewerbeagent.de    # noch der richtige Server?
    curl https://gewerbeagent.de/health
    ```
 
-7. **Smoke-Test:** Sven schickt /status im Telegram, checkt /rechnungen_anzeigen.
+7. **Smoke-Test:** In der App einloggen (`/app/login`), Aktuelles +
+   Buchhaltung oeffnen.
 
 8. **gewerbeagent_broken liegen lassen** (mindestens 30 Tage) fuer
    Forensik oder falls noch Daten gerettet werden muessen.
@@ -249,9 +252,8 @@ ENCRYPTION_KEY unter 64 Zeichen → Phase-B-Hardening.
    ```
 
 5. **Smoke-Test:**
-   - `/status` im Telegram (Tenant-Bots gehen?)
-   - `/microsoft_status` (Microsoft-Token decrypt-bar?)
-   - `/lexware_status` (Lexware-Key decrypt-bar?)
+   - In der App unter Mehr → Verbindungen: Microsoft-Token
+     decrypt-bar? Lexware-Key decrypt-bar?
 
 6. **Bei Problemen** (z.B. ein Token blieb mit OLD verschluesselt):
    DB-Restore aus dem Pre-Rotation-Backup (Szenario 4).
@@ -326,9 +328,8 @@ SQL
 **Symptom:** Tenant-Push `Microsoft Outlook-Verbindung getrennt`. Cron-
 Logs zeigen `invalid_grant` Fehler.
 
-**Tenant-Aktion:** im Telegram `/microsoft_setup` bzw.
-`/kalender_verbinden` erneut. Token wird neu geholt + verschluesselt
-gespeichert.
+**Tenant-Aktion:** in der App unter Mehr → Verbindungen erneut
+verbinden. Token wird neu geholt + verschluesselt gespeichert.
 
 **Wenn Tenant nicht reagiert:** Sven kann den `oauth_tokens`-Eintrag
 manuell loeschen + den Tenant kontaktieren. Mail-Polling pausiert

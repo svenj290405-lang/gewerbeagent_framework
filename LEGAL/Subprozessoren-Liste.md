@@ -1,4 +1,4 @@
-# Subprozessoren-Liste (Stand: 25.05.2026)
+# Subprozessoren-Liste (Stand: 21.08.2026)
 
 Diese Liste nennt alle Dienste, an die personenbezogene Daten beim
 Betrieb des Gewerbeagent-Frameworks weitergegeben werden, und ist
@@ -20,11 +20,10 @@ hinterlegte Kontakt-Adresse) und kann Aenderungen innerhalb von
 | 2 | **Microsoft Ireland Operations Ltd.** | Outlook / Mail-API + Graph-Calendar | Dublin, IE | EU + USA-Backup | Mail-Inhalte, Termine, Kunden-Mail-Adressen | Standardvertragsklauseln, EU-USA Data Privacy Framework |
 | 3 | **Google Ireland Ltd.** | Google Calendar, Google Drive (Kunden-Archiv), Vertex AI (Gemini) | Dublin, IE | EU + USA | Termin-Inhalte, Drive-Dateien, KI-Prompts mit Kunden-Mails | Standardvertragsklauseln, EU-USA Data Privacy Framework |
 | 4 | **Sendinblue SAS (Brevo)** | Transaktionale Mails (Rechnungen, Visualisierungen) | Paris, FR | EU | Empfaenger-Mail-Adresse, Mail-Inhalt, Anhaenge | EU-intern, kein Drittlandstransfer |
-| 5 | **Telegram Messenger Inc.** | Tenant-Bot (Telegram-Push) | London, UK | UK / Singapore | Telegram-User-ID, Bot-Nachrichten | UK GDPR Adequacy + Telegram-AGB |
-| 6 | **Sipgate GmbH** | Voice-Telefon-Nummer + Anruf-Routing | Duesseldorf, DE | EU (DE) | Anrufer-Nummer, Anruf-Zeitstempel | Telekommunikations-Anbieter (TKG), DSGVO |
-| 7 | **ElevenLabs Inc.** | Voice-AI (Telefon-Annahme-Agent) | San Francisco, USA | USA (mit SCC) | Anrufer-Audio, Transkripte | Standardvertragsklauseln (SCC); Modell-Training via Zero-Retention-Mode/Opt-out deaktiviert |
-| 8 | **Deepgram Inc.** | Speech-to-Text (Voice-Transkription) | San Francisco, USA | USA (mit SCC) | Audio-Snippets, Transkripte | Standardvertragsklauseln (SCC) |
-| 9 | **Lexware (Haufe-Lexware GmbH & Co. KG)** | Buchhaltung (Rechnungen, Bezahl-Status) | Freiburg, DE | EU (DE) | Kunden-Stammdaten, Rechnungsbetraege, Lexware-API-Key | Auftragsverarbeitung (Lexware AVV) |
+| 5 | **Sipgate GmbH** | Voice-Telefon-Nummer + Anruf-Routing | Duesseldorf, DE | EU (DE) | Anrufer-Nummer, Anruf-Zeitstempel | Telekommunikations-Anbieter (TKG), DSGVO |
+| 6 | **ElevenLabs Inc.** | Voice-AI (Telefon-Annahme-Agent) | San Francisco, USA | USA (mit SCC) | Anrufer-Audio, Transkripte | Standardvertragsklauseln (SCC); Modell-Training via Zero-Retention-Mode/Opt-out deaktiviert |
+| 7 | **Deepgram Inc.** | Speech-to-Text (Voice-Transkription) | San Francisco, USA | USA (mit SCC) | Audio-Snippets, Transkripte | Standardvertragsklauseln (SCC) |
+| 8 | **Lexware (Haufe-Lexware GmbH & Co. KG)** | Buchhaltung (Rechnungen, Bezahl-Status) | Freiburg, DE | EU (DE) | Kunden-Stammdaten, Rechnungsbetraege, Lexware-API-Key | Auftragsverarbeitung (Lexware AVV) |
 
 ---
 
@@ -34,7 +33,6 @@ hinterlegte Kontakt-Adresse) und kann Aenderungen innerhalb von
 - Microsoft: https://www.microsoft.com/de-de/trust-center/privacy/data-protection-addendum
 - Google: https://workspace.google.com/intl/de/terms/dpa_terms.html
 - Brevo: https://www.brevo.com/de/datenschutz/
-- Telegram: https://telegram.org/privacy
 - Sipgate: https://www.sipgate.de/datenschutz
 - ElevenLabs: https://elevenlabs.io/privacy-policy
 - Deepgram: https://deepgram.com/privacy
@@ -70,3 +68,9 @@ hinterlegte Kontakt-Adresse) und kann Aenderungen innerhalb von
 - 2026-05-11: Erstfassung fuer Pilot-Phase.
 - 2026-05-25: Training-Use-Schutz praezisiert (ElevenLabs: Zero-
   Retention-Mode/Opt-out aktiv; Deepgram: kein MIP-Opt-in).
+- 2026-08-21: **Telegram Messenger Inc. gestrichen.** Der Bot wurde
+  vollstaendig entfernt (Code, Bot-Token, Webhook) und alle bei uns
+  gespeicherten Telegram-Chat-IDs wurden geloescht. Benachrichtigungen
+  laufen ausschliesslich als Web-Push in die eigene App; die
+  Push-Zustellung erfolgt ueber den Push-Dienst des jeweiligen
+  Browser-Herstellers und enthaelt keine Endkunden-Daten.

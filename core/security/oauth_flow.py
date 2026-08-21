@@ -175,7 +175,7 @@ def _get_redirect_uri() -> str:
 # State-Praefix kodiert, ob dieser Flow eine bestehende, bereits verbundene
 # Kalender-/Mail-Anbindung auf ein ANDERES Konto umbiegen darf. Nur der
 # authentifizierte PWA-Pfad (Recht `einstellungen.verwalten`) setzt "r"; der oeffentliche
-# GET /oauth/start (Telegram-Deeplinks, Reauth-Mails) bleibt "n" und kann so
+# GET /oauth/start (Links aus der App, Reauth-Mails) bleibt "n" und kann so
 # eine verbundene Anbindung nicht fremduebernehmen (Confused-Deputy-Schutz).
 _STATE_PREFIX_REBIND = "r"
 _STATE_PREFIX_NORMAL = "n"
@@ -548,20 +548,6 @@ async def _handle_callback_microsoft(
             )
             try:
                 from core.integrations.notify import notify_employee
-                warn = (
-                    "⚠️ <b>Outlook-Kalender verbunden — aber Zeitzone pruefen!</b>\n\n"
-                    f"Account: <code>{account_email}</code>\n"
-                    f"Deine Outlook-Mailbox steht auf <b>{mailbox_tz}</b>. "
-                    f"Termine die wir um 11:00 buchen werden im Outlook-Client "
-                    f"deshalb verschoben angezeigt (meist 2h frueher).\n\n"
-                    f"<b>So aenderst du das (einmalig, 30 Sek):</b>\n"
-                    f"Outlook-Web -> Settings (Zahnrad oben rechts) -> "
-                    f"<b>Calendar -> View</b> -> Time zone: "
-                    f"<code>(UTC+01:00) Amsterdam, Berlin, Bern, Rom, Stockholm, Wien</code>\n\n"
-                    f"Danach passt die Anzeige. Unsere Buchungen sind "
-                    f"unabhaengig davon im Hintergrund korrekt — nur die "
-                    f"Outlook-Anzeige ist betroffen."
-                )
                 await notify_employee(
                     tenant.id, employee_id,
                     title="Outlook verbunden — Zeitzone prüfen",
@@ -570,7 +556,6 @@ async def _handle_callback_microsoft(
                         f"Anleitung in der App."
                     ),
                     url="/app#mehr", tag="tz-warnung",
-                    telegram_text=warn,
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.warning(f"TZ-Warning-Push failed: {exc}")

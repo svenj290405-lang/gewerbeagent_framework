@@ -1,8 +1,10 @@
 # Gewerbeagent Framework — Orientierung fuer Devs + KI-Assistenten
 
 Multi-Tenant SaaS fuer Handwerksbetriebe. Eingehende Anfragen (Mail,
-Telefon, Web-Formular) werden via Telegram-Bot + KI-Klassifikation
-automatisch verarbeitet, Termine gebucht, Rechnungen geschrieben.
+Telefon, Web-Formular) werden per KI-Klassifikation automatisch
+verarbeitet, Termine gebucht, Rechnungen geschrieben. Oberflaeche fuer
+den Betrieb ist die PWA unter /app (der fruehere Telegram-Bot wurde am
+2026-08-21 aus DSGVO-Gruenden entfernt).
 
 ## Stack
 
@@ -49,12 +51,11 @@ core/features/           Catalog + Package-System
 core/models/             SQLAlchemy-Models (alle Tabellen)
 core/security/           encryption, oauth_flow, oauth_token_lookup
 core/logging_context.py  contextvars-basiertes strukturiertes Logging
-plugins/                 telegram_notify, kalender, mail_intake,
-                         voice_init, hello (Beispiel)
+plugins/                 kalender, voice_init, hello (Beispiel)
 migrations/versions/     Alembic
 scripts/                 onboard, deploy_prod, backup_db, restore_db,
                          rotate_encryption_key, external_liveness_check,
-                         assign_number, generate_qr, ...
+                         assign_number, app_login_link, ...
 LEGAL/                   AVV-Template, Subprozessoren-Liste
 tests/                   pytest (Unit + Smoke); Integration kommt Beta-2
 ```

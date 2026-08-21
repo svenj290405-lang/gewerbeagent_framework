@@ -2,7 +2,7 @@
 Tenant-Alert-Pipeline.
 
 Zentrale Stelle fuer alle proaktiven Benachrichtigungen an den Tenant
-ueber Telegram. Verhindert dass kritische Probleme (Token expired,
+per Web-Push. Verhindert dass kritische Probleme (Token expired,
 Cron tot, API-Limit erreicht) lautlos im Container-Log versanden.
 
 Design:
@@ -78,59 +78,22 @@ async def _send_alert(
     *, tenant_id: UUID, message: str,
     employee_id: UUID | None = None,
 ) -> bool:
-    """Benachrichtigt den Betrieb per Web-Push und (noch) per Telegram.
+    """Benachrichtigt den Betrieb per Web-Push.
 
-    Failsafe: keiner der beiden Kanaele darf den Aufrufer abbrechen.
-    Rueckgabe bezieht sich auf Telegram, solange das der Hauptkanal ist.
+    Failsafe: ein Alert-Fehler darf den Aufrufer nie abbrechen. Die
+    ``message`` bleibt bewusst im Server (sie kann Kunden-PII enthalten) —
+    der Push sagt nur, dass etwas anliegt, die Details holt die App.
     """
-    # Web-Push zuerst — inhaltslos, weil message Kunden-PII enthalten kann.
     try:
         from core.integrations.push_notifier import send_push_to_tenant
-        await send_push_to_tenant(
+        return bool(await send_push_to_tenant(
             tenant_id,
             title="Hinweis zu deinem Betrieb",
             body="In der App ansehen.",
             url="/app#aktuelles", tag="tenant-alert",
-        )
+        ))
     except Exception as e:  # noqa: BLE001
         logger.warning(f"_send_alert push failed: {e}")
-
-    from core.integrations.notify import telegram_active
-    if not telegram_active():
-        return False
-
-    try:
-        # Lazy-Import damit keine Plugin-Loading-Zirkel.
-        # resolve_employee_push_target liefert (bot_token, chat_id, prefix);
-        # das frueher hier genutzte _resolve_chat_id_for_push hatte eine
-        # andere Signatur (session/fallback) + Rueckgabe (nur chat_id) und
-        # warf bei diesem Aufruf still einen TypeError -> Push fiel lautlos aus.
-        from plugins.telegram_notify.handler import TelegramNotifier  # type: ignore
-        bot_token, chat_id, prefix = (
-            await TelegramNotifier.resolve_employee_push_target(
-                tenant_id, employee_id,
-            )
-        )
-        if not chat_id or not bot_token:
-            return False
-        if prefix:
-            message = f"{prefix}{message}"
-        # Direkter Telegram-API-Call (httpx) um nicht den Plugin-State
-        # zu pollutieren.
-        import httpx
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.post(
-                f"https://api.telegram.org/bot{bot_token}/sendMessage",
-                json={
-                    "chat_id": chat_id,
-                    "text": message,
-                    "parse_mode": "HTML",
-                    "disable_web_page_preview": True,
-                },
-            )
-            return resp.status_code == 200
-    except Exception as e:
-        logger.warning(f"_send_alert failed: {e}")
         return False
 
 

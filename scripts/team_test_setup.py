@@ -68,7 +68,6 @@ async def _upsert_employee(tenant_id, *, slug, name, skills, calendar_id):
             tenant_id=tenant_id, slug=slug, name=name,
             is_default=False, is_active=True, skills=skills,
             calendar_provider="google", calendar_id=calendar_id,
-            telegram_chat_id=None,
         )
         s.add(emp)
         await s.commit()
@@ -161,7 +160,7 @@ async def main():
         print(f"    {start:%H:%M} {subject[:34]:34} {verdict}")
 
     print("\n" + "=" * 72)
-    print("Setup fertig. Jetzt im Telegram-Bot:")
+    print("Setup fertig. Jetzt in der App:")
     print("  1) /team      → Max + Anna sollten erscheinen")
     print("  2) /krank     → 'Max Test' wählen → 'Nur heute'")
     print("  3) Push + Zusammenfassung beobachten")

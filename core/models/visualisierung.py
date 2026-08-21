@@ -9,7 +9,6 @@ import datetime as dt
 import uuid
 
 from sqlalchemy import (
-    BigInteger,
     DateTime,
     ForeignKey,
     LargeBinary,
@@ -50,8 +49,6 @@ class Visualisierung(Base):
         nullable=False,
     )
 
-    # Telegram-Chat von dem die Anfrage kam
-    chat_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 
     # An wen die Visualisierung gemailt wird (optional, kann auch nur intern bleiben)
     kunde_email: Mapped[str | None] = mapped_column(String(255), nullable=True)

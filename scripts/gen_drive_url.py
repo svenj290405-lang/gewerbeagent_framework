@@ -1,5 +1,5 @@
 """Erzeugt direkt eine Google-OAuth-Connect-URL fuer einen Tenant
-(umgeht den Telegram-Button). State + PKCE werden in der DB persistiert,
+(umgeht den Verbinden-Knopf in der App). State + PKCE werden in der DB persistiert,
 der Callback laeuft normal ueber /oauth/callback.
 
 Aufruf (im Container):

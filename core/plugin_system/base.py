@@ -42,7 +42,7 @@ class PluginManifest(BaseModel):
     # False = NUR in-process aufrufbar (z.B. voice_init -> kalender). Der
     # zentrale Dispatcher (core/api/app.py) lehnt externe Aufrufe an solche
     # Plugins mit 404 ab, BEVOR on_webhook laeuft. Plugins, die echte externe
-    # Webhooks empfangen (ElevenLabs, Telegram), setzen das auf True UND sind
+    # Webhooks empfangen (z.B. ElevenLabs), setzen das auf True UND sind
     # selbst fuer ihre Signatur-/Secret-Pruefung in on_webhook verantwortlich.
     # Default False, damit ein neues Plugin keinen Endpunkt aus Versehen
     # offen ins Netz haengt (z.B. eine Buchungs-/Loesch-Route).
@@ -88,7 +88,7 @@ class BasePlugin(ABC):
             payload: JSON-Body des Requests
             headers: HTTP-Request-Header (lowercase keys). Optional damit
                 bestehende Plugins die Signatur ignorieren koennen — neue
-                Plugins (Telegram, Brevo, ElevenLabs) nutzen sie zur
+                Plugins (Brevo, ElevenLabs) nutzen sie zur
                 Signature-Verifikation eingehender Webhooks.
 
         Returns:

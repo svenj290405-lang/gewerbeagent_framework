@@ -4,7 +4,7 @@ Pro Eintrag: ein durchgehender Zeitraum mit Typ (krank|urlaub|sonstiges).
 end_date NULL = open-ended ("krank, weiss noch nicht wie lange").
 
 Verwendet von:
-- /krank, /urlaub, /abwesend, /zurueck Telegram-Wizards.
+- Krank-/Urlaubs-Meldung im Team-Screen der App.
 - core.routing.employee_router: choose_employee() filtert mit
   is_employee_working_at(emp, target_dt) abwesende Mitarbeiter
   raus (siehe target_datetime-Param).

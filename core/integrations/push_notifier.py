@@ -1,6 +1,6 @@
 """Web-Push-Versand (VAPID) an die Inhaber-/Mitarbeiter-PWA.
 
-Loest die Telegram-Pushes ab. **DSGVO-Kern:** der Payload ist bewusst
+Einziger Benachrichtigungskanal. **DSGVO-Kern:** der Payload ist bewusst
 minimal/inhaltslos — er enthaelt KEINE Endkunden-PII. FCM/APNs/Mozilla
 sehen nur einen verschluesselten Blob mit z.B. {"title": "Neue Buchung",
 "body": "In der App ansehen", "url": "/app#termine"}. Die eigentlichen
@@ -135,7 +135,7 @@ async def send_push_to_tenant(
     zugestellter Pushes ueber alle Empfaenger zusammen.
 
     Wird vom Mail-Pipeline-Worker aufgerufen wenn eine neue Anfrage
-    eingeht (Telegram-Ersatz). ``inhaber_only=True`` schraenkt auf
+    eingeht. ``inhaber_only=True`` schraenkt auf
     is_default-Employees ein — sinnvoll fuer geschaeftliche Eskalations-
     Events. Default geht an alle (Pflege/Aerztin sehen auch was los ist).
     """

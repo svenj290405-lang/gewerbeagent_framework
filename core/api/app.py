@@ -288,7 +288,7 @@ async def webhook_dispatch(
         )
 
     # Header-Dict zum Plugin durchreichen (lowercase fuer konsistenten
-    # Lookup von Signatur-Headers wie X-Telegram-Bot-Api-Secret-Token).
+    # Lookup von Signatur-Headers wie ElevenLabs-Signature).
     headers_lc = {k.lower(): v for k, v in request.headers.items()}
 
     # Dispatch an Plugin
@@ -374,16 +374,6 @@ async def oauth_callback(
     try:
         oauth_token = await handle_callback(code=code, state=state)
         safe_email = _h(oauth_token.account_email or "?")
-        # Onboarding: steht der Tenant gerade beim Kalender-Schritt, das
-        # Tutorial automatisch weiterschalten (Telegram-Push). Failsafe —
-        # ein Telegram-Problem darf den OAuth-Erfolg nie kippen.
-        try:
-            from plugins.telegram_notify.handler import onboarding_advance_after_oauth
-            await onboarding_advance_after_oauth(
-                oauth_token.tenant_id, oauth_token.provider,
-            )
-        except Exception:
-            logger.exception("Onboarding-Auto-Advance nach OAuth fehlgeschlagen")
         return HTMLResponse(
             content=f"""
             <html>
@@ -395,7 +385,7 @@ async def oauth_callback(
                 <script>
                   // Aus der PWA per window.open geoeffnet? Dann automatisch
                   // schliessen — die App laedt den Status beim Schliessen neu.
-                  // Im normalen Browser-Tab (z.B. via Telegram-Link) ist
+                  // Im normalen Browser-Tab ist
                   // window.close() ein No-Op, schadet also nicht.
                   setTimeout(function() {{ try {{ window.close(); }} catch (e) {{}} }}, 1500);
                 </script>

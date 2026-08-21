@@ -29,18 +29,20 @@ def _reset_throttle():
 
 @pytest.fixture
 def push_capture(monkeypatch):
-    """Faengt TelegramNotifier.send_for_tenant ab."""
+    """Faengt die Push-Zustellung (notify_tenant) ab."""
     calls: list[dict] = []
 
-    async def fake_send(tenant_id, text, *, employee_id=None):
+    async def fake_send(tenant_id, *, title, body, url="/app", tag=None,
+                        employee_id=None, inhaber_only=False):
         calls.append({
-            "tenant_id": tenant_id, "text": text,
-            "employee_id": employee_id,
+            "tenant_id": tenant_id, "title": title, "body": body,
+            "text": f"{title} {body}",
+            "url": url, "tag": tag, "employee_id": employee_id,
         })
-        return True
+        return 1
 
-    import plugins.telegram_notify.handler as tnh
-    monkeypatch.setattr(tnh.TelegramNotifier, "send_for_tenant", fake_send)
+    import core.integrations.notify as notify_mod
+    monkeypatch.setattr(notify_mod, "notify_tenant", fake_send)
     return calls
 
 
@@ -84,24 +86,18 @@ def tenant_in_db(monkeypatch):
 async def test_google_push_contains_reauth_link_and_warn_advice(
     push_capture, tenant_in_db,
 ):
-    """Google-Push: Re-Auth-URL, Schritte fuer Verifizierungs-Warnung,
-    Sven-Hinweis."""
+    """Google: Push meldet die unterbrochene Verbindung und schickt in
+    die App — die Re-Auth-Schritte stehen dort, nicht im Push."""
     sent = await oauth_alert.notify_oauth_token_invalid(
         tenant_in_db.id, "google", reason="invalid_grant",
     )
     assert sent is True
     assert len(push_capture) == 1
-    text = push_capture[0]["text"]
-    # Re-Auth-URL mit Tenant-Slug + Provider
-    # URL ist HTML-escaped (`&` -> `&amp;`)
-    assert "tenant=demo" in text and "provider=google" in text
-    # Google-Schritte erwaehnt
-    assert "Erweitert" in text
-    assert "nicht verifiziert" in text
-    # Sven-Kontakt-Hinweis
-    assert "Sven" in text
-    # Drive + Kalender Label
-    assert "Drive" in text and "Kalender" in text
+    call = push_capture[0]
+    assert call["title"] == "Verbindung unterbrochen"
+    assert "Google" in call["body"]
+    assert call["url"] == "/app#mehr"
+    assert call["tag"] == "oauth-google"
 
 
 @pytest.mark.asyncio
@@ -114,8 +110,8 @@ async def test_microsoft_push_has_no_unverified_warning(
         tenant_in_db.id, "microsoft",
     )
     text = push_capture[0]["text"]
-    assert "Outlook" in text or "Microsoft" in text
-    assert "tenant=demo" in text and "provider=microsoft" in text
+    assert "Microsoft" in text
+    assert push_capture[0]["tag"] == "oauth-microsoft"
     # KEIN Verifizierungs-Theater fuer Microsoft
     assert "nicht verifiziert" not in text
     assert "Erweitert" not in text

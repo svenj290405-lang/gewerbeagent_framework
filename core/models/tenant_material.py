@@ -3,7 +3,7 @@
 Workflow:
 1. Handwerker legt einmal an: Name + Bestell-Link (z.B. Toolnation-URL)
 2. Bei Bedarf: /bestellen <slug> [menge]
-3. Bot zeigt Inline-Telegram-Button mit URL → Tenant klickt → Browser
+3. App zeigt den Bestell-Knopf mit URL → Tenant klickt → Browser
 4. Bestellung wird in material_bestellung als Audit-Log persistiert
 
 KEINE automatische Mail-Bestellung — nur URL-Link-Variante (Sven-Wahl).

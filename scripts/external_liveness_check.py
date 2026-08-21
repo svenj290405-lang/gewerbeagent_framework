@@ -7,8 +7,12 @@ Henne-Ei wenn Framework crasht). Prueft alle 5 min:
   1. HTTP /health gegen den Framework-Container
   2. DB-SELECT 1 gegen Postgres
   3. Bei 3 aufeinanderfolgenden Fehlern UND > 1h seit letztem Alert:
-     Telegram-Push an Sven.
-  4. Wenn vorher 'down' war und jetzt wieder 'ok': Recovery-Push.
+     Alarm (siehe _alarm() — aktuell nur Log, siehe unten).
+  4. Wenn vorher 'down' war und jetzt wieder 'ok': Recovery-Meldung.
+
+ACHTUNG: Der Alarm hat seit dem Telegram-Ausbau (2026-08-21) KEINEN
+Transport mehr — er landet nur in dieser Log-Datei. Wer das Postfach
+nicht liest, merkt einen Ausfall nicht. Ersatzkanal steht aus.
 
 State-Datei: /tmp/gewerbeagent-liveness-state.json
    { "framework": {"consecutive_failures": N, "last_alert_at": "ISO",
@@ -28,8 +32,6 @@ Konfiguration via Env (alle optional):
    POSTGRES_CONTAINER     default gewerbeagent_postgres
    POSTGRES_USER          default gewerbeagent
    POSTGRES_DB            default gewerbeagent
-   ADMIN_TELEGRAM_BOT_TOKEN  Pflicht fuer Push
-   ADMIN_TELEGRAM_CHAT_ID    Pflicht fuer Push
    STATE_FILE             default /tmp/gewerbeagent-liveness-state.json
 """
 from __future__ import annotations
@@ -119,32 +121,16 @@ def check_db() -> tuple[bool, str]:
         return False, f"Exception: {type(e).__name__}: {e}"
 
 
-def send_telegram(message: str) -> bool:
-    """Push an Admin-Telegram. Token + Chat aus Env. Failsafe."""
-    token = os.environ.get("ADMIN_TELEGRAM_BOT_TOKEN", "")
-    chat_id = os.environ.get("ADMIN_TELEGRAM_CHAT_ID", "")
-    if not token or not chat_id:
-        print("ERR: ADMIN_TELEGRAM_BOT_TOKEN/CHAT_ID fehlt — kein Push",
-              file=sys.stderr)
-        return False
-    try:
-        data = json.dumps({
-            "chat_id": chat_id,
-            "text": message[:4000],
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True,
-        }).encode("utf-8")
-        req = urllib.request.Request(
-            f"https://api.telegram.org/bot{token}/sendMessage",
-            data=data,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            return resp.status == 200
-    except Exception as e:
-        print(f"ERR: Telegram-Push fehlgeschlagen: {e}", file=sys.stderr)
-        return False
+def _alarm(message: str) -> bool:
+    """Alarm ausgeben.
+
+    Frueher ging das als Telegram-Push an Sven; der Bot ist entfernt
+    (DSGVO/Drittland). Bis ein Ersatzkanal steht, landet der Alarm nur
+    hier im Log — bewusst auf stderr, damit Cron ihn per MAILTO
+    weiterreichen kann, wenn das auf dem Host eingerichtet ist.
+    """
+    print(f"ALARM: {message}", file=sys.stderr)
+    return True
 
 
 def _evaluate_component(
@@ -168,9 +154,9 @@ def _evaluate_component(
     if ok:
         # Recovery-Branch: war vorher 'down' → einmal "wieder ok" pushen.
         if prev_status == "down":
-            send_telegram(
-                f"✅ <b>{label} wieder online</b>\n\n"
-                f"<code>{_now().isoformat(timespec='seconds')}</code>"
+            _alarm(
+                f"{label} wieder online "
+                f"({_now().isoformat(timespec='seconds')})"
             )
             comp["status"] = "ok"
         comp["consecutive_failures"] = 0
@@ -200,11 +186,10 @@ def _evaluate_component(
         except Exception:
             pass
 
-    sent = send_telegram(
-        f"⚠️ <b>{label} antwortet nicht</b>\n\n"
-        f"Seit {n} Checks (= ~{n * 5} min) keine Antwort.\n"
-        f"Letzter Grund: <code>{reason}</code>\n"
-        f"<code>{now.isoformat(timespec='seconds')}</code>"
+    sent = _alarm(
+        f"{label} antwortet nicht — seit {n} Checks (= ~{n * 5} min). "
+        f"Letzter Grund: {reason} "
+        f"({now.isoformat(timespec='seconds')})"
     )
     if sent:
         comp["last_alert_at"] = now.isoformat()

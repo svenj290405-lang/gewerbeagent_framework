@@ -8,7 +8,6 @@ Deckt:
 - EmployeeAbsence.covers: Datums-Abdeckung (geschlossen + open-ended)
 - create_absence: Eingabe-Validierung (Typ, end < start) — vor jedem DB-Call
 - is_employee_working_at: aktiv + Absence + Arbeitstag + Arbeitszeit
-- RedistributionReport.summary: Telegram-Zusammenfassung
 - _run_cron_for_today: KERNREGEL — nur 'krank' wird umverteilt, 'urlaub' nicht
 
 Alle DB-Zugriffe sind gemockt (kein echtes Postgres noetig) — gleiche
@@ -272,74 +271,6 @@ async def test_working_available_true(monkeypatch):
     monkeypatch.setattr("core.database.AsyncSessionLocal", _session_factory([emp]))
     monkeypatch.setattr(ea, "is_employee_absent_on", AsyncMock(return_value=False))
     assert await ea.is_employee_working_at(emp.id, target) is True
-
-
-# =====================================================================
-# RedistributionReport.summary (Telegram-Zusammenfassung — pure)
-# =====================================================================
-
-
-def _result(reason, subject="Heizung Mueller", new_slug=None, err=None):
-    return ar.EventRedistributionResult(
-        event_id="evt1", event_subject=subject,
-        event_start=dt.datetime(2026, 5, 20, 9, 30),
-        sick_emp_slug="max", new_emp_slug=new_slug, reason=reason, error=err,
-    )
-
-
-def test_report_summary_reassigned():
-    rep = ar.RedistributionReport(
-        sick_emp_slug="max", sick_emp_name="Max Mueller",
-        date_range=(dt.date(2026, 5, 20), dt.date(2026, 5, 20)),
-        reassigned=[_result("moved", new_slug="anna")],
-    )
-    out = rep.summary()
-    assert "Max Mueller" in out
-    assert "✅" in out and "anna" in out
-
-
-def test_report_summary_no_coverage_and_errors():
-    rep = ar.RedistributionReport(
-        sick_emp_slug="max", sick_emp_name="Max",
-        date_range=(dt.date(2026, 5, 20), dt.date(2026, 5, 21)),
-        no_coverage=[_result("no-coverage")],
-        errors=[_result("error", err="Kalender weg")],
-    )
-    out = rep.summary()
-    assert "⚠️" in out  # kein Kollege verfuegbar
-    assert "❌" in out and "Kalender weg" in out
-
-
-def test_report_summary_empty():
-    rep = ar.RedistributionReport(
-        sick_emp_slug="max", sick_emp_name="Max",
-        date_range=(dt.date(2026, 5, 20), dt.date(2026, 5, 20)),
-    )
-    assert "keine Termine" in rep.summary()
-
-
-def test_telegram_summary_is_contentless():
-    """Welle 0: die Telegram-Variante zeigt nur Zaehler, KEINE Termin-
-    Betreffe (Kundennamen) oder den Namen des kranken Mitarbeiters."""
-    rep = ar.RedistributionReport(
-        sick_emp_slug="max", sick_emp_name="Max Mueller",
-        date_range=(dt.date(2026, 5, 20), dt.date(2026, 5, 20)),
-        reassigned=[_result("moved", subject="Heizung Mueller", new_slug="anna")],
-        no_coverage=[_result("no-coverage", subject="Bad Schmidt")],
-    )
-    out = rep.telegram_summary()
-    assert "1 Termin(e) umverteilt" in out
-    assert "1 Termin(e) ohne Kollegen" in out
-    for pii in ("Max Mueller", "Heizung Mueller", "Bad Schmidt", "anna"):
-        assert pii not in out
-
-
-def test_telegram_summary_empty():
-    rep = ar.RedistributionReport(
-        sick_emp_slug="max", sick_emp_name="Max",
-        date_range=(dt.date(2026, 5, 20), dt.date(2026, 5, 20)),
-    )
-    assert "keine Termine" in rep.telegram_summary()
 
 
 # =====================================================================

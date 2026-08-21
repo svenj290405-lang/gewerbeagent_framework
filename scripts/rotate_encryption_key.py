@@ -13,7 +13,7 @@ Was verschluesselt ist:
   - oauth_tokens._access_token_encrypted
   - tool_configs.config['encrypted_api_key']  (Lexware-Keys)
   - tool_configs.config['encrypted_*']        (defensiv: jede 'encrypted_*'-Key)
-  - tool_configs.config['bot_token']          (Telegram-Bot pro Betrieb —
+  - tool_configs.config['bot_token']          (Bot-Token je Betrieb —
     verschluesselt gespeichert, folgt aber NICHT dem 'encrypted_'-Schema;
     muss explizit mit-rotiert werden, sonst Daten-Verlust)
 
@@ -136,7 +136,7 @@ async def _rotate_tool_configs(
     Conventions:
       - cfg['encrypted_api_key']  (Lexware)
       - andere encrypted_*-Felder werden defensiv mitgenommen
-      - cfg['bot_token'] (Telegram-Bot pro Betrieb) wird explizit
+      - cfg['bot_token'] wird explizit
         mitgenommen, obwohl es nicht dem 'encrypted_'-Schema folgt.
         Es kann historisch im Klartext vorliegen (try_decrypt-Fallback);
         in dem Fall bleibt es unveraendert (kein harter Fehler).
@@ -239,7 +239,7 @@ async def _main(old_key: str, new_key: str, execute: bool) -> int:
             "=== ROTATION FERTIG. JETZT TUN: ===\n"
             "  1. ENCRYPTION_KEY in .env auf den neuen Wert setzen\n"
             "  2. docker compose -p prod restart framework\n"
-            "  3. /status im Telegram pruefen: alle Tokens funktionieren\n"
+            "  3. In der App pruefen: alle Verbindungen funktionieren\n"
             "Bei Problemen: DB-Restore aus dem Pre-Rotation-Backup."
         )
     else:

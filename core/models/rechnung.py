@@ -1,5 +1,5 @@
 """
-Rechnung: Telegram-Wizard zur Rechnungserstellung in Lexware.
+Rechnung: Rechnungserstellung in Lexware (App/Q-Flow).
 
 Tenant tippt oder spricht: 'Rechnung an Frau Mueller in Trier,
 Moebelmontage 350 Euro brutto'.
@@ -12,7 +12,6 @@ import decimal
 import uuid
 
 from sqlalchemy import (
-    BigInteger,
     Boolean,
     DateTime,
     ForeignKey,
@@ -56,7 +55,7 @@ RECHNUNG_INPUT_VOICE = "voice"
 
 
 class Rechnung(Base):
-    """Eine ueber Telegram angelegte Rechnung."""
+    """Eine ueber die App angelegte Rechnung."""
 
     __tablename__ = "rechnungen"
 
@@ -71,8 +70,6 @@ class Rechnung(Base):
         ForeignKey("tenants.id", ondelete="CASCADE"),
         nullable=False,
     )
-
-    chat_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 
     # Eingabe-Audit-Trail
     input_type: Mapped[str] = mapped_column(String(10), nullable=False)

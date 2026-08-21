@@ -11,7 +11,7 @@ Workflow:
 1. Voice-Agent ruft das Tool 'rueckruf_anfordern' auf
    (plugins/voice_init/handler.py -> _handle_rueckruf_anfordern).
 2. Hier wird eine Zeile mit Status 'offen' gespeichert.
-3. Sofortiger Telegram-Push an den zustaendigen Mitarbeiter/Tenant mit
+3. Sofortiger Push an den zustaendigen Mitarbeiter/Tenant mit
    Inline-Button '✅ Erledigt'.
 4. Handwerker hakt per Button (oder ueber /rueckrufe) ab -> Status
    'erledigt'.

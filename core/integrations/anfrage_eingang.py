@@ -1,6 +1,6 @@
 """Drive-Archiv wenn Kunde Anfrage-Formular abschickt.
 
-Kein Telegram-Push mehr — siehe notify_tenant_anfrage_submitted-Docstring
+Kein Push an den Betrieb — siehe notify_tenant_anfrage_submitted-Docstring
 fuer die Begruendung.
 """
 from __future__ import annotations
@@ -100,7 +100,7 @@ async def _save_submission_to_drive(
         anfrage_2026-05-18_15-30-45__foto_kueche.jpg
         anfrage_2026-05-18_15-30-45__skizze.pdf
 
-    Returns: Drive-Folder-URL bei Erfolg (fuer Anzeige im Telegram-
+    Returns: Drive-Folder-URL bei Erfolg (fuer Anzeige im App-
     Push), None bei Fehler. Eigene Fehler werden geloggt — Drive ist
     Backup, DB-Response bleibt Source of Truth.
     """
@@ -177,7 +177,7 @@ def _anliegen_text_from_antworten(antworten: dict) -> str:
 async def notify_tenant_anfrage_submitted(token_str: str, antworten: dict) -> None:
     """Verarbeitet eine Formular-Submission: schreibt alles ins Drive-Archiv.
 
-    Kein Telegram-Push mehr — die Eingaenge sammeln sich im Kunden-Drive-
+    Kein Push mehr — die Eingaenge sammeln sich im Kunden-Drive-
     Ordner an, der Handwerker pruefen via /formulare (Status-Liste)
     oder direkt im Drive ueber /archiv <kunde>. So fluten viele
     parallele Anfragen nicht mehr den Chat.
@@ -212,7 +212,7 @@ async def notify_tenant_anfrage_submitted(token_str: str, antworten: dict) -> No
             )
             employee_id = routing.employee_id if routing else None
         except Exception as e:  # noqa: BLE001
-            logger.warning(f"anfrage_telegram: choose_employee failed: {e}")
+            logger.warning(f"anfrage_eingang: choose_employee failed: {e}")
 
     now_berlin = datetime.now(_BERLIN_TZ)
     drive_folder_url = await _save_submission_to_drive(

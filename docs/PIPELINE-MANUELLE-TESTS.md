@@ -19,7 +19,7 @@ Thread weiterschreiben, ausser bei Test 5 "Reply-Threading").
   cd /opt/gewerbeagent/framework
   docker compose logs -f framework | grep -iE "(microsoft_inbox|mail_pipeline|RELEVANT_KUNDE|intent=|bounce|push_tenant)"
   ```
-- **Telegram** (Tenant-Bot) — Pushes "Neue Anfrage", "Storno",
+- **App-Push** (PWA) — Pushes "Neue Anfrage", "Storno",
   "Verschiebung", "Bounce", "Folge-Mail".
 - **DB-Tabelle `email_conversations`** — jeder Vorgang bekommt eine
   Zeile (state, last_message_id, conversation_id_microsoft).
@@ -40,7 +40,7 @@ Thread weiterschreiben, ausser bei Test 5 "Reply-Threading").
 **Erwartet (innerhalb von 2 min):**
 - Antwort-Mail im GMX-Postfach mit Anrede "Hallo Sven" + Link
   zu einem Anfrage-Formular.
-- Telegram-Push an Tenant: "Neue Anfrage".
+- App-Push an Tenant: "Neue Anfrage".
 - Neue Zeile in `email_conversations` mit state != CLOSED.
 
 ## Test 2 — Termin-Storno (intent=termin_stornieren)
@@ -54,7 +54,7 @@ Thread weiterschreiben, ausser bei Test 5 "Reply-Threading").
 
 **Erwartet:**
 - Storno-Bestaetigungsmail an GMX.
-- Telegram-Push "Storno" an Tenant.
+- App-Push "Storno" an Tenant.
 - Wenn ein passender Kalender-Termin existiert: in Google
   Calendar geloescht/durchgestrichen (je nach Implementation).
 
@@ -69,7 +69,7 @@ Thread weiterschreiben, ausser bei Test 5 "Reply-Threading").
 
 **Erwartet:**
 - Antwort-Mail mit Slot-Vorschlaegen oder Bestaetigung.
-- Telegram-Push "Verschiebung" an Tenant.
+- App-Push "Verschiebung" an Tenant.
 
 ## Test 4 — Rechnungsanfrage (intent=rechnungsanfrage)
 
@@ -81,7 +81,7 @@ Thread weiterschreiben, ausser bei Test 5 "Reply-Threading").
 > faellig? Habt ihr noch keine Mahnung verschickt?
 
 **Erwartet:**
-- Antwort-Mail oder Telegram-Push "Rechnungsfrage" — der genaue
+- Antwort-Mail oder App-Push "Rechnungsfrage" — der genaue
   Auto-Reply-Pfad haengt davon ab, ob fuer den Kunden in der DB
   eine Rechnung existiert (mit Demo-Daten typischerweise nicht).
 
@@ -96,7 +96,7 @@ Thread weiterschreiben, ausser bei Test 5 "Reply-Threading").
 - Pipeline erkennt die Mail als **Folge** der bestehenden
   Konversation (via Microsoft conversationId und In-Reply-To).
 - KEINE neue Anfrage-Mail mit Formular-Link.
-- Telegram-Push "Folge-Mail" an den zustaendigen Mitarbeiter.
+- App-Push "Folge-Mail" an den zustaendigen Mitarbeiter.
 - `email_conversations` bekommt KEINE neue Zeile (gleiche updaten).
 
 ## Test 6 — Bounce-Erkennung
@@ -116,7 +116,7 @@ Mail-Client das erlaubt — sonst reicht das Subject-Pattern.)
 - KEINE Antwort an GMX (sonst Endlosschleife).
 - Log-Eintrag: `is_bounce_or_autoreply -> True`.
 - Wenn die "Empfaenger nicht erreichbar"-Logik zum bouncenden
-  Vorgang einen Tenant-Mitarbeiter findet: Telegram-Push
+  Vorgang einen Tenant-Mitarbeiter findet: App-Push
   "Bounce" mit dem betroffenen Konversations-Vorgang.
 
 ## Test 7 — NICHT_RELEVANT (Newsletter/Werbung)
@@ -147,7 +147,7 @@ Mail-Client das erlaubt — sonst reicht das Subject-Pattern.)
   - Q's Text (z.B. "klar, hier ein paar Vorschlaege")
   - durchnummerierter Slot-Box mit 2-4 Terminvorschlaegen
     aus dem Kalender (KEIN Formular-Button)
-- Telegram-Push "Termin-Slots vorgeschlagen" an Tenant
+- App-Push "Termin-Slots vorgeschlagen" an Tenant
 - `email_conversations.state = proposing_slots`, `proposed_slots`
   enthaelt die JSON-Liste
 
@@ -163,7 +163,7 @@ im GMX-Postfach angekommen sind.
 **Erwartet:**
 - Antwort-Mail "Termin bestaetigt"-Box mit Datum + Uhrzeit
   + Anliegen (KEINE Slot-Liste mehr, KEIN Formular-Button)
-- Telegram-Push "Termin gebucht (Mail-Dialog)"
+- App-Push "Termin gebucht (Mail-Dialog)"
 - Eintrag im Google Calendar
 - `email_conversations.state = booked`, `gcal_event_id` gesetzt,
   `proposed_slots = NULL`
@@ -185,7 +185,7 @@ deine Mail-Adresse (z.B. via Test 9 vorher).
 **Erwartet:**
 - Antwort-Mail mit "Termin storniert"-Box (oder "Termin nicht
   gefunden" wenn der Kalender leer war)
-- Telegram-Push "Termin storniert (Mail-Dialog)"
+- App-Push "Termin storniert (Mail-Dialog)"
 - `email_conversations.state = storniert`
 - Kalender-Termin geloescht
 

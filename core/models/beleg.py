@@ -1,8 +1,8 @@
 """
 Beleg: Foto/PDF eines Eingangs-Belegs (Rechnung, Quittung, etc.)
-das via Telegram an Lexware hochgeladen wird.
+das an Lexware hochgeladen wird.
 
-Tenant fotografiert Beleg in Telegram, wir speichern roh in DB
+Tenant fotografiert den Beleg in der App, wir speichern roh in DB
 (Audit-Trail) und reichen ihn an Lexware /v1/files weiter.
 Tenant prueft + verbucht selbst in Lexware-UI.
 """
@@ -10,7 +10,6 @@ import datetime as dt
 import uuid
 
 from sqlalchemy import (
-    BigInteger,
     DateTime,
     ForeignKey,
     Integer,
@@ -31,8 +30,8 @@ BELEG_STATUS_UPLOADING = "uploading"    # Lexware-Call laeuft gerade
 BELEG_STATUS_UPLOADED = "uploaded"      # Erfolgreich an Lexware uebergeben
 BELEG_STATUS_ERROR = "error"            # Upload fehlgeschlagen
 
-# Quellen
-BELEG_SOURCE_TELEGRAM = "telegram"
+# Quellen ("telegram" gibt es seit 2026-08-21 nicht mehr; Altbestand in
+# der Spalte bleibt lesbar, neue Belege kommen aus App oder Mail)
 BELEG_SOURCE_MAIL = "mail"
 BELEG_SOURCE_API = "api"
 
@@ -54,9 +53,6 @@ class Beleg(Base):
         nullable=False,
     )
 
-    # Telegram-Chat von dem die Anfrage kam (None wenn z.B. Mail)
-    chat_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
-
     # Datei-Daten
     file_data: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
     file_mime: Mapped[str] = mapped_column(String(100), nullable=False)
@@ -68,7 +64,7 @@ class Beleg(Base):
 
     # Wo kommt der Beleg her
     source: Mapped[str] = mapped_column(
-        String(20), nullable=False, server_default=BELEG_SOURCE_TELEGRAM
+        String(20), nullable=False, server_default=BELEG_SOURCE_API
     )
 
     # User-Notiz (z.B. "Bauhaus-Quittung Schrauben")

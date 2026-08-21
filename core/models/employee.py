@@ -1,24 +1,22 @@
 """Employee — ein Mitarbeiter eines Tenants.
 
 Bisher war im Framework "1 Tenant == 1 Person" hartcodiert: Tenant
-hatte EINEN telegram_chat_id, EINE Werkstatt-Heimat, EINEN Google-
-OAuth-Token. Mit Multi-Mitarbeiter-Setup (Plan: das-machen-wir-gleich-
-foamy-frost.md, Phase 0) bekommt jeder Tenant 1..N Employees, jeder
-mit eigener Telegram-Identitaet, eigener Heimat-Adresse, eigenem
-Skill-Set und (Phase 1) eigenem OAuth-Token.
+hatte EINE Werkstatt-Heimat, EINEN Google-OAuth-Token. Mit
+Multi-Mitarbeiter-Setup (Plan: das-machen-wir-gleich-foamy-frost.md,
+Phase 0) bekommt jeder Tenant 1..N Employees, jeder mit eigener
+Heimat-Adresse, eigenem Skill-Set und (Phase 1) eigenem OAuth-Token.
 
 Backward-Compatibility:
 - Migration legt fuer jeden bestehenden Tenant exakt einen Default-
   Employee an (is_default=true), der die heutigen Tenant-Felder erbt.
   Nicht "Sonderfall: kein Employee", sondern "1-Person-Tenant hat 1
   Employee" — der Code bleibt employee-zentrisch ohne if-else.
-- tenants.telegram_chat_id, tenants.heimat_* bleiben als "Mirror" des
+- tenants.heimat_* bleiben als "Mirror" des
   Default-Employee bestehen, damit aeltere Code-Pfade weiter lesen
   koennen. Wird ueber mehrere Phasen migriert, dann eventuell gedroppt.
 
 Felder fuer alle Phasen sind direkt vorgesehen, damit keine zweite
 Migration noetig wird wenn Phase 2/3/4 implementiert werden:
-- Phase 2: telegram_chat_id (Multi-Telegram pro Tenant)
 - Phase 3: heimat_* (Per-Mitarbeiter-Smart-Routing)
 - Phase 4: skills, arbeitszeiten, arbeitstage (Skill-Routing + per-User
   Schichten — arbeitszeiten/-tage erst in Phase 4 aktiv genutzt; bis
@@ -32,7 +30,6 @@ import uuid
 from typing import TYPE_CHECKING
 
 from sqlalchemy import (
-    BigInteger,
     Boolean,
     DateTime,
     ForeignKey,
@@ -99,7 +96,6 @@ class Employee(Base):
             unique=True,
             postgresql_where=text("is_default"),
         ),
-        Index("ix_emp_chat", "telegram_chat_id"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -154,11 +150,6 @@ class Employee(Base):
     # is_default per partial unique index einmalig bleibt.
     role: Mapped[str] = mapped_column(
         String(20), nullable=False, server_default="monteur", default="monteur",
-    )
-
-    # Phase 2 — Telegram-Identitaet
-    telegram_chat_id: Mapped[int | None] = mapped_column(
-        BigInteger, nullable=True, unique=True,
     )
 
     # Phase 3 — Werkstatt-Heimat fuer Smart-Routing
@@ -241,62 +232,3 @@ async def get_employees_for_tenant(
         stmt = stmt.order_by(Employee.is_default.desc(), Employee.slug.asc())
         result = await session.execute(stmt)
         return list(result.scalars().all())
-
-
-async def get_employee_by_telegram_chat(
-    chat_id: int,
-) -> tuple["Tenant", Employee] | None:
-    """Findet (Tenant, Employee) anhand einer Telegram-Chat-ID.
-
-    Sucht zuerst employees.telegram_chat_id (= Multi-User), faellt
-    zurueck auf tenants.telegram_chat_id (= Legacy / Default-Employee).
-    Im Fallback-Fall wird der Default-Employee als Employee
-    zurueckgegeben.
-
-    Die zurueckgegebenen Objekte sind aus der Session expunged —
-    der Caller kann sie ohne aktive Session weiterverwenden, darf
-    aber keine relationships lazy-loaden.
-    """
-    from core.database import AsyncSessionLocal
-    from core.models.tenant import Tenant
-
-    # telegram_chat_id ist eine bigint-Spalte — eine String-Chat-ID (z.B.
-    # aus manchen Webhook-/Callback-Pfaden) wuerde "bigint = varchar"
-    # werfen und die Aufloesung still auf _global zuruckfallen lassen.
-    # Defensiv auf int casten; nicht-numerisch -> kein Treffer.
-    try:
-        chat_id = int(chat_id)
-    except (TypeError, ValueError):
-        return None
-
-    async with AsyncSessionLocal() as session:
-        # 1) Direkter Match auf employees.telegram_chat_id
-        emp = (await session.execute(
-            select(Employee).where(Employee.telegram_chat_id == chat_id)
-        )).scalar_one_or_none()
-        if emp is not None:
-            tenant = (await session.execute(
-                select(Tenant).where(Tenant.id == emp.tenant_id)
-            )).scalar_one()
-            session.expunge(emp)
-            session.expunge(tenant)
-            return tenant, emp
-        # 2) Fallback: alter tenants.telegram_chat_id-Pfad
-        tenant = (await session.execute(
-            select(Tenant).where(Tenant.telegram_chat_id == chat_id)
-        )).scalar_one_or_none()
-        if tenant is None:
-            return None
-        emp = (await session.execute(
-            select(Employee).where(
-                Employee.tenant_id == tenant.id,
-                Employee.is_default.is_(True),
-            )
-        )).scalar_one_or_none()
-        if emp is None:
-            # Tenant existiert, aber kein Default-Employee — sollte
-            # nicht vorkommen wenn Migration sauber lief.
-            return None
-        session.expunge(emp)
-        session.expunge(tenant)
-        return tenant, emp

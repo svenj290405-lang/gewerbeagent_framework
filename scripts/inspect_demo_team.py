@@ -1,6 +1,6 @@
 """READ-ONLY: Ist-Zustand des demo-Tenants fuer den Krank-E2E-Test.
 
-Zeigt pro Mitarbeiter: slug, name, default/aktiv, telegram_chat_id,
+Zeigt pro Mitarbeiter: slug, name, default/aktiv,
 calendar_provider/-id, skills, arbeitstage/-zeiten. Plus: ist das
 Feature 'mitarbeiter' aktiv? Aendert NICHTS.
 """
@@ -28,7 +28,6 @@ async def main():
             return
         print(f"\n>>> Inspiziere Tenant: {t.slug}")
         print(f"Tenant: slug={t.slug} id={t.id}")
-        print(f"  tenant.telegram_chat_id (legacy) = {getattr(t, 'telegram_chat_id', None)}")
 
         emps = (await s.execute(
             select(Employee).where(Employee.tenant_id == t.id)
@@ -38,7 +37,6 @@ async def main():
             print(
                 f"  - slug={e.slug!r} name={e.name!r} "
                 f"default={e.is_default} aktiv={e.is_active}\n"
-                f"      chat_id={e.telegram_chat_id} "
                 f"cal_provider={e.calendar_provider!r} cal_id={e.calendar_id!r}\n"
                 f"      skills={e.skills} arbeitstage={e.arbeitstage} "
                 f"arbeitszeiten={e.arbeitszeiten}"

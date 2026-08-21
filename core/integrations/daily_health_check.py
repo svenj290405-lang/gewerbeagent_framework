@@ -3,7 +3,6 @@
 Laeuft 1x morgens (settings.health_check_hour, Europe/Berlin) und prueft,
 ob der Bot / das System noch laeuft:
   1. DB erreichbar (SELECT 1)
-  2. Telegram-Bot erreichbar (getMe auf den Admin-Bot-Token)
   3. Background-Crons leben (Heartbeats via cron_health.get_health_report)
 
 Das Ergebnis wird in health_check_results persistiert (im Admin-Tool unter
@@ -21,7 +20,6 @@ import datetime as dt
 import logging
 import zoneinfo
 
-import httpx
 from sqlalchemy import select, text
 
 from config.settings import settings
@@ -30,7 +28,6 @@ from core.database import AsyncSessionLocal
 logger = logging.getLogger(__name__)
 
 TICK_INTERVAL_SECONDS = 60
-TELEGRAM_TIMEOUT = 10.0
 GLOBAL_TENANT_SLUG = "_global"
 
 # Wird vom Cron-Loop gesetzt; verhindert Mehrfach-Lauf am selben Tag.
@@ -45,27 +42,6 @@ async def _check_db() -> tuple[bool, str | None]:
         async with AsyncSessionLocal() as s:
             await s.execute(text("SELECT 1"))
         return True, None
-    except Exception as e:  # noqa: BLE001
-        return False, str(e)[:200]
-
-
-async def _check_telegram() -> tuple[bool, str | None]:
-    """getMe auf den Admin-Bot-Token — prueft Telegram-API-Erreichbarkeit
-    + Gueltigkeit des Bot-Tokens."""
-    token = settings.admin_telegram_bot_token
-    if not token:
-        # Kein Token konfiguriert -> nicht als Fehler werten (uebersprungen).
-        return True, "kein admin_telegram_bot_token gesetzt (uebersprungen)"
-    try:
-        async with httpx.AsyncClient(timeout=TELEGRAM_TIMEOUT) as client:
-            resp = await client.get(
-                f"https://api.telegram.org/bot{token}/getMe"
-            )
-        data = resp.json() if resp.content else {}
-        if resp.status_code == 200 and data.get("ok"):
-            uname = (data.get("result") or {}).get("username")
-            return True, (f"@{uname}" if uname else "ok")
-        return False, f"HTTP {resp.status_code}: {str(data)[:150]}"
     except Exception as e:  # noqa: BLE001
         return False, str(e)[:200]
 
@@ -89,7 +65,6 @@ async def run_health_check(*, send_alert: bool = True):
     )
 
     db_ok, db_err = await _check_db()
-    tg_ok, tg_info = await _check_telegram()
     try:
         crons_ok, cron_report = _check_crons()
     except Exception as e:  # noqa: BLE001
@@ -97,14 +72,13 @@ async def run_health_check(*, send_alert: bool = True):
 
     if not db_ok:
         status = HEALTH_STATUS_ERROR
-    elif not (tg_ok and crons_ok):
+    elif not crons_ok:
         status = HEALTH_STATUS_DEGRADED
     else:
         status = HEALTH_STATUS_OK
 
     detail = {
         "db": {"ok": db_ok, "error": db_err},
-        "telegram": {"ok": tg_ok, "info": tg_info},
         "crons": cron_report,
     }
 
@@ -117,7 +91,7 @@ async def run_health_check(*, send_alert: bool = True):
 
     async with AsyncSessionLocal() as s:
         result = HealthCheckResult(
-            status=status, db_ok=db_ok, telegram_ok=tg_ok,
+            status=status, db_ok=db_ok,
             crons_ok=crons_ok, detail=detail, alert_sent=alert_sent,
         )
         s.add(result)
@@ -126,8 +100,8 @@ async def run_health_check(*, send_alert: bool = True):
         s.expunge(result)
 
     logger.info(
-        "Daily-Health-Check: status=%s db=%s tg=%s crons=%s alert=%s",
-        status, db_ok, tg_ok, crons_ok, alert_sent,
+        "Daily-Health-Check: status=%s db=%s crons=%s alert=%s",
+        status, db_ok, crons_ok, alert_sent,
     )
     return result
 
@@ -137,7 +111,6 @@ async def run_health_check(*, send_alert: bool = True):
 # ---------------------------------------------------------------------
 def _build_alert_bodies(status: str, detail: dict) -> tuple[str, str]:
     db = detail.get("db", {})
-    tg = detail.get("telegram", {})
     crons = detail.get("crons", {})
     dead = [
         name for name, c in (crons.get("crons") or {}).items()
@@ -156,8 +129,6 @@ def _build_alert_bodies(status: str, detail: dict) -> tuple[str, str]:
         "<ul>"
         f"<li>Datenbank: {mark(db.get('ok'))}"
         f"{(' — ' + str(db.get('error'))) if db.get('error') else ''}</li>"
-        f"<li>Telegram-Bot: {mark(tg.get('ok'))} "
-        f"({tg.get('info') or ''})</li>"
         f"<li>Background-Crons: {mark(crons.get('status') == 'ok')}"
         f"{(' — tot: ' + ', '.join(dead)) if dead else ''}</li>"
         "</ul>"
@@ -169,7 +140,6 @@ def _build_alert_bodies(status: str, detail: dict) -> tuple[str, str]:
         f"Gewerbeagent System-Health-Check: {status.upper()} ({stamp})\n\n"
         f"- Datenbank: {mark(db.get('ok'))}"
         f"{(' - ' + str(db.get('error'))) if db.get('error') else ''}\n"
-        f"- Telegram-Bot: {mark(tg.get('ok'))} ({tg.get('info') or ''})\n"
         f"- Crons: {mark(crons.get('status') == 'ok')}"
         f"{(' - tot: ' + ', '.join(dead)) if dead else ''}\n\n"
         "Bitte Server/Container pruefen."

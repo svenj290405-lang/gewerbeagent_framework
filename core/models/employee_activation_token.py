@@ -1,13 +1,12 @@
 """EmployeeActivationToken — One-Time-Use-Token fuer Mitarbeiter-Onboarding.
 
 Lifecycle:
-1. Inhaber legt Mitarbeiter via `/mitarbeiter neu` an.
+1. Inhaber legt den Mitarbeiter im Team-Screen der App an.
 2. Direkt nach Employee-Insert wird ein Token erzeugt
-   (`create_activation_token`) und der Inhaber bekommt einen Deep-Link
-   `https://t.me/{bot_username}?start=activate_{token}` per Telegram.
-3. Mitarbeiter klickt den Link, /start-Handler ruft
-   `consume_activation_token` → setzt `employee.telegram_chat_id` und
-   markiert den Token mit `used_at`.
+   (`create_activation_token`); der Inhaber bekommt den Link
+   `/app/activate?token=…` zum Weiterschicken.
+3. Mitarbeiter oeffnet den Link und setzt sein Passwort —
+   `consume_activation_token` markiert den Token mit `used_at`.
 4. Token kann nicht erneut eingeloest werden (one-time-use).
 
 Gueltigkeit: 7 Tage ab `created_at`. Abgelaufene Tokens bleiben in der
@@ -38,8 +37,8 @@ from core.database.base import Base
 _TOKEN_BYTES = 48
 DEFAULT_TTL_DAYS = 7
 
-# Kurzer, tippbarer Aktivierungs-Code fuer Onboarding per Telegram-Suche
-# (ohne Deep-Link). Base32-Alphabet ohne verwechselbare Zeichen (kein
+# Kurzer, tippbarer Aktivierungs-Code fuer Faelle ohne klickbaren Link
+# (Vorlesen am Telefon). Base32-Alphabet ohne verwechselbare Zeichen (kein
 # 0/O/1/I) — 8 Zeichen ~= 40 Bit; mit Einmal-Use + Ablauf + Rate-Limit
 # brute-force-sicher.
 _SHORT_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
@@ -173,8 +172,8 @@ async def consume_activation_token(
         EmployeeActivationToken bei Erfolg (used_at gesetzt),
         None wenn Token nicht existiert, abgelaufen oder bereits benutzt.
 
-    Caller kann aus dem Return-Wert `employee_id` lesen und die
-    Telegram-Chat-ID am Mitarbeiter setzen.
+    Caller kann aus dem Return-Wert `employee_id` lesen und den
+    Mitarbeiter-Zugang darauf aufsetzen.
     """
     from core.database import AsyncSessionLocal
     now = now or dt.datetime.now(dt.timezone.utc)
@@ -197,8 +196,8 @@ async def consume_activation_code(
     *,
     now: dt.datetime | None = None,
 ) -> EmployeeActivationToken | None:
-    """Wie consume_activation_token, aber per kurzem short_code (Onboarding
-    per Telegram-Suche, ohne Deep-Link).
+    """Wie consume_activation_token, aber per kurzem short_code (fuer
+    Faelle ohne klickbaren Link).
 
     Normalisiert die Eingabe (Grossschrift, ohne Bindestrich/Leerzeichen).
     Returns die Token-Zeile bei Erfolg (used_at gesetzt), sonst None

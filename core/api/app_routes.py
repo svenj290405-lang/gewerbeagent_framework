@@ -1,6 +1,6 @@
 """Routen der Inhaber-/Mitarbeiter-PWA (``/app``).
 
-Loest den Telegram-Bot als Bedien-Oberflaeche ab. Diese Welle 1 liefert:
+Die Bedien-Oberflaeche des Betriebs. Welle 1 liefert:
 - Passwortloser Login via Magic-Link (Mail ueber das _global-Outlook-
   Plattformpostfach, gleicher Pfad wie Onboarding-/Health-Mails).
 - App-Shell (statische PWA) + Service-Worker + Manifest.

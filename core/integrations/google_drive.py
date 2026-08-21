@@ -2,7 +2,7 @@
 Google-Drive-Integration fuer Kunden-Daten-Archiv.
 
 Pro Kunde wird ein Sub-Ordner unter einem Tenant-Root-Ordner erstellt.
-Telegram-Uploads landen dort. /briefing zeigt den Drive-Link.
+Uploads aus der App landen dort.
 
 Folder-Struktur:
   📁 Gewerbeagent — <Company-Name>     (Root, einmalig pro Tenant)
@@ -143,7 +143,7 @@ async def get_drive_service(
     if not oauth_token:
         raise ValueError(
             "Kein Google-OAuth-Token vorhanden. "
-            "Bitte /drive_verbinden im Telegram ausfuehren."
+            "Bitte in der App unter Mehr → Verbindungen Google verbinden."
         )
 
     # Pruefen ob drive-Scope drin ist (sonst hat Tenant noch nicht
@@ -152,7 +152,7 @@ async def get_drive_service(
     if not any("drive" in s for s in scopes):
         raise ValueError(
             "Google-Token hat keinen Drive-Scope. "
-            "Bitte einmal /drive_verbinden im Telegram ausfuehren."
+            "Bitte Google in der App einmal neu verbinden."
         )
 
     client_id, client_secret = _get_google_client_creds()
@@ -212,7 +212,7 @@ async def get_drive_service(
                 # gehoert in einen Thread, sonst steht der Event-Loop.
                 await asyncio.to_thread(creds.refresh, GRequest())
             except Exception as exc:
-                # invalid_grant / Refresh-Token revoked? Tenant per Telegram
+                # invalid_grant / Refresh-Token revoked? Tenant per Push
                 # alarmieren damit er re-authorizen kann. Pipeline wirft
                 # weiterhin den Fehler nach oben — der Push ist nur Sichtbar-
                 # keits-Helfer, nicht Error-Suppression.
@@ -522,7 +522,7 @@ async def upload_file_to_kunde_folder(
             'kunde_folder_url': str,
             'upload_count': int,  # neu nach Inkrement
         }
-    Raises bei Fehlern (Caller fängt + meldet im Telegram).
+    Raises bei Fehlern (Caller fängt + meldet in der App).
 
     Failure-Counter (Phase-A A4): wenn 5 Uploads pro Tenant in einer
     Stunde fehlschlagen, geht ein Sven-Alert UND eine Tenant-Push-
@@ -563,7 +563,7 @@ async def upload_file_to_kunde_folder(
                 tenant_id=tenant_id, count=count, last_reason=str(exc)[:200],
                 kunde_name=kunde_name,
             )
-        # Original-Exception weitergeben — Caller meldet im Telegram.
+        # Original-Exception weitergeben — Caller meldet in der App.
         raise
 
     # upload_count + last_upload_at hochzaehlen

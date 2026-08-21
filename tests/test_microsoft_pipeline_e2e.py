@@ -6,13 +6,13 @@ Pipeline testet). Hier wird die NEUE Microsoft-Pipeline abgedeckt:
     / spam / low-conf)
   - Intent-Handler (_handle_storno_intent, _handle_verschiebung_intent,
     _handle_rechnungsanfrage_intent)
-  - mail_pipeline Helper (Konv-Lookup, Persistenz, Telegram-Pushes)
+  - mail_pipeline Helper (Konv-Lookup, Persistenz, Pushes)
   - classify_mail_subject Intent-Klassifikation + Keyword-Backup
   - Reply-Threading via send_tracked_mail
   - Bounce-Tracking
   - Regression-Tests gegen die Audit-Funde aus Teil A
 
-Externe Abhaengigkeiten (Microsoft Graph, Gemini, Telegram, Postgres,
+Externe Abhaengigkeiten (Microsoft Graph, Gemini, Postgres,
 Kalender-Plugin) werden gemockt. Die Tests verifizieren Verzweigungs-
 logik + Persistenz-Calls + Push-Inhalte, nicht die unterliegenden
 Services selbst.
@@ -109,18 +109,20 @@ class _FakeKalender:
 
 @pytest.fixture
 def push_capture(monkeypatch):
-    """Captured calls zu TelegramNotifier.send_for_tenant."""
+    """Captured calls zu notify_tenant."""
     calls: list[dict] = []
 
-    async def fake_send(tenant_id, text, *, employee_id=None):
+    async def fake_send(tenant_id, *, title, body, url="/app", tag=None,
+                        employee_id=None, inhaber_only=False):
         calls.append({
-            "tenant_id": tenant_id, "text": text,
-            "employee_id": employee_id,
+            "tenant_id": tenant_id, "title": title, "body": body,
+            "text": f"{title} {body}",
+            "url": url, "tag": tag, "employee_id": employee_id,
         })
-        return True
+        return 1
 
-    import plugins.telegram_notify.handler as tnh
-    monkeypatch.setattr(tnh.TelegramNotifier, "send_for_tenant", fake_send)
+    import core.integrations.notify as notify_mod
+    monkeypatch.setattr(notify_mod, "notify_tenant", fake_send)
     return calls
 
 
@@ -590,7 +592,7 @@ async def test_verschiebung_handler_finds_event_sends_rueckfrage(
 async def test_rechnung_handler_pushes_no_auto_reply(
     monkeypatch, push_capture, mail_send_capture, persistence_capture,
 ):
-    """Rechnungsanfrage: KEINE Auto-Antwort, nur Telegram-Push.
+    """Rechnungsanfrage: KEINE Auto-Antwort, nur Push.
     Outlook-Kategorie wird gesetzt (impliziert ueber das Aufrufer-
     Verhalten _mark_and_categorize_message)."""
     tenant = _make_tenant()

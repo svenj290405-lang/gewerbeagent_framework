@@ -10,7 +10,7 @@ Workflow alle 5 Min:
      + Tenant-Push.
 
 Tenants ohne Brevo-Config werden silent uebersprungen (queue waechst
-nicht weiter, weil der Telegram-Branch dann auch nichts mehr enqueued).
+nicht weiter, weil dann auch nichts mehr enqueued wird).
 
 Integration mit Phase A:
 - Sven-Alert via core/integrations/admin_alerts.notify_sven_admin_alert
@@ -555,7 +555,7 @@ async def cron_loop() -> None:
             await asyncio.sleep(ERROR_RETRY_SECONDS)
 
 
-# Convenience-Helper fuer Caller (Telegram-Handler etc.)
+# Convenience-Helper fuer Caller
 
 async def enqueue_failed_mail(
     *,

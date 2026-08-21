@@ -396,9 +396,9 @@ async def test_kalender_book_appointment_passes_email_to_adapter(monkeypatch):
         return _FakeAdapter()
 
     monkeypatch.setattr(kalender_handler, "get_calendar_adapter", fake_get_adapter)
-    # Telegram-Push silent
-    from plugins.telegram_notify import handler as tn
-    monkeypatch.setattr(tn.TelegramNotifier, "send_for_employee", AsyncMock())
+    # Push silent
+    import core.integrations.notify as notify_mod
+    monkeypatch.setattr(notify_mod, "notify_employee", AsyncMock())
 
     context = SimpleNamespace(
         tenant_id=uuid.uuid4(),

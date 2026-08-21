@@ -1,7 +1,7 @@
 """Kundengespraech - Aufgezeichnetes Gespraech zwischen Tenant und Kunde.
 
 Workflow:
-1. Tenant nimmt Gespraech via Telegram-/aufnahme auf
+1. Tenant nimmt das Gespraech in der App auf
 2. Gemini analysiert: Transkript + Briefing + Positionen + Termin
 3. Wird hier gespeichert
 4. Optional: Lexware-Angebot draus erstellt (angebot_id verknuepft)

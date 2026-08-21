@@ -1,12 +1,11 @@
-"""OAuth-Token-Invalid-Alarm: Telegram-Push an Tenant wenn der
+"""OAuth-Token-Invalid-Alarm: Push an den Tenant wenn der
 Refresh-Token eines Providers (Google/Microsoft) abgelaufen oder
 revoked ist.
 
 Hintergrund: bisher loggten wir invalid_grant nur als WARNING — der
 Tenant merkte erst Stunden/Tage spaeter dass Drive-Archiv leise
-gestorben ist. Mit diesem Helper kriegt er einen Push mit klickbarem
-Re-Auth-Link, einer Mini-Anleitung zur Google-"unverified app"-Warnung
-und einem Kontakt-Hinweis fuer Rueckfragen.
+gestorben ist. Jetzt bekommt er einen Push; die Re-Auth-Schritte
+stehen in der App unter "Mehr".
 
 Throttling: max. 1 Push pro 6h pro (tenant_id, provider) — sonst spammt
 es bei retry-loops in google_drive/kalender (jede fehlgeschlagene
@@ -34,84 +33,22 @@ _ALERT_THROTTLE_SECONDS: Final[int] = 6 * 60 * 60
 _LAST_ALERT_AT: dict[tuple[UUID, str], _dt.datetime] = {}
 
 
-PROVIDER_LABEL = {
-    "google": "Google-Konto (Drive + Kalender)",
-    "microsoft": "Microsoft-Konto (Outlook + Kalender)",
-}
-
-
-def _build_push_text(
-    provider: str,
-    reauth_url: str,
-    tenant_name: str | None,
-) -> str:
-    """Baut den HTML-Telegram-Push.
-
-    Inhalt:
-    - Was kaputt ist
-    - Re-Auth-Link
-    - Schritt-fuer-Schritt fuer die Google-"unverified app"-Warnung
-      (entfaellt fuer Microsoft, kein Warn-Screen dort)
-    - Hinweis bei Rueckfragen an Sven
-    """
-    from html import escape as _h
-
-    label = PROVIDER_LABEL.get(provider, provider)
-    tenant_str = f" ({_h(tenant_name)})" if tenant_name else ""
-
-    text = (
-        f"⚠️ <b>{_h(label)} muss neu verbunden werden</b>{tenant_str}\n\n"
-        f"Q kann gerade nicht mehr auf das Konto zugreifen — die "
-        f"OAuth-Verbindung ist abgelaufen oder wurde widerrufen.\n\n"
-        f"👉 <b>Hier neu verbinden:</b>\n"
-        f"<a href=\"{_h(reauth_url)}\">{_h(reauth_url)}</a>\n\n"
-    )
-
-    if provider == "google":
-        text += (
-            "Beim Klick passiert das:\n"
-            "1. Google-Login mit dem Geschaefts-Account\n"
-            "2. Bildschirm <b>\"Google hat diese App nicht verifiziert\"</b> "
-            "erscheint — bitte annehmen:\n"
-            "   • unten auf <b>\"Erweitert\"</b> tippen\n"
-            "   • dann <b>\"peppy-winter-492820-h3 öffnen (unsicher)\"</b>\n"
-            "3. Berechtigungen (Drive + Kalender) zulassen\n"
-            "4. Fertig — Q laeuft sofort wieder.\n\n"
-            "Der Warnscreen kommt nur weil die App noch nicht von Google "
-            "verifiziert ist. Das ist sicher fuer Sie — Sie geben den "
-            "Zugriff an Ihre eigene Q-Instanz.\n\n"
-        )
-    elif provider == "microsoft":
-        text += (
-            "Beim Klick passiert das:\n"
-            "1. Microsoft-Login mit dem Geschaefts-Account\n"
-            "2. Berechtigungen (Mail + Kalender) zulassen\n"
-            "3. Fertig — Q laeuft sofort wieder.\n\n"
-        )
-
-    text += (
-        "Bei Fragen oder Problemen: an <b>Sven</b> wenden."
-    )
-    return text
-
-
 async def notify_oauth_token_invalid(
     tenant_id: UUID,
     provider: str,
     *,
     reason: str | None = None,
 ) -> bool:
-    """Schickt einen Telegram-Push an den Tenant, dass der OAuth-Token
+    """Schickt einen Push an den Tenant, dass der OAuth-Token
     fuer `provider` (=google|microsoft) re-authorized werden muss.
 
     Throttled: max. 1 Push pro 6h pro (tenant_id, provider). Wiederholte
     Aufrufe im Throttle-Fenster sind no-op (False return).
 
     Returns: True wenn ein Push abgeschickt wurde, False wenn
-    geskippt (Throttle, kein Telegram, Tenant nicht gefunden).
+    geskippt (Throttle oder Tenant nicht gefunden).
     """
     from sqlalchemy import select
-    from config.settings import settings
     from core.database import AsyncSessionLocal
     from core.models import Tenant
     from core.integrations.notify import notify_tenant
@@ -145,14 +82,6 @@ async def notify_oauth_token_invalid(
         )
         return False
 
-    base = (settings.public_url or "").rstrip("/")
-    reauth_url = f"{base}/oauth/start?tenant={tenant.slug}&provider={provider}"
-    text = _build_push_text(
-        provider=provider,
-        reauth_url=reauth_url,
-        tenant_name=tenant.company_name,
-    )
-
     try:
         ok = await notify_tenant(
             tenant_id,
@@ -162,7 +91,7 @@ async def notify_oauth_token_invalid(
                 f"hergestellt werden. In der App öffnen."
             ),
             url="/app#mehr", tag=f"oauth-{provider}",
-            telegram_text=text, inhaber_only=True,
+            inhaber_only=True,
         )
     except Exception as e:
         logger.warning(

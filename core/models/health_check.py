@@ -2,7 +2,7 @@
 
 Der Daily-Health-Check (core/integrations/daily_health_check.py) laeuft
 1x morgens und prueft, ob der Bot/das System noch laeuft (DB erreichbar,
-Telegram-Bot erreichbar, Background-Crons leben). Jedes Ergebnis wird hier
+Background-Crons leben). Jedes Ergebnis wird hier
 persistiert, damit es im Admin-Tool (/admin/health) angezeigt werden kann —
 anders als der reine In-Memory-Heartbeat ueberlebt das den Container-Restart.
 
@@ -41,9 +41,6 @@ class HealthCheckResult(Base):
     status: Mapped[str] = mapped_column(String(20), nullable=False)
 
     db_ok: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
-    telegram_ok: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, default=True,
-    )
     crons_ok: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=True,
     )

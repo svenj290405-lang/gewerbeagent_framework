@@ -1,7 +1,7 @@
 """Angebot - Header eines Angebots.
 
 Pro Tenant gibt es N Angebote. Jedes Angebot hat 1-M angebot_positionen.
-Wird via Telegram-Bot (Voice/Text) erstellt, in Lexware als Quotation gespeichert.
+Wird in der App (Voice/Text) erstellt, in Lexware als Quotation gespeichert.
 """
 from __future__ import annotations
 

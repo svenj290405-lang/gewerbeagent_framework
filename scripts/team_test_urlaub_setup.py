@@ -42,7 +42,6 @@ async def main():
             is_default=False, is_active=True,
             skills=["heizung", "sanitaer"],
             calendar_provider=None, calendar_id=None,
-            telegram_chat_id=None,
         )
         s.add(tom)
         await s.commit()
@@ -50,7 +49,7 @@ async def main():
         print(f"Mitarbeiter angelegt: tom -> {tom.id} (skills {tom.skills})")
 
     print("\n" + "=" * 72)
-    print("Jetzt im Telegram-Bot Urlaub setzen:")
+    print("Jetzt in der App Urlaub setzen:")
     print("  1) /urlaub")
     print("  2) 'Tom Test' wählen")
     print("  3) Start (ab wann?):  2026-05-25")

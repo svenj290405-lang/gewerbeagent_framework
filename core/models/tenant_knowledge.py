@@ -1,7 +1,7 @@
 """
 TenantKnowledge = Wissensbasis-Snippet pro Tenant.
 
-Wird vom Telegram-Bot gepflegt. Handwerker schickt /wissen, traegt strukturiert
+Wird in der App gepflegt (Mehr → Wissen). Der Handwerker traegt strukturiert
 Infos ein (Materialien, Preise, Anfahrt, Notfall, Oeffnungszeiten, FAQ).
 Voice- und Mail-Plugin lesen die passenden Eintraege und geben sie als Kontext
 an den KI-Agenten.

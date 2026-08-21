@@ -1,7 +1,7 @@
 """Admin-Alert-Pipeline (Sven-Benachrichtigungen).
 
 Schwester-Modul zu `tenant_alert.py` — gleicher Grundgedanke, nur:
-- Empfaenger: Sven (settings.admin_telegram_*), nicht Tenant-User
+- Empfaenger: der Betreiber (Sven), nicht Tenant-User
 - Throttle: 1h Cooldown pro alert_kind (Tenant: 6h)
 - Failsafe: jeder Fehler wird verschluckt, ein Alert darf nie den
   Caller abbrechen
@@ -25,7 +25,6 @@ import datetime as dt
 import logging
 from typing import Any
 
-import httpx
 from sqlalchemy import desc, select
 
 from config.settings import settings
@@ -89,36 +88,20 @@ async def _record_admin_alert(
         logger.debug(f"admin alert audit log failed (egal): {e}")
 
 
-async def _send_telegram_to_sven(message: str) -> bool:
-    """Direkter Telegram-API-Call an Sven's Admin-Chat. Failsafe."""
-    token = settings.admin_telegram_bot_token
-    chat_id = settings.admin_telegram_chat_id
-    if not token or not chat_id:
-        logger.warning(
-            "Sven-Alert nicht zustellbar — admin_telegram_bot_token oder "
-            "admin_telegram_chat_id ist nicht gesetzt"
-        )
-        return False
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.post(
-                f"https://api.telegram.org/bot{token}/sendMessage",
-                json={
-                    "chat_id": chat_id,
-                    "text": message[:4000],  # Telegram-Limit 4096
-                    "parse_mode": "HTML",
-                    "disable_web_page_preview": True,
-                },
-            )
-            ok = resp.status_code == 200
-            if not ok:
-                logger.warning(
-                    "Sven-Alert HTTP %d: %s", resp.status_code, resp.text[:200]
-                )
-            return ok
-    except Exception as e:
-        logger.warning(f"_send_telegram_to_sven failed: {e}")
-        return False
+async def _deliver_to_sven(kind: str, message: str) -> bool:
+    """Zustellung an den Betreiber.
+
+    ACHTUNG — hier ist gerade KEIN Transport dran: der Telegram-Bot wurde
+    am 2026-08-21 aus DSGVO-Gruenden entfernt (Drittland-Transfer), ein
+    Ersatzkanal steht noch aus. Bis dahin landet der Alert nur als
+    ERROR im Container-Log und im admin_audit_log; die Rueckgabe ist
+    bewusst False, damit sich niemand auf eine Zustellung verlaesst.
+
+    Ein Mail-Kanal ueber das _global-Postfach waere zirkulaer (genau die
+    Mail-Pipeline ist einer der Alarm-Ausloeser) und deshalb kein Ersatz.
+    """
+    logger.error("SVEN-ALERT [%s] (kein Transport aktiv): %s", kind, message[:800])
+    return False
 
 
 async def notify_sven_admin_alert(
@@ -134,16 +117,16 @@ async def notify_sven_admin_alert(
     Args:
         kind: kurzer Identifier fuer Cooldown-Gruppierung, z.B.
             'framework_down', 'cron_dead.microsoft', 'drive_upload_loop'.
-        message: HTML-formatierte Telegram-Nachricht (max 4000 chars).
+        message: Alarmtext (wird gekuerzt geloggt).
         details: optionale Strukturdaten fuer Audit-Log.
         cooldown_hours: Mindestabstand zu identischem Alert (default 1h).
         bypass_cooldown: True = Cooldown ignorieren (fuer
             Recovery-Nachrichten z.B. "wieder online").
 
     Returns:
-        True wenn Telegram-Push erfolgreich versendet wurde, False sonst.
-        Erfolg-False heisst NICHT, dass der Caller einen Retry machen
-        sollte — der Caller sollte den Alert "fire & forget" behandeln.
+        True wenn der Alert zugestellt wurde, False sonst (aktuell immer
+        False — siehe _deliver_to_sven). Erfolg-False heisst NICHT, dass
+        der Caller einen Retry machen sollte — "fire & forget".
     """
     if not bypass_cooldown:
         if await _was_admin_recently_alerted(
@@ -154,7 +137,7 @@ async def notify_sven_admin_alert(
             )
             return False
 
-    sent = await _send_telegram_to_sven(message)
+    sent = await _deliver_to_sven(kind, message)
     await _record_admin_alert(kind=kind, success=sent, details=details)
     if sent:
         logger.info(f"Sven-Alert '{kind}' gesendet")

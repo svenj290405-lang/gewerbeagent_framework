@@ -5,7 +5,7 @@ Workflow:
 2. Bot generiert AnfrageToken mit Expiry +7 Tage
 3. Bot sendet Mail an Kunde mit Link https://gewerbeagent.de/anfrage/{token}
 4. Kunde fuellt Web-Formular aus
-5. AnfrageResponse wird gespeichert + Telegram-Push an Tenant
+5. AnfrageResponse wird gespeichert + Push an den Tenant
 """
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ ANFRAGE_TYP_ALLGEMEIN = "allgemein"
 
 
 # Bearbeitungs-Status fuer eingegangene Formulare (AnfrageResponse).
-# Wird vom Handwerker per Inline-Button im Telegram-Push gesetzt.
+# Wird vom Handwerker in der App gesetzt.
 # Heartbeat-Cron pingt morgens nach wenn Antworten > 12h auf 'neu' /
 # 'in_bearbeitung' stehen.
 FORMULAR_STATUS_NEU = "neu"
