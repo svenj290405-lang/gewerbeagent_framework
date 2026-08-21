@@ -16,6 +16,7 @@ import datetime as dt
 import logging
 import re
 import uuid
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse, Response
@@ -87,7 +88,45 @@ router = APIRouter(
 )
 
 
+# Zeitstempel gibt es in diesem Projekt in ZWEI Sorten, und im Modell
+# sehen sie identisch aus (beide DateTime(timezone=True)):
+#
+#  * Echtes UTC — created_at, updated_at, gespraech_datum, mail_sent_at,
+#    accepted_at … Zum Anzeigen MUSS nach Europe/Berlin gerechnet
+#    werden, sonst steht die App im Sommer zwei Stunden in der
+#    Vergangenheit (um 08:52 bestellt, angezeigt als 06:52).
+#  * Lokale Wanduhrzeit mit UTC-Etikett — termin_datum und die naiven
+#    Kalender-Events. Die tragen schon die Zeit, die der Betrieb meint;
+#    Umrechnen wuerde aus einem 14-Uhr-Termin 16 Uhr machen. Siehe
+#    _kalender_termin_parsen.
+#
+# Darum zwei Namen: wer eine Zeit anzeigt, muss sich entscheiden,
+# welche Sorte er in der Hand haelt.
+# Zeitzone des Betriebs. Eine Stelle, zwei Nutzer: die Anzeige und
+# das Parsen von Kalender-Zeiten (_kalender_termin_parsen).
+_KALENDER_ZONE = "Europe/Berlin"
+_ANZEIGE_ZONE = ZoneInfo(_KALENDER_ZONE)
+
+
 def _fmt_dt(d: dt.datetime | None) -> str:
+    """Echten UTC-Zeitstempel in Ortszeit anzeigen.
+
+    Naive Werte bleiben unangetastet — die kommen aus dem Kalender und
+    sind bereits Ortszeit.
+    """
+    if not d:
+        return ""
+    if d.tzinfo is not None:
+        d = d.astimezone(_ANZEIGE_ZONE)
+    return d.strftime("%d.%m. %H:%M")
+
+
+def _fmt_wanduhr(d: dt.datetime | None) -> str:
+    """Wanduhrzeit unveraendert anzeigen (termin_datum, Kalender).
+
+    Bewusst OHNE Umrechnung: der Wert IST die Zeit, die im Kalender
+    steht, auch wenn ein UTC-Etikett daran haengt.
+    """
     if not d:
         return ""
     return d.strftime("%d.%m. %H:%M")
@@ -208,7 +247,7 @@ async def _termine(tenant_id: uuid.UUID, *, only_today: bool, limit: int = 50) -
         "id": str(k.id),
         "kunde": k.kunde_name,
         "ort": k.termin_ort or "",
-        "zeit": _fmt_dt(k.termin_datum),
+        "zeit": _fmt_wanduhr(k.termin_datum),
         "termin_iso": k.termin_datum.isoformat() if k.termin_datum else None,
     } for k in rows]
 
@@ -815,7 +854,7 @@ async def _beratung_leads(tenant_id: uuid.UUID) -> list[dict]:
             "id": str(k.id),
             "kunde": k.kunde_name,
             "briefing": (k.briefing_kurz or "")[:200],
-            "termin": _fmt_dt(k.termin_datum),
+            "termin": _fmt_wanduhr(k.termin_datum),
             "termin_iso": k.termin_datum.isoformat() if k.termin_datum else None,
         } for k in rows]
 
@@ -872,7 +911,7 @@ async def _aktuelle_auftraege(tenant_id: uuid.UUID, scope=None) -> list[dict]:
                 "in_arbeit": False,
                 "fertig": False,
                 "fortschritt": 0,
-                "zeit": _fmt_dt(k.termin_datum),
+                "zeit": _fmt_wanduhr(k.termin_datum),
             })
     await _stunden_anreichern(tenant_id, out)
     return out
@@ -1890,7 +1929,7 @@ async def api_aufnahme_detail(
         "notizen": k.notizen_lang or "",
         "todos": list(k.todos or []),
         "transkript": k.raw_transcript or "",
-        "termin": _fmt_dt(k.termin_datum) if k.termin_datum else "",
+        "termin": _fmt_wanduhr(k.termin_datum) if k.termin_datum else "",
         "termin_ort": k.termin_ort or "",
     })
 
@@ -2461,7 +2500,6 @@ _GESPRAECH_FOTO_MIMES = {
 # API-Call beim Provider (parallel abgesetzt) — 7 Tage sind die Woche,
 # die der Handwerker ueberblickt, ohne dass der Screen haengt.
 _GESPRAECH_GEPLANT_TAGE = 7
-_KALENDER_ZONE = "Europe/Berlin"
 
 # Betreff der gebuchten Termine: "[Betrieb] Anliegen - Kunde Name"
 # (plugins/kalender/handler.py). Der Betriebs-Praefix ist Rauschen, der
@@ -2503,8 +2541,7 @@ def _kalender_termin_parsen(roh) -> dt.datetime | None:
         return _parse_diktat_termin(text)
     if wert.tzinfo is not None:
         try:
-            from zoneinfo import ZoneInfo
-            wert = wert.astimezone(ZoneInfo(_KALENDER_ZONE))
+            wert = wert.astimezone(_ANZEIGE_ZONE)
         except Exception:  # noqa: BLE001
             pass
         wert = wert.replace(tzinfo=None)
@@ -2760,7 +2797,7 @@ async def api_gespraeche_geplant(
         "kunde": g.kunde_name,
         "titel": g.kunde_name,
         "ort": g.termin_ort or "",
-        "zeit": _fmt_dt(g.termin_datum),
+        "zeit": _fmt_wanduhr(g.termin_datum),
         "termin_iso": g.termin_datum.isoformat() if g.termin_datum else "",
         "event_id": g.kalender_event_id or "",
     } for g in offen]
@@ -2774,7 +2811,7 @@ async def api_gespraeche_geplant(
             "kunde": _kunde_aus_betreff(ev["titel"]),
             "titel": ev["titel"],
             "ort": ev["ort"],
-            "zeit": _fmt_dt(ev["start"]),
+            "zeit": _fmt_wanduhr(ev["start"]),
             "termin_iso": ev["start"].isoformat(),
             "event_id": ev["event_id"],
         })
@@ -2813,7 +2850,7 @@ async def api_gespraech_detail(
         "handnotiz": g.handnotiz or "",
         "todos": list(g.todos or []),
         "transkript": g.raw_transcript or "",
-        "termin": _fmt_dt(g.termin_datum) if g.termin_datum else "",
+        "termin": _fmt_wanduhr(g.termin_datum) if g.termin_datum else "",
         "termin_ort": g.termin_ort or "",
         "bilder": [_datei_zeile(d) for d in dateien],
         "status": g.status,
