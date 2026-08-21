@@ -166,3 +166,113 @@ async def test_bestellungen_history_mapping(monkeypatch):
     assert [b["material"] for b in j["bestellungen"]] == ["Spax", "Dübel"]
     assert j["bestellungen"][0]["menge"] == 5
     assert j["bestellungen"][1]["einheit"] == "Stück"
+
+
+# =====================================================================
+# POST /material/anlegen — Link-Pruefung
+# =====================================================================
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("link", [
+    "javascript:alert(1)",          # kein Web-Link -> landet in window.open()
+    "shop.example/spax",            # Schema vergessen
+    "data:text/html,<script>1</script>",
+])
+async def test_anlegen_lehnt_nicht_web_links_ab(link):
+    resp = await app_screens.api_material_anlegen(
+        request=_req({"name": "Spax", "bestell_link": link}), _e=None, _c=None,
+    )
+    assert resp.status_code == 400
+    assert "http" in _json_body(resp)["error"]
+
+
+@pytest.mark.asyncio
+async def test_anlegen_lehnt_zu_langen_link_ab():
+    resp = await app_screens.api_material_anlegen(
+        request=_req({"name": "Spax", "bestell_link": "https://x.de/" + "a" * 2000}),
+        _e=None, _c=None,
+    )
+    assert resp.status_code == 400
+    assert "lang" in _json_body(resp)["error"]
+
+
+# =====================================================================
+# Q-Tools (core/ai/command_center.py)
+# =====================================================================
+
+def _q_ctx(tid=None):
+    from core.ai import command_center as cc
+    tenant = SimpleNamespace(id=tid or uuid.uuid4(), slug="pilot",
+                             company_name="Jantos GmbH")
+    return cc.Ctx(tenant=tenant, employee=_emp(), tid=tenant.id)
+
+
+class _FakeScalarSession:
+    """Session, die auf jedes execute() denselben Skalar liefert."""
+
+    def __init__(self, wert):
+        self.wert = wert
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def execute(self, stmt):
+        return SimpleNamespace(scalar_one_or_none=lambda: self.wert)
+
+
+@pytest.mark.asyncio
+async def test_q_bestaetigung_zeigt_namen_statt_uuid(monkeypatch):
+    """Gemini liefert nur die material_id — der Nutzer darf trotzdem keine
+    UUID zur Bestaetigung vorgelegt bekommen."""
+    from core.ai import command_center as cc
+    import core.database.connection as conn
+
+    monkeypatch.setattr(conn, "get_session",
+                        lambda: _FakeScalarSession("Spax-Schrauben"))
+    mid = str(uuid.uuid4())
+    zeile = await cc._summary_material(_q_ctx(), {"material_id": mid, "menge": 4})
+    assert zeile == "4× Spax-Schrauben bestellen?"
+    assert mid not in zeile
+
+
+@pytest.mark.asyncio
+async def test_q_bestaetigung_faellt_auf_material_zurueck(monkeypatch):
+    """Unbekannte/fremde ID: lieber das neutrale Wort als die UUID."""
+    from core.ai import command_center as cc
+    import core.database.connection as conn
+
+    monkeypatch.setattr(conn, "get_session", lambda: _FakeScalarSession(None))
+    zeile = await cc._summary_material(_q_ctx(), {"material_id": str(uuid.uuid4())})
+    assert zeile == "Material bestellen?"
+
+
+@pytest.mark.asyncio
+async def test_q_material_anlegen_lehnt_nicht_web_link_ab():
+    from core.ai import command_center as cc
+
+    res = await cc._run_material_anlegen(
+        _q_ctx(), {"name": "Spax", "bestell_link": "javascript:alert(1)"})
+    assert res["ok"] is False
+    assert "http" in res["error"]
+
+
+@pytest.mark.asyncio
+async def test_q_bestellhistorie_liefert_eintraege(monkeypatch):
+    from core.ai import command_center as cc
+    import core.database.connection as conn
+    import datetime as dt
+
+    rows = [
+        SimpleNamespace(material_name="Spax", menge=5, einheit="Packung",
+                        created_at=dt.datetime(2026, 8, 21, 9, 30)),
+        SimpleNamespace(material_name="Dübel", menge=2, einheit="Stück",
+                        created_at=None),
+    ]
+    monkeypatch.setattr(conn, "get_session", lambda: _FakeListSession(rows))
+    res = await cc._run_material_bestellungen(_q_ctx(), {"anzahl": 99})
+    assert [b["material"] for b in res["bestellungen"]] == ["Spax", "Dübel"]
+    assert res["bestellungen"][0]["zeit"].startswith("2026-08-21")
+    assert res["bestellungen"][1]["zeit"] is None

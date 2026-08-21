@@ -2,7 +2,7 @@
 
 Tagesfunktionen: Dashboard, Termine (read-only Liste), Anrufe/Aufnahmen,
 Rueckrufe. Mutierende Aktionen (Rueckruf abhaken, Termin stornieren) rufen
-exakt die Logik auf, die auch der Telegram-Bot nutzt — kalender-Plugin via
+exakt die Logik auf, die auch Q nutzt — kalender-Plugin via
 ``get_plugin_for_tenant`` + ``cancel_appointment`` + Storno-Mail.
 
 HARTE Tenant-Isolation: jede Query/Aktion scoped auf
@@ -445,7 +445,7 @@ async def api_buchhaltung_ausgaben(
 
 # Status, die das Board direkt setzen darf. Der finale Schritt
 # ``rechnung_gesendet`` ist BEWUSST ausgeschlossen: er loest in der
-# Telegram-Pipeline (_run_rechnung_versand_pipeline) die Lexware-
+# Versand-Pipeline (_run_rechnung_versand_pipeline) die Lexware-
 # Finalisierung + Rechnungs-Mail aus — ein Geld-Pfad, der hier nicht
 # dupliziert wird. Rechnung versenden laeuft ueber den eigenen
 # Rechnungs-Flow.
@@ -1760,7 +1760,7 @@ async def api_termin_storno(
     _e=Depends(require_app_user),
     _c=Depends(require_app_csrf),
 ) -> JSONResponse:
-    """Storniert einen Termin — spiegelt den Telegram-Storno-Wizard.
+    """Storniert einen Termin — gleiche Logik wie der Voice-/Mail-Storno.
 
     Sicher: cancelt NUR, wenn die kalender-Suche (find_events) zu diesem
     Kunden im Zeitfenster GENAU EINEN Termin liefert. Bei 0 oder mehreren
@@ -1896,10 +1896,10 @@ async def api_aufnahme_detail(
 
 
 # =====================================================================
-# Sprach-Diktat aus dem Browser (Telegram-/aufnahme-Ersatz)
+# Sprach-Diktat aus dem Browser
 # =====================================================================
 
-# Maximale Audio-Groesse — spiegelt das Telegram-Limit
+# Maximale Audio-Groesse
 # (AUFNAHME_MAX_AUDIO_BYTES = 50 MB). Der Browser kodiert client-seitig zu
 # WAV 16 kHz mono (~1,9 MB/min), das Gemini nativ versteht; ein Diktat
 # bleibt damit problemlos unter dem Limit.
@@ -1970,7 +1970,7 @@ async def _save_diktat_gespraech(
 ) -> tuple[uuid.UUID, list[dict]]:
     """Speichert ein Kundengespraech aus der Diktat-Extraktion.
 
-    Spiegelt exakt das Mapping aus dem Telegram-Flow
+    Spiegelt exakt das Mapping aus dem Voice-Flow
     (_handle_aufnahme_audio_received); zusaetzlich wird der diktierende
     Mitarbeiter als created_by/assigned vermerkt.
 
@@ -2024,14 +2024,14 @@ async def api_aufnahme_diktat(
     Der Hauptweg der App laeuft inzwischen ueber den Gespraechs-Bereich:
     dort steht der Kunde vorher fest und das Diktat geht an
     ``/gespraeche/{id}/diktat``. Dieser Endpunkt bleibt der Einstieg fuer
-    „Kunde noch unbekannt" und spiegelt weiterhin den Telegram-Flow.
+    „Kunde noch unbekannt".
 
     Der Browser nimmt das Gespraech per Web-Audio auf, kodiert es
     client-seitig zu WAV (16 kHz mono — von Gemini nativ unterstuetzt) und
     schickt die rohen Bytes als Request-Body. mime kommt aus Content-Type,
     die optionale Dauer (Sekunden) aus dem Header X-Audio-Duration.
 
-    Spiegelt exakt den Telegram-/aufnahme-Flow: gleiche Gemini-Funktion,
+    Gleiche Gemini-Funktion wie der Voice-Flow,
     gleiches Datenmodell, gleiche Pflichtfeld-Pruefung (kunde_name). HARTE
     Tenant-Isolation — gespeichert wird ausschliesslich auf
     current_tenant_id(request).
@@ -2100,7 +2100,7 @@ async def api_aufnahme_diktat(
 
 _VIZ_MAX_BYTES = 15_000_000  # 15 MB Eingangsfoto
 _VIZ_ALLOWED_MIMES = {"image/jpeg", "image/png"}
-# Stil-Boilerplate analog zum Telegram-Flow (dort VIZ_PROMPT_BOILERPLATE):
+# Stil-Boilerplate (VIZ_PROMPT_BOILERPLATE):
 # fotorealistisch, gleiche Perspektive, nur das Beschriebene aendern.
 _VIZ_BOILERPLATE = (
     "Erstelle eine fotorealistische Visualisierung auf Basis dieses Fotos. "
@@ -3329,7 +3329,7 @@ async def api_kunden_merge(
 # =====================================================================
 # Kunden-Archiv: Dateien/Notizen in den Drive-Ordner des Kunden ablegen
 #
-# Telegram-Paritaet zum /archiv-Wizard. Wiederverwendung:
+# Archiv-Upload. Wiederverwendung:
 # upload_file_to_kunde_folder (google_drive.py) legt den Kunden-Ordner
 # race-safe an bzw. findet ihn (TenantKundeDrive) und zaehlt upload_count
 # hoch — hier liegt nur der App-Upload-Endpoint im Belege-Muster (rohe
@@ -3338,7 +3338,7 @@ async def api_kunden_merge(
 # =====================================================================
 
 _ARCHIV_ALLOWED_MIMES = {"image/jpeg", "image/png", "image/webp", "application/pdf"}
-_ARCHIV_MAX_SIZE_BYTES = 25_000_000  # 25 MB (wie Telegram-/archiv)
+_ARCHIV_MAX_SIZE_BYTES = 25_000_000  # 25 MB
 _ARCHIV_EXT = {
     "image/jpeg": ".jpg", "image/png": ".png",
     "image/webp": ".webp", "application/pdf": ".pdf",
@@ -3352,7 +3352,7 @@ def _normalize_archiv_mime(raw: str | None) -> str | None:
 
 def _archiv_note_blob(kunde_name: str, text: str) -> bytes:
     """Text-Notiz als .txt mit Kopfzeile (Kunde + Zeitstempel) — spiegelt den
-    Telegram-Notiz-Header."""
+    Notiz-Header."""
     ts = dt.datetime.now(dt.timezone.utc).strftime("%d.%m.%Y %H:%M")
     header = f"Notiz für {kunde_name}\nErfasst: {ts} UTC\n" + ("-" * 40) + "\n\n"
     return (header + text).encode("utf-8")
@@ -3632,7 +3632,7 @@ async def api_wissen_delete(
     return JSONResponse({"ok": True})
 
 
-# =================== Anfragen-Inbox (Welle 2: Telegram-Ersatz) ===================
+# =========================== Anfragen-Inbox ===============================
 #
 # Datenmodell: EmailConversation (eine pro (Tenant, Kunden-Mail)). Die KI hat
 # pro Conversation classification + classification_confidence, der State zeigt
@@ -3816,7 +3816,7 @@ async def api_anfrage_detail(
 
 async def _build_lexware_provider(tenant_id: uuid.UUID):
     """Inline-Provider-Factory analog zu angebot_mail.py — vermeidet eine
-    zirkulaere Abhaengigkeit auf den Telegram-Handler."""
+    zirkulaere Abhaengigkeit auf das Plugin."""
     from core.models.tool_config import ToolConfig
     from core.security.encryption import decrypt
     from core.integrations.lexware import LexwareProvider
@@ -3979,7 +3979,7 @@ async def api_rechnung_senden(
 ) -> JSONResponse:
     """Wichtig: send_rechnung_to_customer erwartet eine Lexware-Rechnung die
     NICHT mehr im Draft-Status ist (Draft = kein PDF-Download).
-    Das Finalisieren passiert idealerweise im Telegram-/Cron-Flow.
+    Das Finalisieren passiert idealerweise im Cron-Flow.
     Hier rufen wir die Mail trotzdem auf — wenn Draft → kommt sauberer Fehler."""
     tid = current_tenant_id(request)
     try:
@@ -4030,7 +4030,7 @@ async def api_rechnung_senden(
 
 
 # =================== Belege (Lexware-Voucher-Upload) ===================
-# Spiegelt die Telegram-/beleg-Logik (_handle_beleg_photo_received): gleiche
+# Beleg-Upload: gleiche
 # MIME-Whitelist, gleiches 10-MB-Limit, Hash-Idempotenz, gleiche
 # provider.upload_voucher_file()-Logik und dasselbe Beleg-Modell.
 
@@ -4172,7 +4172,7 @@ async def api_beleg_upload(
     """Beleg-Foto/PDF aus der PWA → Lexware-Voucher-Upload.
 
     Body = rohe Datei-Bytes; Content-Type bestimmt den MIME; optionale Notiz
-    als ?caption=. Spiegelt exakt den Telegram-/beleg-Flow: MIME-Whitelist,
+    als ?caption=. MIME-Whitelist,
     10-MB-Limit, Hash-Idempotenz (selber Datei-Inhalt → kein Doppel-Upload),
     gleiche provider.upload_voucher_file()-Logik, gleiches Beleg-Modell.
 
@@ -4367,11 +4367,25 @@ async def api_material_anlegen(
     """
     tid = current_tenant_id(request)
     body = await request.json()
-    name = (body.get("name") or "").strip()
+    name = (body.get("name") or "").strip()[:200]
     bestell_link = (body.get("bestell_link") or "").strip()
     if not name or not bestell_link:
         return JSONResponse(
             {"ok": False, "error": "Name und Bestell-Link sind Pflicht."},
+            status_code=400,
+        )
+    # Der Link landet spaeter in window.open() — nur echte Web-Adressen
+    # zulassen (dieselbe Pruefung wie bei
+    # /objekt/merken). Laenge wie die Spalte, sonst kippt der INSERT.
+    if not bestell_link.startswith(("http://", "https://")):
+        return JSONResponse(
+            {"ok": False,
+             "error": "Der Bestell-Link muss mit http:// oder https:// beginnen."},
+            status_code=400,
+        )
+    if len(bestell_link) > 2000:
+        return JSONResponse(
+            {"ok": False, "error": "Der Bestell-Link ist zu lang (max. 2000 Zeichen)."},
             status_code=400,
         )
 
@@ -4413,7 +4427,7 @@ async def api_material_toggle(
     _c=Depends(require_app_csrf),
 ) -> JSONResponse:
     """Toggelt aktiv-Flag. Material wird nicht geloescht — bleibt als
-    Historie in Voice-/Telegram-Auto-Bestellungen referenzierbar."""
+    Historie in Voice-Auto-Bestellungen referenzierbar."""
     tid = current_tenant_id(request)
     try:
         mid_uuid = uuid.UUID(mid)
@@ -4443,7 +4457,7 @@ async def api_material_bestellen(
 ) -> JSONResponse:
     """Loest eine Material-Bestellung aus: schreibt den Audit-Log-Eintrag
     (MaterialBestellung) und gibt den Bestell-Link zurueck, den die App
-    oeffnet. Spiegelt den Telegram-/bestellen-Flow (_ausloesen_bestellung):
+    oeffnet:
     nur Link + Log, kein Auto-Mail.
 
     Body (optional): { menge }. require_app_user (kein Inhaber-Gate) — der
@@ -4533,7 +4547,7 @@ async def api_team_abwesenheit(
     _c=Depends(require_app_csrf),
 ) -> JSONResponse:
     """Inhaber meldet einen Mitarbeiter krank / im Urlaub. Spiegel der
-    Telegram-Befehle /krank + /urlaub.
+    Krank- und Urlaubs-Meldung.
 
     Body: { typ: 'krank'|'urlaub'|'sonstiges', start: 'YYYY-MM-DD',
             ende?: 'YYYY-MM-DD' (None = offen), notes?: str }
@@ -4590,7 +4604,7 @@ async def api_team_zurueck(
     _c=Depends(require_app_csrf),
 ) -> JSONResponse:
     """Beendet die aktive Abwesenheit eines Mitarbeiters mit heutigem Datum.
-    Spiegel des Telegram-Befehls /zurueck.
+    Gegenstueck zur Abwesenheits-Meldung.
     """
     tid = current_tenant_id(request)
     from core.models.employee import Employee
@@ -4927,7 +4941,7 @@ async def api_branding_logo(
 # ─────────────────────────────────────────────────────────────────────
 # Verbindungen (OAuth + API-Keys) im Einstellungen-Screen
 #
-# Telegram-Paritaet: der Inhaber verknuepft Google (Kalender + Drive),
+# Der Inhaber verknuepft Google (Kalender + Drive),
 # Microsoft/Outlook und Lexware Office direkt aus der App. Der OAuth-Kern
 # (generate_auth_url / handle_callback / OAuthState / OAuthToken) wird
 # UNVERAENDERT wiederverwendet — hier liegt nur die App-Bedienoberflaeche
@@ -5062,7 +5076,7 @@ async def api_oauth_start(
 # /verbindungen und /oauth/start sind Betriebs-Sache (Lexware-Key,
 # Betriebspostfach) und bleiben beim Inhaber. Ein Mitarbeiter muss
 # aber seinen EIGENEN Kalender anschliessen koennen — bisher ging das
-# nur ueber Telegram, in der App gar nicht.
+# frueher gar nicht in der App.
 #
 # Der Scope ist dabei enger als beim Inhaber: bei Google sieht Q nur
 # die Belegung und einen selbst angelegten Zweitkalender, private
@@ -5190,7 +5204,7 @@ async def api_lexware_verbinden(
 ) -> JSONResponse:
     """Lexware-API-Key entgegennehmen, gegen Lexware live pruefen
     (health_check) und verschluesselt in der ToolConfig ablegen. Spiegelt
-    den Telegram-/lexware_setup-Flow, ohne den Telegram-Handler zu
+    den Lexware-Setup-Flow, ohne ein Plugin zu
     importieren. Body: { api_key }."""
     from core.integrations.lexware import LexwareProvider
     from core.security.encryption import encrypt
@@ -5282,7 +5296,7 @@ async def api_verbindungen_trennen(
 # ─────────────────────────────────────────────────────────────────────
 # Anfrage-Formular-Editor (Einstellungen → Anfrage-Formular)
 #
-# Telegram-Paritaet zum /formular-Wizard: der Inhaber bearbeitet die Felder
+# Formular-Werkstatt: der Inhaber bearbeitet die Felder
 # seines oeffentlichen Anfrage-Formulars (TenantAnfrageSchema) aus der App.
 # Wiederverwendung: get_schema_for_tenant / upsert_tenant_schema /
 # delete_tenant_schema / validate_schema_fields aus core.integrations.
@@ -5296,7 +5310,7 @@ async def api_verbindungen_trennen(
 
 _ANFRAGE_FORMULAR_FEATURE = "anfrage_formular"
 
-# Feldtypen mit Anzeige-Label (Reihenfolge wie im Telegram-Wizard)
+# Feldtypen mit Anzeige-Label
 _FIELD_TYPE_CHOICES = [
     {"value": "text", "label": "Text (eine Zeile)"},
     {"value": "textarea", "label": "Mehrzeiliger Text"},
@@ -6364,7 +6378,7 @@ async def api_assistent_transkript(
 
 # =================== Welle 7: Diagnose + Verbindungs-Tests ===================
 #
-# Spiegelt die Telegram-Diagnose-Befehle (/status, /microsoft_check,
+# Diagnose-Ansicht (Verbindungen, Microsoft-Check,
 # /lexware_status, /kalender_status, /werkstatt_status). Beantwortet
 # fuer den Inhaber/Mitarbeiter die Frage "laeuft das Tool gerade?" ohne
 # dass er ueber den Server-Status-Page muss.
@@ -6451,7 +6465,7 @@ async def api_diagnose(
     }
 
     # 4) Werkstatt-Adresse — spiegelt /werkstatt_status. Aus dem Default-
-    # Employee weil dort die Quelle der Wahrheit ist (Telegram-Code
+    # Employee weil dort die Quelle der Wahrheit ist (Legacy-Code
     # spiegelt den Wert anschliessend auf tenant.heimat_*, aber Employee
     # ist die kanonische Stelle).
     async with get_session() as s:

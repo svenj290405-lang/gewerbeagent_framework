@@ -38,7 +38,7 @@ und optional inhaber-gegated (Abwesenheit melden). So sieht Gemini nur die
 Tools, die dieser Mitarbeiter in diesem Betrieb wirklich nutzen darf.
 
 Die Aktionen selbst sind dünne Wrapper um genau dieselben Primitive, die
-auch die manuellen App-Routen und der Telegram-Bot nutzen
+auch die manuellen App-Routen nutzen
 (``kalender.on_webhook(...)``, ``Rueckruf``-Insert, ``create_absence`` …) —
 keine doppelte Geschäftslogik.
 """
@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import inspect
 import logging
 import re
 import uuid
@@ -106,7 +107,14 @@ class ToolSpec:
     # über den Knopf verboten).
     permission: str | None = None
     # Baut für Write-Tools die menschenlesbare Bestätigungs-Zeile.
-    summarize: Callable[[Ctx, dict], str] | None = None
+    # Darf async sein, wenn die Zeile erst nachschlagen muss (z.B. den
+    # Material-Namen zur ID) — der Aufrufer awaitet dann.
+    summarize: Callable[[Ctx, dict], str | Awaitable[str]] | None = None
+
+
+# Platzhalter fuer den kind-Vergleich, wenn ein Call auf kein Tool passt.
+_LEER = ToolSpec(name="", kind="read", description="", parameters={},
+                 run=None)  # type: ignore[arg-type]
 
 
 def _available_tools(ctx: Ctx) -> list[ToolSpec]:
@@ -445,8 +453,13 @@ async def run_command(text: str, ctx: Ctx, history: list | None = None, screen_c
 
         cand_content = resp.candidates[0].content
         parts = cand_content.parts or []
-        fc = next((p.function_call for p in parts
-                   if getattr(p, "function_call", None)), None)
+        # Gemini darf in EINEM Zug mehrere Tools aufrufen (z.B. Termine +
+        # Rückrufe für ein Tagesbriefing). Dann erwartet die API im nächsten
+        # Zug GENAU so viele function_response-Parts wie es calls gab —
+        # sonst 400 INVALID_ARGUMENT und der Assistent fällt komplett aus.
+        fcs = [p.function_call for p in parts
+               if getattr(p, "function_call", None)]
+        fc = fcs[0] if fcs else None
         say = "".join(p.text for p in parts if getattr(p, "text", None)).strip()
 
         if fc is None:
@@ -470,6 +483,11 @@ async def run_command(text: str, ctx: Ctx, history: list | None = None, screen_c
             return {"type": "message",
                     "text": say or "Ich habe dich nicht ganz verstanden — kannst du es anders sagen?"}
 
+        # Bei mehreren Calls entscheidet der erste Write-Call: Write-Pfade
+        # kehren sofort zurück (Bestätigung/Ausführung), da wird nichts an
+        # Gemini zurückgegeben — die Antwort-Parität ist dann kein Thema.
+        fc = next((c for c in fcs
+                   if (_spec_by_name(c.name) or _LEER).kind == "write"), fcs[0])
         spec = _spec_by_name(fc.name)
         args = _to_plain(dict(fc.args or {}))
         if spec is None or spec not in specs:
@@ -507,6 +525,8 @@ async def run_command(text: str, ctx: Ctx, history: list | None = None, screen_c
 
         if spec.kind == "write":
             summary = spec.summarize(ctx, args) if spec.summarize else f"{spec.name} ausführen"
+            if inspect.isawaitable(summary):
+                summary = await summary
 
             if ctx.mode_for(spec.name) != MODE_AUTOMATISCH:
                 # 'assistiert': NICHT ausführen — Bestätigung einholen.
@@ -528,19 +548,28 @@ async def run_command(text: str, ctx: Ctx, history: list | None = None, screen_c
             return {"type": "done", "tool": spec.name, "result": _to_plain(result),
                     "summary": summary, "frage": say or None}
 
-        # Read-Tool: ausführen und Ergebnis an Gemini zurückgeben.
-        try:
-            result = await spec.run(ctx, args)
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("command_center read-tool %s crash: %s", spec.name, exc)
-            result = {"error": "Tool-Aufruf fehlgeschlagen."}
+        # Read-Tools: ALLE Calls dieses Zuges ausführen und je eine
+        # Antwort zurückgeben (siehe Kommentar oben zur Parität).
+        antwort_parts = []
+        for call in fcs:
+            call_spec = _spec_by_name(call.name)
+            call_args = _to_plain(dict(call.args or {}))
+            if call_spec is None or call_spec not in specs:
+                logger.warning(
+                    "command_center: Gemini rief unzulässiges Tool %r auf", call.name)
+                ergebnis = {"error": "Dieses Werkzeug steht hier nicht zur Verfügung."}
+            else:
+                try:
+                    ergebnis = await call_spec.run(ctx, call_args)
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception(
+                        "command_center read-tool %s crash: %s", call.name, exc)
+                    ergebnis = {"error": "Tool-Aufruf fehlgeschlagen."}
+            antwort_parts.append(types.Part.from_function_response(
+                name=call.name, response={"result": _to_plain(ergebnis)}))
 
         contents.append(cand_content)
-        contents.append(types.Content(
-            role="user",
-            parts=[types.Part.from_function_response(
-                name=spec.name, response={"result": _to_plain(result)})],
-        ))
+        contents.append(types.Content(role="user", parts=antwort_parts))
 
     return {"type": "message",
             "text": "Das war mir zu komplex — bitte den Befehl in kleinere Schritte teilen."}
@@ -668,6 +697,49 @@ async def _run_material_liste(ctx: Ctx, args: dict) -> dict:
     return {"material": [{"id": str(m.id), "name": m.name,
                           "einheit": m.einheit,
                           "standard_menge": m.standard_menge} for m in rows]}
+
+
+async def _run_material_bestellungen(ctx: Ctx, args: dict) -> dict:
+    """Zuletzt ausgeloeste Material-Bestellungen (spiegelt den Verlauf im
+    Material-Screen). Betriebsweit, nicht nur die eigenen — im Betrieb
+    zaehlt, was bestellt IST, nicht wer geklickt hat."""
+    from core.database.connection import get_session
+    from core.models.tenant_material import MaterialBestellung
+    from sqlalchemy import select
+
+    try:
+        anzahl = int(args.get("anzahl") or 10)
+    except (TypeError, ValueError):
+        anzahl = 10
+    anzahl = max(1, min(anzahl, 25))
+    async with get_session() as s:
+        rows = (await s.execute(
+            select(MaterialBestellung)
+            .where(MaterialBestellung.tenant_id == ctx.tid)
+            .order_by(MaterialBestellung.created_at.desc()).limit(anzahl)
+        )).scalars().all()
+    return {"bestellungen": [
+        {"material": o.material_name, "menge": o.menge, "einheit": o.einheit,
+         "zeit": o.created_at.isoformat() if o.created_at else None}
+        for o in rows]}
+
+
+async def _material_name(ctx: Ctx, material_id: str) -> str:
+    """Name zur Material-ID — leer, wenn die ID nicht zu diesem Betrieb
+    gehoert (dieselbe Tenant-Grenze wie beim Bestellen)."""
+    from core.database.connection import get_session
+    from core.models.tenant_material import TenantMaterial
+    from sqlalchemy import select
+
+    try:
+        mid = uuid.UUID(material_id)
+    except (ValueError, TypeError):
+        return ""
+    async with get_session() as s:
+        return (await s.execute(
+            select(TenantMaterial.name)
+            .where(TenantMaterial.id == mid)
+            .where(TenantMaterial.tenant_id == ctx.tid))).scalar_one_or_none() or ""
 
 
 async def _run_offene_rueckrufe(ctx: Ctx, args: dict) -> dict:
@@ -911,8 +983,14 @@ async def _run_material_bestellen(ctx: Ctx, args: dict) -> dict:
                 "einheit": m.einheit, "bestell_link": m.bestell_link}
 
 
-def _summary_material(ctx: Ctx, args: dict) -> str:
-    bez = (args.get("name") or args.get("material_id") or "Material").strip()
+async def _summary_material(ctx: Ctx, args: dict) -> str:
+    # Gemini liefert meist nur die material_id aus material_liste. Eine UUID
+    # in der Bestaetigung ("4x ebf24bc3-... bestellen?") liest sich wie ein
+    # Fehler, darum hier der Umweg ueber die DB auf den echten Namen.
+    bez = (args.get("name") or "").strip()
+    if not bez:
+        bez = await _material_name(ctx, (args.get("material_id") or "").strip())
+    bez = bez or "Material"
     menge = args.get("menge")
     return (f"{menge}× " if menge else "") + f"{bez} bestellen?"
 
@@ -1206,10 +1284,15 @@ async def _run_material_anlegen(ctx: Ctx, args: dict) -> dict:
     from core.models.tenant_material import TenantMaterial
     from sqlalchemy import select
 
-    name = (args.get("name") or "").strip()
+    name = (args.get("name") or "").strip()[:200]
     link = (args.get("bestell_link") or "").strip()
     if not name or not link:
         return {"ok": False, "error": "Name und Bestell-Link sind Pflicht."}
+    if not link.startswith(("http://", "https://")):
+        return {"ok": False,
+                "error": "Der Bestell-Link muss mit http:// oder https:// beginnen."}
+    if len(link) > 2000:
+        return {"ok": False, "error": "Der Bestell-Link ist zu lang (max. 2000 Zeichen)."}
     try:
         std = int(args.get("standard_menge") or 1)
     except (TypeError, ValueError):
@@ -1241,7 +1324,7 @@ def _summary_material_anlegen(ctx: Ctx, args: dict) -> str:
     return f"Material „{(args.get('name') or '—').strip()}\" im Katalog anlegen?"
 
 
-# ---- READ (Telegram-Paritaet) ---------------------------------------------
+# ---- READ -----------------------------------------------------------------
 
 async def _run_archiv_suchen(ctx: Ctx, args: dict) -> dict:
     """Findet die Drive-Archiv-Ordner eines Kunden (spiegelt /archiv ohne
@@ -1311,7 +1394,7 @@ async def _run_formulare_status(ctx: Ctx, args: dict) -> dict:
     return {"letzte_30_tage": counts}
 
 
-# ---- WRITE (Telegram-Paritaet) --------------------------------------------
+# ---- WRITE ----------------------------------------------------------------
 
 async def _run_wissen_loeschen(ctx: Ctx, args: dict) -> dict:
     from core.database.connection import get_session
@@ -1345,7 +1428,7 @@ def _summary_wissen_loeschen(ctx: Ctx, args: dict) -> str:
 # ---- WRITE (Kundenzyklus / Beleg-Fluss) -----------------------------------
 #
 # Diese Tools rufen den geteilten Service core.services.document_flow, den
-# auch die App-Routen und der Telegram-Bot nutzen. Senden geht an echte
+# auch die App-Routen nutzen. Senden geht an echte
 # Kunden — daher (wie alle Write-Tools) erst nach Bestaetigung.
 
 async def _run_angebot_erstellen(ctx: Ctx, args: dict) -> dict:
@@ -1763,6 +1846,14 @@ _REGISTRY: list[ToolSpec] = [
             "suche": {"type": _S, "description": "Optionaler Namensfilter."}}},
         run=_run_material_liste),
     ToolSpec(
+        name="material_bestellungen", kind="read",
+        description="Zeigt die zuletzt ausgelösten Material-Bestellungen des "
+                    "Betriebs (was wurde wann in welcher Menge bestellt).",
+        parameters={"type": "OBJECT", "properties": {
+            "anzahl": {"type": _I,
+                       "description": "Wie viele Einträge (Standard 10, max 25)."}}},
+        run=_run_material_bestellungen),
+    ToolSpec(
         name="offene_rueckrufe", kind="read",
         description="Zeigt die aktuell offenen Rückrufe.",
         parameters={"type": "OBJECT", "properties": {}},
@@ -1934,7 +2025,7 @@ _REGISTRY: list[ToolSpec] = [
             "required": ["name", "bestell_link"]},
         run=_run_material_anlegen, summarize=_summary_material_anlegen),
 
-    # ---- READ (Telegram-Paritaet) ----
+    # ---- READ (weitere Nachschlage-Tools) ----
     ToolSpec(
         name="archiv_suchen", kind="read", feature="drive_archiv",
         description="Findet den Drive-Archiv-Ordner eines Kunden (mit Link und "
@@ -1975,7 +2066,7 @@ _REGISTRY: list[ToolSpec] = [
         parameters={"type": "OBJECT", "properties": {}},
         run=_run_formulare_status),
 
-    # ---- WRITE (Telegram-Paritaet) ----
+    # ---- WRITE (weitere Aktionen) ----
     ToolSpec(
         name="wissen_loeschen", kind="write", permission="wissen.pflegen",
         description="Löscht einen Eintrag aus der Wissensdatenbank (per "

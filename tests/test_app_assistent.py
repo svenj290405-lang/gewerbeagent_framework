@@ -219,7 +219,8 @@ def test_beleg_fluss_tools_gating():
 # stimmt. Wer ein Tool ergaenzt, traegt es hier bewusst nach.
 _ERWARTETE_TOOLS = {
     # read
-    "freie_termine_finden", "kunde_suchen", "material_liste", "offene_rueckrufe",
+    "freie_termine_finden", "kunde_suchen", "material_liste", "material_bestellungen",
+    "offene_rueckrufe",
     "anzeige_oeffnen", "anstehende_termine", "team_status", "offene_anfragen",
     "wissen_suchen", "archiv_suchen", "archiv_dateien", "rechnungen_pruefen",
     "offene_posten", "formulare_status",
@@ -495,3 +496,55 @@ async def test_nachfassen_passiert_nur_einmal(monkeypatch):
     res = await cc.run_command("Schreib Henrik eine Mail wegen morgen", _ctx())
     assert res["type"] == "message"
     assert models.calls == 2  # kein Endlos-Nachfassen
+
+
+# ==========================================================================
+# Parallele Tool-Calls in EINEM Gemini-Zug
+# ==========================================================================
+# Gemini darf pro Zug mehrere Werkzeuge aufrufen. Die API verlangt dann im
+# Folgezug GENAU so viele function_response-Parts wie es calls gab — sonst
+# 400 INVALID_ARGUMENT ("number of function response parts is equal to the
+# number of function call parts") und der Assistent faellt komplett aus.
+
+@pytest.mark.asyncio
+async def test_mehrere_read_calls_bekommen_je_eine_antwort(monkeypatch):
+    aufgerufen: list[str] = []
+
+    async def fake_termine(ctx, args):
+        aufgerufen.append("anstehende_termine")
+        return {"termine": []}
+
+    async def fake_rueckrufe(ctx, args):
+        aufgerufen.append("offene_rueckrufe")
+        return {"rueckrufe": []}
+
+    _patch_tool(monkeypatch, "anstehende_termine", fake_termine)
+    _patch_tool(monkeypatch, "offene_rueckrufe", fake_rueckrufe)
+
+    models = _patch_gemini(monkeypatch, [
+        _resp([_part_fc("anstehende_termine", {}),
+               _part_fc("offene_rueckrufe", {})]),
+        _resp([_part_text("Heute ist nichts offen.")]),
+    ])
+
+    out = await cc.run_command("Wie ist der Stand heute?", _ctx())
+    assert out["type"] == "message"
+    assert sorted(aufgerufen) == ["anstehende_termine", "offene_rueckrufe"]
+
+    # Zweiter Gemini-Call: so viele function_response-Parts wie calls
+    antwort_content = models.seen_contents[1][-1]
+    assert len(antwort_content.parts) == 2
+
+
+@pytest.mark.asyncio
+async def test_write_call_neben_read_call_geht_in_die_bestaetigung(monkeypatch):
+    """Ist ein Write-Tool dabei, gewinnt es: der Pfad kehrt sofort mit der
+    Bestaetigung zurueck (dann geht nichts an Gemini zurueck)."""
+    _patch_gemini(monkeypatch, [
+        _resp([_part_fc("anstehende_termine", {}),
+               _part_fc("rueckruf_anlegen",
+                        {"kunde_name": "Meier", "kunde_telefon": "0651"})]),
+    ])
+    out = await cc.run_command("Ruf Meier zurueck", _ctx())
+    assert out["type"] == "confirm"
+    assert out["tool"] == "rueckruf_anlegen"

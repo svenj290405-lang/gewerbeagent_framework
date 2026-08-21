@@ -1216,13 +1216,26 @@ const SCREENS = {
         if (r && r.ok) navigate("material"); else { b.disabled = false; alert("Konnte nicht ändern."); }
       }));
     // Bestellen: Link sofort im Klick-Gesture öffnen (kein Popup-Blocker),
-    // Bestellung im Hintergrund protokollieren.
+    // Bestellung danach protokollieren. Das "✓ Bestellt" kommt erst, wenn
+    // der Eintrag wirklich im Verlauf steht — sonst hält der Betrieb eine
+    // Bestellung für erfasst, die nirgends steht (z.B. weil das Material
+    // zwischenzeitlich deaktiviert wurde).
     document.querySelectorAll("[data-mat-order]").forEach((b) =>
-      b.addEventListener("click", () => {
+      b.addEventListener("click", async () => {
         if (b.dataset.link) window.open(b.dataset.link, "_blank", "noopener");
-        b.disabled = true; b.textContent = "✓ Bestellt";
-        api(`/app/api/material/${b.dataset.matOrder}/bestellen`, { method: "POST", body: "{}" })
-          .catch(() => {});
+        const label = b.textContent;
+        b.disabled = true; b.textContent = "…";
+        const r = await api(`/app/api/material/${b.dataset.matOrder}/bestellen`,
+          { method: "POST", body: "{}" }).catch(() => null);
+        const d = r && r.ok ? await r.json().catch(() => null) : null;
+        if (d && d.ok) {
+          b.textContent = `✓ ${d.menge} ${d.einheit || ""}`.trim() + " bestellt";
+        } else {
+          b.textContent = label; b.disabled = false;
+          alert((d && d.error)
+            ? `Nicht protokolliert: ${d.error}`
+            : "Der Bestell-Link wurde geöffnet, aber die Bestellung konnte nicht protokolliert werden.");
+        }
       }));
   },
 
@@ -1850,7 +1863,7 @@ const SCREENS = {
         : `<button class="btn-sm" data-lexware="1">Verbinden</button>`;
 
       mount.innerHTML = `<div class="card"><h2>Verbindungen</h2>
-        <p class="muted" style="font-size:12px;margin-top:0">Verknüpfe deine Konten direkt hier — kein Umweg mehr über Telegram oder den Setup-Bereich.</p>
+        <p class="muted" style="font-size:12px;margin-top:0">Verknüpfe deine Konten direkt hier — kein Umweg über den Setup-Bereich.</p>
         ${row("📅 Google (Kalender + Drive)", gSub, gBtns)}
         ${row("✉️ Microsoft / Outlook", mSub, mBtns)}
         ${row("🧾 Lexware Office", lxSub, lxBtns)}
