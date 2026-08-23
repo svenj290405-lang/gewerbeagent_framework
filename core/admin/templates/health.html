@@ -12,7 +12,9 @@
     <div>
         <h1>System-Health</h1>
         <p>Täglicher Morgen-Check ({{ "%02d"|format(check_hour) }}:00) — läuft der Bot noch?
-           Bei einem Problem geht eine Mail an <strong>{{ alert_email }}</strong>.</p>
+           Bei einem Problem geht eine Meldung an <strong>{{ alert_email }}</strong>{% if not smtp_konfiguriert %}
+           — <span style="color:#b45309;">Mailweg noch nicht eingerichtet (ALERT_SMTP_* fehlen),
+           es bleibt nur der Push in die App</span>{% endif %}.</p>
     </div>
     <div style="display:flex;gap:8px;">
         <form method="post" action="/admin/health/run" style="display:inline">
@@ -95,4 +97,63 @@
     </tbody>
 </table>
 </div>
+
+<div class="section-title">Anbindungen (letzter Check)</div>
+<div class="card" style="margin-bottom:28px;">
+    {% if anbindungen %}
+        <table>
+            <thead><tr><th>Betrieb</th><th>Dienst</th><th>Zustand</th><th>Hinweis</th></tr></thead>
+            <tbody>
+            {% for slug, dienste in anbindungen.items() %}
+                {% for dienst, info in dienste.items() %}
+                <tr>
+                    <td>{{ slug }}</td>
+                    <td>{{ dienst }}</td>
+                    <td>{{ badge(info.ok, 'verbunden', 'PRÜFEN') }}</td>
+                    <td class="muted" style="font-size:12px;">
+                        {{ info.fehler or '' }}
+                        {% if info.tage_ohne_nutzung is not none %}
+                            seit {{ info.tage_ohne_nutzung }} Tagen ungenutzt
+                        {% endif %}
+                    </td>
+                </tr>
+                {% endfor %}
+            {% endfor %}
+            </tbody>
+        </table>
+    {% else %}
+        <p class="muted">Noch kein Check mit Anbindungs-Prüfung gelaufen.</p>
+    {% endif %}
+</div>
+
+<div class="section-title">Alarme</div>
+{% if nicht_zugestellt %}
+<div class="card" style="border-left:3px solid #ef4444;margin-bottom:14px;">
+    <strong>{{ nicht_zugestellt }} der letzten {{ alarme|length }} Alarme wurden NICHT zugestellt.</strong>
+    Bis zum 23.08.2026 gab es nach dem Telegram-Ausbau überhaupt keinen Transport — die
+    Meldungen landeten nur im Log. Seitdem läuft die Zustellung über ein zweites Postfach
+    (sobald ALERT_SMTP_* gesetzt sind) und ersatzweise als Push in die App.
+</div>
+{% endif %}
+<div class="table-wrap" style="margin-bottom:14px;">
+    <table>
+        <thead><tr><th>Zeitpunkt</th><th>Art</th><th>Zugestellt</th></tr></thead>
+        <tbody>
+        {% for a in alarme %}
+            <tr>
+                <td>{{ a.created_at.strftime('%d.%m.%Y %H:%M') if a.created_at else '' }}</td>
+                <td>{{ a.action.replace('sven_alert.', '') }}</td>
+                <td>{{ badge(a.success, 'ja', 'nein') }}</td>
+            </tr>
+        {% else %}
+            <tr><td colspan="3" class="muted">Keine Alarme aufgezeichnet.</td></tr>
+        {% endfor %}
+        </tbody>
+    </table>
+</div>
+<p class="muted" style="font-size:13px;">
+    Fehlgeschlagene Vorgänge insgesamt in den letzten 24 Stunden: <strong>{{ fehler_24h }}</strong>.
+    Alarme vor dem 23.08.2026 stammen teils aus Testläufen — die Testsuite löste damals
+    echte Alarme aus, das ist inzwischen abgestellt.
+</p>
 {% endblock %}

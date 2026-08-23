@@ -560,16 +560,45 @@ async def health_view(
                     request=request, session=s)
 
     try:
-        from core.integrations.cron_health import get_health_report
-        live = get_health_report()
+        # Persistente Variante: die reine Speicher-Sicht zeigte nach jedem
+        # Neustart "alle Crons tot" und von ausserhalb des Prozesses immer.
+        from core.integrations.cron_health import get_health_report_persistent
+        live = await get_health_report_persistent()
     except Exception:  # noqa: BLE001
         live = None
+
+    # Alarm-Historie. Sie steht im Audit-Log, war aber nirgends sichtbar —
+    # und genau dort sieht man, dass ueber Monate Alarme ausgeloest und
+    # nie zugestellt wurden (success=False), weil der Transport fehlte.
+    async with get_session() as s:
+        alarme = (await s.execute(
+            select(AdminAuditLog)
+            .where(AdminAuditLog.action.like("sven_alert.%"))
+            .order_by(AdminAuditLog.created_at.desc())
+            .limit(40)
+        )).scalars().all()
+        seit = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=24)
+        fehler_24h = (await s.execute(
+            select(func.count()).select_from(AdminAuditLog)
+            .where(AdminAuditLog.created_at >= seit)
+            .where(AdminAuditLog.success.is_(False))
+        )).scalar_one()
+
+    nicht_zugestellt = sum(1 for a in alarme if not a.success)
+    anbindungen = {}
+    if results and isinstance(results[0].detail, dict):
+        anbindungen = results[0].detail.get("anbindungen") or {}
 
     return templates.TemplateResponse(request, "health.html", {
         "request": request, "user": user, "active": "health",
         "results": results, "latest": results[0] if results else None,
         "live": live,
-        "alert_email": settings.health_alert_email,
+        "alarme": alarme,
+        "nicht_zugestellt": nicht_zugestellt,
+        "fehler_24h": int(fehler_24h),
+        "anbindungen": anbindungen,
+        "alert_email": settings.alert_smtp_to or settings.health_alert_email,
+        "smtp_konfiguriert": bool(settings.alert_smtp_host),
         "check_hour": settings.health_check_hour,
         "csrf_token": request.state.admin_csrf,
     })
