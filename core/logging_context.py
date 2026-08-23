@@ -132,6 +132,14 @@ _REDACTION_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     # Versionsstrings wie 0.1.2.3.4.5.6.7.8.9 faelschlich maskiert).
     (re.compile(r"(?<!\d)(?:\+|00)(?:[\s/()-]{0,4}\d){9,14}(?!\d)"), "<tel-redacted>"),
     (re.compile(r"(?<!\d)0(?:[\s/()-]{0,4}\d){9,13}(?!\d)"), "<tel-redacted>"),
+    # Namen und Suchbegriffe in Query-Strings. Aufgefallen im Audit am
+    # 2026-08-23: der Zugriffs-Log enthielt
+    # "GET /app/api/archiv/dateien?kunde=<Klarname>" — ein Kundenname im
+    # Klartext, den weder das Mail- noch das Telefon-Muster erwischt.
+    # Namen generisch zu erkennen ist unmoeglich; an dieser Stelle geht
+    # es aber, weil der Parametername sie ankuendigt.
+    (re.compile(r"(?i)([?&](?:kunde|kunde_name|name|suche|q|email|telefon)=)"
+                r"[^&\s\"']+"), r"\1<redacted>"),
 )
 
 
@@ -177,6 +185,17 @@ def configure_structured_logging(*, level: str = "INFO") -> None:
     # (Der RedactingFormatter ist die zweite Verteidigungslinie.)
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+    # uvicorn bringt eigene Handler mit und leitet NICHT an den Root
+    # weiter — der Zugriffs-Log lief deshalb komplett am Redaction-
+    # Formatter vorbei. Genau dort tauchte im Audit ein Kundenname im
+    # Klartext auf ("GET /app/api/archiv/dateien?kunde=..."). Wir nehmen
+    # uvicorn seine Handler weg und lassen es ueber den Root schreiben.
+    for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+        uvlog = logging.getLogger(name)
+        for h in list(uvlog.handlers):
+            uvlog.removeHandler(h)
+        uvlog.propagate = True
 
 
 # Convenience: kurzer Helper fuer Cron-Loops, die pro Tenant iterieren.

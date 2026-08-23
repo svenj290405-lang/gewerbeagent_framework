@@ -380,8 +380,8 @@ async def resolve_kunde_id_safe(
         return kunde.id
     except Exception:
         logger.exception(
-            "Kundenaufloesung fehlgeschlagen (tenant=%s, name=%r) — "
-            "kunde_id bleibt NULL", tenant_id, name,
+            "Kundenaufloesung fehlgeschlagen (tenant=%s) — "
+            "kunde_id bleibt NULL", tenant_id,
         )
         return None
 

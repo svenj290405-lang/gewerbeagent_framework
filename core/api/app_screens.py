@@ -2214,8 +2214,8 @@ async def api_aufnahme_diktat(
     from core.models.app_usage_event import record_app_usage, USAGE_DIKTAT
     await record_app_usage(tid, emp.id, USAGE_DIKTAT)
     logger.info(
-        "PWA-Diktat gespeichert: id=%s tenant=%s mitarbeiter=%s kunde=%r todos=%d",
-        g_id, tid, emp.id, kunde_name, len(extracted.get("todos") or []),
+        "PWA-Diktat gespeichert: id=%s tenant=%s mitarbeiter=%s todos=%d",
+        g_id, tid, emp.id, len(extracted.get("todos") or []),
     )
     return JSONResponse({
         "ok": True,
@@ -2810,7 +2810,7 @@ async def api_gespraech_neu(
         await s.flush()
         gid = g.id
         await s.commit()
-    logger.info("PWA-Gespräch angelegt: id=%s tenant=%s kunde=%r", gid, tid, name)
+    logger.info("PWA-Gespräch angelegt: id=%s tenant=%s", gid, tid)
     return JSONResponse({"ok": True, "id": str(gid), "kunde": name})
 
 
@@ -3613,7 +3613,8 @@ async def api_archiv_notiz(
     except Exception as e:  # noqa: BLE001
         logger.exception("PWA-Archiv-Notiz fehlgeschlagen: %s", e)
         return JSONResponse({"ok": False, "error": "Notiz konnte nicht abgelegt werden."}, status_code=502)
-    logger.info("PWA-Archiv-Notiz: tenant=%s mitarbeiter=%s kunde=%s", tid, emp.id, kunde_name)
+    # Kundenname bewusst nicht ins Log — die Zuordnung steht in der DB.
+    logger.info("PWA-Archiv-Notiz: tenant=%s mitarbeiter=%s", tid, emp.id)
     return JSONResponse({
         "ok": True,
         "folder_url": result.get("kunde_folder_url"),

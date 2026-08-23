@@ -67,3 +67,42 @@ def test_no_false_positive_on_plain_text():
     # Kein "@", kein "%40", keine Nummer -> unveraendert
     txt = "Cron-Lauf fertig: 1 offene Tokens geprueft"
     assert _redact_secrets(txt) == txt
+
+
+# =====================================================================
+# Namen und Suchbegriffe in Query-Strings
+# =====================================================================
+# Aufgefallen im Audit am 2026-08-23: im Zugriffs-Log stand
+# "GET /app/api/archiv/dateien?kunde=<Klarname>". Der uvicorn-Logger lief
+# an diesem Formatter vorbei (eigene Handler, kein propagate), und ein
+# Name ist ausserdem von keinem der bestehenden Muster erfasst. Beides
+# ist gefixt — hier die Absicherung.
+
+def test_kundenname_im_query_string_wird_maskiert():
+    zeile = 'GET /app/api/archiv/dateien?kunde=Henrik%20Anton HTTP/1.1" 200'
+    aus = _redact_secrets(zeile)
+    assert "Henrik" not in aus
+    assert "kunde=<redacted>" in aus
+
+
+def test_suchbegriff_wird_maskiert_rest_der_url_bleibt():
+    aus = _redact_secrets("GET /app/api/kunden?suche=Mueller&limit=5")
+    assert "Mueller" not in aus
+    assert "limit=5" in aus, "Nur der PII-Parameter darf verschwinden"
+
+
+def test_harmlose_parameter_bleiben_lesbar():
+    zeile = "GET /app/api/auftraege?status=offen&tage=14"
+    assert _redact_secrets(zeile) == zeile
+
+
+def test_uvicorn_logger_schreibt_ueber_den_root():
+    """Ohne das lief der Zugriffs-Log komplett an der Maskierung vorbei."""
+    import logging
+    from core.logging_context import configure_structured_logging
+
+    configure_structured_logging()
+    for name in ("uvicorn", "uvicorn.access", "uvicorn.error"):
+        log = logging.getLogger(name)
+        assert log.propagate is True, f"{name} leitet nicht an den Root weiter"
+        assert not log.handlers, f"{name} hat noch eigene Handler"

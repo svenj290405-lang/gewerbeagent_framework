@@ -144,8 +144,8 @@ async def _act(
                 await s.commit()
                 gesetzt = True
         logger.info(
-            "angebot_antwort AUTOMATISCH: angebot=%s -> %s (kunde=%s)",
-            angebot_id, ziel_status, kunde_name,
+            "angebot_antwort AUTOMATISCH: angebot=%s -> %s",
+            angebot_id, ziel_status,
         )
 
     await _notify(

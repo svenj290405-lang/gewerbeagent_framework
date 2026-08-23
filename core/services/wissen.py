@@ -564,9 +564,12 @@ async def merke_luecke(
                 kunde=(kunde or None),
                 zuletzt_gefragt_am=jetzt,
             ))
+        # Der Fragetext stammt vom Kunden und kann alles enthalten —
+        # Namen, Adressen, Anliegen. Er gehoert nicht ins Log; die Frage
+        # steht ohnehin in der Wissensluecken-Liste in der App.
         logger.info(
-            "Wissensluecke erfasst: tenant=%s kanal=%s frage=%r",
-            tenant_id, kanal, frage[:80],
+            "Wissensluecke erfasst: tenant=%s kanal=%s laenge=%d",
+            tenant_id, kanal, len(frage or ""),
         )
         return True
     except Exception as exc:  # noqa: BLE001

@@ -418,8 +418,8 @@ class LexwareProvider(AccountingProvider):
                 raw_data=entry,
             ))
         logger.info(
-            "Lexware search_contacts: name=%r -> %d Treffer",
-            name, len(results),
+            "Lexware search_contacts: %d Zeichen Suchbegriff -> %d Treffer",
+            len(name or ""), len(results),
         )
         return results
 
@@ -533,7 +533,9 @@ class LexwareProvider(AccountingProvider):
             data = r.json()
 
         cid = UUID(data["id"])
-        logger.info("Lexware create_contact OK: id=%s name=%r email=%r", cid, name, email)
+        # Name und Mail des Kunden bleiben draussen; die Lexware-ID
+        # reicht, um den Vorgang nachzuvollziehen.
+        logger.info("Lexware create_contact OK: id=%s", cid)
 
         # Format-konsistent zu search_contacts
         roles = data.get("roles") or {}

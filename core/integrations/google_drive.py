@@ -732,8 +732,8 @@ async def list_files_in_kunde_folder(
         return []
     except Exception as exc:
         logger.warning(
-            "list_files_in_kunde_folder fehlgeschlagen (tenant=%s kunde=%s): %s",
-            tenant_id, kunde_name, exc,
+            "list_files_in_kunde_folder fehlgeschlagen (tenant=%s): %s",
+            tenant_id, exc,
         )
         return []
 
