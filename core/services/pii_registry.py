@@ -201,6 +201,7 @@ _EINTRAEGE: list[PiiTabelle] = [
             ("admin_login_attempts", "Anmeldeversuche am Betreiber-Backend."),
             ("admin_audit_log", "Protokoll der Betreiber-Aktionen."),
             ("tool_configs", "Konfiguration, kein Personenbezug."),
+            ("cron_heartbeats", "Lebenszeichen der Hintergrundjobs — `cron_name` ist ein Jobname, kein Personenname."),
             ("tenant_leistungen", "Leistungskatalog des Betriebs."),
             ("tenant_material", "Materialkatalog samt Lieferant (Firma)."),
             ("tenant_kalkulationen", "Kalkulationsvorlagen des Betriebs."),

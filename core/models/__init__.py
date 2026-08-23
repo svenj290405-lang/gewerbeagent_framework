@@ -46,6 +46,7 @@ from core.models.employee import (
     get_employees_for_tenant,
 )
 from core.models.health_check import (
+    CronHeartbeat,
     HealthCheckResult,
     HEALTH_STATUS_OK,
     HEALTH_STATUS_DEGRADED,
@@ -149,6 +150,7 @@ __all__ = [
     "ALLE_SKILLS",
     "get_default_employee",
     "get_employees_for_tenant",
+    "CronHeartbeat",
     "HealthCheckResult",
     "HEALTH_STATUS_OK",
     "HEALTH_STATUS_DEGRADED",

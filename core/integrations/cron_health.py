@@ -5,9 +5,11 @@ Jeder Background-Cron schreibt nach jedem erfolgreichen Tick einen
 Heartbeat. Der Admin-Health-Endpoint kann dann pruefen ob alle Crons
 noch leben.
 
-Kein neues Schema noetig — wir nutzen ein In-Memory-Dict + aktuell
-ueberlebt das Container-Restart nicht. Fuer einfaches Monitoring reicht
-das aus; fuer Persistenz spaeter eine Tabelle anbauen.
+Der Heartbeat liegt im Prozess (schnell, ohne DB-Last) UND einmal pro
+Minute in der Tabelle `cron_heartbeats`. Die Persistenz kam mit dem
+Audit am 2026-08-23 dazu: vorher sah nach jedem Neustart alles tot aus,
+und jede Pruefung von ausserhalb des Prozesses meldete "alle Crons tot" —
+solange der Alarmweg stumm war, fiel das nicht auf.
 """
 from __future__ import annotations
 
@@ -37,13 +39,86 @@ EXPECTED_CRONS = {
 }
 
 
+# Wann zuletzt in die DB geschrieben wurde (pro Cron). Der Speicher-
+# Heartbeat ist gratis, ein DB-Schreibvorgang nicht — bei einem Tick pro
+# Sekunde waere das sinnlose Last.
+_DB_INTERVALL_SEKUNDEN = 60
+_LETZTER_DB_SCHREIB: dict[str, dt.datetime] = {}
+
+
 def record_heartbeat(cron_name: str) -> None:
-    """Vom Cron-Loop nach jedem Tick (oder Sleep) aufrufen."""
+    """Vom Cron-Loop nach jedem Tick (oder Sleep) aufrufen.
+
+    Schreibt sofort in den Speicher und hoechstens einmal pro Minute
+    zusaetzlich in die DB — nebenlaeufig, damit ein langsamer oder
+    kaputter DB-Schreibvorgang niemals einen Cron aufhaelt.
+    """
+    jetzt = dt.datetime.now(dt.timezone.utc)
     with _LOCK:
-        _HEARTBEATS[cron_name] = dt.datetime.now(dt.timezone.utc)
+        _HEARTBEATS[cron_name] = jetzt
+        zuletzt = _LETZTER_DB_SCHREIB.get(cron_name)
+        faellig = (
+            zuletzt is None
+            or (jetzt - zuletzt).total_seconds() >= _DB_INTERVALL_SEKUNDEN
+        )
+        if faellig:
+            _LETZTER_DB_SCHREIB[cron_name] = jetzt
+    if not faellig:
+        return
+    try:
+        import asyncio
+        asyncio.get_running_loop().create_task(_schreibe_heartbeat(cron_name, jetzt))
+    except RuntimeError:
+        pass  # kein laufender Loop (Test, Sync-Kontext) — Speicher genuegt
 
 
-def get_health_report() -> dict:
+async def _schreibe_heartbeat(cron_name: str, zeitpunkt: dt.datetime) -> None:
+    """Upsert einer Zeile. Fehler werden geschluckt: ein fehlender
+    Heartbeat darf den Cron nicht stoeren, den er beschreibt."""
+    try:
+        from sqlalchemy.dialects.postgresql import insert
+        from core.database import AsyncSessionLocal
+        from core.models import CronHeartbeat
+
+        async with AsyncSessionLocal() as s:
+            stmt = insert(CronHeartbeat.__table__).values(
+                cron_name=cron_name, last_beat=zeitpunkt,
+            ).on_conflict_do_update(
+                index_elements=["cron_name"],
+                set_={"last_beat": zeitpunkt},
+            )
+            await s.execute(stmt)
+            await s.commit()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Heartbeat nicht persistiert (%s): %s", cron_name, exc)
+
+
+async def lade_heartbeats_aus_db() -> dict[str, dt.datetime]:
+    """Heartbeats aus der DB — fuer Pruefungen ausserhalb des Prozesses."""
+    from sqlalchemy import select
+    from core.database import AsyncSessionLocal
+    from core.models import CronHeartbeat
+
+    async with AsyncSessionLocal() as s:
+        zeilen = (await s.execute(select(CronHeartbeat))).scalars().all()
+        return {z.cron_name: z.last_beat for z in zeilen}
+
+
+async def get_health_report_persistent() -> dict:
+    """Wie get_health_report, aber mit den Werten aus der DB gemischt.
+
+    Genommen wird jeweils der juengere Zeitpunkt: im laufenden Prozess ist
+    der Speicherwert aktueller, von aussen gibt es nur die DB.
+    """
+    aus_db = await lade_heartbeats_aus_db()
+    with _LOCK:
+        for name, zeit in _HEARTBEATS.items():
+            if name not in aus_db or zeit > aus_db[name]:
+                aus_db[name] = zeit
+    return get_health_report(snapshot=aus_db)
+
+
+def get_health_report(snapshot: dict | None = None) -> dict:
     """Liefert Status pro Cron + globalen Status.
 
     Returns:
@@ -57,8 +132,9 @@ def get_health_report() -> dict:
     """
     now = dt.datetime.now(dt.timezone.utc)
     report = {"status": "ok", "crons": {}}
-    with _LOCK:
-        snapshot = dict(_HEARTBEATS)
+    if snapshot is None:
+        with _LOCK:
+            snapshot = dict(_HEARTBEATS)
 
     for name, max_minutes in EXPECTED_CRONS.items():
         last = snapshot.get(name)

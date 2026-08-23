@@ -55,3 +55,29 @@ class HealthCheckResult(Base):
 
     def __repr__(self) -> str:
         return f"<HealthCheckResult {self.status} @ {self.checked_at}>"
+
+
+class CronHeartbeat(Base):
+    """Letztes Lebenszeichen eines Background-Crons — dauerhaft.
+
+    Die Heartbeats lagen bisher nur im Speicher des Prozesses. Das hatte
+    zwei Folgen, die beide erst im Audit am 2026-08-23 auffielen: nach
+    jedem Neustart sahen alle Crons kurzzeitig tot aus, und jede Pruefung
+    von AUSSERHALB des Prozesses (Skript, Host-Cron) meldete "alle Crons
+    tot" — ein Fehlalarm, der jetzt, wo der Alarmweg wieder zustellt,
+    echten Schaden anrichten wuerde.
+
+    Eine Zeile pro Cron, im Sekundentakt ueberschrieben. Kein Verlauf —
+    fuer den gibt es HealthCheckResult.
+    """
+    __tablename__ = "cron_heartbeats"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4,
+    )
+    cron_name: Mapped[str] = mapped_column(
+        String(80), nullable=False, unique=True, index=True,
+    )
+    last_beat: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(),
+    )

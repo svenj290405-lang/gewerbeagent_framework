@@ -46,15 +46,105 @@ async def _check_db() -> tuple[bool, str | None]:
         return False, str(e)[:200]
 
 
-def _check_crons() -> tuple[bool, dict]:
-    from core.integrations.cron_health import get_health_report
-    report = get_health_report()
+async def _check_crons() -> tuple[bool, dict]:
+    """Cron-Status aus Speicher UND DB.
+
+    Frueher nur aus dem Speicher — dadurch meldete jede Pruefung
+    ausserhalb des laufenden Prozesses "alle Crons tot", und direkt nach
+    einem Neustart ebenfalls.
+    """
+    from core.integrations.cron_health import get_health_report_persistent
+    report = await get_health_report_persistent()
     return report.get("status") == "ok", report
 
 
 # ---------------------------------------------------------------------
 # HAUPT-CHECK
 # ---------------------------------------------------------------------
+async def _check_anbindungen() -> tuple[bool, dict]:
+    """Prueft die externen Anbindungen jedes Tenants.
+
+    Bis zum Audit am 2026-08-23 prueften wir nur DB und Cron-Loops.
+    Genau die Teile, die von aussen wegbrechen koennen — ein abgelaufenes
+    Postfach-Token, ein ungueltiger Lexware-Schluessel — fielen niemandem
+    auf: die `health_check()`-Funktionen existierten, wurden aber nur per
+    Knopfdruck in der App aufgerufen. Ein totes Token faellt so erst auf,
+    wenn eine Kundenmail unbeantwortet bleibt.
+
+    Bewertung bewusst milde: ein Tenant OHNE Anbindung ist kein Fehler
+    (nicht jeder Betrieb nutzt jede Funktion). Gemeldet wird nur, was
+    verbunden IST und nicht mehr antwortet.
+    """
+    from sqlalchemy import select
+    from core.models import Tenant
+    from core.models.employee import get_default_employee
+    from core.security.oauth_token_lookup import find_oauth_token
+
+    bericht: dict = {}
+    alles_ok = True
+
+    async with AsyncSessionLocal() as s:
+        tenants = (await s.execute(select(Tenant))).scalars().all()
+        for t in tenants:
+            s.expunge(t)
+
+    for tenant in tenants:
+        eintrag: dict = {}
+        try:
+            emp = await get_default_employee(tenant.id)
+        except Exception:  # noqa: BLE001
+            emp = None
+        emp_id = emp.id if emp else None
+
+        for provider in ("microsoft", "google"):
+            try:
+                token = await find_oauth_token(tenant.id, provider, emp_id)
+            except Exception as exc:  # noqa: BLE001
+                eintrag[provider] = {"ok": False, "fehler": str(exc)[:120]}
+                alles_ok = False
+                continue
+            if token is None:
+                continue  # nicht verbunden — kein Mangel
+            ablauf = getattr(token, "access_token_expires_at", None)
+            # Der Refresh-Token ist das, was wirklich zaehlt. Microsoft
+            # entwertet ihn nach 90 Tagen Untaetigkeit — deshalb zaehlen
+            # wir die Tage seit der letzten Benutzung.
+            zuletzt = getattr(token, "updated_at", None)
+            tage_still = None
+            if zuletzt is not None:
+                tage_still = (
+                    dt.datetime.now(dt.timezone.utc) - zuletzt
+                ).days
+            gefaehrdet = bool(tage_still is not None and tage_still > 60)
+            eintrag[provider] = {
+                "ok": not gefaehrdet,
+                "ablauf": ablauf.isoformat() if ablauf else None,
+                "tage_ohne_nutzung": tage_still,
+            }
+            if gefaehrdet:
+                alles_ok = False
+
+        # Lexware: derselbe Weg wie der "Verbindung testen"-Knopf in der
+        # App, nur eben automatisch.
+        try:
+            from core.api.app_screens import _build_lexware_provider
+            provider = await _build_lexware_provider(tenant.id)
+        except Exception:  # noqa: BLE001
+            provider = None
+        if provider is not None:
+            try:
+                await provider.health_check()
+                eintrag["lexware"] = {"ok": True}
+            except Exception as exc:  # noqa: BLE001
+                eintrag["lexware"] = {"ok": False, "fehler": str(exc)[:160]}
+                alles_ok = False
+
+        if eintrag:
+            bericht[tenant.slug] = eintrag
+
+    return alles_ok, bericht
+
+
 async def run_health_check(*, send_alert: bool = True):
     """Fuehrt alle Teilpruefungen aus, persistiert das Ergebnis und schickt
     bei einem Problem eine Alarm-Mail. Returns das (detached)
@@ -66,13 +156,19 @@ async def run_health_check(*, send_alert: bool = True):
 
     db_ok, db_err = await _check_db()
     try:
-        crons_ok, cron_report = _check_crons()
+        crons_ok, cron_report = await _check_crons()
     except Exception as e:  # noqa: BLE001
         crons_ok, cron_report = False, {"error": str(e)[:200]}
 
+    try:
+        anbindungen_ok, anbindungen = await _check_anbindungen()
+    except Exception as e:  # noqa: BLE001
+        logger.exception(f"Anbindungs-Pruefung fehlgeschlagen: {e}")
+        anbindungen_ok, anbindungen = True, {"fehler": str(e)[:200]}
+
     if not db_ok:
         status = HEALTH_STATUS_ERROR
-    elif not crons_ok:
+    elif not crons_ok or not anbindungen_ok:
         status = HEALTH_STATUS_DEGRADED
     else:
         status = HEALTH_STATUS_OK
@@ -80,6 +176,7 @@ async def run_health_check(*, send_alert: bool = True):
     detail = {
         "db": {"ok": db_ok, "error": db_err},
         "crons": cron_report,
+        "anbindungen": anbindungen,
     }
 
     alert_sent = False
@@ -120,6 +217,21 @@ def _build_alert_bodies(status: str, detail: dict) -> tuple[str, str]:
         "%d.%m.%Y %H:%M"
     )
 
+    # Auffaellige Anbindungen aufzaehlen — ein totes Postfach-Token oder
+    # ein ungueltiger Lexware-Schluessel ist genau die Art Ausfall, die
+    # sonst erst auffaellt, wenn eine Kundenmail unbeantwortet bleibt.
+    probleme: list[str] = []
+    for slug, dienste in (detail.get("anbindungen") or {}).items():
+        if not isinstance(dienste, dict):
+            continue
+        for dienst, info in dienste.items():
+            if isinstance(info, dict) and not info.get("ok"):
+                grund = info.get("fehler")
+                if not grund and info.get("tage_ohne_nutzung") is not None:
+                    grund = (f"seit {info['tage_ohne_nutzung']} Tagen nicht "
+                             f"benutzt — Token verfaellt")
+                probleme.append(f"{slug}/{dienst}: {grund or 'antwortet nicht'}")
+
     def mark(ok: bool) -> str:
         return "✅ ok" if ok else "❌ PROBLEM"
 
@@ -131,6 +243,8 @@ def _build_alert_bodies(status: str, detail: dict) -> tuple[str, str]:
         f"{(' — ' + str(db.get('error'))) if db.get('error') else ''}</li>"
         f"<li>Background-Crons: {mark(crons.get('status') == 'ok')}"
         f"{(' — tot: ' + ', '.join(dead)) if dead else ''}</li>"
+        f"<li>Anbindungen: {mark(not probleme)}"
+        f"{('<br>' + '<br>'.join(probleme)) if probleme else ''}</li>"
         "</ul>"
         "<p style=\"color:#666;font-size:13px\">Bitte den Server / die "
         "Container pruefen (docker ps, docker logs gewerbeagent_framework). "
@@ -141,7 +255,9 @@ def _build_alert_bodies(status: str, detail: dict) -> tuple[str, str]:
         f"- Datenbank: {mark(db.get('ok'))}"
         f"{(' - ' + str(db.get('error'))) if db.get('error') else ''}\n"
         f"- Crons: {mark(crons.get('status') == 'ok')}"
-        f"{(' - tot: ' + ', '.join(dead)) if dead else ''}\n\n"
+        f"{(' - tot: ' + ', '.join(dead)) if dead else ''}\n"
+        f"- Anbindungen: {mark(not probleme)}"
+        f"{(chr(10) + '  ' + (chr(10) + '  ').join(probleme)) if probleme else ''}\n\n"
         "Bitte Server/Container pruefen."
     )
     return html, text_body
