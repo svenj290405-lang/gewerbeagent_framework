@@ -33,14 +33,16 @@ import datetime as dt
 import logging
 import sys
 
-from sqlalchemy import and_, delete, or_, select
+from sqlalchemy import and_, delete, or_, select, update
 
 from core.database import AsyncSessionLocal
 from core.models import (
     AnfrageToken,
     GeocodeCache,
     Kundengespraech,
+    Rueckruf,
     Visualisierung,
+    Wissensluecke,
 )
 from core.models.failed_mail_queue import (
     FAILED_MAIL_DEAD,
@@ -200,6 +202,78 @@ async def cleanup_failed_mail_queue(
         return res.rowcount
 
 
+async def cleanup_rueckrufe(
+    retention_days: int, execute: bool, *, tenant_id=None,
+) -> int:
+    """Loescht Rueckrufbitten aelter als retention_days.
+
+    Enthalten Name, Telefonnummer und das Anliegen im Freitext — also
+    genau die Daten, die ein Anrufer am Telefon hinterlaesst. Die
+    Tabelle fehlte bis zum Audit am 2026-08-23 in diesem Skript: die
+    Eintraege lagen unbegrenzt herum, obwohl der Betrieb eine
+    Aufbewahrungsfrist von 90 Tagen gesetzt hat.
+
+    Anker ist created_at, nicht erledigt_at — sonst wuerde ein nie
+    abgehakter Rueckruf ewig bleiben.
+    """
+    cutoff = _cutoff(retention_days)
+    async with AsyncSessionLocal() as s:
+        stmt = select(Rueckruf.id).where(Rueckruf.created_at < cutoff)
+        if tenant_id is not None:
+            stmt = stmt.where(Rueckruf.tenant_id == tenant_id)
+        ids = list((await s.execute(stmt)).scalars())
+
+        if not execute:
+            logger.info(
+                f"[rueckrufe] Trockenlauf: {len(ids)} Kandidaten "
+                f"(cutoff={cutoff.date().isoformat()})"
+            )
+            return 0
+        if not ids:
+            return 0
+        res = await s.execute(delete(Rueckruf).where(Rueckruf.id.in_(ids)))
+        await s.commit()
+        return res.rowcount
+
+
+async def cleanup_wissensluecken(
+    retention_days: int, execute: bool, *, tenant_id=None,
+) -> int:
+    """Loescht den Fragesteller aus alten Wissensluecken.
+
+    Die Frage selbst ist Betriebswissen und soll bleiben — sie fuellt
+    die Wissensbasis. Der Name des Anrufers oder Mail-Absenders im Feld
+    `kunde` hat dagegen nach Ablauf der Frist nichts mehr dort zu
+    suchen. Deshalb wird hier nur das Feld geleert, nicht die Zeile
+    geloescht.
+    """
+    cutoff = _cutoff(retention_days)
+    async with AsyncSessionLocal() as s:
+        stmt = select(Wissensluecke.id).where(
+            Wissensluecke.created_at < cutoff,
+            Wissensluecke.kunde.isnot(None),
+        )
+        if tenant_id is not None:
+            stmt = stmt.where(Wissensluecke.tenant_id == tenant_id)
+        ids = list((await s.execute(stmt)).scalars())
+
+        if not execute:
+            logger.info(
+                f"[wissensluecken] Trockenlauf: {len(ids)} Kandidaten "
+                f"(cutoff={cutoff.date().isoformat()})"
+            )
+            return 0
+        if not ids:
+            return 0
+        res = await s.execute(
+            update(Wissensluecke)
+            .where(Wissensluecke.id.in_(ids))
+            .values(kunde=None)
+        )
+        await s.commit()
+        return res.rowcount
+
+
 async def cleanup_geocode_cache(retention_days: int, execute: bool) -> int:
     """Loescht Geocode-Cache-Eintraege (Kundenadressen) aelter als
     retention_days. Tabelle ist tenant-uebergreifend (kein tenant_id) —
@@ -225,7 +299,7 @@ async def cleanup_geocode_cache(retention_days: int, execute: bool) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Loescht alte PII (Transkripte, Anfragen, Geocode-Cache)."
+        description="Loescht alte PII (Transkripte, Anfragen, Rueckrufe, Visualisierungen, Mail-Queue, Geocode-Cache)."
     )
     parser.add_argument("--days", type=int, default=DEFAULT_RETENTION_DAYS)
     parser.add_argument("--execute", action="store_true")
@@ -237,11 +311,14 @@ def main() -> int:
         v = await cleanup_visualisierungen(args.days, args.execute)
         f = await cleanup_failed_mail_queue(args.days, args.execute)
         c = await cleanup_geocode_cache(args.days, args.execute)
+        r = await cleanup_rueckrufe(args.days, args.execute)
+        w = await cleanup_wissensluecken(args.days, args.execute)
         if args.execute:
             logger.info(
                 f"Geloescht: {g} Gespraeche, {a} Anfragen, "
                 f"{v} Visualisierungen, {f} Mail-Queue-Eintraege, "
-                f"{c} Geocode-Eintraege."
+                f"{c} Geocode-Eintraege, {r} Rueckrufe; "
+                f"{w} Wissensluecken anonymisiert."
             )
 
     asyncio.run(_run())

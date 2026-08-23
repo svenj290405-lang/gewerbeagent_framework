@@ -20,9 +20,10 @@ zum Merge-Ziel, statt den Kunden zu ueberspringen.
 """
 from __future__ import annotations
 
+import datetime as dt
 import uuid
 
-from sqlalchemy import Boolean, ForeignKey, String, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, ForeignKey, String, UniqueConstraint
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -67,6 +68,15 @@ class Kunde(Base):
         UUID(as_uuid=True),
         ForeignKey("kunden.id", ondelete="SET NULL"),
         nullable=True,
+    )
+
+    # Gesetzt, wenn ein Betroffener nach Art. 17 DSGVO Loeschung verlangt
+    # hat: Name, Mail, Telefon und Adresse sind dann geleert, die Zeile
+    # bleibt aber stehen, damit Rechnungen und Auftraege ihren Bezug
+    # behalten (Aufbewahrungspflicht, Art. 17 Abs. 3 lit. b). Macht den
+    # Vorgang nachweisbar und wiederholbar — siehe scripts/dsar.py.
+    anonymized_at: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True,
     )
 
     # created_at + updated_at via Base

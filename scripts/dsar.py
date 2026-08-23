@@ -9,7 +9,7 @@ loescht nur ganze Betriebe).
 Identifikation ueber E-Mail und/oder Telefon (exakt) — optional Name
 (unscharf, nur wo kein E-Mail/Telefon-Feld existiert, z.B. Transkripte).
 
-WICHTIG — was NICHT geloescht wird (Art. 17 Abs. 3 lit. b DSGVO):
+Die Kundenakte (`kunden`) wird ANONYMISIERT statt geloescht: an ihr\nhaengen Rechnungen und Auftraege, die bleiben muessen. Zeile und ID\nbleiben, Name/Mail/Telefon/Adresse werden geleert, `anonymized_at`\nhaelt den Vorgang fest.\n\nWICHTIG — was NICHT geloescht wird (Art. 17 Abs. 3 lit. b DSGVO):
 Rechnungen, Angebote, Belege und der Lexware-Kontakt unterliegen der
 gesetzlichen Aufbewahrungspflicht (GoBD / § 147 AO / § 257 HGB, i.d.R.
 10 Jahre). Diese werden NUR GEMELDET, nicht geloescht — der Betrieb muss
@@ -36,16 +36,22 @@ import json
 import logging
 import sys
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, update
 
 from core.database import AsyncSessionLocal
 from core.models import (
+    Angebot,
     AnfrageToken,
     EmailConversation,
+    Kunde,
+    KundeExternalRef,
     Kundengespraech,
+    Rechnung,
+    Rueckruf,
     Tenant,
     TenantKundeDrive,
     Visualisierung,
+    Wissensluecke,
 )
 from core.utils.phone import normalize_phone
 
@@ -90,6 +96,11 @@ async def collect(
         "drive_folders": [],
         "kundengespraeche_name_match": [],
         "visualisierungen": [],
+        "kunden": [],
+        "rueckrufe": [],
+        "wissensluecken": [],
+        # Aufbewahrungspflichtig: wird gemeldet, aber nie geloescht.
+        "aufbewahrungspflichtig": {"rechnungen": [], "angebote": []},
         "_ids": {
             "email_conversations": [],
             "anfragen": [],
@@ -97,6 +108,9 @@ async def collect(
             "kundengespraeche": [],
             "visualisierungen": [],         # praezise (E-Mail-Match)
             "visualisierungen_name": [],    # unscharf (nur Name-Match)
+            "kunden": [],                   # werden anonymisiert, nicht geloescht
+            "rueckrufe": [],
+            "wissensluecken": [],
         },
     }
 
@@ -204,6 +218,106 @@ async def collect(
                     else:
                         out["_ids"]["visualisierungen_name"].append(r.id)
 
+        # --- Kunde (Stammdatensatz) ---------------------------------
+        # Die Kundenakte selbst. Wird nie geloescht, sondern anonymisiert:
+        # an ihr haengen Rechnungen und Auftraege, die bleiben muessen.
+        kcand = (await s.execute(
+            select(Kunde).where(Kunde.tenant_id == tenant_id)
+        )).scalars().all()
+        for r in kcand:
+            treffer = (
+                _email_matches(r.email, email_norm)
+                or _phone_matches(r.telefon, phone_norm)
+                or bool(name_norm and (r.name or "").strip().lower() == name_norm)
+            )
+            if not treffer:
+                continue
+            out["kunden"].append({
+                "id": str(r.id),
+                "name": r.name,
+                "email": r.email,
+                "telefon": r.telefon,
+                "adresse": r.adresse,
+                "anonymized_at": getattr(r, "anonymized_at", None),
+                "created_at": getattr(r, "created_at", None),
+            })
+            out["_ids"]["kunden"].append(r.id)
+
+        kunden_ids = list(out["_ids"]["kunden"])
+
+        # --- Verweise in Fremdsysteme (haengen am Kunden) ------------
+        if kunden_ids:
+            refs = (await s.execute(
+                select(KundeExternalRef).where(
+                    KundeExternalRef.tenant_id == tenant_id,
+                    KundeExternalRef.kunde_id.in_(kunden_ids),
+                )
+            )).scalars().all()
+            for r in refs:
+                out.setdefault("kunde_external_refs", []).append({
+                    "id": str(r.id),
+                    "kunde_id": str(r.kunde_id),
+                    "system": getattr(r, "system", None),
+                })
+
+        # --- Rueckrufe ----------------------------------------------
+        rcand = (await s.execute(
+            select(Rueckruf).where(Rueckruf.tenant_id == tenant_id)
+        )).scalars().all()
+        for r in rcand:
+            if (_email_matches(r.kunde_email, email_norm)
+                    or _phone_matches(r.kunde_telefon, phone_norm)
+                    or (kunden_ids and r.kunde_id in kunden_ids)):
+                out["rueckrufe"].append({
+                    "id": str(r.id),
+                    "kunde_name": r.kunde_name,
+                    "kunde_telefon": r.kunde_telefon,
+                    "kunde_email": r.kunde_email,
+                    "anliegen": r.anliegen,
+                    "erledigt_at": r.erledigt_at,
+                    "created_at": getattr(r, "created_at", None),
+                })
+                out["_ids"]["rueckrufe"].append(r.id)
+
+        # --- Wissensluecken (nur das Feld `kunde`) -------------------
+        # Die Frage bleibt Betriebswissen, der Fragesteller geht raus.
+        if name_norm:
+            wcand = (await s.execute(
+                select(Wissensluecke)
+                .where(Wissensluecke.tenant_id == tenant_id)
+                .where(func.lower(Wissensluecke.kunde) == name_norm)
+            )).scalars().all()
+            for r in wcand:
+                out["wissensluecken"].append({
+                    "id": str(r.id),
+                    "kunde": r.kunde,
+                    "frage": r.frage,
+                    "kanal": r.kanal,
+                    "status": r.status,
+                })
+                out["_ids"]["wissensluecken"].append(r.id)
+
+        # --- Aufbewahrungspflichtig: nur melden ----------------------
+        for modell, schluessel in ((Rechnung, "rechnungen"),
+                                   (Angebot, "angebote")):
+            cand2 = (await s.execute(
+                select(modell).where(modell.tenant_id == tenant_id)
+            )).scalars().all()
+            for r in cand2:
+                treffer = (
+                    _email_matches(getattr(r, "kunde_email", None), email_norm)
+                    or bool(name_norm and (getattr(r, "kunde_name", "") or "")
+                            .strip().lower() == name_norm)
+                    or (kunden_ids and getattr(r, "kunde_id", None) in kunden_ids)
+                )
+                if treffer:
+                    out["aufbewahrungspflichtig"][schluessel].append({
+                        "id": str(r.id),
+                        "kunde_name": getattr(r, "kunde_name", None),
+                        "kunde_email": getattr(r, "kunde_email", None),
+                        "created_at": getattr(r, "created_at", None),
+                    })
+
     return out
 
 
@@ -272,6 +386,10 @@ async def erase(
     # Praezise (E-Mail) immer; reiner Name-Match nur mit --name-match.
     vis_delete_ids = vis_ids + (vis_name_ids if name_match else [])
 
+    kunden_ids = found["_ids"].get("kunden", [])
+    rueckruf_ids = found["_ids"].get("rueckrufe", [])
+    luecken_ids = found["_ids"].get("wissensluecken", [])
+
     stats = {
         "email_conversations": len(ec_ids),
         "anfragen": len(af_ids),
@@ -279,6 +397,9 @@ async def erase(
         "drive_folders_deleted": 0,
         "kundengespraeche": len(gespraech_ids) if name_match else 0,
         "visualisierungen": len(vis_delete_ids),
+        "rueckrufe": len(rueckruf_ids),
+        "wissensluecken_anonymisiert": len(luecken_ids),
+        "kunden_anonymisiert": len(kunden_ids),
     }
 
     if not execute:
@@ -304,6 +425,35 @@ async def erase(
             await s.execute(
                 delete(Visualisierung)
                 .where(Visualisierung.id.in_(vis_delete_ids))
+            )
+        if rueckruf_ids:
+            await s.execute(
+                delete(Rueckruf).where(Rueckruf.id.in_(rueckruf_ids))
+            )
+        if luecken_ids:
+            # Frage bleibt (Betriebswissen), Fragesteller geht raus.
+            await s.execute(
+                update(Wissensluecke)
+                .where(Wissensluecke.id.in_(luecken_ids))
+                .values(kunde=None)
+            )
+        if kunden_ids:
+            # Kundenakte wird NICHT geloescht: Rechnungen und Auftraege
+            # verweisen darauf und unterliegen der Aufbewahrungspflicht.
+            # Stattdessen werden die personenbezogenen Felder geleert.
+            # `name` ist NOT NULL, deshalb ein sprechender Platzhalter.
+            await s.execute(
+                delete(KundeExternalRef)
+                .where(KundeExternalRef.kunde_id.in_(kunden_ids))
+            )
+            await s.execute(
+                update(Kunde)
+                .where(Kunde.id.in_(kunden_ids))
+                .values(
+                    name="(auf Verlangen geloescht)",
+                    email=None, telefon=None, adresse=None,
+                    anonymized_at=dt.datetime.now(dt.timezone.utc),
+                )
             )
         # Drive: erst den echten Ordner, dann die Mapping-Zeile.
         for row_id, folder_id in drive:
@@ -361,11 +511,21 @@ async def _main(args) -> int:
     n_ge = len(found["kundengespraeche_name_match"])
     n_vi = len(found["visualisierungen"])
     n_vi_name = len(found["_ids"]["visualisierungen_name"])
+    n_ku = len(found["kunden"])
+    n_ru = len(found["rueckrufe"])
+    n_wl = len(found["wissensluecken"])
+    n_re = len(found["aufbewahrungspflichtig"]["rechnungen"])
+    n_an = len(found["aufbewahrungspflichtig"]["angebote"])
     logger.info(
-        f"Gefunden: {n_ec} Mail-Konversationen, {n_af} Anfragen, "
-        f"{n_dr} Drive-Ordner, {n_ge} Transkripte (Name-Match), "
-        f"{n_vi} Visualisierungen, "
-        f"{len(lex)} Lexware-Kontakte (nur Report)."
+        f"Gefunden: {n_ku} Kundenakte(n), {n_ec} Mail-Konversationen, "
+        f"{n_af} Anfragen, {n_dr} Drive-Ordner, "
+        f"{n_ge} Transkripte (Name-Match), {n_vi} Visualisierungen, "
+        f"{n_ru} Rueckrufe, {n_wl} Wissensluecken."
+    )
+    logger.info(
+        f"Aufbewahrungspflichtig (nur Auskunft, keine Loeschung): "
+        f"{n_re} Rechnungen, {n_an} Angebote, "
+        f"{len(lex)} Lexware-Kontakte."
     )
 
     if args.mode == "export":
@@ -417,8 +577,16 @@ async def _main(args) -> int:
         f"{verb}: {stats['email_conversations']} Mail-Konversationen, "
         f"{stats['anfragen']} Anfragen (+Responses), "
         f"{stats['kundengespraeche']} Transkripte, "
+        f"{stats['rueckrufe']} Rueckrufe, "
         f"{stats['drive_db']} Drive-Mappings "
         f"(davon {stats['drive_folders_deleted']} Ordner real geloescht)."
+    )
+    logger.info(
+        f"{'ANONYMISIERT' if args.execute else 'wuerde anonymisieren'}: "
+        f"{stats['kunden_anonymisiert']} Kundenakte(n) "
+        f"(Zeile bleibt, Felder werden geleert), "
+        f"{stats['wissensluecken_anonymisiert']} Wissensluecke(n) "
+        f"(Frage bleibt, Fragesteller geht raus)."
     )
     if lex:
         logger.info(
