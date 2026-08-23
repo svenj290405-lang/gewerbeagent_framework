@@ -436,13 +436,33 @@ async def app_push_subscribe(
                             status_code=400)
 
     async with get_session() as s:
+        # Re-Bind nur INNERHALB des eigenen Betriebs (z.B. anderer
+        # Mitarbeiter am selben Geraet). Eine Zeile, die einem ANDEREN
+        # Tenant gehoert, darf nicht einfach uebernommen werden — sonst
+        # wandert das Geraet still in einen fremden Betrieb und bekaeme
+        # dessen Pushes. `endpoint` ist global eindeutig, deshalb wird die
+        # fremde Zeile verworfen und sauber neu angelegt.
         existing = (await s.execute(
-            select(PushSubscription).where(PushSubscription.endpoint == endpoint)
+            select(PushSubscription).where(
+                PushSubscription.endpoint == endpoint,
+                PushSubscription.tenant_id == tenant_id,
+            )
         )).scalar_one_or_none()
+        if existing is None:
+            fremd = (await s.execute(
+                select(PushSubscription).where(
+                    PushSubscription.endpoint == endpoint,
+                )
+            )).scalar_one_or_none()
+            if fremd is not None:
+                logger.warning(
+                    "push subscribe: Endpoint gehoerte Tenant %s, wird fuer "
+                    "Tenant %s neu angelegt", fremd.tenant_id, tenant_id,
+                )
+                await s.delete(fremd)
+                await s.flush()
         if existing is not None:
-            # Re-Bind (z.B. anderer Mitarbeiter am selben Geraet)
             existing.employee_id = emp.id
-            existing.tenant_id = tenant_id
             existing.p256dh = p256dh
             existing.auth = auth
             existing.user_agent = (request.headers.get("user-agent") or "")[:500] or None
