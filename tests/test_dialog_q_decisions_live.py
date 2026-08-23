@@ -53,6 +53,22 @@ _BASE = dict(
 )
 
 
+def _MIT_SIGNATUR(text: str) -> str:
+    """Haengt eine gewoehnliche Mail-Signatur an.
+
+    Wichtig fuer diese Tests: seit c56dbd3 ist eine Termin-Aktion nur
+    erlaubt, wenn voller Name UND Telefonnummer vorliegen (Gate (I) im
+    Prompt). Die Testmails hier hatten beides nie — deshalb antwortete Q
+    voellig regelkonform mit ASK_MORE, und die Tests waren seit Mai rot,
+    ohne dass es jemand sah: `addopts = -m 'not slow'` nimmt sie aus dem
+    normalen Lauf heraus. Eine echte Kundenmail bringt beides in der
+    Signatur mit, also tun diese es jetzt auch. Dass das Gate wirklich
+    greift, prueft eigens
+    test_q_fragt_nach_wenn_telefonnummer_fehlt.
+    """
+    return f"{text}\n\nViele Gruesse\nSven Jantos\nTel. 0651 1234567"
+
+
 # Stellvertretender "Formular wurde ausgefuellt"-Status, fuer alle
 # Tests die Termin-Aktionen erwarten. Ohne diesen Block schickt Q nach
 # der neuen Workflow-Regel das Formular zuerst.
@@ -75,9 +91,9 @@ async def test_q_picks_book_direct_for_concrete_date_and_time():
     Voraussetzung: Anfrage-Formular bereits ausgefuellt."""
     res = await handle_kunde_mail_dialog(
         subject="Termin",
-        sender_name="Sven",
+        sender_name="Sven Jantos",
         sender_email="kunde@x.de",
-        latest_message="Der 22.05.26 um 14 Uhr wuerde mir passen.",
+        latest_message=_MIT_SIGNATUR("Der 22.05.26 um 14 Uhr wuerde mir passen."),
         anfrage_status=_FORM_SUBMITTED,
         **_BASE,
     )
@@ -96,9 +112,9 @@ async def test_q_picks_propose_slots_for_day_only():
     Voraussetzung: Anfrage-Formular bereits ausgefuellt."""
     res = await handle_kunde_mail_dialog(
         subject="Termin Beratung",
-        sender_name="Sven",
+        sender_name="Sven Jantos",
         sender_email="kunde@x.de",
-        latest_message=(
+        latest_message=_MIT_SIGNATUR(
             "Koennte ich naechste Woche einen Termin haben fuer "
             "eine Beratung? Mir passt Montag ganz gut."
         ),
@@ -117,9 +133,9 @@ async def test_q_does_not_resend_form_if_already_submitted():
     NIE SEND_FORMULAR. Sollte PROPOSE_SLOTS (Montag) sein."""
     res = await handle_kunde_mail_dialog(
         subject="Termin Beratung",
-        sender_name="Sven",
+        sender_name="Sven Jantos",
         sender_email="kunde@x.de",
-        latest_message=(
+        latest_message=_MIT_SIGNATUR(
             "Ich habe das Formular jetzt ausgefuellt — koennte ich "
             "naechste Woche einen Termin haben fuer eine Beratung? "
             "Mir passt Montag ganz gut."
@@ -151,7 +167,7 @@ async def test_q_picks_cancel_for_storno_intent():
     """'Ich muss meinen Termin absagen' -> CANCEL_TERMIN."""
     res = await handle_kunde_mail_dialog(
         subject="Re: Terminbestaetigung",
-        sender_name="Sven",
+        sender_name="Sven Jantos",
         sender_email="kunde@x.de",
         latest_message="Hallo, ich muss meinen Termin doch leider absagen.",
         **_BASE,
@@ -171,9 +187,9 @@ async def test_q_picks_book_slot_when_confirming_listed_slot():
     ]
     res = await handle_kunde_mail_dialog(
         subject="Re: Termin",
-        sender_name="Sven",
+        sender_name="Sven Jantos",
         sender_email="kunde@x.de",
-        latest_message="Der erste Termin passt mir, bitte buchen.",
+        latest_message=_MIT_SIGNATUR("Der erste Termin passt mir, bitte buchen."),
         previous_proposed_slots=slots,
         anfrage_status=_FORM_SUBMITTED,
         **_BASE,
@@ -189,7 +205,7 @@ async def test_q_picks_ask_more_for_pure_knowledge_question():
     """Reine Wissensfrage ohne Auftrag/Termin -> ASK_MORE."""
     res = await handle_kunde_mail_dialog(
         subject="Frage",
-        sender_name="Sven",
+        sender_name="Sven Jantos",
         sender_email="kunde@x.de",
         latest_message=(
             "Hallo, kurze Frage: wann habt ihr Mo-Fr geoeffnet? "
@@ -204,46 +220,58 @@ async def test_q_picks_ask_more_for_pure_knowledge_question():
 
 
 @pytest.mark.asyncio
-async def test_q_sends_formular_first_when_termin_wish_without_form():
-    """Vor-Gate: Termin-Wunsch (PROPOSE_SLOTS-Signal) OHNE Formular
-    eingegangen -> Q soll SEND_FORMULAR waehlen, NICHT direkt einen
-    Slot vorschlagen. Sonst kommt der Handwerker blind zum Termin."""
+async def test_q_schlaegt_termin_vor_auch_ohne_formular():
+    """Termin-Wunsch ohne Formular -> erst der Termin, das Formular folgt.
+
+    Bis c56dbd3 ("Termin vor Formular", 2026-05-20) war es umgekehrt: Q
+    schickte zuerst das Formular und liess den Kunden warten. Seitdem
+    wird gebucht bzw. vorgeschlagen, und das Formular geht zusammen mit
+    der Terminbestaetigung raus (Regel (III) im Prompt). Dieser Test hielt
+    noch den alten Ablauf fest.
+    """
     res = await handle_kunde_mail_dialog(
         subject="Termin Beratung",
-        sender_name="Sven",
+        sender_name="Sven Jantos",
         sender_email="kunde@x.de",
-        latest_message=(
+        latest_message=_MIT_SIGNATUR(
             "Hallo, ich braeuchte naechste Woche einen Beratungs-"
             "termin. Montag passt mir gut."
         ),
         anfrage_status=None,  # noch nie ein Token raus
         **_BASE,
     )
-    assert res["next_action"] == "SEND_FORMULAR", (
-        f"Erwartet SEND_FORMULAR (Gate vor Termin), bekam "
+    assert res["next_action"] in ("PROPOSE_SLOTS", "BOOK_DIRECT"), (
+        f"Erwartet eine Termin-Aktion (Formular folgt automatisch), bekam "
         f"{res['next_action']} (reason={res.get('reason')!r})"
     )
 
 
 @pytest.mark.asyncio
-async def test_q_reminds_instead_of_resending_when_form_open():
-    """Formular OFFEN (Token raus, nicht ausgefuellt) + Termin-Wunsch ->
-    Q soll NICHT nochmal das Formular schicken (SEND_FORMULAR), sondern
-    ans offene erinnern -> ASK_MORE. Genau der Doppel-Formular-Bug."""
+async def test_q_schickt_kein_zweites_formular():
+    """Formular OFFEN + Termin-Wunsch -> auf keinen Fall ein zweites Formular.
+
+    Das ist der eigentliche Schutz (der Doppel-Formular-Bug). Frueher
+    stand hier ASK_MORE als einzig richtige Antwort; seit "Termin vor
+    Formular" darf Q den genannten Termin auch direkt buchen — nur eben
+    ohne dem Kunden nochmal dasselbe Formular zu schicken.
+    """
     res = await handle_kunde_mail_dialog(
         subject="Termin",
-        sender_name="Sven",
+        sender_name="Sven Jantos",
         sender_email="kunde@x.de",
-        latest_message="22.05.26 um 14 Uhr wuerde mir passen.",
+        latest_message=_MIT_SIGNATUR("22.05.26 um 14 Uhr wuerde mir passen."),
         anfrage_status={
             "status": "open", "sent_at": None, "submitted_at": None,
             "antworten": None, "anliegen": None,
         },
         **_BASE,
     )
-    assert res["next_action"] == "ASK_MORE", (
-        f"Erwartet ASK_MORE (Erinnerung statt Doppel-Formular), "
-        f"bekam {res['next_action']} (reason={res.get('reason')!r})"
+    assert res["next_action"] != "SEND_FORMULAR", (
+        f"Zweites Formular obwohl schon eines offen ist — "
+        f"reason={res.get('reason')!r}"
+    )
+    assert res["next_action"] in ("ASK_MORE", "BOOK_DIRECT"), (
+        f"Erwartet Erinnerung oder Buchung, bekam {res['next_action']}"
     )
 
 
@@ -252,7 +280,7 @@ async def test_q_picks_send_formular_for_offer_without_date():
     """Konkrete Auftrags-/Angebots-Anfrage OHNE Termin-Signal -> SEND_FORMULAR."""
     res = await handle_kunde_mail_dialog(
         subject="Anfrage neue Werkbank",
-        sender_name="Sven",
+        sender_name="Sven Jantos",
         sender_email="kunde@x.de",
         latest_message=(
             "Hallo, ich brauche fuer meine Werkstatt eine massive "
@@ -263,4 +291,25 @@ async def test_q_picks_send_formular_for_offer_without_date():
     )
     assert res["next_action"] == "SEND_FORMULAR", (
         f"Erwartet SEND_FORMULAR, bekam {res['next_action']}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_q_fragt_nach_wenn_telefonnummer_fehlt():
+    """Ohne Telefonnummer darf Q nicht buchen — Gate (I) im Prompt.
+
+    Gegenstueck zu den Faellen oben: dieselbe Mail, nur ohne Signatur.
+    Q muss nachfragen statt zu buchen.
+    """
+    res = await handle_kunde_mail_dialog(
+        subject="Termin",
+        sender_name="Sven Jantos",
+        sender_email="kunde@x.de",
+        latest_message="Der 22.05.26 um 14 Uhr wuerde mir passen.",
+        anfrage_status=_FORM_SUBMITTED,
+        **_BASE,
+    )
+    assert res["next_action"] == "ASK_MORE", (
+        f"Ohne Telefonnummer darf nicht gebucht werden, bekam "
+        f"{res['next_action']} (reason={res.get('reason')!r})"
     )
