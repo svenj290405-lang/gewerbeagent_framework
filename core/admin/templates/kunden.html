@@ -1,0 +1,95 @@
+{% extends "_base.html" %}
+{% set active = 'kunden' %}
+{% block title %}Kunden — Gewerbeagent Admin{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <div>
+        <h1>Kunden</h1>
+        <p>Läuft bei jedem Betrieb noch alles? Was rot ist, steht oben.</p>
+    </div>
+</div>
+
+<div class="stats-grid">
+    <div class="stat-card">
+        <div class="stat-label">Braucht Hilfe</div>
+        <div class="stat-value" style="color:#ef4444;">{{ zusammenfassung.rot }}</div>
+        <div class="stat-sub">Verbindung antwortet nicht</div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-label">Im Blick behalten</div>
+        <div class="stat-value" style="color:#f59e0b;">{{ zusammenfassung.gelb }}</div>
+        <div class="stat-sub">still, hängend oder ablaufend</div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-label">Läuft</div>
+        <div class="stat-value" style="color:#10b981;">{{ zusammenfassung.gruen }}</div>
+        <div class="stat-sub">keine Auffälligkeit</div>
+    </div>
+</div>
+
+<div class="table-wrap" style="margin-top:24px;">
+    <table>
+        <thead>
+            <tr>
+                <th style="width:34px;"></th>
+                <th>Betrieb</th>
+                <th>Einschätzung</th>
+                <th>Verbindungen</th>
+                <th style="text-align:right;white-space:nowrap;">Nutzung&nbsp;7&nbsp;T</th>
+                <th style="text-align:right;min-width:130px;">Offen</th>
+            </tr>
+        </thead>
+        <tbody>
+        {% for z in zeilen %}
+            <tr>
+                <td>
+                    <span style="display:inline-block;width:10px;height:10px;border-radius:50%;
+                        background:{% if z.farbe == 'rot' %}#ef4444{% elif z.farbe == 'gelb' %}#f59e0b{% else %}#10b981{% endif %};"></span>
+                </td>
+                <td>
+                    <a href="/admin/tenants/{{ z.id }}"><strong>{{ z.name }}</strong></a>
+                    <div class="muted" style="font-size:12px;">{{ z.slug }}</div>
+                </td>
+                <td>{{ z.begruendung }}</td>
+                <td>
+                    {% if z.anbindungen %}
+                        {% for dienst, info in z.anbindungen.items() %}
+                            <span class="badge" title="{{ info.fehler or '' }}">
+                                {% if info.ok %}✅{% else %}⚠️{% endif %} {{ dienst }}
+                            </span>
+                        {% endfor %}
+                    {% else %}
+                        <span class="muted">keine</span>
+                    {% endif %}
+                </td>
+                <td style="text-align:right;">{{ z.nutzung_7t }}</td>
+                <td style="text-align:right;">
+                    {% set teile = [] %}
+                    {% if z.offene_anfragen %}{% set _ = teile.append(z.offene_anfragen ~ (" Anfrage" if z.offene_anfragen == 1 else " Anfragen")) %}{% endif %}
+                    {% if z.offene_rueckrufe %}{% set _ = teile.append(z.offene_rueckrufe ~ (" Rückruf" if z.offene_rueckrufe == 1 else " Rückrufe")) %}{% endif %}
+                    {% if z.haengende_mails %}{% set _ = teile.append(z.haengende_mails ~ (" Mail" if z.haengende_mails == 1 else " Mails")) %}{% endif %}
+                    {{ teile | join(", ") }}
+                    {% if not (z.offene_anfragen or z.offene_rueckrufe or z.haengende_mails) %}
+                        <span class="muted">—</span>
+                    {% endif %}
+                </td>
+            </tr>
+        {% else %}
+            <tr><td colspan="6" class="muted">Noch kein Betrieb angelegt.</td></tr>
+        {% endfor %}
+        </tbody>
+    </table>
+</div>
+
+<p class="muted" style="margin-top:14px;font-size:13px;line-height:1.6;">
+    <strong>Wie die Farbe entsteht:</strong>
+    <span style="color:#ef4444;">rot</span> = eine verbundene Anbindung antwortet nicht mehr ·
+    <span style="color:#f59e0b;">gelb</span> = ein Zugang läuft demnächst ab (Microsoft entwertet
+    Zugänge nach 90 Tagen Untätigkeit), der Betrieb hat die App 7 Tage nicht benutzt, oder es
+    hängen Mails im Versand ·
+    <span style="color:#10b981;">grün</span> = nichts davon.
+    Der Betriebs-<em>Status</em> aus der Tenant-Verwaltung wird bewusst nicht herangezogen —
+    er wird nicht gepflegt (der Pilotbetrieb steht seit Mai auf „onboarding", obwohl er live ist).
+</p>
+{% endblock %}

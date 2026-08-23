@@ -61,7 +61,9 @@ async def _check_crons() -> tuple[bool, dict]:
 # ---------------------------------------------------------------------
 # HAUPT-CHECK
 # ---------------------------------------------------------------------
-async def _check_anbindungen() -> tuple[bool, dict]:
+async def _check_anbindungen(
+    nur_tenant_id=None,
+) -> tuple[bool, dict]:
     """Prueft die externen Anbindungen jedes Tenants.
 
     Bis zum Audit am 2026-08-23 prueften wir nur DB und Cron-Loops.
@@ -74,6 +76,10 @@ async def _check_anbindungen() -> tuple[bool, dict]:
     Bewertung bewusst milde: ein Tenant OHNE Anbindung ist kein Fehler
     (nicht jeder Betrieb nutzt jede Funktion). Gemeldet wird nur, was
     verbunden IST und nicht mehr antwortet.
+
+    Mit ``nur_tenant_id`` wird ein einzelner Betrieb geprueft — so nutzt
+    es die Kundenansicht im Admin, ohne bei jedem Seitenaufruf alle
+    Anbindungen aller Betriebe anzufassen.
     """
     from sqlalchemy import select
     from core.models import Tenant
@@ -84,7 +90,10 @@ async def _check_anbindungen() -> tuple[bool, dict]:
     alles_ok = True
 
     async with AsyncSessionLocal() as s:
-        tenants = (await s.execute(select(Tenant))).scalars().all()
+        stmt = select(Tenant)
+        if nur_tenant_id is not None:
+            stmt = stmt.where(Tenant.id == nur_tenant_id)
+        tenants = (await s.execute(stmt)).scalars().all()
         for t in tenants:
             s.expunge(t)
 

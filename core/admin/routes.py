@@ -1147,6 +1147,43 @@ async def costs_export(
 
 
 # =====================================================================
+# KUNDEN — eine Ampel je Betrieb
+# =====================================================================
+
+@router.get("/kunden", response_class=HTMLResponse)
+async def kunden_ampel_page(
+    request: Request,
+    user: AdminUser = Depends(require_admin),
+):
+    """Laeuft bei jedem Betrieb noch alles?
+
+    Fuehrt zusammen, was es schon gibt: Verbindungspruefung, App-Nutzung
+    der letzten Woche und liegengebliebene Vorgaenge. Rot steht oben —
+    was brennt, soll man nicht suchen muessen.
+    """
+    from core.services.kundenampel import alle_ampeln
+
+    zeilen = await alle_ampeln()
+    zusammenfassung = {
+        "rot": sum(1 for z in zeilen if z["farbe"] == "rot"),
+        "gelb": sum(1 for z in zeilen if z["farbe"] == "gelb"),
+        "gruen": sum(1 for z in zeilen if z["farbe"] == "gruen"),
+    }
+
+    async with get_session() as s:
+        await audit(user_id=user.id, action="kunden.view",
+                    request=request, session=s)
+
+    return templates.TemplateResponse(request, "kunden.html", {
+        "request": request,
+        "user": user,
+        "csrf_token": request.state.admin_session.csrf_token,
+        "zeilen": zeilen,
+        "zusammenfassung": zusammenfassung,
+    })
+
+
+# =====================================================================
 # AKQUISE — Website-Besuche
 # =====================================================================
 

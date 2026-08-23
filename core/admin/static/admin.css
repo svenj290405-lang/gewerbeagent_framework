@@ -98,11 +98,15 @@ input, select, textarea {
 .admin-nav-links {
     display: flex;
     gap: 4px;
+    /* Mit zehn Eintraegen wird es auf schmalen Bildschirmen eng: lieber
+       umbrechen als einzelne Beschriftungen mitten im Wort zerreissen. */
+    flex-wrap: wrap;
 }
 .admin-nav-links a {
     font-size: 13.5px;
     color: var(--ink-soft);
-    padding: 8px 14px;
+    white-space: nowrap;
+    padding: 8px 12px;
     border-radius: 8px;
     transition: background 0.18s var(--easing), color 0.18s var(--easing);
 }
