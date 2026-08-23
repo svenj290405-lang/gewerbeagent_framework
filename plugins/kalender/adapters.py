@@ -99,6 +99,22 @@ class CalendarAdapter(ABC):
         Metadaten (Backward-Compat).
         """
 
+    async def list_events_for_range(self, start_date, end_date):
+        """Events eines Zeitraums. Standard: Tag fuer Tag, NACHEINANDER.
+
+        Provider, die Zeitraeume koennen (Google, Microsoft), ueberschreiben
+        das mit einem einzigen Aufruf. Der Standard bleibt bewusst
+        sequenziell statt parallel: parallele Tagesabrufe laufen in die
+        Drosselung der Anbieter, und fehlende Tage faellt niemandem auf.
+        """
+        import datetime as _dt
+        alle = []
+        tag = start_date
+        while tag <= end_date:
+            alle.extend(await self.list_events_for_day(tag) or [])
+            tag += _dt.timedelta(days=1)
+        return alle
+
     @abstractmethod
     async def delete_event(self, event_id: str) -> bool:
         """Loeschen. True bei Erfolg oder schon-weg."""
@@ -207,18 +223,24 @@ class GoogleCalendarAdapter(CalendarAdapter):
         return result.get("calendars", {}).get(self.calendar_id, {}).get("busy", [])
 
     async def list_events_for_day(self, target_date):
+        return await self.list_events_for_range(target_date, target_date)
+
+    async def list_events_for_range(self, start_date, end_date):
         from dateutil import parser as _p  # type: ignore
         service = await self._get_service()
-        day_start = self._rfc3339(dt.datetime.combine(target_date, dt.time(0, 0)))
-        day_end = self._rfc3339(dt.datetime.combine(target_date, dt.time(23, 59)))
+        day_start = self._rfc3339(dt.datetime.combine(start_date, dt.time(0, 0)))
+        day_end = self._rfc3339(dt.datetime.combine(end_date, dt.time(23, 59)))
         try:
             resp = service.events().list(
                 calendarId=self.calendar_id,
                 timeMin=day_start, timeMax=day_end,
                 singleEvents=True, orderBy="startTime",
+                maxResults=500,
             ).execute()
         except Exception as exc:  # noqa: BLE001
-            logger.warning(f"Google list_events_for_day({target_date}) failed: {exc}")
+            logger.warning(
+                f"Google list_events({start_date}..{end_date}) failed: {exc}"
+            )
             return []
 
         events = []
@@ -531,6 +553,13 @@ class MicrosoftCalendarAdapter(CalendarAdapter):
         from core.integrations.microsoft_calendar import list_events_for_day
         return await list_events_for_day(
             self.tenant_id, target_date, employee_id=self.employee_id,
+        )
+
+    async def list_events_for_range(self, start_date, end_date):
+        from core.integrations.microsoft_calendar import list_events_for_range
+        return await list_events_for_range(
+            self.tenant_id, start_date, end_date,
+            employee_id=self.employee_id,
         )
 
     async def create_event(

@@ -2831,18 +2831,22 @@ async def _geplante_kalendertermine(
         return []
 
     heute = dt.datetime.now().date()
-    tage_liste = [heute + dt.timedelta(days=i) for i in range(max(1, tage))]
-    ergebnisse = await asyncio.gather(
-        *[adapter.list_events_for_day(tag) for tag in tage_liste],
-        return_exceptions=True,
-    )
+    # EIN Aufruf ueber den ganzen Zeitraum. Vorher lief hier ein
+    # asyncio.gather ueber je einen Abruf pro Tag — bei zwei Wochen also
+    # 14 gleichzeitige Anfragen. Microsoft hat das mit HTTP 429
+    # gedrosselt, die betroffenen Tage fielen still aus der Liste, und im
+    # Log stand nur eine INFO-Zeile. Beide Anbieter koennen Zeitraeume
+    # nativ (siehe CalendarAdapter.list_events_for_range).
+    letzter_tag = heute + dt.timedelta(days=max(1, tage) - 1)
+    try:
+        roh = await adapter.list_events_for_range(heute, letzter_tag)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Geplante Gespräche: Kalenderabruf gescheitert: %s", exc)
+        return []
 
     jetzt = dt.datetime.now()
     events: list[dict] = []
-    for ergebnis in ergebnisse:
-        if isinstance(ergebnis, BaseException):
-            logger.info("Geplante Gespräche: Tagesabruf gescheitert: %s", ergebnis)
-            continue
+    for ergebnis in [roh]:
         for ev in ergebnis or []:
             start = ev.get("start_dt")
             if not isinstance(start, dt.datetime) or start < jetzt:

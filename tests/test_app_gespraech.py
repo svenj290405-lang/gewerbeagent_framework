@@ -382,7 +382,10 @@ async def test_geplante_termine_ueberspringen_vergangenes(monkeypatch):
     jetzt = _dt.datetime.now()
 
     class _Adapter:
-        async def list_events_for_day(self, tag):
+        # Der Bildschirm holt den ganzen Zeitraum in EINEM Aufruf — ein
+        # Abruf pro Tag lief bei Microsoft in die Drosselung (HTTP 429)
+        # und liess Tage still verschwinden.
+        async def list_events_for_range(self, von, bis):
             return [
                 {"start_dt": jetzt - _dt.timedelta(hours=2), "subject": "vorbei",
                  "event_id": "alt", "location": ""},

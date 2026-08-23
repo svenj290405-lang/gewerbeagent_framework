@@ -217,6 +217,60 @@ async def get_free_busy(
 # EVENT-LIST (analog Google events.list)
 # ---------------------------------------------------------------------
 
+async def list_events_for_range(
+    tenant_id: UUID, start_date: dt.date, end_date: dt.date,
+    employee_id: UUID | None = None,
+) -> list[dict[str, Any]]:
+    """Alle Events eines ZEITRAUMS in EINEM Aufruf.
+
+    Graph kann calendarView ueber beliebige Zeitraeume — ein Aufruf pro
+    Tag ist reine Verschwendung und laeuft ausserdem in die Drosselung:
+    beim Audit lieferte Microsoft bei 14 parallelen Tagesabrufen
+    reihenweise HTTP 429, und die betroffenen Tage fielen still aus der
+    Terminliste heraus.
+    """
+    token = await get_microsoft_token(tenant_id, employee_id=employee_id)
+    von = dt.datetime.combine(start_date, dt.time(0, 0))
+    bis = dt.datetime.combine(end_date, dt.time(23, 59))
+
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS) as client:
+        resp = await client.get(
+            f"{GRAPH_API_BASE}/me/calendarView",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Prefer": f'outlook.timezone="{DEFAULT_TIMEZONE}"',
+            },
+            params={
+                "startDateTime": _iso_no_tz(von),
+                "endDateTime": _iso_no_tz(bis),
+                "$select": "id,subject,start,end,location,bodyPreview,webLink",
+                "$top": 500,
+                "$orderby": "start/dateTime",
+            },
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+    events: list[dict[str, Any]] = []
+    for ev in data.get("value", []):
+        try:
+            loc = (ev.get("location") or {}).get("displayName") or ""
+            events.append({
+                "start_dt": dt.datetime.fromisoformat(
+                    ev["start"]["dateTime"]).replace(tzinfo=None),
+                "end_dt": dt.datetime.fromisoformat(
+                    ev["end"]["dateTime"]).replace(tzinfo=None),
+                "location": loc.strip(),
+                "subject": (ev.get("subject") or "").strip(),
+                "event_id": ev.get("id") or "",
+                "body_preview": (ev.get("bodyPreview") or "").strip(),
+                "web_link": (ev.get("webLink") or "").strip(),
+            })
+        except (KeyError, ValueError) as exc:
+            logger.warning(f"Skipping malformed event: {exc}")
+    return events
+
+
 async def list_events_for_day(
     tenant_id: UUID, target_date: dt.date,
     employee_id: UUID | None = None,
