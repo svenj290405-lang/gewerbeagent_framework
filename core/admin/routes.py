@@ -1147,6 +1147,90 @@ async def costs_export(
 
 
 # =====================================================================
+# AKQUISE — Website-Besuche
+# =====================================================================
+
+@router.get("/akquise", response_class=HTMLResponse)
+async def akquise_page(
+    request: Request,
+    days: int = 30,
+    user: AdminUser = Depends(require_admin),
+):
+    """Was die Website bringt: Besucher, Herkunft, Kontakt-Klicks.
+
+    Zahlen kommen aus der eigenen, cookielosen Zaehlung (siehe
+    core/services/website_stats.py). Solange die Seite hinter Basic-Auth
+    liegt, steht ein Hinweis oben — sonst haelt man eigene Testaufrufe
+    fuer echte Besucher.
+    """
+    from core.services import website_stats as ws
+
+    # 0 steht in _PERIODS fuer "Gesamt"; fuer einen Tagesverlauf ist das
+    # kein sinnvoller Wert, deshalb ein Jahr.
+    erlaubt = {d for d, _ in _PERIODS}
+    zeitraum = days if days in erlaubt else 30
+    if zeitraum == 0:
+        zeitraum = 365
+
+    kennzahlen = await ws.kennzahlen(zeitraum)
+    verlauf = await ws.verlauf(min(zeitraum, 90))
+    herkunft = await ws.herkunft(zeitraum)
+    top_seiten = await ws.top_seiten(zeitraum)
+    trichter = await ws.trichter(zeitraum)
+
+    async with get_session() as s:
+        await audit(user_id=user.id, action="akquise.view",
+                    request=request, session=s)
+
+    # Signatur mit request zuerst — so ruft das ganze Modul es auf.
+    return templates.TemplateResponse(request, "akquise.html", {
+        "request": request,
+        "user": user,
+        "csrf_token": request.state.admin_session.csrf_token,
+        "kennzahlen": kennzahlen,
+        "verlauf": verlauf,
+        "herkunft": herkunft,
+        "top_seiten": top_seiten,
+        "trichter": trichter,
+        "periods": _PERIODS,
+        "days": zeitraum,
+        # Die Website ist in der geschlossenen Demo-Phase noch durch
+        # Basic-Auth geschuetzt; dann sind die Zahlen nicht repraesentativ.
+        "website_geschlossen": True,
+    })
+
+
+@router.get("/akquise/export.csv")
+async def akquise_export(
+    request: Request,
+    days: int = 30,
+    user: AdminUser = Depends(require_admin),
+):
+    """Tagesverlauf als CSV — gleiche Form wie die anderen Exporte."""
+    from core.services import website_stats as ws
+
+    zeitraum = days or 30
+    verlauf = await ws.verlauf(min(zeitraum, 365))
+
+    buf = io.StringIO()
+    writer = csv.writer(buf, dialect="excel-tab")
+    writer.writerow(["tag", "besucher", "kontakt_klicks"])
+    for zeile in verlauf:
+        writer.writerow([zeile["tag"], zeile["besucher"], zeile["kontakte"]])
+
+    async with get_session() as s:
+        await audit(user_id=user.id, action="akquise.export",
+                    request=request, session=s)
+
+    fname = f"gewerbeagent-website-{dt.datetime.now().strftime('%Y%m%d')}.csv"
+    return Response(
+        content=buf.getvalue(),
+        media_type="text/tab-separated-values",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+    )
+
+
+# =====================================================================
 # PRICING
 # =====================================================================
 

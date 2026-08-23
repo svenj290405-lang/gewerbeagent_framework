@@ -1,0 +1,144 @@
+{% extends "_base.html" %}
+{% set active = 'akquise' %}
+{% block title %}Akquise — Gewerbeagent Admin{% endblock %}
+
+{% block content %}
+<div class="page-header">
+    <div>
+        <h1>Akquise</h1>
+        <p>Was die Website bringt — eigene Zählung, ohne Cookies und ohne Drittanbieter.</p>
+    </div>
+    <a href="/admin/akquise/export.csv?days={{ days }}" class="btn btn-primary">CSV Export</a>
+</div>
+
+{% if website_geschlossen %}
+<div class="card" style="border-left:3px solid #f59e0b;margin-bottom:20px;">
+    <strong>Die Website ist noch nicht öffentlich.</strong>
+    Sie liegt in der geschlossenen Demo-Phase hinter einem Passwortschutz — hier
+    stehen deshalb bislang nur eigene Aufrufe. Sobald der Schutz fällt (dafür
+    müssen Impressum und Datenschutzerklärung vollständig sein), zählt die Seite
+    echte Besucher.
+</div>
+{% endif %}
+
+<div class="filter-bar" style="margin-bottom:18px;">
+    {% for d, label in periods %}
+        <a href="/admin/akquise?days={{ d }}"
+           class="btn {% if d == days %}btn-primary{% endif %}">{{ label }}</a>
+    {% endfor %}
+</div>
+
+<div class="stats-grid">
+    <div class="stat-card">
+        <div class="stat-label">Besucher heute</div>
+        <div class="stat-value">{{ kennzahlen.besucher_heute }}</div>
+        <div class="stat-sub">{{ kennzahlen.aufrufe_heute }} Seitenaufrufe</div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-label">Besuche im Zeitraum</div>
+        <div class="stat-value">{{ kennzahlen.besuche_zeitraum }}</div>
+        <div class="stat-sub">{{ kennzahlen.aufrufe_zeitraum }} Aufrufe</div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-label">Kontakt-Klicks</div>
+        <div class="stat-value">{{ kennzahlen.kontakte_zeitraum }}</div>
+        <div class="stat-sub">{{ kennzahlen.kontakte_heute }} heute</div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-label">Kontaktquote</div>
+        <div class="stat-value">{{ kennzahlen.kontaktquote }} %</div>
+        <div class="stat-sub">der Besuche endet im Kontakt</div>
+    </div>
+</div>
+
+<div class="section-title">Verlauf</div>
+<div class="card" style="margin-bottom:28px;">
+    <div style="height:260px;"><canvas id="verlaufChart"></canvas></div>
+</div>
+
+<div class="grid-2" style="display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-bottom:28px;">
+    <div>
+        <div class="section-title">Woher sie kommen</div>
+        <div class="card">
+            {% if herkunft %}
+                <div style="height:230px;"><canvas id="herkunftChart"></canvas></div>
+            {% else %}
+                <p class="muted">Noch keine Daten.</p>
+            {% endif %}
+        </div>
+    </div>
+    <div>
+        <div class="section-title">Meistgelesene Seiten</div>
+        <div class="card">
+            {% if top_seiten %}
+                <div style="height:230px;"><canvas id="seitenChart"></canvas></div>
+            {% else %}
+                <p class="muted">Noch keine Daten.</p>
+            {% endif %}
+        </div>
+    </div>
+</div>
+
+<div class="section-title">Vom Besuch zum Betrieb</div>
+<div class="card" style="margin-bottom:20px;">
+    <div style="display:flex;gap:28px;align-items:flex-end;flex-wrap:wrap;">
+        <div>
+            <div class="stat-value">{{ trichter.besuche }}</div>
+            <div class="stat-label">Besuche</div>
+        </div>
+        <div style="font-size:22px;color:var(--ink-muted);">→</div>
+        <div>
+            <div class="stat-value">{{ trichter.kontakte }}</div>
+            <div class="stat-label">Kontakt-Klicks</div>
+        </div>
+        <div style="font-size:22px;color:var(--ink-muted);">→</div>
+        <div>
+            <div class="stat-value">{{ trichter.betriebe }}</div>
+            <div class="stat-label">Betriebe angelegt</div>
+        </div>
+    </div>
+    <p class="muted" style="margin-top:14px;font-size:13px;line-height:1.6;">
+        <strong>So ist das zu lesen:</strong> drei Stufen im selben Zeitraum, nebeneinandergestellt —
+        <em>keine</em> personenbezogene Verfolgung. Es wird nirgends festgehalten, ob ein bestimmter
+        Besucher später Kunde wurde; das wäre genau das Tracking, das wir nicht machen.
+        Besucher werden nur tageweise unterschieden, „Besuche" über mehrere Tage sind also
+        Besuchstage, nicht Personen.
+        {% if kennzahlen.bots_heute %}
+        Heute wurden zusätzlich {{ kennzahlen.bots_heute }} automatische Zugriffe erkannt und
+        aus allen Zahlen herausgehalten.
+        {% endif %}
+        Wer JavaScript blockiert, wird nicht gezählt.
+    </p>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="/admin/static/vendor/chart.umd.min.js"></script>
+<script src="/admin/static/admin-charts.js"></script>
+<script>
+(function () {
+    const VERLAUF = {{ verlauf | tojson }};
+    const HERKUNFT = {{ herkunft | tojson }};
+    const SEITEN = {{ top_seiten | tojson }};
+
+    AdminCharts.linie(
+        'verlaufChart',
+        VERLAUF.map(z => z.tag.slice(8) + '.' + z.tag.slice(5, 7) + '.'),
+        [
+            { name: 'Besucher', werte: VERLAUF.map(z => z.besucher) },
+            { name: 'Kontakt-Klicks', werte: VERLAUF.map(z => z.kontakte) }
+        ]
+    );
+    AdminCharts.anteile(
+        'herkunftChart',
+        HERKUNFT.map(z => z.quelle),
+        HERKUNFT.map(z => z.besucher)
+    );
+    AdminCharts.balkenQuer(
+        'seitenChart',
+        SEITEN.map(z => z.pfad),
+        SEITEN.map(z => z.aufrufe)
+    );
+})();
+</script>
+{% endblock %}
