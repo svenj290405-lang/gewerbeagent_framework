@@ -108,6 +108,20 @@ class Settings(BaseSettings):
     health_check_hour: int = 7          # Stunde (Europe/Berlin), morgens
     health_alert_email: str = "svenj05@gmx.de"
 
+    # Alarmweg an den Betreiber (core/integrations/admin_alerts.py).
+    # Bewusst ein ZWEITER Weg neben dem eigenen Outlook-Postfach: wenn die
+    # Mail-Pipeline oder das Graph-Token selbst der Ausfallgrund ist, kann
+    # der Alarm nicht ueber genau diesen Weg hinausgehen. Leer = dieser
+    # Transport ist aus, dann bleibt nur Web-Push.
+    alert_smtp_host: str = ""
+    alert_smtp_port: int = 587
+    alert_smtp_user: str = ""
+    alert_smtp_password: str = ""
+    alert_smtp_from: str = ""
+    alert_smtp_to: str = ""
+    # STARTTLS (Port 587) ist der Normalfall; False = implizites TLS (465).
+    alert_smtp_starttls: bool = True
+
     @property
     def is_production(self) -> bool:
         return self.environment == "production"

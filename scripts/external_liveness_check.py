@@ -10,9 +10,10 @@ Henne-Ei wenn Framework crasht). Prueft alle 5 min:
      Alarm (siehe _alarm() — aktuell nur Log, siehe unten).
   4. Wenn vorher 'down' war und jetzt wieder 'ok': Recovery-Meldung.
 
-ACHTUNG: Der Alarm hat seit dem Telegram-Ausbau (2026-08-21) KEINEN
-Transport mehr — er landet nur in dieser Log-Datei. Wer das Postfach
-nicht liest, merkt einen Ausfall nicht. Ersatzkanal steht aus.
+Der Alarm geht per Stdlib-smtplib ueber ein FREMDES Postfach raus
+(ALERT_SMTP_* aus der Umgebung oder der .env) — bewusst nicht ueber die
+eigene Mail-Pipeline, denn die kann selbst der Ausfallgrund sein. Ohne
+SMTP-Konfiguration bleibt es beim stderr-Eintrag im Log.
 
 State-Datei: /tmp/gewerbeagent-liveness-state.json
    { "framework": {"consecutive_failures": N, "last_alert_at": "ISO",
@@ -28,7 +29,7 @@ Exit-Codes:
    1  unerwarteter Skript-Fehler
 
 Konfiguration via Env (alle optional):
-   FRAMEWORK_URL          default http://localhost:8001/health
+   FRAMEWORK_URL          default https://gewerbeagent.de/health
    POSTGRES_CONTAINER     default gewerbeagent_postgres
    POSTGRES_USER          default gewerbeagent
    POSTGRES_DB            default gewerbeagent
@@ -45,7 +46,14 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-FRAMEWORK_URL = os.environ.get("FRAMEWORK_URL", "http://localhost:8001/health")
+# Absichtlich die OEFFENTLICHE Adresse: der framework-Container hat gar
+# keinen Host-Port (er haengt nur im Docker-Netz hinter Caddy), ein
+# localhost:8001 waere also ein Dauer-Fehlalarm. Ueber die echte URL
+# wird ausserdem die ganze Kette geprueft, die auch ein Kunde benutzt —
+# DNS, Caddy, TLS, App.
+FRAMEWORK_URL = os.environ.get(
+    "FRAMEWORK_URL", "https://gewerbeagent.de/health",
+)
 POSTGRES_CONTAINER = os.environ.get("POSTGRES_CONTAINER", "gewerbeagent_postgres")
 POSTGRES_USER = os.environ.get("POSTGRES_USER", "gewerbeagent")
 POSTGRES_DB = os.environ.get("POSTGRES_DB", "gewerbeagent")
@@ -122,15 +130,78 @@ def check_db() -> tuple[bool, str]:
 
 
 def _alarm(message: str) -> bool:
-    """Alarm ausgeben.
+    """Alarm ausgeben — moeglichst ueber ein fremdes Postfach.
 
-    Frueher ging das als Telegram-Push an Sven; der Bot ist entfernt
-    (DSGVO/Drittland). Bis ein Ersatzkanal steht, landet der Alarm nur
-    hier im Log — bewusst auf stderr, damit Cron ihn per MAILTO
-    weiterreichen kann, wenn das auf dem Host eingerichtet ist.
+    Dieses Skript laeuft auf dem HOST, damit es auch dann noch meldet,
+    wenn der Container tot ist. Genau deshalb importiert es NICHTS aus
+    `core/` und verschickt per Stdlib-smtplib ueber ein fremdes Postfach
+    (dieselben ALERT_SMTP_*-Werte wie die App, hier aus der Umgebung
+    bzw. der .env gelesen).
+
+    Ist kein SMTP hinterlegt, bleibt es beim stderr-Eintrag — der geht
+    ueber Cron nur dann an jemanden, wenn MAILTO auf dem Host steht.
     """
     print(f"ALARM: {message}", file=sys.stderr)
-    return True
+
+    host = _env("ALERT_SMTP_HOST")
+    empfaenger = _env("ALERT_SMTP_TO") or _env("HEALTH_ALERT_EMAIL")
+    if not host or not empfaenger:
+        return False
+
+    import smtplib
+    from email.message import EmailMessage
+
+    msg = EmailMessage()
+    msg["Subject"] = "[Gewerbeagent] Liveness-Alarm"
+    msg["From"] = _env("ALERT_SMTP_FROM") or _env("ALERT_SMTP_USER") or empfaenger
+    msg["To"] = empfaenger
+    msg.set_content(message)
+    port = int(_env("ALERT_SMTP_PORT") or "587")
+    benutzer = _env("ALERT_SMTP_USER")
+    passwort = _env("ALERT_SMTP_PASSWORD")
+    try:
+        if (_env("ALERT_SMTP_STARTTLS") or "true").lower() != "false":
+            with smtplib.SMTP(host, port, timeout=20) as srv:
+                srv.starttls()
+                if benutzer:
+                    srv.login(benutzer, passwort)
+                srv.send_message(msg)
+        else:
+            with smtplib.SMTP_SSL(host, port, timeout=20) as srv:
+                if benutzer:
+                    srv.login(benutzer, passwort)
+                srv.send_message(msg)
+        print("ALARM per Mail zugestellt.", file=sys.stderr)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        print(f"ALARM-Mail fehlgeschlagen: {exc}", file=sys.stderr)
+        return False
+
+
+def _env(name: str) -> str:
+    """Wert aus der Umgebung, sonst aus der .env des Projekts.
+
+    Der Host-Cron hat die .env nicht geladen, deshalb wird sie hier
+    einmal selbst gelesen — ohne Fremdbibliothek.
+    """
+    import os
+    wert = os.environ.get(name)
+    if wert:
+        return wert.strip()
+    pfad = os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), ".env")
+    try:
+        with open(pfad, encoding="utf-8") as f:
+            for zeile in f:
+                zeile = zeile.strip()
+                if not zeile or zeile.startswith("#") or "=" not in zeile:
+                    continue
+                schluessel, _, w = zeile.partition("=")
+                if schluessel.strip() == name:
+                    return w.strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return ""
 
 
 def _evaluate_component(

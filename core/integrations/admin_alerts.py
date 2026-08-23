@@ -88,20 +88,123 @@ async def _record_admin_alert(
         logger.debug(f"admin alert audit log failed (egal): {e}")
 
 
-async def _deliver_to_sven(kind: str, message: str) -> bool:
-    """Zustellung an den Betreiber.
+def _smtp_konfiguriert() -> bool:
+    return bool(
+        settings.alert_smtp_host
+        and (settings.alert_smtp_to or settings.health_alert_email)
+    )
 
-    ACHTUNG — hier ist gerade KEIN Transport dran: der Telegram-Bot wurde
-    am 2026-08-21 aus DSGVO-Gruenden entfernt (Drittland-Transfer), ein
-    Ersatzkanal steht noch aus. Bis dahin landet der Alert nur als
-    ERROR im Container-Log und im admin_audit_log; die Rueckgabe ist
-    bewusst False, damit sich niemand auf eine Zustellung verlaesst.
 
-    Ein Mail-Kanal ueber das _global-Postfach waere zirkulaer (genau die
-    Mail-Pipeline ist einer der Alarm-Ausloeser) und deshalb kein Ersatz.
+def _sende_smtp_blockierend(betreff: str, text: str) -> None:
+    """Verschickt die Alarmmail ueber ein FREMDES Postfach (Stdlib).
+
+    Bewusst smtplib statt der eigenen Graph-Pipeline: wenn das
+    Outlook-Postfach oder dessen Token der Ausfallgrund ist, kann der
+    Alarm nicht ueber genau diesen Weg hinaus.
     """
-    logger.error("SVEN-ALERT [%s] (kein Transport aktiv): %s", kind, message[:800])
-    return False
+    import smtplib
+    from email.message import EmailMessage
+
+    msg = EmailMessage()
+    msg["Subject"] = betreff[:200]
+    msg["From"] = settings.alert_smtp_from or settings.alert_smtp_user
+    msg["To"] = settings.alert_smtp_to or settings.health_alert_email
+    msg.set_content(text)
+
+    if settings.alert_smtp_starttls:
+        with smtplib.SMTP(
+            settings.alert_smtp_host, settings.alert_smtp_port, timeout=20,
+        ) as srv:
+            srv.starttls()
+            if settings.alert_smtp_user:
+                srv.login(settings.alert_smtp_user, settings.alert_smtp_password)
+            srv.send_message(msg)
+    else:
+        with smtplib.SMTP_SSL(
+            settings.alert_smtp_host, settings.alert_smtp_port, timeout=20,
+        ) as srv:
+            if settings.alert_smtp_user:
+                srv.login(settings.alert_smtp_user, settings.alert_smtp_password)
+            srv.send_message(msg)
+
+
+async def _sende_push_an_betreiber(kind: str, message: str) -> int:
+    """Web-Push an die PWA des Betreibers.
+
+    Zweitweg, kein Ersatz fuer die Mail: er braucht den laufenden
+    Container, der im Ernstfall selbst das Problem sein kann. Dafuer ist
+    er sofort da und kostet nichts.
+    """
+    from core.integrations.push_notifier import (
+        push_enabled, send_push_to_employee,
+    )
+    if not push_enabled():
+        return 0
+    from core.security.app_auth import find_employee_by_email
+
+    ziel = settings.alert_smtp_to or settings.health_alert_email
+    async with get_session() as s:
+        emp = await find_employee_by_email(ziel, session=s)
+        emp_id = emp.id if emp else None
+    if emp_id is None:
+        return 0
+    return await send_push_to_employee(
+        emp_id, title="Systemwarnung", body=message[:180],
+        url="/app", tag=f"alert-{kind}"[:60],
+    )
+
+
+async def _deliver_to_sven(kind: str, message: str) -> bool:
+    """Zustellung an den Betreiber ueber zwei unabhaengige Wege.
+
+    Vorgeschichte: mit dem Telegram-Bot (entfernt am 2026-08-21,
+    Drittland-Transfer) verschwand der einzige Alarmweg. Seitdem gab
+    diese Funktion hart False zurueck — ein Ausfall waere niemandem
+    aufgefallen, ausser jemand liest zufaellig das Container-Log.
+
+    Reihenfolge:
+      1. SMTP ueber ein FREMDES Postfach (settings.alert_smtp_*).
+         Unabhaengig von Graph und vom eigenen Postfach, also auch dann
+         noch da, wenn genau die Mail-Pipeline der Ausfallgrund ist.
+      2. Web-Push an die PWA des Betreibers — sofort da, braucht aber
+         den laufenden Container, deshalb nur Zweitweg.
+
+    Der erste Erfolg zaehlt. Bleiben beide stumm, ist die Rueckgabe
+    weiterhin False, damit sich niemand auf eine Zustellung verlaesst,
+    die es nicht gab.
+    """
+    import asyncio
+
+    betreff = f"[Gewerbeagent] {kind}"
+    zugestellt = False
+
+    if _smtp_konfiguriert():
+        try:
+            await asyncio.wait_for(
+                asyncio.to_thread(_sende_smtp_blockierend, betreff, message),
+                timeout=30,
+            )
+            zugestellt = True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Alarm-SMTP fehlgeschlagen: %s", exc)
+
+    try:
+        if await _sende_push_an_betreiber(kind, message) > 0:
+            zugestellt = True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Alarm-Push fehlgeschlagen: %s", exc)
+
+    if not zugestellt:
+        logger.error(
+            "SVEN-ALERT [%s] NICHT zugestellt (SMTP: %s, Push: kein "
+            "Empfaenger oder kein Geraet): %s",
+            kind,
+            "fehlgeschlagen" if _smtp_konfiguriert() else "nicht konfiguriert",
+            message[:800],
+        )
+    else:
+        logger.info("SVEN-ALERT [%s] zugestellt.", kind)
+    return zugestellt
 
 
 async def notify_sven_admin_alert(
