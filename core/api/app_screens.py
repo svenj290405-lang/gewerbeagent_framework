@@ -5314,6 +5314,106 @@ async def api_einstellungen_get(
     })
 
 
+# Tabellen, die NIE in einen Export gehoeren: Zugangsdaten, Sitzungen
+# und Betriebsinterna der Plattform. Alles andere mit tenant_id ist
+# Eigentum des Betriebs und darf mit.
+_EXPORT_TABU = {
+    "oauth_tokens", "app_sessions", "app_login_tokens", "tool_configs",
+    "push_subscriptions", "employee_activation_tokens", "cron_heartbeats",
+    "oauth_states", "failed_mail_queue",
+    # Nutzungs-Telemetrie: unsere Betriebszahlen, nicht die Daten des
+    # Handwerksbetriebs — und in einer CSV zehntausende Zeilen Rauschen.
+    "api_usage_log", "app_usage_events",
+}
+
+
+@router.get("/einstellungen/export")
+async def api_datenexport(
+    request: Request,
+    _e=Depends(require_app_permission("einstellungen.verwalten")),
+):
+    """Alle Daten des Betriebs als ZIP mit je einer CSV pro Tabelle.
+
+    Steht so in den haeufigen Fragen auf der Website ("Du bekommst alle
+    deine Daten als Export — Anfragen, Briefings, Belege, alles") und war
+    bis zum Audit am 2026-08-23 nirgends gebaut. Fuer einen Anbieter, der
+    mit "kein Vendor-Lock-in" wirbt, ist das keine Kuer.
+
+    Bewusst schlicht: CSV je Tabelle, alles was am Tenant haengt. Dateien
+    im Drive bleiben draussen — sie liegen ohnehin im Google-Konto des
+    Betriebs, und ein ZIP mit allen Fotos waere weder erzeugbar noch
+    zustellbar. Die Verweise darauf stehen in den CSVs.
+    """
+    import csv
+    import io
+    import zipfile
+    from sqlalchemy import select as _select
+    from core.database.base import Base
+
+    tid = current_tenant_id(request)
+    tenant = request.state.app_tenant
+
+    puffer = io.BytesIO()
+    enthalten: list[str] = []
+    async with get_session() as s:
+        with zipfile.ZipFile(puffer, "w", zipfile.ZIP_DEFLATED) as z:
+            for name, tabelle in sorted(Base.metadata.tables.items()):
+                if name in _EXPORT_TABU or "tenant_id" not in tabelle.columns:
+                    continue
+                # Bilddaten und andere Blobs bleiben draussen: in einer
+                # CSV sind sie unbrauchbar (abgeschnittenes base64) und
+                # blaehen die Datei um ein Vielfaches auf. Die Zeile bleibt
+                # mit allen Metadaten drin, nur das Feld ist ersetzt.
+                spalten = [c for c in tabelle.columns]
+                blob_namen = {
+                    c.name for c in spalten
+                    if any(kennwort in str(c.type).upper()
+                           for kennwort in ("BLOB", "BYTEA", "LARGEBINARY"))
+                }
+                zeilen = (await s.execute(
+                    _select(*spalten).where(tabelle.c.tenant_id == tid)
+                )).all()
+                if not zeilen:
+                    continue
+                text = io.StringIO()
+                schreiber = csv.writer(text, delimiter=";")
+                schreiber.writerow([c.name for c in spalten])
+                for zeile in zeilen:
+                    werte = []
+                    for spalte, wert in zip(spalten, zeile):
+                        if wert is None:
+                            werte.append("")
+                        elif spalte.name in blob_namen:
+                            werte.append(f"<Datei, {len(wert)} Bytes>")
+                        else:
+                            werte.append(str(wert)[:5000])
+                    schreiber.writerow(werte)
+                z.writestr(f"{name}.csv", text.getvalue())
+                enthalten.append(f"{name} ({len(zeilen)})")
+
+            z.writestr("LIESMICH.txt", (
+                f"Datenexport {tenant.company_name or tenant.slug}\n"
+                f"Erstellt am {dt.datetime.now():%d.%m.%Y %H:%M}\n\n"
+                "Je eine CSV pro Tabelle, Trennzeichen Semikolon, UTF-8.\n"
+                "Nicht enthalten: Zugangsdaten und Sitzungen (gehoeren nicht\n"
+                "in einen Export) sowie die Dateien in Google Drive — die\n"
+                "liegen in Ihrem eigenen Google-Konto, die CSVs enthalten\n"
+                "die Verweise darauf. Fotos in der Datenbank sind als\n"
+                "Platzhalter vermerkt; sie stehen in der App zum Ansehen\n"
+                "und Herunterladen bereit.\n\n"
+                "Enthaltene Tabellen:\n  " + "\n  ".join(enthalten) + "\n"
+            ))
+
+    puffer.seek(0)
+    logger.info("Datenexport erstellt: tenant=%s tabellen=%d", tid, len(enthalten))
+    dateiname = f"gewerbeagent-export-{tenant.slug}-{dt.date.today():%Y%m%d}.zip"
+    return Response(
+        content=puffer.getvalue(),
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{dateiname}"'},
+    )
+
+
 @router.post("/einstellungen")
 async def api_einstellungen_set(
     request: Request,

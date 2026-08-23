@@ -136,6 +136,9 @@ ROUTE_RECHTE: dict[str, str] = {
     # eine ausgehende Verbindung im Namen des Betriebs — gehoert hinter
     # dasselbe Recht wie das Pflegen selbst.
     "api_wissen_import_website": "wissen.pflegen",
+    # Der Datenexport zieht ALLE Daten des Betriebs in ein ZIP —
+    # das gehoert an dasselbe Recht wie die Stammdaten selbst.
+    "api_datenexport": "einstellungen.verwalten",
     "api_wissen_import_datei": "wissen.pflegen",
     # Einrichtungs-Interview: die Fragen darf jeder sehen (auch als
     # Durchsicht "was steht zu Preisen drin?"), Antworten speichern heisst
