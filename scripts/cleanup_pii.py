@@ -42,6 +42,8 @@ from core.models import (
     Kundengespraech,
     Rueckruf,
     Visualisierung,
+    WebsiteSalt,
+    WebsiteVisit,
     Wissensluecke,
 )
 from core.models.failed_mail_queue import (
@@ -297,6 +299,58 @@ async def cleanup_geocode_cache(retention_days: int, execute: bool) -> int:
         return res.rowcount
 
 
+async def cleanup_website_visits(
+    retention_days: int = 14, execute: bool = False,
+) -> int:
+    """Verdichtet Besuchsereignisse zu Tagessummen und loescht die Rohdaten.
+
+    Reihenfolge ist wichtig: erst aggregieren, dann loeschen — sonst
+    verschwinden Zahlen. Die Tagessummen bleiben dauerhaft, sie enthalten
+    keine Besucherkennung mehr.
+
+    Die Frist ist bewusst 14 Tage: genau so lange, wie die
+    Datenschutzerklaerung es fuer Server-Logs zusagt. Der Tages-Salt geht
+    schon nach zwei Tagen — danach ist kein Hash mehr nachrechenbar.
+    """
+    from core.models.website_visit import SALT_TAGE
+    from core.services.website_stats import aggregiere_offene_tage
+
+    cutoff_tag = dt.date.today() - dt.timedelta(days=retention_days)
+    salt_cutoff = dt.date.today() - dt.timedelta(days=SALT_TAGE)
+
+    async with AsyncSessionLocal() as s:
+        alt = list((await s.execute(
+            select(WebsiteVisit.id).where(WebsiteVisit.tag < cutoff_tag)
+        )).scalars())
+        salts = list((await s.execute(
+            select(WebsiteSalt.id).where(WebsiteSalt.tag < salt_cutoff)
+        )).scalars())
+
+        if not execute:
+            logger.info(
+                f"[website_visits] Trockenlauf: {len(alt)} Ereignisse, "
+                f"{len(salts)} Tagesschluessel (cutoff="
+                f"{cutoff_tag.isoformat()})"
+            )
+            return 0
+
+        # Erst verdichten — auch Tage, die noch nicht faellig sind.
+        await aggregiere_offene_tage()
+
+        geloescht = 0
+        if alt:
+            res = await s.execute(
+                delete(WebsiteVisit).where(WebsiteVisit.id.in_(alt))
+            )
+            geloescht = res.rowcount
+        if salts:
+            await s.execute(
+                delete(WebsiteSalt).where(WebsiteSalt.id.in_(salts))
+            )
+        await s.commit()
+        return geloescht
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Loescht alte PII (Transkripte, Anfragen, Rueckrufe, Visualisierungen, Mail-Queue, Geocode-Cache)."
@@ -313,11 +367,15 @@ def main() -> int:
         c = await cleanup_geocode_cache(args.days, args.execute)
         r = await cleanup_rueckrufe(args.days, args.execute)
         w = await cleanup_wissensluecken(args.days, args.execute)
+        # Feste 14 Tage statt der Tenant-Frist: die Besuchsdaten gehoeren
+        # zu keinem Betrieb, sondern zu unserer eigenen Website.
+        b = await cleanup_website_visits(execute=args.execute)
         if args.execute:
             logger.info(
                 f"Geloescht: {g} Gespraeche, {a} Anfragen, "
                 f"{v} Visualisierungen, {f} Mail-Queue-Eintraege, "
-                f"{c} Geocode-Eintraege, {r} Rueckrufe; "
+                f"{c} Geocode-Eintraege, {r} Rueckrufe, "
+                f"{b} Besuchsereignisse; "
                 f"{w} Wissensluecken anonymisiert."
             )
 

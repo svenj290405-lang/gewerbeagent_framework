@@ -73,6 +73,7 @@ async def _maybe_run_cleanup() -> None:
             cleanup_kundengespraeche,
             cleanup_rueckrufe,
             cleanup_visualisierungen,
+            cleanup_website_visits,
             cleanup_wissensluecken,
         )
 
@@ -143,6 +144,14 @@ async def _maybe_run_cleanup() -> None:
                     f"DSGVO-Cleanup Tenant {slug} fehlgeschlagen: {t_exc}"
                 )
 
+        # Besuchszahlen der eigenen Website: gehoeren keinem Betrieb,
+        # feste 14-Tage-Frist (siehe cleanup_website_visits).
+        besuche_deleted = 0
+        try:
+            besuche_deleted = await cleanup_website_visits(execute=True)
+        except Exception as w_exc:  # noqa: BLE001
+            logger.exception(f"Website-Besuchs-Cleanup fehlgeschlagen: {w_exc}")
+
         # Geocode-Cache ist tenant-uebergreifend → einmal global mit der
         # laengsten Tenant-Retention.
         geocode_deleted = 0
@@ -160,7 +169,8 @@ async def _maybe_run_cleanup() -> None:
             f"{total_visualisierungen} Visualisierungen, "
             f"{total_mailq} Mail-Queue-Eintraege, "
             f"{total_rueckrufe} Rueckrufe, "
-            f"{geocode_deleted} Geocode-Eintraege geloescht; "
+            f"{geocode_deleted} Geocode-Eintraege, "
+            f"{besuche_deleted} Besuchsereignisse geloescht; "
             f"{total_luecken} Wissensluecken anonymisiert"
         )
         # Nur bei Erfolg merken — bei Fehler retried der naechste Tick

@@ -68,14 +68,31 @@ def _check_tenant_submit_limit(tenant_id, max_per_hour: int) -> bool:
     return True
 
 
+def _ohne_port(wert: str) -> str:
+    """Schneidet einen angehaengten Port ab.
+
+    Caddy schickte lange `{remote}` statt `{remote_host}`, also
+    "1.2.3.4:52344" — mit wechselndem Port bei JEDEM Aufruf. Damit war
+    jede Zaehlung pro IP wirkungslos: jeder Aufruf sah aus wie ein neuer
+    Absender. Der Caddyfile ist gefixt, aber die App verlaesst sich nicht
+    darauf.
+    """
+    wert = (wert or "").strip()
+    if wert.startswith("["):                      # IPv6 in Klammern
+        return wert.split("]")[0].lstrip("[")[:64]
+    if wert.count(":") == 1:                      # IPv4:Port
+        return wert.split(":")[0][:64]
+    return wert[:64]
+
+
 def _client_ip_anfrage(request: Request) -> str:
     xri = request.headers.get("x-real-ip")
     if xri:
-        return xri.split(",")[0].strip()[:64]
+        return _ohne_port(xri.split(",")[0])
     xff = request.headers.get("x-forwarded-for")
     if xff:
-        return xff.split(",")[0].strip()[:64]
-    return (request.client.host if request.client else "unknown")[:64]
+        return _ohne_port(xff.split(",")[0])
+    return _ohne_port(request.client.host if request.client else "unknown")
 
 
 def _check_anfrage_rate_limit(

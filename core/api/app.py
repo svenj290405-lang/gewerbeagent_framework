@@ -23,6 +23,7 @@ from core.plugin_system import (
     get_plugin_for_tenant,
 )
 from core.api.anfrage_routes import router as anfrage_router
+from core.api.track_routes import router as track_router
 from core.api.app_routes import router as app_router, mount_app_static
 from core.api.app_screens import router as app_screens_router
 from core.admin.routes import router as admin_router, mount_static as mount_admin_static
@@ -169,6 +170,10 @@ app = FastAPI(
 # ============================================================
 
 app.include_router(anfrage_router)
+# Zaehl-Endpunkt der Website. Oeffentlich, ohne Login — Caddy
+# reicht /z/* aus dem www-Block hierher durch, damit die
+# Zaehlung same-origin bleibt (CSP: connect-src 'self').
+app.include_router(track_router)
 app.include_router(app_router)
 app.include_router(app_screens_router)
 mount_app_static(app)

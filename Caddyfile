@@ -43,8 +43,8 @@ gewerbeagent.de {
 
     reverse_proxy framework:8001 {
         header_up Host {host}
-        header_up X-Real-IP {remote}
-        header_up X-Forwarded-For {remote}
+        header_up X-Real-IP {remote_host}
+        header_up X-Forwarded-For {remote_host}
         header_up X-Forwarded-Proto {scheme}
     }
 
@@ -71,8 +71,8 @@ app.gewerbeagent.de {
 
     reverse_proxy framework:8001 {
         header_up Host {host}
-        header_up X-Real-IP {remote}
-        header_up X-Forwarded-For {remote}
+        header_up X-Real-IP {remote_host}
+        header_up X-Forwarded-For {remote_host}
         header_up X-Forwarded-Proto {scheme}
     }
 
@@ -91,16 +91,32 @@ www.gewerbeagent.de {
 
     import security_headers
 
-    # Geschlossene Demo-Phase: Website nur fuer 1-2 eingeladene Leute.
-    # Basic-Auth haelt die Seite "nicht oeffentlich" → Impressumspflicht
-    # greift in dieser Phase nicht. Vor oeffentlichem Launch entfernen
-    # (dann Impressum/Datenschutz ausfuellen).
-    basic_auth {
-        "svenj05@gmx.de" $2a$14$DE654iml3iLSHil8zdu6OexJwdmiuJA8fm93a5lq7PHHdcR9MWJ2C
+    # Besucherzaehlung: /z/* geht ans Framework, NICHT an den Dateiserver.
+    # Muss vor der Basic-Auth stehen und ohne sie erreichbar sein — sonst
+    # waere Raterei, ob der Browser die gespeicherten Zugangsdaten an
+    # sendBeacon mitgibt. Same-Origin ist Pflicht, weil die CSP nur
+    # connect-src 'self' erlaubt (siehe security_headers oben).
+    handle /z/* {
+        reverse_proxy framework:8001 {
+            header_up Host {host}
+            header_up X-Real-IP {remote_host}
+            header_up X-Forwarded-For {remote_host}
+            header_up X-Forwarded-Proto {scheme}
+        }
     }
 
-    root * /srv/website
-    file_server
+    handle {
+        # Geschlossene Demo-Phase: Website nur fuer 1-2 eingeladene Leute.
+        # Basic-Auth haelt die Seite "nicht oeffentlich" → Impressumspflicht
+        # greift in dieser Phase nicht. Vor oeffentlichem Launch entfernen
+        # (dann Impressum/Datenschutz ausfuellen).
+        basic_auth {
+            "svenj05@gmx.de" $2a$14$DE654iml3iLSHil8zdu6OexJwdmiuJA8fm93a5lq7PHHdcR9MWJ2C
+        }
+
+        root * /srv/website
+        file_server
+    }
 
     log {
         output file /var/log/caddy/website-access.log {
@@ -131,8 +147,8 @@ quant.gewerbeagent.de {
 
     reverse_proxy quantpipeline_framework:8002 {
         header_up Host {host}
-        header_up X-Real-IP {remote}
-        header_up X-Forwarded-For {remote}
+        header_up X-Real-IP {remote_host}
+        header_up X-Forwarded-For {remote_host}
         header_up X-Forwarded-Proto {scheme}
     }
 
@@ -170,8 +186,8 @@ status.gewerbeagent.de {
 
     reverse_proxy framework:8001 {
         header_up Host {host}
-        header_up X-Real-IP {remote}
-        header_up X-Forwarded-For {remote}
+        header_up X-Real-IP {remote_host}
+        header_up X-Forwarded-For {remote_host}
         header_up X-Forwarded-Proto {scheme}
     }
 
@@ -210,8 +226,8 @@ status.gewerbeagent.de {
 #
 #     reverse_proxy framework_dev:8001 {
 #         header_up Host {host}
-#         header_up X-Real-IP {remote}
-#         header_up X-Forwarded-For {remote}
+#         header_up X-Real-IP {remote_host}
+#         header_up X-Forwarded-For {remote_host}
 #         header_up X-Forwarded-Proto {scheme}
 #     }
 #

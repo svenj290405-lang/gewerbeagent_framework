@@ -178,6 +178,18 @@ _EINTRAEGE: list[PiiTabelle] = [
                  "Konversation, deshalb kein eigener Auskunftspfad.",
     ),
     PiiTabelle(
+        tabelle="website_visits", umgang=LOESCHEN,
+        begruendung="Besuchsereignisse der Website. Enthalten keine IP und "
+                    "keinen Namen, nur eine Tageskennung — der Schluessel "
+                    "dafuer wird nach zwei Tagen geloescht.",
+        pii_spalten=("besucher_hash",),
+        in_cleanup=True,
+        hinweise="Bewusst NICHT in der Auskunft: eine Zuordnung zu einer "
+                 "Person ist technisch unmoeglich, und genau das ist das "
+                 "Ziel der Bauweise. Rohdaten fallen nach 14 Tagen weg, "
+                 "danach bleiben nur anonyme Tagessummen.",
+    ),
+    PiiTabelle(
         tabelle="geocode_cache", umgang=LOESCHEN,
         begruendung="Zwischenspeicher fuer Kundenadressen, jederzeit neu "
                     "berechenbar.",
@@ -201,6 +213,10 @@ _EINTRAEGE: list[PiiTabelle] = [
             ("admin_login_attempts", "Anmeldeversuche am Betreiber-Backend."),
             ("admin_audit_log", "Protokoll der Betreiber-Aktionen."),
             ("tool_configs", "Konfiguration, kein Personenbezug."),
+            ("website_tage", "Anonyme Tagessummen der Website — keine "
+             "Besucherkennung mehr enthalten."),
+            ("website_salt", "Taeglicher Zufallswert der Besucherzaehlung; "
+             "wird nach zwei Tagen geloescht."),
             ("cron_heartbeats", "Lebenszeichen der Hintergrundjobs — `cron_name` ist ein Jobname, kein Personenname."),
             ("tenant_leistungen", "Leistungskatalog des Betriebs."),
             ("tenant_material", "Materialkatalog samt Lieferant (Firma)."),
