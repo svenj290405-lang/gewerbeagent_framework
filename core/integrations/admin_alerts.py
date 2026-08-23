@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+import os
 from typing import Any
 
 from sqlalchemy import desc, select
@@ -227,10 +228,22 @@ async def notify_sven_admin_alert(
             Recovery-Nachrichten z.B. "wieder online").
 
     Returns:
-        True wenn der Alert zugestellt wurde, False sonst (aktuell immer
-        False — siehe _deliver_to_sven). Erfolg-False heisst NICHT, dass
-        der Caller einen Retry machen sollte — "fire & forget".
+        True wenn der Alert zugestellt wurde, sonst False. Erfolg-False
+        heisst NICHT, dass der Caller einen Retry machen sollte —
+        "fire & forget".
     """
+    # Unter pytest wird NICHTS zugestellt und nichts protokolliert.
+    # Anlass: `tests/test_phase_b_modules.py` rief den ORS-Quota-Alarm
+    # echt auf; seit Mai standen dadurch 139 Phantom-Alarme im
+    # admin_audit_log der PRODUKTIV-Datenbank — die Suite laeuft im
+    # Container gegen die echte DB. Solange der Alarmweg tot war, fiel es
+    # nicht auf; seit er wieder zustellt, wuerde jeder Testlauf eine
+    # Systemwarnung ausloesen. Ein Alarmweg, den Tests bedienen koennen,
+    # ist keiner.
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        logger.debug("Sven-Alert '%s' im Test unterdrueckt.", kind)
+        return False
+
     if not bypass_cooldown:
         if await _was_admin_recently_alerted(
             kind=kind, cooldown_hours=cooldown_hours,

@@ -125,12 +125,36 @@ def test_db_maintenance_constants():
     assert dbm.MAINTENANCE_HOUR_LOCAL == 2  # NICHT 03:00 (DSGVO-Konflikt)
 
 
-def test_ors_quota_alert_helper_callable():
-    """B9 _maybe_alert_quota_exhausted darf importiert + aufgerufen werden."""
+def test_ors_quota_alert_helper_callable(monkeypatch):
+    """B9 _maybe_alert_quota_exhausted darf importiert + aufgerufen werden.
+
+    Der Alarm selbst wird ERSETZT. Vorher rief dieser Test ihn echt auf:
+    die Suite laeuft im Container gegen die Produktiv-Datenbank, und so
+    standen dort seit Mai 139 Phantom-Alarme im admin_audit_log. Solange
+    der Alarmweg tot war, fiel das nicht auf — seit er wieder zustellt,
+    haette jeder Testlauf eine Systemwarnung ausgeloest.
+    """
     import asyncio
-    from core.integrations.openrouteservice import _maybe_alert_quota_exhausted
-    # Failsafe-Pfad: kein Token gesetzt → silent skip, kein Crash
-    asyncio.run(_maybe_alert_quota_exhausted())
+    from core.integrations import openrouteservice as ors
+
+    gerufen = []
+
+    async def _fake_alert(**kwargs):
+        gerufen.append(kwargs.get("kind"))
+        return False
+
+    monkeypatch.setattr(
+        "core.integrations.admin_alerts.notify_sven_admin_alert", _fake_alert,
+    )
+    monkeypatch.setattr(ors, "_ORS_LAST_QUOTA_ALERT", None, raising=False)
+
+    # Failsafe-Pfad: darf nie werfen.
+    asyncio.run(ors._maybe_alert_quota_exhausted())
+    assert gerufen == ["ors_quota_exhausted"]
+
+    # Cooldown: der zweite Aufruf innerhalb von 24 h bleibt still.
+    asyncio.run(ors._maybe_alert_quota_exhausted())
+    assert len(gerufen) == 1
 
 
 def test_rotate_encryption_key_module_imports():
