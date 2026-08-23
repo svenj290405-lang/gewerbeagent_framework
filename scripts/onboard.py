@@ -31,7 +31,7 @@ from core.database import AsyncSessionLocal
 from core.features.catalog import FEATURES
 from core.features.check import GLOBALLY_DISABLED_FEATURES
 from core.models import (
-    Tenant, TenantKnowledge, TenantStatus, ToolConfig,
+    QUELLE_TEMPLATE, Tenant, TenantKnowledge, TenantStatus, ToolConfig,
     ALLE_KATEGORIEN,
 )
 from core.models.employee import Employee
@@ -192,6 +192,12 @@ async def onboard_tenant(
                             tenant_id=tenant_id,
                             kategorie=kat,
                             text=text[:2000],
+                            # Herkunft festhalten: Vorlagen-Eintraege sind
+                            # Branchen-Durchschnitt, keine Aussage ueber
+                            # DIESEN Betrieb. In der App sind sie deshalb
+                            # als "Branchen-Vorlage" gekennzeichnet, damit
+                            # klar ist, was noch angefasst werden muss.
+                            quelle=QUELLE_TEMPLATE,
                         ))
                         knowledge_loaded += 1
                 await session.commit()

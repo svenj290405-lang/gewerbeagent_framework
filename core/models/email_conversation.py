@@ -107,6 +107,12 @@ class EmailConversation(Base):
 
     # Konversations-Memory fuer Multi-Turn (Q weiss was er zuletzt fragte)
     last_q_reply: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # Antwort-Nachweis: welche Angaben aus der Wissensbasis Q in der
+    # letzten Antwort verwendet hat (Liste kurzer Strings, von Q selbst
+    # gemeldet). Macht in der Anfragen-Ansicht pruefbar, worauf eine
+    # Kundenauskunft gestuetzt war.
+    genutztes_wissen: Mapped[list | None] = mapped_column(JSONB, nullable=True)
     last_user_message: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     # State-Machine

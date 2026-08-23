@@ -378,6 +378,7 @@ async def record_outbound_q_reply(
     microsoft_conversation_id: str | None = None,
     q_reply_text: str | None = None,
     subject: str | None = None,
+    genutztes_wissen: list | None = None,
 ) -> None:
     """Vermerkt eine ausgehende Q-Antwort. Setzt last_message_id auf die
     Microsoft-`internetMessageId` damit der naechste eingehende Reply
@@ -404,6 +405,12 @@ async def record_outbound_q_reply(
             conv.last_q_reply = q_reply_text[:4000]
         if subject is not None:
             conv.last_subject = subject[:500]
+        # Antwort-Nachweis: gehoert zur selben Antwort wie last_q_reply und
+        # wird deshalb hier mitgeschrieben. None = "nicht mitgeliefert",
+        # leere Liste = "Q hat nichts aus der Wissensbasis gebraucht" —
+        # der Unterschied ist beim Nachvollziehen wichtig.
+        if genutztes_wissen is not None:
+            conv.genutztes_wissen = list(genutztes_wissen)[:8] or None
         await s.commit()
 
 

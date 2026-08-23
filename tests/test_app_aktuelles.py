@@ -77,6 +77,12 @@ async def test_aktuelles_aggregates(monkeypatch):
     monkeypatch.setattr(app_screens, "_open_rueckrufe", _rr)
     monkeypatch.setattr(app_screens, "_beratung_leads", _ber)
     monkeypatch.setattr(app_screens, "_aktuelle_auftraege", _auf)
+    # _recent_aufnahmen fehlte hier — der Test ging damit an die ECHTE DB
+    # und fiel je nach Testreihenfolge mit "attached to a different loop"
+    # um (Connection-Pool aus einem fremden Event-Loop).
+    async def _auf_nahmen(tid, limit=20):
+        return []
+    monkeypatch.setattr(app_screens, "_recent_aufnahmen", _auf_nahmen)
     resp = await app_screens.api_aktuelles(request=_req(), _e=None)
     j = _body(resp)
     assert [x["kunde"] for x in j["rueckrufe"]] == ["A"]

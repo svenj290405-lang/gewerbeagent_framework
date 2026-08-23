@@ -223,11 +223,12 @@ _ERWARTETE_TOOLS = {
     "offene_rueckrufe",
     "anzeige_oeffnen", "anstehende_termine", "team_status", "offene_anfragen",
     "wissen_suchen", "archiv_suchen", "archiv_dateien", "rechnungen_pruefen",
-    "offene_posten", "formulare_status",
+    "offene_posten", "formulare_status", "wissensluecken", "ueberschlag",
     # write
     "termin_anlegen", "termin_stornieren", "termin_verschieben", "rueckruf_anlegen",
     "rueckruf_erledigt", "material_bestellen", "material_anlegen",
     "abwesenheit_melden", "mitarbeiter_zurueck", "wissen_merken", "wissen_loeschen",
+    "wissensluecke_beantworten",
     "auftrag_status", "angebot_erstellen", "angebot_senden", "rechnung_erstellen",
     "rechnung_abrechnen", "anfrage_beantworten", "email_schreiben",
     "drive_ordner_anlegen", "drive_notiz_anlegen",

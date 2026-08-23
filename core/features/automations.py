@@ -179,8 +179,9 @@ AUTOMATIONS: dict[str, Automation] = {
     "wissen": Automation(
         key="wissen",
         label="Wissensbasis",
-        description="Q merkt sich neue Betriebs-Infos und löscht veraltete.",
-        tools=("wissen_merken", "wissen_loeschen"),
+        description="Q merkt sich neue Betriebs-Infos, löscht veraltete und "
+                    "beantwortet offene Kundenfragen aus der Lücken-Liste.",
+        tools=("wissen_merken", "wissen_loeschen", "wissensluecke_beantworten"),
         feature="wissensbasis",
         manuell_hint="Die Wissensbasis pflegst du selbst unter „Mehr → Wissen\".",
         group=_GRUPPE_ASSISTENT,

@@ -56,7 +56,25 @@ from core.models.kundengespraech import (
     KUNDENGESPRAECH_STATUS_VERWORFEN,
 )
 from core.models.rechnung import Rechnung
-from core.models.tenant_knowledge import KATEGORIE_LABELS, TenantKnowledge
+from core.models.tenant_knowledge import (
+    ALLE_SICHTBARKEITEN,
+    FRISCHE_KATEGORIEN,
+    FRISCHE_TAGE,
+    KATEGORIE_FAQ,
+    KATEGORIE_LABELS,
+    QUELLE_IMPORT,
+    QUELLE_LABELS,
+    QUELLE_MENSCH,
+    SICHTBARKEIT_KUNDE,
+    SICHTBARKEIT_LABELS,
+    TenantKnowledge,
+)
+from core.models.tenant_kalkulation import TenantKalkulation
+from core.models.wissensluecke import (
+    STATUS_BEANTWORTET as LUECKE_STATUS_BEANTWORTET,
+    STATUS_VERWORFEN as LUECKE_STATUS_VERWORFEN,
+    Wissensluecke,
+)
 from core.models.rueckruf import (
     RUECKRUF_STATUS_ERLEDIGT,
     RUECKRUF_STATUS_OFFEN,
@@ -978,11 +996,24 @@ async def api_aktuelles(request: Request, _e=Depends(require_app_user)) -> JSONR
     """Aggregiert alles Relevante für den Start-Screen 'Aktuelles'."""
     tid = current_tenant_id(request)
     aufnahmen = await _recent_aufnahmen(tid, limit=20)
+    # Die unbeantworteten Kundenfragen gehoeren auf den Start-Screen, nicht
+    # nur in die Wissens-Ansicht: sonst sieht sie nur, wer ohnehin schon
+    # Wissen pflegen wollte — und genau das passiert selten von selbst.
+    #
+    # Best-effort: dieser Screen traegt Rueckrufe und Auftraege. Er darf
+    # nicht leer bleiben, nur weil die Wissensbasis gerade klemmt.
+    luecken: list = []
+    try:
+        from core.services import wissen as wissen_service
+        luecken = await wissen_service.offene_luecken(tid, limit=5)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Wissensluecken fuer /aktuelles nicht ladbar: %s", exc)
     return JSONResponse({
         "rueckrufe": await _open_rueckrufe(tid),
         "beratung": await _beratung_leads(tid),
         "auftraege": await _aktuelle_auftraege(tid, auftrag_scope(request)),
         "aufnahmen_count": len(aufnahmen),
+        "wissensluecken": luecken,
     })
 
 
@@ -1024,6 +1055,8 @@ async def _build_briefing_text(ctx) -> str:
     auftraege = await _aktuelle_auftraege(ctx.tid, briefing_scope)
     beratung = await _beratung_leads(ctx.tid)
     team = await _run_team_status(ctx, {})
+    from core.services import wissen as wissen_service
+    luecken = await wissen_service.offene_luecken(ctx.tid, limit=5)
     anfragen = {"anzahl": 0, "anfragen": []}
     if "mail_intake" in (ctx.features or set()):
         anfragen = await _run_offene_anfragen(ctx, {})
@@ -1039,6 +1072,9 @@ async def _build_briefing_text(ctx) -> str:
         "laufende_auftraege": [{"kunde": a.get("kunde"), "status": a.get("status_label")}
                                for a in auftraege],
         "neue_beratungs_leads": [{"kunde": b.get("kunde")} for b in beratung],
+        "kundenfragen_ohne_antwort": [
+            {"frage": l["frage"], "wie_oft": l["anzahl"]} for l in luecken
+        ],
     }
     name = (getattr(ctx.employee, "name", "") or "").split(" ")[0] or "Chef"
     betrieb = getattr(ctx.tenant, "company_name", "") or "deinem Betrieb"
@@ -1053,6 +1089,9 @@ async def _build_briefing_text(ctx) -> str:
         f"Beginne mit '{gruss}, {name}'. Fasse nur das Wichtigste zusammen, was "
         "waehrend seiner Abwesenheit reinkam und heute ansteht: heutige Termine, "
         "offene Rueckrufe, neue Anfragen, Team-Abwesenheiten, dringende Auftraege. "
+        "Stehen unter kundenfragen_ohne_antwort Eintraege, erwaehne die "
+        "haeufigste in einem Halbsatz — das sind Fragen, die du Kunden nicht "
+        "beantworten konntest. "
         "KEINE Aufzaehlungszeichen, KEIN Markdown, flieSSender Text, konkret mit "
         "Zahlen und Namen. Wenn kaum etwas ansteht, sag es knapp und positiv. "
         "Erfinde nichts - nutze ausschliesslich diese Daten (JSON):\n"
@@ -1078,6 +1117,8 @@ async def _build_briefing_text(ctx) -> str:
             teile.append(f"{anfragen['anzahl']} neue Anfrage(n)")
         if abwesend:
             teile.append("abwesend: " + ", ".join(abwesend))
+        if luecken:
+            teile.append(f"{len(luecken)} offene Kundenfrage(n) in der Wissensbasis")
         kern = "; ".join(teile) if teile else "nichts Dringendes - ruhiger Tag."
         text = f"{gruss}, {name}. {kern}"
     return text
@@ -3665,7 +3706,13 @@ async def api_archiv_datei_proxy(
 
 
 # =====================================================================
-# Wissensdatenbank (lesen / anlegen / löschen)
+# Wissensdatenbank
+#
+# Lesen / anlegen / aendern / stilllegen / bestaetigen, dazu die
+# Wissensluecken (unbeantwortete Kundenfragen) und die Ueberschlags-
+# Formeln. Alle Leseprfade laufen ueber core/services/wissen.py, damit
+# App, Telefon und Mail dieselben Eintraege sehen — mit dem einen
+# Unterschied, dass die App auch interne Eintraege zeigt.
 # =====================================================================
 
 @router.get("/wissen")
@@ -3676,14 +3723,39 @@ async def api_wissen(request: Request, _e=Depends(require_app_user)) -> JSONResp
             select(TenantKnowledge).where(TenantKnowledge.tenant_id == tid)
             .order_by(TenantKnowledge.kategorie, TenantKnowledge.created_at.desc())
         )).scalars().all()
-    eintraege = [{
-        "id": str(w.id),
-        "kategorie": w.kategorie,
-        "kategorie_label": KATEGORIE_LABELS.get(w.kategorie, w.kategorie),
-        "text": w.text,
-    } for w in rows]
+
+    jetzt = dt.datetime.now(dt.timezone.utc)
+    eintraege = []
+    for w in rows:
+        stand = w.zuletzt_bestaetigt_am or w.created_at
+        tage = (jetzt - stand).days if stand else None
+        eintraege.append({
+            "id": str(w.id),
+            "kategorie": w.kategorie,
+            "kategorie_label": KATEGORIE_LABELS.get(w.kategorie, w.kategorie),
+            "text": w.text,
+            "quelle": w.quelle,
+            "quelle_label": QUELLE_LABELS.get(w.quelle, w.quelle),
+            "sichtbarkeit": w.sichtbarkeit,
+            "aktiv": bool(w.aktiv),
+            "tage_alt": tage,
+            # Nur Preise/Materialien veralten sichtbar — der Rest (Notfall-
+            # Logik, Anfahrtsgebiet) ist jahrelang stabil und soll nicht
+            # jedes Jahr eine Aufgabe erzeugen.
+            "veraltet": bool(
+                w.kategorie in FRISCHE_KATEGORIEN
+                and tage is not None
+                and tage > FRISCHE_TAGE
+            ),
+        })
     kategorien = [{"key": k, "label": v} for k, v in KATEGORIE_LABELS.items()]
-    return JSONResponse({"eintraege": eintraege, "kategorien": kategorien})
+    return JSONResponse({
+        "eintraege": eintraege,
+        "kategorien": kategorien,
+        "sichtbarkeiten": [
+            {"key": k, "label": v} for k, v in SICHTBARKEIT_LABELS.items()
+        ],
+    })
 
 
 @router.post("/wissen")
@@ -3694,12 +3766,110 @@ async def api_wissen_add(
     body = await request.json() or {}
     kategorie = (body.get("kategorie") or "").strip()
     text = (body.get("text") or "").strip()
+    sichtbarkeit = (body.get("sichtbarkeit") or SICHTBARKEIT_KUNDE).strip()
     if kategorie not in KATEGORIE_LABELS:
         return JSONResponse({"ok": False, "error": "unbekannte Kategorie"}, status_code=400)
+    if sichtbarkeit not in ALLE_SICHTBARKEITEN:
+        sichtbarkeit = SICHTBARKEIT_KUNDE
     if not (3 <= len(text) <= 2000):
         return JSONResponse({"ok": False, "error": "Text 3–2000 Zeichen"}, status_code=400)
     async with get_session() as s:
-        s.add(TenantKnowledge(tenant_id=tid, kategorie=kategorie, text=text))
+        s.add(TenantKnowledge(
+            tenant_id=tid, kategorie=kategorie, text=text,
+            sichtbarkeit=sichtbarkeit, quelle=QUELLE_MENSCH,
+            zuletzt_bestaetigt_am=dt.datetime.now(dt.timezone.utc),
+        ))
+    # Gespeichert wird auf jeden Fall — der Hinweis erscheint danach, weil
+    # nur der Betrieb entscheiden kann, ob eine Nummer seine eigene ist.
+    from core.services.wissen import pruefe_personenbezug
+    return JSONResponse({"ok": True, "hinweis": pruefe_personenbezug(text)})
+
+
+@router.post("/wissen/{wid}/aendern")
+async def api_wissen_update(
+    wid: str, request: Request,
+    _e=Depends(require_app_permission("wissen.pflegen")), _c=Depends(require_app_csrf),
+) -> JSONResponse:
+    """Eintrag bearbeiten.
+
+    Vorher gab es nur anlegen und loeschen — ein Tippfehler oder ein
+    geaenderter Preis hiess: loeschen und neu tippen. Jede Aenderung
+    zaehlt zugleich als Bestaetigung ("gilt so"), damit der Frische-Ping
+    nicht Eintraege anmahnt, die gerade erst angefasst wurden.
+    """
+    tid = current_tenant_id(request)
+    try:
+        wid_uuid = uuid.UUID(wid)
+    except (ValueError, TypeError):
+        return JSONResponse({"ok": False, "error": "ungueltige id"}, status_code=400)
+    body = await request.json() or {}
+
+    # ERST alles pruefen, DANN zuweisen. Wird mitten im Zuweisen abgebrochen,
+    # committet get_session() beim Verlassen des Blocks die halbe Aenderung —
+    # der Nutzer bekaeme "fehlgeschlagen" zu sehen, und der Text waere
+    # trotzdem geaendert.
+    aenderungen: dict = {}
+    if "text" in body:
+        text = (body.get("text") or "").strip()
+        if not (3 <= len(text) <= 2000):
+            return JSONResponse(
+                {"ok": False, "error": "Text 3–2000 Zeichen"}, status_code=400
+            )
+        aenderungen["text"] = text
+    if "kategorie" in body:
+        kat = (body.get("kategorie") or "").strip()
+        if kat not in KATEGORIE_LABELS:
+            return JSONResponse(
+                {"ok": False, "error": "unbekannte Kategorie"}, status_code=400
+            )
+        aenderungen["kategorie"] = kat
+    if "sichtbarkeit" in body:
+        sicht = (body.get("sichtbarkeit") or "").strip()
+        if sicht not in ALLE_SICHTBARKEITEN:
+            return JSONResponse(
+                {"ok": False, "error": "unbekannte Sichtbarkeit"}, status_code=400
+            )
+        aenderungen["sichtbarkeit"] = sicht
+    if "aktiv" in body:
+        aenderungen["aktiv"] = bool(body.get("aktiv"))
+
+    async with get_session() as s:
+        w = (await s.execute(
+            select(TenantKnowledge)
+            .where(TenantKnowledge.id == wid_uuid)
+            .where(TenantKnowledge.tenant_id == tid)
+        )).scalar_one_or_none()
+        if w is None:
+            return JSONResponse({"ok": False, "error": "nicht gefunden"}, status_code=404)
+        for feld, wert in aenderungen.items():
+            setattr(w, feld, wert)
+        # Wer einen Eintrag anfasst, bestaetigt ihn damit auch.
+        w.zuletzt_bestaetigt_am = dt.datetime.now(dt.timezone.utc)
+        neuer_text = w.text
+    from core.services.wissen import pruefe_personenbezug
+    return JSONResponse({"ok": True, "hinweis": pruefe_personenbezug(neuer_text)})
+
+
+@router.post("/wissen/{wid}/bestaetigen")
+async def api_wissen_bestaetigen(
+    wid: str, request: Request,
+    _e=Depends(require_app_permission("wissen.pflegen")), _c=Depends(require_app_csrf),
+) -> JSONResponse:
+    """"Gilt noch" — setzt nur den Frische-Stempel, ohne den Text zu aendern."""
+    tid = current_tenant_id(request)
+    try:
+        wid_uuid = uuid.UUID(wid)
+    except (ValueError, TypeError):
+        return JSONResponse({"ok": False, "error": "ungueltige id"}, status_code=400)
+    async with get_session() as s:
+        w = (await s.execute(
+            select(TenantKnowledge)
+            .where(TenantKnowledge.id == wid_uuid)
+            .where(TenantKnowledge.tenant_id == tid)
+        )).scalar_one_or_none()
+        if w is None:
+            return JSONResponse({"ok": False, "error": "nicht gefunden"}, status_code=404)
+        w.zuletzt_bestaetigt_am = dt.datetime.now(dt.timezone.utc)
     return JSONResponse({"ok": True})
 
 
@@ -3723,6 +3893,390 @@ async def api_wissen_delete(
             return JSONResponse({"ok": False, "error": "nicht gefunden"}, status_code=404)
         await s.delete(w)
     return JSONResponse({"ok": True})
+
+
+@router.get("/wissen/pruefung")
+async def api_wissen_pruefung(
+    request: Request, _e=Depends(require_app_user),
+) -> JSONResponse:
+    """Widersprueche + veraltete Eintraege.
+
+    Der praktisch wichtigste Fall: zwei Preisangaben zum selben Thema mit
+    verschiedenen Betraegen. Genau dann sagt Q am Telefon eine andere Zahl,
+    als das Angebot spaeter rechnet — und der Kunde merkt es.
+    """
+    tid = current_tenant_id(request)
+    from core.services import wissen as wissen_service
+    ergebnis = await wissen_service.pruefe_qualitaet(tid)
+    return JSONResponse({"ok": True, **ergebnis})
+
+
+# --------------------- Import aus der Website ------------------------
+
+@router.post("/wissen/import/website")
+async def api_wissen_import_website(
+    request: Request,
+    _e=Depends(require_app_permission("wissen.pflegen")), _c=Depends(require_app_csrf),
+) -> JSONResponse:
+    """Liest die Betriebs-Website und schlaegt Wissens-Eintraege vor.
+
+    Speichert NICHTS. Der Betrieb hakt in der App ab, was stimmt — eine
+    Website ist Werbetext, und was Q am Telefon als Tatsache sagt, muss
+    ein Mensch bestaetigt haben.
+    """
+    from core.services.wissen_import import ImportFehler, vorschlaege_von_website
+
+    tid = current_tenant_id(request)
+    body = await request.json() or {}
+    try:
+        ergebnis = await vorschlaege_von_website(
+            (body.get("url") or ""), tenant_id=tid,
+        )
+    except ImportFehler as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+    except Exception:
+        logger.exception("Website-Import fehlgeschlagen: tenant=%s", tid)
+        return JSONResponse(
+            {"ok": False, "error": "Der Import ist fehlgeschlagen."}, status_code=502
+        )
+    return JSONResponse({"ok": True, **ergebnis})
+
+
+@router.get("/wissen/interview")
+async def api_wissen_interview(
+    request: Request, _e=Depends(require_app_user),
+) -> JSONResponse:
+    """Die Einrichtungs-Fragen samt dem, was schon dazu hinterlegt ist.
+
+    Doppelter Nutzen: beim Onboarding fuellt es die Wissensbasis, spaeter
+    ist es die Durchsicht ("was steht eigentlich zu Preisen drin?").
+    """
+    from core.services.wissen_import import INTERVIEW_FRAGEN
+
+    tid = current_tenant_id(request)
+    async with get_session() as s:
+        rows = (await s.execute(
+            select(TenantKnowledge)
+            .where(TenantKnowledge.tenant_id == tid)
+            .where(TenantKnowledge.aktiv.is_(True))
+        )).scalars().all()
+    vorhanden: dict[str, list[str]] = {}
+    for r in rows:
+        vorhanden.setdefault(r.kategorie, []).append(r.text)
+
+    return JSONResponse({"ok": True, "fragen": [{
+        "kategorie": f["kategorie"],
+        "kategorie_label": KATEGORIE_LABELS.get(f["kategorie"], f["kategorie"]),
+        "frage": f["frage"],
+        "hilfe": f["hilfe"],
+        "vorhanden": vorhanden.get(f["kategorie"], []),
+    } for f in INTERVIEW_FRAGEN]})
+
+
+@router.post("/wissen/interview")
+async def api_wissen_interview_speichern(
+    request: Request,
+    _e=Depends(require_app_permission("wissen.pflegen")), _c=Depends(require_app_csrf),
+) -> JSONResponse:
+    """Nimmt die Interview-Antworten entgegen und legt sie als Eintraege an.
+
+    Body: ``{"antworten": {"preise": "ja also 75 die stunde …", …}}``.
+    Die Rohantworten werden vorher zu sauberen Saetzen umformuliert
+    (siehe formuliere_interview) — gespeichert wird der formulierte Text.
+    """
+    from core.services.wissen import pruefe_personenbezug
+    from core.services.wissen_import import formuliere_interview
+
+    tid = current_tenant_id(request)
+    body = await request.json() or {}
+    antworten = body.get("antworten")
+    if not isinstance(antworten, dict) or not antworten:
+        return JSONResponse({"ok": False, "error": "keine Antworten"},
+                            status_code=400)
+
+    try:
+        eintraege = await formuliere_interview(antworten)
+    except Exception:
+        logger.exception("Interview-Formulierung fehlgeschlagen: tenant=%s", tid)
+        return JSONResponse(
+            {"ok": False, "error": "Das hat gerade nicht geklappt."},
+            status_code=502)
+    if not eintraege:
+        return JSONResponse(
+            {"ok": False, "error": "Da war nichts Verwertbares dabei."},
+            status_code=400)
+
+    jetzt = dt.datetime.now(dt.timezone.utc)
+    hinweise: list[str] = []
+    async with get_session() as s:
+        for e in eintraege:
+            if e["kategorie"] not in KATEGORIE_LABELS:
+                continue
+            s.add(TenantKnowledge(
+                tenant_id=tid, kategorie=e["kategorie"], text=e["text"][:2000],
+                sichtbarkeit=SICHTBARKEIT_KUNDE, quelle=QUELLE_MENSCH,
+                zuletzt_bestaetigt_am=jetzt,
+            ))
+            hinweis = pruefe_personenbezug(e["text"])
+            if hinweis and hinweis not in hinweise:
+                hinweise.append(hinweis)
+    return JSONResponse({
+        "ok": True,
+        "angelegt": len(eintraege),
+        "eintraege": eintraege,
+        "hinweis": hinweise[0] if hinweise else None,
+    })
+
+
+@router.post("/wissen/import/datei")
+async def api_wissen_import_datei(
+    request: Request,
+    _e=Depends(require_app_permission("wissen.pflegen")), _c=Depends(require_app_csrf),
+) -> JSONResponse:
+    """Liest eine hochgeladene Preisliste/Flyer/Angebot und schlaegt Eintraege vor.
+
+    Body = rohe Datei-Bytes, Content-Type bestimmt den Typ (wie beim
+    Archiv-Upload). Speichert nichts — der Betrieb bestaetigt einzeln.
+    """
+    from core.services.wissen_import import (
+        DATEI_MIMES, ImportFehler, vorschlaege_von_datei,
+    )
+
+    tid = current_tenant_id(request)
+    daten = await request.body()
+    if not daten:
+        return JSONResponse({"ok": False, "error": "Keine Datei empfangen."},
+                            status_code=400)
+    mime = (request.headers.get("content-type") or "").split(";")[0].strip().lower()
+    if mime not in DATEI_MIMES:
+        return JSONResponse(
+            {"ok": False, "error": "Nur PDF, JPEG, PNG oder WebP koennen gelesen werden."},
+            status_code=415)
+    dateiname = (request.query_params.get("filename") or "").strip()[:255]
+    try:
+        ergebnis = await vorschlaege_von_datei(
+            daten, mime, tenant_id=tid, dateiname=dateiname,
+        )
+    except ImportFehler as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+    except Exception:
+        logger.exception("Datei-Import fehlgeschlagen: tenant=%s", tid)
+        return JSONResponse(
+            {"ok": False, "error": "Der Import ist fehlgeschlagen."}, status_code=502)
+    return JSONResponse({"ok": True, **ergebnis})
+
+
+@router.post("/wissen/import/uebernehmen")
+async def api_wissen_import_uebernehmen(
+    request: Request,
+    _e=Depends(require_app_permission("wissen.pflegen")), _c=Depends(require_app_csrf),
+) -> JSONResponse:
+    """Uebernimmt die vom Betrieb bestaetigten Vorschlaege."""
+    tid = current_tenant_id(request)
+    body = await request.json() or {}
+    roh = body.get("eintraege")
+    if not isinstance(roh, list) or not roh:
+        return JSONResponse({"ok": False, "error": "keine Einträge"}, status_code=400)
+
+    jetzt = dt.datetime.now(dt.timezone.utc)
+    uebernommen = 0
+    async with get_session() as s:
+        for eintrag in roh[:30]:
+            if not isinstance(eintrag, dict):
+                continue
+            kategorie = (eintrag.get("kategorie") or "").strip()
+            text = (eintrag.get("text") or "").strip()
+            if kategorie not in KATEGORIE_LABELS or not (3 <= len(text) <= 2000):
+                continue
+            s.add(TenantKnowledge(
+                tenant_id=tid, kategorie=kategorie, text=text,
+                sichtbarkeit=SICHTBARKEIT_KUNDE, quelle=QUELLE_IMPORT,
+                zuletzt_bestaetigt_am=jetzt,
+            ))
+            uebernommen += 1
+    return JSONResponse({"ok": True, "uebernommen": uebernommen})
+
+
+# ------------------------- Wissensluecken ----------------------------
+
+@router.get("/wissensluecken")
+async def api_wissensluecken(
+    request: Request, _e=Depends(require_app_user),
+) -> JSONResponse:
+    """Fragen, die Q Kunden nicht beantworten konnte — haeufigste zuerst."""
+    tid = current_tenant_id(request)
+    from core.services import wissen as wissen_service
+    return JSONResponse({
+        "ok": True,
+        "luecken": await wissen_service.offene_luecken(tid),
+    })
+
+
+@router.post("/wissensluecken/{lid}/beantworten")
+async def api_wissensluecke_beantworten(
+    lid: str, request: Request,
+    _e=Depends(require_app_permission("wissen.pflegen")), _c=Depends(require_app_csrf),
+) -> JSONResponse:
+    """Antwort auf eine Luecke -> wird sofort zum Wissens-Eintrag.
+
+    Das ist der Kreislauf, der die Wissensbasis aus dem laufenden Betrieb
+    wachsen laesst: Kunde fragt, Q kann nicht, Betrieb antwortet einmal,
+    ab dann kann Q es auf jedem Kanal.
+    """
+    tid = current_tenant_id(request)
+    try:
+        lid_uuid = uuid.UUID(lid)
+    except (ValueError, TypeError):
+        return JSONResponse({"ok": False, "error": "ungueltige id"}, status_code=400)
+    body = await request.json() or {}
+    text = (body.get("text") or "").strip()
+    kategorie = (body.get("kategorie") or KATEGORIE_FAQ).strip()
+    sichtbarkeit = (body.get("sichtbarkeit") or SICHTBARKEIT_KUNDE).strip()
+    if kategorie not in KATEGORIE_LABELS:
+        kategorie = KATEGORIE_FAQ
+    if sichtbarkeit not in ALLE_SICHTBARKEITEN:
+        sichtbarkeit = SICHTBARKEIT_KUNDE
+    if not (3 <= len(text) <= 2000):
+        return JSONResponse({"ok": False, "error": "Text 3–2000 Zeichen"}, status_code=400)
+
+    jetzt = dt.datetime.now(dt.timezone.utc)
+    async with get_session() as s:
+        luecke = (await s.execute(
+            select(Wissensluecke)
+            .where(Wissensluecke.id == lid_uuid)
+            .where(Wissensluecke.tenant_id == tid)
+        )).scalar_one_or_none()
+        if luecke is None:
+            return JSONResponse({"ok": False, "error": "nicht gefunden"}, status_code=404)
+        eintrag = TenantKnowledge(
+            tenant_id=tid, kategorie=kategorie, text=text,
+            sichtbarkeit=sichtbarkeit, quelle=QUELLE_MENSCH,
+            zuletzt_bestaetigt_am=jetzt,
+        )
+        s.add(eintrag)
+        # flush, damit eintrag.id fuer die Verknuepfung existiert
+        await s.flush()
+        luecke.status = LUECKE_STATUS_BEANTWORTET
+        luecke.erledigt_am = jetzt
+        luecke.knowledge_id = eintrag.id
+    return JSONResponse({"ok": True})
+
+
+@router.post("/wissensluecken/{lid}/verwerfen")
+async def api_wissensluecke_verwerfen(
+    lid: str, request: Request,
+    _e=Depends(require_app_permission("wissen.pflegen")), _c=Depends(require_app_csrf),
+) -> JSONResponse:
+    """Einzelfall, den niemand pflegen muss — verschwindet aus der Liste."""
+    tid = current_tenant_id(request)
+    try:
+        lid_uuid = uuid.UUID(lid)
+    except (ValueError, TypeError):
+        return JSONResponse({"ok": False, "error": "ungueltige id"}, status_code=400)
+    async with get_session() as s:
+        luecke = (await s.execute(
+            select(Wissensluecke)
+            .where(Wissensluecke.id == lid_uuid)
+            .where(Wissensluecke.tenant_id == tid)
+        )).scalar_one_or_none()
+        if luecke is None:
+            return JSONResponse({"ok": False, "error": "nicht gefunden"}, status_code=404)
+        luecke.status = LUECKE_STATUS_VERWORFEN
+        luecke.erledigt_am = dt.datetime.now(dt.timezone.utc)
+    return JSONResponse({"ok": True})
+
+
+# ------------------------ Ueberschlags-Formeln -----------------------
+
+@router.get("/kalkulationen")
+async def api_kalkulationen(
+    request: Request, _e=Depends(require_app_user),
+) -> JSONResponse:
+    tid = current_tenant_id(request)
+    async with get_session() as s:
+        rows = (await s.execute(
+            select(TenantKalkulation)
+            .where(TenantKalkulation.tenant_id == tid)
+            .order_by(TenantKalkulation.sortierung, TenantKalkulation.name)
+        )).scalars().all()
+    return JSONResponse({"formeln": [{
+        "id": str(r.id),
+        "name": r.name,
+        "formel": r.formel,
+        "variablen": list(r.variablen or []),
+        "einheit": r.einheit or "EUR",
+        "beschreibung": r.beschreibung or "",
+        "aktiv": bool(r.aktiv),
+    } for r in rows]})
+
+
+@router.post("/kalkulationen")
+async def api_kalkulation_add(
+    request: Request,
+    _e=Depends(require_app_permission("wissen.pflegen")), _c=Depends(require_app_csrf),
+) -> JSONResponse:
+    """Formel anlegen. Die Variablenliste faellt aus der Formel ab, damit
+    der Betrieb sie nicht doppelt pflegt (und sie nie auseinanderlaufen)."""
+    from core.services.kalkulation import FormelFehler, pruefe_formel
+
+    tid = current_tenant_id(request)
+    body = await request.json() or {}
+    name = (body.get("name") or "").strip()
+    formel = (body.get("formel") or "").strip()
+    einheit = (body.get("einheit") or "EUR").strip()[:50]
+    beschreibung = (body.get("beschreibung") or "").strip() or None
+    if not (2 <= len(name) <= 200):
+        return JSONResponse({"ok": False, "error": "Name 2–200 Zeichen"}, status_code=400)
+    try:
+        variablen = pruefe_formel(formel)
+    except FormelFehler as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+    async with get_session() as s:
+        s.add(TenantKalkulation(
+            tenant_id=tid, kategorie="allgemein", name=name, formel=formel,
+            variablen=variablen, einheit=einheit, beschreibung=beschreibung,
+        ))
+    return JSONResponse({"ok": True, "variablen": variablen})
+
+
+@router.post("/kalkulationen/{kid}/loeschen")
+async def api_kalkulation_delete(
+    kid: str, request: Request,
+    _e=Depends(require_app_permission("wissen.pflegen")), _c=Depends(require_app_csrf),
+) -> JSONResponse:
+    tid = current_tenant_id(request)
+    try:
+        kid_uuid = uuid.UUID(kid)
+    except (ValueError, TypeError):
+        return JSONResponse({"ok": False, "error": "ungueltige id"}, status_code=400)
+    async with get_session() as s:
+        k = (await s.execute(
+            select(TenantKalkulation)
+            .where(TenantKalkulation.id == kid_uuid)
+            .where(TenantKalkulation.tenant_id == tid)
+        )).scalar_one_or_none()
+        if k is None:
+            return JSONResponse({"ok": False, "error": "nicht gefunden"}, status_code=404)
+        await s.delete(k)
+    return JSONResponse({"ok": True})
+
+
+@router.post("/kalkulationen/{kid}/rechnen")
+async def api_kalkulation_rechnen(
+    kid: str, request: Request, _e=Depends(require_app_user),
+    _c=Depends(require_app_csrf),
+) -> JSONResponse:
+    """Probelauf in der App — damit man die Formel testen kann, bevor Q
+    sie einem Kunden am Telefon vorrechnet."""
+    from core.services.kalkulation import rechne
+
+    tid = current_tenant_id(request)
+    body = await request.json() or {}
+    werte = body.get("werte") or {}
+    if not isinstance(werte, dict):
+        return JSONResponse({"ok": False, "error": "werte muss ein Objekt sein"},
+                            status_code=400)
+    return JSONResponse(await rechne(tid, kid, werte))
 
 
 # =========================== Anfragen-Inbox ===============================
@@ -3876,6 +4430,7 @@ async def api_anfrage_detail(
         "subject": c.last_subject or "(kein Betreff)",
         "last_user_message": c.last_user_message or "",
         "last_q_reply": c.last_q_reply or "",
+        "genutztes_wissen": c.genutztes_wissen or [],
         "classification": c.classification or "",
         "classification_label": cls_label,
         "classification_style": cls_style,
@@ -5703,6 +6258,19 @@ async def api_formular_q(
         return JSONResponse({"ok": False, "error": err}, status_code=400)
 
     tenant = request.state.app_tenant
+    # Die Wissensbasis mitgeben: sonst schlaegt Q bei "mach eine Auswahl mit
+    # unseren Gewerken" Branchen-Klischees vor statt der Leistungen, die
+    # dieser Betrieb wirklich anbietet. Best-effort — ein Umbau darf nicht
+    # daran scheitern, dass die Wissensbasis gerade nicht ladbar ist; dann
+    # arbeitet Q eben ohne diesen Kontext weiter.
+    try:
+        from core.services import wissen as _wissen
+        wissens_kontext = await _wissen.baue_zeilen(
+            tid, max_chars=1500, leer_text="",
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Formular-Q: Wissensbasis nicht ladbar (tenant=%s): %s", tid, exc)
+        wissens_kontext = ""
     vorschlag = await formular_umbauen(
         schema={
             "title": (body.get("title") or "").strip(),
@@ -5712,6 +6280,7 @@ async def api_formular_q(
         auftrag=auftrag,
         branche=getattr(tenant, "branche", "") or "",
         company_name=tenant.company_name or "",
+        wissensbasis=wissens_kontext,
     )
     if not vorschlag.get("ok"):
         return JSONResponse(
@@ -6048,6 +6617,10 @@ async def api_termin_anlegen(
         "event_id": res.get("event_id"),
         "datum": payload["datum"],
         "uhrzeit": payload["uhrzeit"],
+        # z.B. "Marco arbeitet zu dieser Zeit laut Planung nicht" —
+        # gebucht wird trotzdem, der Nutzer soll es nur wissen.
+        "hinweise": res.get("hinweise") or [],
+        "mitarbeiter": res.get("mitarbeiter") or "",
     })
 
 

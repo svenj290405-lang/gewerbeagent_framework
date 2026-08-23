@@ -823,7 +823,11 @@ async def _run_termin_anlegen(ctx: Ctx, args: dict) -> dict:
     if (res or {}).get("error"):
         return {"ok": False, "error": res.get("error")}
     return {"ok": True, "datum": datum, "uhrzeit": uhrzeit,
-            "kunde": name, "event_id": (res or {}).get("event_id")}
+            "kunde": name, "event_id": (res or {}).get("event_id"),
+            # Abwesenheit / fehlender Kalender: Q soll es sagen, statt
+            # kommentarlos in einen Urlaub hinein zu buchen.
+            "mitarbeiter": (res or {}).get("mitarbeiter") or "",
+            "hinweise": (res or {}).get("hinweise") or []}
 
 
 def _summary_termin(ctx: Ctx, args: dict) -> str:
@@ -1155,44 +1159,80 @@ async def _run_offene_anfragen(ctx: Ctx, args: dict) -> dict:
 
 
 async def _run_wissen_suchen(ctx: Ctx, args: dict) -> dict:
-    from core.database.connection import get_session
-    from core.models.tenant_knowledge import TenantKnowledge, KATEGORIE_LABELS
-    from sqlalchemy import select
+    """Wissensdatenbank durchsuchen.
+
+    Nutzt dasselbe Ranking wie Telefon und Mail (core/services/wissen.py)
+    statt eines eigenen ``ilike`` — sonst findet Q in der App etwas, was er
+    am Telefon nicht findet, und der Inhaber kann Kundenauskuenfte nicht
+    nachvollziehen.
+
+    ``nur_kunde=False``: in der App sieht der Betrieb auch seine internen
+    Eintraege. Nach draussen gehen die nie (Voice/Mail filtern).
+    """
+    from core.models.tenant_knowledge import SICHTBARKEIT_KUNDE
+    from core.services import wissen as wissen_service
 
     frage = (args.get("frage") or "").strip()
+    alle = await wissen_service.lade(ctx.tid, nur_kunde=False)
+    treffer = wissen_service.sortiere(frage, alle, limit=12) if frage else alle[:30]
+    if frage and not treffer:  # nichts Passendes → lieber alles zeigen
+        treffer = alle[:30]
+    return {"eintraege": [{
+        "kategorie": e.label,
+        "text": e.text,
+        "nur_intern": e.sichtbarkeit != SICHTBARKEIT_KUNDE,
+    } for e in treffer]}
 
-    async def _fetch(filtered: bool):
-        async with get_session() as s:
-            q = select(TenantKnowledge).where(TenantKnowledge.tenant_id == ctx.tid)
-            if filtered and len(frage) >= 2:
-                q = q.where(TenantKnowledge.text.ilike(f"%{frage}%"))
-            return (await s.execute(
-                q.order_by(TenantKnowledge.kategorie).limit(30))).scalars().all()
 
-    rows = await _fetch(filtered=True)
-    if frage and not rows:  # Filter ohne Treffer → alles liefern (Tabelle ist klein)
-        rows = await _fetch(filtered=False)
-    return {"eintraege": [
-        {"kategorie": KATEGORIE_LABELS.get(r.kategorie, r.kategorie), "text": r.text}
-        for r in rows]}
+async def _run_wissensluecken(ctx: Ctx, args: dict) -> dict:
+    """Die Kundenfragen, auf die Q keine Antwort hatte."""
+    from core.services import wissen as wissen_service
+    luecken = await wissen_service.offene_luecken(ctx.tid, limit=10)
+    return {"anzahl": len(luecken), "luecken": luecken}
+
+
+async def _run_ueberschlag(ctx: Ctx, args: dict) -> dict:
+    """Richtwert nach einer hinterlegten Formel — deterministisch gerechnet."""
+    from core.services.kalkulation import rechne
+    werte = args.get("werte") or {}
+    if not isinstance(werte, dict):
+        werte = {}
+    return await rechne(ctx.tid, (args.get("name") or "").strip(), werte)
 
 
 # ---- WRITE (Erweiterung) --------------------------------------------------
 
 async def _run_wissen_merken(ctx: Ctx, args: dict) -> dict:
+    import datetime as _dt
+
     from core.database.connection import get_session
-    from core.models.tenant_knowledge import TenantKnowledge, KATEGORIE_LABELS
+    from core.models.tenant_knowledge import (
+        ALLE_SICHTBARKEITEN, KATEGORIE_LABELS, QUELLE_Q, SICHTBARKEIT_KUNDE,
+        TenantKnowledge,
+    )
 
     kategorie = (args.get("kategorie") or "").strip()
     text = (args.get("text") or "").strip()
+    sichtbarkeit = (args.get("sichtbarkeit") or SICHTBARKEIT_KUNDE).strip()
     if kategorie not in KATEGORIE_LABELS:
         kategorie = "faq"
+    if sichtbarkeit not in ALLE_SICHTBARKEITEN:
+        sichtbarkeit = SICHTBARKEIT_KUNDE
     if not (3 <= len(text) <= 2000):
         return {"ok": False, "error": "Text muss 3–2000 Zeichen haben."}
     async with get_session() as s:
-        s.add(TenantKnowledge(tenant_id=ctx.tid, kategorie=kategorie, text=text))
+        s.add(TenantKnowledge(
+            tenant_id=ctx.tid, kategorie=kategorie, text=text,
+            sichtbarkeit=sichtbarkeit, quelle=QUELLE_Q,
+            zuletzt_bestaetigt_am=_dt.datetime.now(_dt.timezone.utc),
+        ))
         await s.commit()
-    return {"ok": True, "kategorie": KATEGORIE_LABELS.get(kategorie, kategorie), "text": text}
+    return {
+        "ok": True,
+        "kategorie": KATEGORIE_LABELS.get(kategorie, kategorie),
+        "text": text,
+        "sichtbarkeit": sichtbarkeit,
+    }
 
 
 def _summary_wissen(ctx: Ctx, args: dict) -> str:
@@ -1453,6 +1493,86 @@ async def _run_wissen_loeschen(ctx: Ctx, args: dict) -> dict:
 
 def _summary_wissen_loeschen(ctx: Ctx, args: dict) -> str:
     return f"Wissens-Eintrag mit „{(args.get('suchtext') or '—').strip()}\" löschen?"
+
+
+async def _run_wissensluecke_beantworten(ctx: Ctx, args: dict) -> dict:
+    """Schliesst eine offene Kundenfrage: Antwort -> Wissens-Eintrag.
+
+    Damit kann der Inhaber die Luecke im Vorbeigehen erledigen ("Q, zu
+    der Vinyl-Frage: ja, verlegen wir, ab 35 Euro den Quadratmeter"),
+    statt erst in die Wissens-Ansicht zu wechseln.
+    """
+    import datetime as _dt
+    from sqlalchemy import select
+
+    from core.database.connection import get_session
+    from core.models.tenant_knowledge import (
+        KATEGORIE_LABELS, QUELLE_MENSCH, SICHTBARKEIT_KUNDE, TenantKnowledge,
+    )
+    from core.models.wissensluecke import (
+        STATUS_BEANTWORTET, STATUS_OFFEN, Wissensluecke,
+    )
+    from core.services import wissen as wissen_service
+
+    such = (args.get("frage") or "").strip()
+    antwort = (args.get("antwort") or "").strip()
+    kategorie = (args.get("kategorie") or "faq").strip()
+    if kategorie not in KATEGORIE_LABELS:
+        kategorie = "faq"
+    if not (3 <= len(antwort) <= 2000):
+        return {"ok": False, "error": "Die Antwort muss 3–2000 Zeichen haben."}
+
+    async with get_session() as s:
+        offene = (await s.execute(
+            select(Wissensluecke)
+            .where(Wissensluecke.tenant_id == ctx.tid)
+            .where(Wissensluecke.status == STATUS_OFFEN)
+            .order_by(Wissensluecke.anzahl.desc())
+            .limit(50)
+        )).scalars().all()
+        if not offene:
+            return {"ok": False, "error": "Es sind keine offenen Fragen da."}
+
+        if such:
+            passend = [
+                o for o in offene
+                if wissen_service.aehnlichkeit(such, o.frage) >= 0.4
+            ]
+        else:
+            # Ohne Suchtext nur eindeutig, wenn genau eine Frage offen ist.
+            passend = offene if len(offene) == 1 else []
+        if not passend:
+            return {
+                "ok": False,
+                "error": "Ich finde die Frage nicht eindeutig. Offen sind: "
+                         + "; ".join(o.frage[:80] for o in offene[:5]),
+            }
+        if len(passend) > 1:
+            return {
+                "ok": False,
+                "error": "Mehrere Fragen passen: "
+                         + "; ".join(o.frage[:80] for o in passend[:5]),
+            }
+
+        luecke = passend[0]
+        jetzt = _dt.datetime.now(_dt.timezone.utc)
+        eintrag = TenantKnowledge(
+            tenant_id=ctx.tid, kategorie=kategorie, text=antwort,
+            sichtbarkeit=SICHTBARKEIT_KUNDE, quelle=QUELLE_MENSCH,
+            zuletzt_bestaetigt_am=jetzt,
+        )
+        s.add(eintrag)
+        await s.flush()
+        luecke.status = STATUS_BEANTWORTET
+        luecke.erledigt_am = jetzt
+        luecke.knowledge_id = eintrag.id
+        await s.commit()
+        return {"ok": True, "frage": luecke.frage, "antwort": antwort}
+
+
+def _summary_wissensluecke_beantworten(ctx: Ctx, args: dict) -> str:
+    f = (args.get("frage") or "die offene Frage").strip()
+    return f"Die Frage „{f[:70]}\" mit deiner Antwort in die Wissensdatenbank aufnehmen?"
 
 
 # ---- WRITE (Kundenzyklus / Beleg-Fluss) -----------------------------------
@@ -2001,6 +2121,25 @@ _REGISTRY: list[ToolSpec] = [
         parameters={"type": "OBJECT", "properties": {
             "frage": {"type": _S, "description": "Suchbegriff/Stichwort (optional — leer = alles)."}}},
         run=_run_wissen_suchen),
+    ToolSpec(
+        name="wissensluecken", kind="read",
+        description="Zeigt Fragen, die Kunden am Telefon oder per Mail gestellt "
+                    "haben und die Q nicht beantworten konnte, weil nichts in der "
+                    "Wissensdatenbank stand. Häufigste zuerst.",
+        parameters={"type": "OBJECT", "properties": {}},
+        run=_run_wissensluecken),
+    ToolSpec(
+        name="ueberschlag", kind="read",
+        description="Rechnet einen Preis-Richtwert nach einer hinterlegten Formel "
+                    "des Betriebs (z.B. 'Wand streichen' mit qm). Rechnet "
+                    "deterministisch — nie selbst schätzen. Fehlen Angaben, sagt "
+                    "das Ergebnis welche.",
+        parameters={"type": "OBJECT", "properties": {
+            "name": {"type": _S, "description": "Name der Formel, z.B. 'Wand streichen'."},
+            "werte": {"type": "OBJECT", "description":
+                      "Die Werte der Variablen als Objekt, z.B. {\"qm\": 30}."}},
+            "required": ["name"]},
+        run=_run_ueberschlag),
 
     # ---- WRITE (Erweiterung) ----
     ToolSpec(
@@ -2013,9 +2152,32 @@ _REGISTRY: list[ToolSpec] = [
                           "description": "leistungen | materialien | preise | anfahrt | "
                                          "oeffnungszeiten | notfall | besonderheiten | faq.",
                           "enum": ["leistungen", "materialien", "preise", "anfahrt",
-                                   "oeffnungszeiten", "notfall", "besonderheiten", "faq"]}},
+                                   "oeffnungszeiten", "notfall", "besonderheiten", "faq"]},
+            "sichtbarkeit": {"type": _S,
+                             "description": "'kunde' (Standard) = Q darf es Kunden am "
+                                            "Telefon und per Mail sagen. 'intern' = nur "
+                                            "der Betrieb sieht es (Einkaufspreise, Margen, "
+                                            "Notizen über Kunden). Im Zweifel 'kunde'.",
+                             "enum": ["kunde", "intern"]}},
             "required": ["text"]},
         run=_run_wissen_merken, summarize=_summary_wissen),
+    ToolSpec(
+        name="wissensluecke_beantworten", kind="write", permission="wissen.pflegen",
+        description="Beantwortet eine offene Kundenfrage aus der Lücken-Liste: legt "
+                    "die Antwort als Wissens-Eintrag an und hakt die Frage ab.",
+        parameters={"type": "OBJECT", "properties": {
+            "frage": {"type": _S, "description":
+                      "Stichwort der offenen Frage (leer, wenn nur eine offen ist)."},
+            "antwort": {"type": _S, "description":
+                        "Die Antwort, so wie Q sie künftig Kunden sagen soll."},
+            "kategorie": {"type": _S,
+                          "description": "leistungen | materialien | preise | anfahrt | "
+                                         "oeffnungszeiten | notfall | besonderheiten | faq.",
+                          "enum": ["leistungen", "materialien", "preise", "anfahrt",
+                                   "oeffnungszeiten", "notfall", "besonderheiten", "faq"]}},
+            "required": ["antwort"]},
+        run=_run_wissensluecke_beantworten,
+        summarize=_summary_wissensluecke_beantworten),
     ToolSpec(
         name="rueckruf_erledigt", kind="write",
         description="Hakt den offenen Rückruf eines Kunden als erledigt ab "

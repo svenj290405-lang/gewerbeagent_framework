@@ -73,8 +73,22 @@ function notifGranted() { return notifSupported() && Notification.permission ===
 // bündelt ALLE Anzeigen (inkl. Termine/Angebote/Rechnungen), "Mehr" den
 // Kleinkram. Termine/Büro sind keine eigenen Tabs mehr; ihre Screens bleiben
 // per Q-Chat ("zeig mir die Rechnungen") erreichbar.
+// Der Assistent-Tag traegt ein gezeichnetes Icon statt eines Emojis:
+// Sprechblase mit Funke (Gespraech + KI). Gruende gegen 🤖 — es sieht auf
+// iPhone und Android verschieden aus, wirkt wie Spielzeug, und ein Roboter
+// ist das falsche Versprechen fuer etwas, das im Namen des Betriebs mit
+// Kunden spricht. `stroke="currentColor"` laesst es die Tab-Farbe erben,
+// faerbt sich also von selbst mit, wenn der Tab aktiv wird.
+const ICO_ASSISTENT = `<svg viewBox="0 0 24 24" width="24" height="24" fill="none"
+  stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"
+  aria-hidden="true">
+  <path d="M5 4.4H14.2A3.2 3.2 0 0 1 17.4 7.6V12.6A3.2 3.2 0 0 1 14.2 15.8H10.2L5.8 20V15.8H5A3.2 3.2 0 0 1 1.8 12.6V7.6A3.2 3.2 0 0 1 5 4.4Z"/>
+  <path d="M20.4 2.2 21.1 3.7 22.6 4.4 21.1 5.1 20.4 6.6 19.7 5.1 18.2 4.4 19.7 3.7Z"
+        fill="currentColor" stroke-width="1"/>
+</svg>`;
+
 const TABS = [
-  { key: "assistent",   label: "Assistent", ico: "🤖" },
+  { key: "assistent",   label: "Assistent", ico: ICO_ASSISTENT },
   { key: "aktuelles",   label: "Aktionen",  ico: "📋" },
   { key: "_qoverlay",   label: "Q",         ico: `<canvas id="q-tab-sphere-canvas" width="22" height="22"></canvas>`, overlay: true },
   { key: "mehr",        label: "Mehr",      ico: "⋯" },
@@ -319,6 +333,7 @@ const SCREENS = {
     const auftraege = ak.auftraege || [];
     const rueckrufe = ak.rueckrufe || [];
     const aufnahmenCount = ak.aufnahmen_count || 0;
+    const wissensluecken = ak.wissensluecken || [];
     const termine = td.termine || [];
     const anfragenOffen = (ad.items || []).filter((x) => !x.closed);
     const angebote = angd.angebote || [];
@@ -363,6 +378,21 @@ const SCREENS = {
              </div>
            </div>`);
       });
+    }
+
+    // Unbeantwortete Kundenfragen. Steht bewusst VOR den Bereichs-Kacheln:
+    // es ist die einzige Karte hier, die aus echten Kundengesprächen
+    // entsteht, und sie ist in einem Satz erledigt.
+    if (wissensluecken.length && can("wissen.pflegen")) {
+      parts.push(
+        `<div class="card lead" id="ak-luecken">
+           <div><b>❓ ${wissensluecken.length} Frage${wissensluecken.length === 1 ? "" : "n"}, die Q nicht beantworten konnte</b></div>
+           ${wissensluecken.slice(0, 3).map((l) =>
+             `<div class="sub" style="margin-top:4px">„${esc(l.frage)}"${l.anzahl > 1 ? ` (${l.anzahl}×)` : ""} · ${esc(l.kanal_label)}</div>`).join("")}
+           <div class="confirm-actions" style="margin-top:10px">
+             <button class="btn-sm" id="ak-luecken-go">Beantworten</button>
+           </div>
+         </div>`);
     }
 
     parts.push(`<div class="section-title">Bereiche</div>`);
@@ -441,6 +471,8 @@ const SCREENS = {
     if (inline) inline.addEventListener("click", enablePush);
     const briefRefresh = document.getElementById("ak-briefing-refresh");
     if (briefRefresh) briefRefresh.addEventListener("click", () => loadBriefing(true));
+    const lueckenGo = document.getElementById("ak-luecken-go");
+    if (lueckenGo) lueckenGo.addEventListener("click", () => navigate("wissen"));
     loadBriefing(false);
     bindAktuelles();
     document.querySelectorAll(".home-tile[data-go]").forEach((b) =>
@@ -1131,33 +1163,281 @@ const SCREENS = {
       b.addEventListener("click", () => showAnfrage(b.dataset.anfrage)));
   },
 
+  // Wissensdatenbank.
+  //
+  // Der Bildschirm ist nach Dringlichkeit sortiert, nicht nach Datenmodell:
+  // ganz oben die Fragen, die Kunden gestellt haben und Q nicht beantworten
+  // konnte (das ist echte, konkrete Arbeit mit sofortigem Effekt), dann
+  // Widersprüche/veraltete Preise, dann erst die Einträge selbst.
   async wissen() {
-    const res = await api("/app/api/wissen");
-    if (res && !res.ok) { App.view.innerHTML = errorScreen("Wissen konnte nicht geladen werden."); return; }
-    const d = res && res.ok ? await res.json() : { eintraege: [], kategorien: [] };
-    // Wissen anlegen/loeschen — serverseitig durchgesetzt, hier nur Anzeige.
-    const isInhaber = can("wissen.pflegen");
-    // nach Kategorie gruppieren
+    const [resW, resL, resP, resK] = await Promise.all([
+      api("/app/api/wissen"),
+      api("/app/api/wissensluecken"),
+      api("/app/api/wissen/pruefung"),
+      api("/app/api/kalkulationen"),
+    ]);
+    if (resW && !resW.ok) { App.view.innerHTML = errorScreen("Wissen konnte nicht geladen werden."); return; }
+    const d = resW && resW.ok ? await resW.json() : { eintraege: [], kategorien: [], sichtbarkeiten: [] };
+    const luecken = resL && resL.ok ? (await resL.json()).luecken || [] : [];
+    const pruef = resP && resP.ok ? await resP.json() : { widersprueche: [], veraltet: [] };
+    const formeln = resK && resK.ok ? (await resK.json()).formeln || [] : [];
+
+    const darfPflegen = can("wissen.pflegen");
+    const eintraege = d.eintraege || [];
+    const katOpts = (sel) => (d.kategorien || []).map((k) =>
+      `<option value="${esc(k.key)}"${k.key === sel ? " selected" : ""}>${esc(k.label)}</option>`).join("");
+    const sichtOpts = (sel) => (d.sichtbarkeiten || []).map((s) =>
+      `<option value="${esc(s.key)}"${s.key === sel ? " selected" : ""}>${esc(s.label)}</option>`).join("");
+
+    // --- 1. Offene Kundenfragen -------------------------------------
+    const lueckenCard = luecken.length ? `
+      <div class="card" style="border-left:3px solid var(--warn)">
+        <h2>❓ Das wurde gefragt — Antwort fehlt (${luecken.length})</h2>
+        <div class="sub" style="margin-bottom:10px">
+          Diese Fragen haben Kunden am Telefon oder per Mail gestellt. Beantworte sie
+          einmal, dann kann Q es ab sofort selbst.
+        </div>
+        ${luecken.map((l) => `
+          <div class="row" style="flex-direction:column;align-items:stretch;gap:6px">
+            <div>
+              <b>${esc(l.frage)}</b>
+              <span class="pill">${esc(l.kanal_label)}</span>
+              ${l.anzahl > 1 ? `<span class="pill warn">${l.anzahl}× gefragt</span>` : ""}
+            </div>
+            ${l.kunde ? `<div class="sub">von ${esc(l.kunde)}</div>` : ""}
+            ${darfPflegen ? `
+              <textarea data-luecke-text="${esc(l.id)}" rows="2" placeholder="Antwort, so wie Q sie Kunden sagen soll …"
+                style="width:100%;padding:10px;border:1px solid var(--line);border-radius:10px;font-size:16px"></textarea>
+              <div style="display:flex;gap:8px;flex-wrap:wrap">
+                <select data-luecke-kat="${esc(l.id)}" style="flex:1;min-width:140px;padding:10px;border:1px solid var(--line);border-radius:10px">${katOpts("faq")}</select>
+                <button class="btn-sm" data-luecke-save="${esc(l.id)}">Speichern</button>
+                <button class="btn-sm btn-ghost" data-luecke-drop="${esc(l.id)}">Unwichtig</button>
+              </div>` : ""}
+          </div>`).join("")}
+      </div>` : "";
+
+    // --- 2. Prüfung: Widersprüche + veraltete Preise ------------------
+    const wid = pruef.widersprueche || [];
+    const alt = pruef.veraltet || [];
+    const pruefCard = (wid.length || alt.length) ? `
+      <div class="card" style="border-left:3px solid var(--danger)">
+        <h2>⚠️ Nachschauen</h2>
+        ${wid.length ? `<div class="sub" style="margin:6px 0">
+            Zwei Angaben zum selben Thema nennen verschiedene Beträge. Q sagt sonst am
+            Telefon eine andere Zahl, als im Angebot steht.</div>
+          ${wid.map((c) => `<div class="row" style="flex-direction:column;align-items:stretch;gap:4px">
+              <div class="sub">${esc(c.a_text)}</div>
+              <div class="sub">${esc(c.b_text)}</div>
+              <div><span class="pill danger">${c.betraege.map((b) => esc(String(b))).join(" € · ")} €</span></div>
+            </div>`).join("")}` : ""}
+        ${alt.length ? `<div class="sub" style="margin:10px 0 6px">
+            Länger nicht bestätigt — stimmen die Zahlen noch?</div>
+          ${alt.map((v) => `<div class="row">
+              <div style="flex:1;min-width:0"><div>${esc(v.text)}</div>
+                <div class="sub">${esc(v.kategorie_label)} · seit ${v.tage} Tagen unverändert</div></div>
+              ${darfPflegen ? `<button class="btn-sm btn-ghost" data-w-ok="${esc(v.id)}">Gilt noch</button>` : ""}
+            </div>`).join("")}` : ""}
+      </div>` : "";
+
+    // --- 3. Einträge, nach Kategorie ---------------------------------
     const byCat = {};
-    (d.eintraege || []).forEach((e) => { (byCat[e.kategorie_label] = byCat[e.kategorie_label] || []).push(e); });
+    eintraege.forEach((e) => { (byCat[e.kategorie_label] = byCat[e.kategorie_label] || []).push(e); });
+    const eintragRow = (e) => `
+      <div class="row" data-w-row="${esc(e.id)}" data-such="${esc((e.text + " " + e.kategorie_label).toLowerCase())}">
+        <div style="flex:1;min-width:0">
+          <div${e.aktiv ? "" : ` style="opacity:.5"`}>${esc(e.text)}</div>
+          <div class="sub" style="margin-top:3px">
+            ${e.sichtbarkeit === "intern" ? `<span class="pill">nur intern</span> ` : ""}
+            ${e.aktiv ? "" : `<span class="pill">stillgelegt</span> `}
+            ${e.veraltet ? `<span class="pill warn">${e.tage_alt} Tage alt</span> ` : ""}
+            ${esc(e.quelle_label)}
+          </div>
+        </div>
+        ${darfPflegen ? `<div style="display:flex;gap:4px;flex-shrink:0">
+          <button class="btn-sm btn-ghost" data-w-edit="${esc(e.id)}" title="Bearbeiten">✎</button>
+          <button class="btn-sm btn-ghost" data-del-wissen="${esc(e.id)}" title="Löschen">✕</button>
+        </div>` : ""}
+      </div>`;
     const groups = Object.keys(byCat).map((label) =>
-      `<div class="card"><h2>${esc(label)}</h2>${byCat[label].map((e) =>
-        `<div class="row"><div>${esc(e.text)}</div>${isInhaber ? `<button class="btn-sm btn-ghost" data-del-wissen="${e.id}">✕</button>` : ""}</div>`).join("")}</div>`).join("");
-    const opts = (d.kategorien || []).map((k) => `<option value="${k.key}">${esc(k.label)}</option>`).join("");
+      `<div class="card"><h2>${esc(label)}</h2>${byCat[label].map(eintragRow).join("")}</div>`).join("");
+
+    // --- 4. Überschlags-Formeln --------------------------------------
+    const formelCard = `
+      <details class="card">
+        <summary style="cursor:pointer;font-weight:600">🧮 Überschlags-Formeln (${formeln.length})</summary>
+        <div class="sub" style="margin:8px 0">
+          Damit beantwortet Q „Was kostet das ungefähr?" — gerechnet wird nach deiner
+          Formel, nicht geschätzt. Variablen schreibst du einfach als Wort hinein,
+          z.B. <code>qm * 45 + anfahrt</code>.
+        </div>
+        ${formeln.length ? formeln.map((f) => `
+          <div class="row">
+            <div style="flex:1;min-width:0">
+              <div><b>${esc(f.name)}</b></div>
+              <div class="sub"><code>${esc(f.formel)}</code> → ${esc(f.einheit)}</div>
+              ${f.variablen.length ? `<div class="sub">fragt ab: ${f.variablen.map(esc).join(", ")}</div>` : ""}
+            </div>
+            ${darfPflegen ? `<button class="btn-sm btn-ghost" data-k-del="${esc(f.id)}">✕</button>` : ""}
+          </div>`).join("") : emptyRow("Noch keine Formel.")}
+        ${darfPflegen ? `
+          <div style="display:flex;flex-direction:column;gap:8px;margin-top:10px">
+            <input id="k-name" placeholder="Name, z.B. Wand streichen"
+              style="padding:12px;border:1px solid var(--line);border-radius:10px;font-size:16px">
+            <input id="k-formel" placeholder="Formel, z.B. qm * 12 + anfahrt"
+              style="padding:12px;border:1px solid var(--line);border-radius:10px;font-size:16px">
+            <button class="btn-sm" id="k-add">Formel hinzufügen</button>
+          </div>` : ""}
+      </details>`;
+
+    // --- Zusammensetzen ----------------------------------------------
     App.view.innerHTML =
       `<button class="btn-sm btn-ghost" id="back-mehr" style="margin-bottom:10px">← Zurück</button>` +
-      (groups || `<p class="empty">Noch keine Einträge.</p>`) +
-      `<div class="card"><h2>Neuer Eintrag</h2>
-         <select id="w-kat" style="width:100%;padding:12px;border:1px solid var(--line);border-radius:10px;margin-bottom:8px">${opts}</select>
+      `<div style="display:flex;align-items:center;justify-content:space-between;margin:4px 4px 14px">
+         <h1 style="font-size:22px;margin:0">Wissen</h1>
+         <span class="sub">${eintraege.length} ${eintraege.length === 1 ? "Eintrag" : "Einträge"}</span>
+       </div>` +
+      lueckenCard + pruefCard +
+      // Ganz oben, solange die Wissensbasis fast leer ist: dann ist das
+      // Interview die sinnvollste nächste Handlung. Später rutscht es als
+      // ruhige Zeile unter die Einträge (siehe interviewZeile).
+      (darfPflegen && eintraege.length < 5 ? `
+        <div class="card lead">
+          <div><b>🎤 In 8 Fragen eingerichtet</b></div>
+          <div class="sub" style="margin-top:4px">
+            Q fragt dich der Reihe nach — du kannst einfach draufsprechen.
+            Danach kann er Kunden am Telefon antworten.
+          </div>
+          <div class="confirm-actions" style="margin-top:10px">
+            <button class="btn-sm" id="iv-start">Los geht's</button>
+          </div>
+        </div>` : "") +
+      (eintraege.length > 6 ? `<input id="w-such" placeholder="Suchen …"
+         style="width:100%;padding:12px;border:1px solid var(--line);border-radius:10px;font-size:16px;margin-bottom:10px">` : "") +
+      (groups || emptyRow("Noch keine Einträge.")) +
+      (darfPflegen ? `<div class="card"><h2>Neuer Eintrag</h2>
+         <select id="w-kat" style="width:100%;padding:12px;border:1px solid var(--line);border-radius:10px;margin-bottom:8px">${katOpts(null)}</select>
          <textarea id="w-text" rows="3" placeholder="Wissen eingeben (z.B. Preise, Anfahrt, Öffnungszeiten) …" style="width:100%;padding:12px;border:1px solid var(--line);border-radius:10px;font-size:16px"></textarea>
-         <button class="btn-sm" id="w-add" style="margin-top:8px;width:100%">Hinzufügen</button></div>`;
+         <select id="w-sicht" style="width:100%;padding:12px;border:1px solid var(--line);border-radius:10px;margin-top:8px">${sichtOpts("kunde")}</select>
+         <button class="btn-sm" id="w-add" style="margin-top:8px;width:100%">Hinzufügen</button></div>` : "") +
+      (darfPflegen && eintraege.length >= 5
+        ? `<button class="btn-sm btn-ghost" id="iv-start2" style="width:100%;margin-bottom:10px">🎤 Die 8 Einrichtungs-Fragen durchgehen</button>`
+        : "") +
+      formelCard +
+      (darfPflegen ? `
+        <details class="card">
+          <summary style="cursor:pointer;font-weight:600">🌐 Aus eurer Website übernehmen</summary>
+          <div class="sub" style="margin:8px 0">
+            Ich lese eine Seite und schlage Einträge vor. Du hakst ab, was stimmt —
+            gespeichert wird nichts automatisch.
+          </div>
+          <input id="imp-url" placeholder="www.euer-betrieb.de/leistungen"
+            style="width:100%;padding:12px;border:1px solid var(--line);border-radius:10px;font-size:16px">
+          <button class="btn-sm" id="imp-go" style="margin-top:8px;width:100%">Seite auslesen</button>
+          <div class="sub" style="margin:12px 0 6px">Oder eine Datei — Preisliste, Flyer, altes Angebot (PDF oder Foto):</div>
+          <input type="file" id="imp-datei" accept="application/pdf,image/jpeg,image/png,image/webp"
+            style="width:100%;padding:10px;border:1px solid var(--line);border-radius:10px">
+          <div id="imp-out" style="margin-top:10px"></div>
+        </details>` : "");
+
     document.getElementById("back-mehr").addEventListener("click", () => navigate("mehr"));
-    document.getElementById("w-add").addEventListener("click", async () => {
+    ["iv-start", "iv-start2"].forEach((id) => {
+      const b = document.getElementById(id);
+      if (b) b.addEventListener("click", () => navigate("wissen_interview"));
+    });
+
+    // Suche: rein clientseitig, die Liste ist klein.
+    const such = document.getElementById("w-such");
+    if (such) such.addEventListener("input", () => {
+      const q = such.value.trim().toLowerCase();
+      document.querySelectorAll("[data-such]").forEach((row) => {
+        row.style.display = !q || row.dataset.such.includes(q) ? "" : "none";
+      });
+    });
+
+    // --- Wissenslücken beantworten ---
+    document.querySelectorAll("[data-luecke-save]").forEach((b) =>
+      b.addEventListener("click", async () => {
+        const id = b.dataset.lueckeSave;
+        const text = document.querySelector(`[data-luecke-text="${id}"]`).value.trim();
+        const kategorie = document.querySelector(`[data-luecke-kat="${id}"]`).value;
+        if (text.length < 3) { alert("Bitte eine Antwort eingeben."); return; }
+        b.disabled = true;
+        const r = await api(`/app/api/wissensluecken/${id}/beantworten`,
+          { method: "POST", body: JSON.stringify({ text, kategorie }) });
+        if (r && r.ok) navigate("wissen"); else { b.disabled = false; alert("Konnte nicht speichern."); }
+      }));
+    document.querySelectorAll("[data-luecke-drop]").forEach((b) =>
+      b.addEventListener("click", async () => {
+        b.disabled = true;
+        const r = await api(`/app/api/wissensluecken/${b.dataset.lueckeDrop}/verwerfen`,
+          { method: "POST", body: "{}" });
+        if (r && r.ok) navigate("wissen"); else { b.disabled = false; alert("Konnte nicht verwerfen."); }
+      }));
+
+    // --- "Gilt noch" ---
+    document.querySelectorAll("[data-w-ok]").forEach((b) =>
+      b.addEventListener("click", async () => {
+        b.disabled = true;
+        const r = await api(`/app/api/wissen/${b.dataset.wOk}/bestaetigen`,
+          { method: "POST", body: "{}" });
+        if (r && r.ok) navigate("wissen"); else { b.disabled = false; alert("Konnte nicht bestätigen."); }
+      }));
+
+    // --- Bearbeiten: Zeile wird zum Formular ---
+    document.querySelectorAll("[data-w-edit]").forEach((b) =>
+      b.addEventListener("click", () => {
+        const id = b.dataset.wEdit;
+        const e = eintraege.find((x) => x.id === id);
+        const row = document.querySelector(`[data-w-row="${id}"]`);
+        if (!e || !row) return;
+        row.innerHTML =
+          `<div style="flex:1;min-width:0;display:flex;flex-direction:column;gap:8px">
+             <textarea id="ed-text" rows="3" style="width:100%;padding:10px;border:1px solid var(--line);border-radius:10px;font-size:16px">${esc(e.text)}</textarea>
+             <select id="ed-kat" style="padding:10px;border:1px solid var(--line);border-radius:10px">${katOpts(e.kategorie)}</select>
+             <select id="ed-sicht" style="padding:10px;border:1px solid var(--line);border-radius:10px">${sichtOpts(e.sichtbarkeit)}</select>
+             <label class="sub" style="display:flex;align-items:center;gap:8px">
+               <input type="checkbox" id="ed-aktiv"${e.aktiv ? " checked" : ""}> aktiv (Q darf ihn nutzen)
+             </label>
+             <div style="display:flex;gap:8px">
+               <button class="btn-sm" id="ed-save">Speichern</button>
+               <button class="btn-sm btn-ghost" id="ed-cancel">Abbrechen</button>
+             </div>
+           </div>`;
+        document.getElementById("ed-cancel").addEventListener("click", () => navigate("wissen"));
+        document.getElementById("ed-save").addEventListener("click", async () => {
+          const text = document.getElementById("ed-text").value.trim();
+          if (text.length < 3) { alert("Bitte etwas mehr Text eingeben."); return; }
+          const body = {
+            text,
+            kategorie: document.getElementById("ed-kat").value,
+            sichtbarkeit: document.getElementById("ed-sicht").value,
+            aktiv: document.getElementById("ed-aktiv").checked,
+          };
+          const r = await api(`/app/api/wissen/${id}/aendern`,
+            { method: "POST", body: JSON.stringify(body) });
+          if (!r || !r.ok) { alert("Konnte nicht speichern."); return; }
+          let hinweis = null;
+          try { hinweis = (await r.json()).hinweis; } catch (_) { /* kein JSON */ }
+          if (hinweis) alert(hinweis);
+          navigate("wissen");
+        });
+      }));
+
+    // --- Anlegen / Löschen ---
+    const addBtn = document.getElementById("w-add");
+    if (addBtn) addBtn.addEventListener("click", async () => {
       const kategorie = document.getElementById("w-kat").value;
+      const sichtbarkeit = document.getElementById("w-sicht").value;
       const text = document.getElementById("w-text").value.trim();
       if (text.length < 3) { alert("Bitte etwas mehr Text eingeben."); return; }
-      const r = await api("/app/api/wissen", { method: "POST", body: JSON.stringify({ kategorie, text }) });
-      if (r && r.ok) navigate("wissen"); else alert("Konnte nicht speichern.");
+      const r = await api("/app/api/wissen", { method: "POST", body: JSON.stringify({ kategorie, text, sichtbarkeit }) });
+      if (!r || !r.ok) { alert("Konnte nicht speichern."); return; }
+      // Datenschutz-Hinweis erscheint NACH dem Speichern — nur der Betrieb
+      // weiß, ob eine Nummer seine eigene ist. Blockieren wäre bevormundend.
+      let hinweis = null;
+      try { hinweis = (await r.json()).hinweis; } catch (_) { /* kein JSON */ }
+      if (hinweis) alert(hinweis);
+      navigate("wissen");
     });
     document.querySelectorAll("[data-del-wissen]").forEach((b) =>
       b.addEventListener("click", async () => {
@@ -1165,6 +1445,230 @@ const SCREENS = {
         const r = await api(`/app/api/wissen/${b.dataset.delWissen}/loeschen`, { method: "POST", body: "{}" });
         if (r && r.ok) navigate("wissen"); else alert("Konnte nicht löschen.");
       }));
+
+    // --- Formeln ---
+    const kAdd = document.getElementById("k-add");
+    if (kAdd) kAdd.addEventListener("click", async () => {
+      const name = document.getElementById("k-name").value.trim();
+      const formel = document.getElementById("k-formel").value.trim();
+      if (!name || !formel) { alert("Name und Formel angeben."); return; }
+      kAdd.disabled = true;
+      const r = await api("/app/api/kalkulationen",
+        { method: "POST", body: JSON.stringify({ name, formel }) });
+      if (r && r.ok) { navigate("wissen"); return; }
+      kAdd.disabled = false;
+      // Die Formel-Fehlermeldung ist für Menschen geschrieben — zeigen.
+      let msg = "Konnte nicht speichern.";
+      try { msg = (await r.json()).error || msg; } catch (_) { /* Body kein JSON */ }
+      alert(msg);
+    });
+    document.querySelectorAll("[data-k-del]").forEach((b) =>
+      b.addEventListener("click", async () => {
+        if (!confirm("Formel löschen?")) return;
+        const r = await api(`/app/api/kalkulationen/${b.dataset.kDel}/loeschen`, { method: "POST", body: "{}" });
+        if (r && r.ok) navigate("wissen"); else alert("Konnte nicht löschen.");
+      }));
+
+    // --- Import: erst vorschlagen, dann übernehmen ---
+    // Website und Datei landen in derselben Auswahl-Liste — für den Nutzer
+    // ist es dieselbe Handlung, nur mit anderer Quelle.
+    const impOut = document.getElementById("imp-out");
+
+    function zeigeVorschlaege(data, leerText) {
+      const vs = data.vorschlaege || [];
+      if (!vs.length) { impOut.innerHTML = `<div class="sub">${esc(leerText)}</div>`; return; }
+      impOut.innerHTML =
+        `<div class="sub" style="margin-bottom:6px">${vs.length} Vorschläge — Haken raus, was nicht stimmt:</div>` +
+        vs.map((v, i) =>
+          `<label class="row" style="align-items:flex-start;gap:8px">
+             <input type="checkbox" data-imp-i="${i}" checked style="margin-top:4px">
+             <div style="flex:1;min-width:0"><div>${esc(v.text)}</div>
+               <div class="sub">${esc(v.kategorie_label)}</div></div>
+           </label>`).join("") +
+        `<button class="btn-sm" id="imp-save" style="margin-top:8px;width:100%">Ausgewählte übernehmen</button>`;
+      document.getElementById("imp-save").addEventListener("click", async () => {
+        const gewaehlt = [...document.querySelectorAll("[data-imp-i]")]
+          .filter((c) => c.checked)
+          .map((c) => ({ kategorie: vs[+c.dataset.impI].kategorie, text: vs[+c.dataset.impI].text }));
+        if (!gewaehlt.length) { alert("Nichts ausgewählt."); return; }
+        const r2 = await api("/app/api/wissen/import/uebernehmen",
+          { method: "POST", body: JSON.stringify({ eintraege: gewaehlt }) });
+        if (r2 && r2.ok) navigate("wissen"); else alert("Konnte nicht übernehmen.");
+      });
+    }
+
+    async function importFehlerText(r) {
+      try { return (await r.json()).error || "Das hat nicht geklappt."; }
+      catch (_) { return "Das hat nicht geklappt."; }
+    }
+
+    const impGo = document.getElementById("imp-go");
+    if (impGo) impGo.addEventListener("click", async () => {
+      const url = document.getElementById("imp-url").value.trim();
+      if (!url) { alert("Bitte eine Adresse eingeben."); return; }
+      impGo.disabled = true;
+      impOut.innerHTML = `<div class="sub">Ich lese die Seite …</div>`;
+      const r = await api("/app/api/wissen/import/website",
+        { method: "POST", body: JSON.stringify({ url }) });
+      impGo.disabled = false;
+      if (!r || !r.ok) { impOut.innerHTML = `<div class="sub">${esc(await importFehlerText(r))}</div>`; return; }
+      zeigeVorschlaege(await r.json(),
+        "Auf der Seite stand nichts, was sich als Wissens-Eintrag eignet.");
+    });
+
+    const impDatei = document.getElementById("imp-datei");
+    if (impDatei) impDatei.addEventListener("change", async () => {
+      const datei = impDatei.files && impDatei.files[0];
+      if (!datei) return;
+      impOut.innerHTML = `<div class="sub">Ich lese „${esc(datei.name)}" …</div>`;
+      // Rohe Bytes mit Content-Type — dasselbe Muster wie beim Archiv-Upload.
+      // NICHT über api(): das setzt bei jedem POST hart
+      // Content-Type: application/json und der Server sähe den Dateityp nie.
+      let r;
+      try {
+        r = await fetch(
+          `/app/api/wissen/import/datei?filename=${encodeURIComponent(datei.name)}`,
+          { method: "POST", body: datei,
+            headers: { "X-CSRF-Token": App.me.csrf, "Content-Type": datei.type } });
+      } catch (e) {
+        impOut.innerHTML = `<div class="sub">Upload fehlgeschlagen.</div>`;
+        return;
+      } finally { impDatei.value = ""; }
+      if (r.status === 303 || r.status === 401 || r.redirected) { location.href = "/app/login"; return; }
+      if (!r.ok) { impOut.innerHTML = `<div class="sub">${esc(await importFehlerText(r))}</div>`; return; }
+      zeigeVorschlaege(await r.json(),
+        "In der Datei stand nichts, was sich als Wissens-Eintrag eignet.");
+    });
+  },
+
+  // Einrichtungs-Interview: acht Fragen, eine pro Schritt.
+  //
+  // Warum ein eigener Screen und keine lange Formularseite: acht leere
+  // Textfelder untereinander sieht nach Arbeit aus und wird weggeklickt.
+  // Eine Frage pro Bildschirm, mit Diktier-Knopf, ist in zehn Minuten
+  // durch — und genau das ist der Unterschied zwischen einer gefüllten
+  // und einer leeren Wissensbasis nach dem Onboarding.
+  //
+  // Die Antworten leben in der Closure, nicht in App.*: der Screen
+  // navigiert zwischen den Schritten nicht, er rendert sich neu.
+  async wissen_interview() {
+    const res = await api("/app/api/wissen/interview");
+    if (!res || !res.ok) {
+      App.view.innerHTML = errorScreen("Die Fragen konnten nicht geladen werden.");
+      return;
+    }
+    const d = await res.json();
+    const fragen = d.fragen || [];
+    if (!fragen.length) { navigate("wissen"); return; }
+
+    const antworten = {};
+    let i = 0;
+
+    const abbrechen = () => {
+      if (Object.keys(antworten).length &&
+          !confirm("Deine Antworten sind noch nicht gespeichert. Wirklich zurück?")) return;
+      navigate("wissen");
+    };
+
+    async function speichern(btn) {
+      if (!Object.keys(antworten).length) { navigate("wissen"); return; }
+      btn.disabled = true;
+      btn.textContent = "Q formuliert …";
+      const r = await api("/app/api/wissen/interview",
+        { method: "POST", body: JSON.stringify({ antworten }) });
+      let data = null;
+      try { data = await r.json(); } catch (_) { /* kein JSON */ }
+      if (!data || !data.ok) {
+        btn.disabled = false;
+        btn.textContent = "Fertig — speichern";
+        alert((data && data.error) || "Konnte nicht speichern.");
+        return;
+      }
+      // Ergebnis zeigen statt still wegzuspringen: der Betrieb hat gerade
+      // zehn Minuten investiert und soll sehen, was daraus geworden ist —
+      // und merken, dass Q seine Diktate sauber formuliert hat.
+      App.view.innerHTML =
+        `<div class="card">
+           <div style="font-size:19px;font-weight:600;margin-bottom:4px">✅ ${data.angelegt} Einträge angelegt</div>
+           <div class="sub" style="margin-bottom:8px">So hat Q deine Antworten festgehalten:</div>
+           ${(data.eintraege || []).map((e) =>
+             `<div class="row"><div style="flex:1;min-width:0">
+                <div>${esc(e.text)}</div>
+                <div class="sub">${esc(e.kategorie_label)}</div>
+              </div></div>`).join("")}
+         </div>
+         <button class="btn-sm" id="iv-done" style="width:100%">Zur Wissensdatenbank</button>`;
+      if (data.hinweis) alert(data.hinweis);
+      document.getElementById("iv-done").addEventListener("click", () => navigate("wissen"));
+    }
+
+    function renderStep() {
+      const f = fragen[i];
+      const letzte = i === fragen.length - 1;
+      App.view.innerHTML =
+        `<button class="btn-sm btn-ghost" id="iv-back" style="margin-bottom:10px">← Abbrechen</button>` +
+        `<div class="sub" style="margin:0 4px 6px">Frage ${i + 1} von ${fragen.length}</div>` +
+        `<div class="card">
+           <div style="font-size:19px;font-weight:600;line-height:1.3;margin-bottom:6px">${esc(f.frage)}</div>
+           <div class="sub" style="margin-bottom:10px">${esc(f.hilfe)}</div>
+           <textarea id="iv-text" rows="5" placeholder="Tippen — oder auf 🎤 tippen und einfach erzählen."
+             style="width:100%;padding:12px;border:1px solid var(--line);border-radius:10px;font-size:16px">${esc(antworten[f.kategorie] || "")}</textarea>
+           <div style="display:flex;gap:8px;margin-top:8px">
+             <button class="btn-sm btn-ghost" id="iv-mic" style="flex:0 0 auto">🎤 Sprechen</button>
+             <button class="btn-sm" id="iv-next" style="flex:1">${letzte ? "Fertig — speichern" : "Weiter"}</button>
+           </div>
+           <button class="btn-sm btn-ghost" id="iv-skip" style="width:100%;margin-top:8px">Überspringen</button>
+           <div class="sub" id="iv-hint" style="margin-top:8px"></div>
+         </div>` +
+        (f.vorhanden && f.vorhanden.length
+          ? `<div class="card"><h2>Dazu steht schon da</h2>${f.vorhanden.map((t) =>
+               `<div class="row"><div class="sub">${esc(t)}</div></div>`).join("")}</div>`
+          : "");
+
+      const textEl = document.getElementById("iv-text");
+      const hintEl = document.getElementById("iv-hint");
+
+      const merken = () => {
+        const v = textEl.value.trim();
+        if (v) antworten[f.kategorie] = v; else delete antworten[f.kategorie];
+      };
+      const weiter = () => {
+        merken();
+        if (i < fragen.length - 1) { i += 1; renderStep(); }
+        else speichern(document.getElementById("iv-next"));
+      };
+
+      document.getElementById("iv-back").addEventListener("click", abbrechen);
+      document.getElementById("iv-next").addEventListener("click", weiter);
+      document.getElementById("iv-skip").addEventListener("click", () => {
+        delete antworten[f.kategorie];
+        if (i < fragen.length - 1) { i += 1; renderStep(); }
+        else speichern(document.getElementById("iv-next"));
+      });
+
+      // Diktat: derselbe Recorder wie im Assistenten. Der Text wird an das
+      // Feld angehängt statt es zu ersetzen — man erzählt oft in zwei Anläufen.
+      const mic = document.getElementById("iv-mic");
+      const voice = createVoiceRecorder({
+        onUi(on) {
+          mic.textContent = on ? "⏹ Fertig" : "🎤 Sprechen";
+          hintEl.textContent = on ? "Ich höre zu — nochmal tippen zum Beenden." : "";
+        },
+        onHint(t) { hintEl.textContent = t; },
+        onText(t) {
+          const vorher = textEl.value.trim();
+          textEl.value = vorher ? vorher + " " + t : t;
+          merken();
+          hintEl.textContent = "";
+        },
+        onError(msg) { hintEl.textContent = msg; },
+      });
+      mic.addEventListener("click", () => voice.toggle());
+      // Screen-Wechsel darf das Mikrofon nicht offen lassen.
+      App.recAbort = () => voice.stop("cancel");
+    }
+
+    renderStep();
   },
 
   async material() {
@@ -2337,7 +2841,7 @@ const SCREENS = {
     ];
     const buero = [
       { icon: "💰", label: "Buchhaltung", go: "buchhaltung", hint: "Offene Posten, Rechnungen, Angebote, Belege — alles an einem Ort" },
-      { icon: "🤖", label: "Q-Assistent", go: "assistent", hint: "Diktiere Termin/Rückruf/Angebot/Rechnung" },
+      { icon: "💬", label: "Q-Assistent", go: "assistent", hint: "Diktiere Termin/Rückruf/Angebot/Rechnung" },
     ];
     const stammdaten = [
       { icon: "🔍", label: "Kunden", go: "kunden", hint: "Kunden suchen + Profil + Archiv-Upload" },
@@ -6218,7 +6722,12 @@ async function showNewTerminForm() {
     if (res && res.ok) {
       const j = await res.json();
       if (j.ok) {
-        alert(`Termin angelegt: ${j.datum} · ${j.uhrzeit}`);
+        // Hinweise (Mitarbeiter abwesend / kein eigener Kalender) mit in
+        // die Bestätigung. Gebucht ist gebucht — aber wer in einen Urlaub
+        // hinein bucht, soll es an dieser Stelle erfahren, nicht später.
+        const hin = (j.hinweise || []).length ? "\n\n⚠️ " + j.hinweise.join("\n") : "";
+        const wer = j.mitarbeiter ? ` · ${j.mitarbeiter}` : "";
+        alert(`Termin angelegt: ${j.datum} · ${j.uhrzeit}${wer}${hin}`);
         navigate("termine"); return;
       }
       alert("Konnte nicht anlegen: " + (j.error || "unbekannt"));
@@ -6264,9 +6773,19 @@ async function showAnfrage(id) {
 
   // Letzte Q-Antwort einklappbar — Kontext wenn der Inhaber pruefen will
   // was der Bot zuletzt geschrieben hat, bevor er selbst antwortet.
+  // Antwort-Nachweis: worauf Q die Auskunft gestützt hat. Ohne das ist bei
+  // einer falschen Aussage nicht unterscheidbar, ob der Fehler in der
+  // Wissensbasis steht oder das Modell danebengegriffen hat.
+  const nachweis = (d.genutztes_wissen || []).length
+    ? `<div class="sub" style="margin-top:10px">
+         <b>Gestützt auf:</b>
+         ${d.genutztes_wissen.map((t) => `<div>· ${esc(t)}</div>`).join("")}
+         <div style="margin-top:6px"><a href="#" id="nw-wissen">In der Wissensdatenbank prüfen →</a></div>
+       </div>`
+    : "";
   const qReplyHtml = d.last_q_reply
     ? `<details class="card"><summary style="cursor:pointer;font-weight:600">Letzte Bot-Antwort an Kunden</summary>
-       <div style="margin-top:8px;white-space:pre-wrap">${esc(d.last_q_reply)}</div></details>`
+       <div style="margin-top:8px;white-space:pre-wrap">${esc(d.last_q_reply)}</div>${nachweis}</details>`
     : "";
 
   const lastMsgBlock = d.last_user_message
@@ -6311,6 +6830,8 @@ async function showAnfrage(id) {
        </div>`);
 
   document.getElementById("back-anfragen").addEventListener("click", () => navigate("aktuelles"));
+  const nwLink = document.getElementById("nw-wissen");
+  if (nwLink) nwLink.addEventListener("click", (e) => { e.preventDefault(); navigate("wissen"); });
   const sendBtn = document.getElementById("reply-send");
   if (sendBtn) {
     sendBtn.addEventListener("click", async () => {
@@ -7031,7 +7552,13 @@ function mountQSphere() {
 // und beide dieselben Bestätigungstexte zeigen sollen.
 
 function _assistResultText(tool, r) {
-  if (tool === "termin_anlegen") return `Termin für ${r.kunde} am ${r.datum} um ${r.uhrzeit} angelegt.`;
+  if (tool === "termin_anlegen") {
+    // Hinweise anhängen (Mitarbeiter abwesend / kein eigener Kalender) —
+    // gebucht wurde trotzdem, aber stillschweigend wäre es eine Falle.
+    const hin = (r.hinweise || []).length ? " ⚠️ " + r.hinweise.join(" ") : "";
+    const wer = r.mitarbeiter ? ` (${r.mitarbeiter})` : "";
+    return `Termin für ${r.kunde} am ${r.datum} um ${r.uhrzeit} angelegt${wer}.${hin}`;
+  }
   if (tool === "termin_stornieren") return `Termin von ${r.kunde} storniert${r.mail_sent ? " (Kunde per Mail informiert)" : ""}.`;
   if (tool === "rueckruf_anlegen") return `Rückruf für ${r.kunde} angelegt.`;
   if (tool === "material_bestellen") return `${r.menge}× ${r.material} bestellt.`;

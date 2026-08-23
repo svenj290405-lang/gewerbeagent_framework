@@ -123,9 +123,40 @@ ROUTE_RECHTE: dict[str, str] = {
     "api_archiv_upload": OFFEN,
     "api_archiv_notiz": OFFEN,
 
+    # Wissensbasis. Lesen ist OFFEN — die App ist das Werkzeug des
+    # Betriebs, "intern" grenzt gegen den KUNDEN ab, nicht gegen
+    # Kollegen. Pflegen bleibt beim Recht.
     "api_wissen": OFFEN,
     "api_wissen_add": "wissen.pflegen",
+    "api_wissen_update": "wissen.pflegen",
+    "api_wissen_bestaetigen": "wissen.pflegen",
     "api_wissen_delete": "wissen.pflegen",
+    "api_wissen_pruefung": OFFEN,
+    # Der Import holt eine vom Nutzer genannte URL vom Server. Das ist
+    # eine ausgehende Verbindung im Namen des Betriebs — gehoert hinter
+    # dasselbe Recht wie das Pflegen selbst.
+    "api_wissen_import_website": "wissen.pflegen",
+    "api_wissen_import_datei": "wissen.pflegen",
+    # Einrichtungs-Interview: die Fragen darf jeder sehen (auch als
+    # Durchsicht "was steht zu Preisen drin?"), Antworten speichern heisst
+    # Wissens-Eintraege anlegen.
+    "api_wissen_interview": OFFEN,
+    "api_wissen_interview_speichern": "wissen.pflegen",
+    "api_wissen_import_uebernehmen": "wissen.pflegen",
+
+    # Wissensluecken: die unbeantworteten Kundenfragen. Sehen darf sie
+    # jeder (auch ein Monteur weiss oft die Antwort), beantworten heisst
+    # aber einen Wissens-Eintrag anlegen — also dasselbe Recht.
+    "api_wissensluecken": OFFEN,
+    "api_wissensluecke_beantworten": "wissen.pflegen",
+    "api_wissensluecke_verwerfen": "wissen.pflegen",
+
+    # Ueberschlags-Formeln. Rechnen darf jeder, der beim Kunden steht;
+    # die Ansaetze aendern ist eine Preisentscheidung.
+    "api_kalkulationen": OFFEN,
+    "api_kalkulation_rechnen": OFFEN,
+    "api_kalkulation_add": "wissen.pflegen",
+    "api_kalkulation_delete": "wissen.pflegen",
 
     "api_visualisierungen": OFFEN,
     "api_visualisierung_erstellen": OFFEN,

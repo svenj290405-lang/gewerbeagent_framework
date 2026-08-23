@@ -15,9 +15,7 @@ from sqlalchemy import select
 from core.database import AsyncSessionLocal
 from core.models import (
     ALLE_KATEGORIEN,
-    KATEGORIE_LABELS,
     Tenant,
-    TenantKnowledge,
     ToolConfig,
 )
 from core.models.employee import Employee
@@ -178,34 +176,12 @@ async def _find_tenant_by_phone(phone_number):
         return t
 
 
-async def _load_knowledge(tenant_id):
-    """Holt alle Wissens-Eintraege eines Tenants, gruppiert nach Kategorie."""
-    async with AsyncSessionLocal() as s:
-        entries = (await s.execute(
-            select(TenantKnowledge)
-            .where(TenantKnowledge.tenant_id == tenant_id)
-            .order_by(TenantKnowledge.kategorie, TenantKnowledge.created_at)
-        )).scalars().all()
-    by_kat = {}
-    for e in entries:
-        by_kat.setdefault(e.kategorie, []).append(e.text)
-    return by_kat
-
-
-def _build_knowledge_block(by_kat):
-    """Baut einen lesbaren Wissens-Block fuer den System-Prompt."""
-    if not by_kat:
-        return "Es liegen noch keine spezifischen Betriebs-Informationen vor."
-    parts = []
-    for kat in ALLE_KATEGORIEN:
-        if kat not in by_kat:
-            continue
-        label = KATEGORIE_LABELS.get(kat, kat)
-        parts.append(f"## {label}")
-        for text in by_kat[kat]:
-            parts.append(f"- {text}")
-        parts.append("")
-    return "\n".join(parts).strip()
+# Wissensbasis: die Lade- und Block-Logik lag frueher hier als Kopie neben
+# zwei weiteren im Mail- und App-Pfad. Sie lebt jetzt in
+# core/services/wissen.py — ein Ort, eine Sichtbarkeitsgrenze, ein Ranking.
+# Wichtig fuer diesen Pfad: der Block geht als dynamic_variable an
+# ElevenLabs. Deshalb IMMER nur ``sichtbarkeit=kunde`` (Default des
+# Services) — interne Eintraege duerfen den Betrieb nicht verlassen.
 
 
 def _split_wunschzeit(wunschzeit):
@@ -508,12 +484,16 @@ class Plugin(BasePlugin):
                 },
             }
 
-        by_kat = await _load_knowledge(tenant.id)
-        knowledge_block = _build_knowledge_block(by_kat)
+        from core.services import wissen as wissen_service
+
+        eintraege = await wissen_service.lade(tenant.id)
+        knowledge_block = await wissen_service.baue_block(
+            tenant.id, eintraege=eintraege,
+        )
 
         logger.info(
             f"voice_init: Tenant={tenant.slug} branche={tenant.branche} "
-            f"knowledge_entries={sum(len(v) for v in by_kat.values())}"
+            f"knowledge_entries={len(eintraege)} block_len={len(knowledge_block)}"
         )
 
         return {
@@ -1883,47 +1863,45 @@ class Plugin(BasePlugin):
     async def _handle_wissensbasis(self, payload):
         """Webhook von ElevenLabs wenn Q das Tool 'wissensbasis' aufruft.
 
-        Erlaubt dem Voice-Agent gezielt in der tenant-spezifischen Wissens-
-        basis nachzuschlagen — Alternative zum kompletten Knowledge-Block
-        im System-Prompt (siehe _handle_initiation). Sinnvoll wenn die
-        Wissensbasis waechst und der Prompt zu lang wird, oder wenn der
-        Agent explizit signalisieren soll dass er weiss was er nicht weiss.
+        Gezieltes Nachschlagen waehrend des Gespraechs — Ergaenzung zum
+        Block im System-Prompt (siehe _handle_initiation). Wichtig, wenn
+        die Wissensbasis waechst und nicht mehr komplett in den Prompt
+        passt, und damit der Agent sagen kann, was er NICHT weiss.
 
         Erwartet payload:
           {
             "tenant_slug": "demo",
             "frage": "Was kostet eine Beratung?",  # optional
-            "kategorie": "preise"                   # optional, eine der
-                                                    # ALLE_KATEGORIEN
+            "kategorie": "preise",                  # optional
+            "anrufer": "Frau Meier"                 # optional, fuer die Luecke
           }
         Mindestens eines von frage/kategorie muss gesetzt sein.
 
-        Matching-Logik:
-        1. kategorie gesetzt → alle Snippets dieser Kategorie zurueck
-        2. nur frage gesetzt → simple Keyword-Suche (lowercase substring
-           auf Tokens >=4 Zeichen, deutsche Stopwoerter raus). Bei 0
-           Treffern fallback auf Liste verfuegbarer Kategorien — damit
-           der Agent dem Anrufer sagen kann was er sonst weiss.
+        Zwei Aenderungen gegenueber der ersten Fassung:
 
-        Response (fuer ElevenLabs-Tool):
-          {
-            "erfolg": True,
-            "antwort": "<voice-freundlicher Text, ~max 800 Zeichen>",
-            "anzahl_treffer": 3,
-            "kategorien_genutzt": ["preise", "leistungen"]
-          }
+        1. Gesucht wird ueber core/services/wissen.py — mit Trigramm-
+           Aehnlichkeit und Kategorie-Stichworten statt reinem Substring.
+           "Wann habt ihr auf?" besteht nach Stoppwort-Abzug aus null
+           Tokens und fand deshalb frueher garantiert nichts.
 
-        Keine Vektor-Suche — laut Model-Doku nur 5-30 Snippets pro Tenant.
-        Substring-Match auf Tokens reicht in der Praxis und ist deterministisch
-        (wichtig fuer Voice: keine Halluzinationen ueber nicht-existente
-        Snippets, weil wir nur exakte Snippet-Texte zurueckgeben).
+        2. Findet er nichts, wird die Frage als Wissensluecke gespeichert,
+           statt nur ins Logfile zu wandern. Der Betrieb sieht sie danach
+           in "Aktuelles" und beantwortet sie mit einem Satz.
+
+        Zurueckgegeben werden weiterhin ausschliesslich woertliche
+        Snippet-Texte, nie generierter Text. Das ist die Halluzinations-
+        bremse am Telefon und bleibt so.
         """
+        from core.models.wissensluecke import KANAL_VOICE
+        from core.services import wissen as wissen_service
+
         tenant_slug = (payload.get("tenant_slug") or "").strip()
         if not tenant_slug:
             return {"erfolg": False, "antwort": "tenant_slug fehlt", "anzahl_treffer": 0}
 
         frage = (payload.get("frage") or "").strip()
         kategorie = (payload.get("kategorie") or "").strip().lower()
+        anrufer = (payload.get("anrufer") or "").strip()[:200] or None
         if not frage and not kategorie:
             return {
                 "erfolg": False,
@@ -1942,8 +1920,10 @@ class Plugin(BasePlugin):
                 "anzahl_treffer": 0,
             }
 
-        by_kat = await _load_knowledge(tenant.id)
-        if not by_kat:
+        # Nur kundentaugliche, aktive Eintraege — was hier rauskommt, sagt
+        # der Agent woertlich dem Anrufer.
+        alle = await wissen_service.lade(tenant.id)
+        if not alle:
             return {
                 "erfolg": True,
                 "antwort": (
@@ -1955,7 +1935,7 @@ class Plugin(BasePlugin):
             }
 
         # Strategie 1: explizite Kategorie
-        treffer: list[tuple[str, str]] = []  # (kategorie, text)
+        treffer = []
         if kategorie:
             if kategorie not in ALLE_KATEGORIEN:
                 erlaubt = ", ".join(ALLE_KATEGORIEN)
@@ -1967,52 +1947,32 @@ class Plugin(BasePlugin):
                     ),
                     "anzahl_treffer": 0,
                 }
-            for text in by_kat.get(kategorie, []):
-                treffer.append((kategorie, text))
+            treffer = [e for e in alle if e.kategorie == kategorie]
 
-        # Strategie 2: Keyword-Match wenn frage da ist (und Kategorie
-        # entweder leer oder keine Treffer brachte)
+        # Strategie 2: Relevanz-Ranking auf die Frage
         if frage and not treffer:
-            stopwords = {
-                "der", "die", "das", "den", "dem", "des", "ein", "eine",
-                "einen", "einem", "eines", "und", "oder", "aber", "doch",
-                "wie", "was", "wer", "wann", "wo", "warum", "welche",
-                "welcher", "welches", "ist", "sind", "war", "waren",
-                "kann", "koennen", "sollte", "muesste", "ich", "du", "er",
-                "sie", "wir", "ihr", "mich", "dich", "uns", "euch",
-                "habt", "habe", "haben", "hat", "fuer", "bei", "mit",
-                "ohne", "auf", "aus", "von", "zum", "zur", "im", "am",
-            }
-            tokens = [
-                t for t in frage.lower().replace("?", " ").replace(".", " ").split()
-                if len(t) >= 4 and t not in stopwords
-            ]
-            scored: list[tuple[int, str, str]] = []
-            for kat, texts in by_kat.items():
-                for text in texts:
-                    tl = text.lower()
-                    score = sum(1 for t in tokens if t in tl)
-                    if score > 0:
-                        scored.append((score, kat, text))
-            scored.sort(key=lambda x: -x[0])
-            treffer = [(kat, text) for _, kat, text in scored]
+            treffer = wissen_service.sortiere(frage, alle, limit=6)
 
-        # Strategie 3: kein Treffer → Kategorien-Uebersicht zurueck
+        # Strategie 3: kein Treffer -> Luecke merken + sagen, was da ist
         if not treffer:
-            verfuegbar = [
-                KATEGORIE_LABELS.get(k, k) for k in ALLE_KATEGORIEN
-                if k in by_kat
-            ]
+            if frage:
+                await wissen_service.merke_luecke(
+                    tenant.id, frage, KANAL_VOICE, kunde=anrufer,
+                )
+            verfuegbar = []
+            for e in alle:
+                if e.label not in verfuegbar:
+                    verfuegbar.append(e.label)
             if not verfuegbar:
                 antwort = "Dazu liegen keine Informationen vor."
             else:
                 antwort = (
                     "Dazu habe ich keinen direkten Eintrag. Ich habe aber "
-                    "Informationen zu: " + ", ".join(verfuegbar) + "."
+                    "Informationen zu: " + ", ".join(verfuegbar[:6]) + "."
                 )
             logger.info(
                 f"wissensbasis: tenant={tenant_slug} frage={frage!r} "
-                f"kategorie={kategorie!r} treffer=0"
+                f"kategorie={kategorie!r} treffer=0 -> Luecke erfasst"
             )
             return {
                 "erfolg": True,
@@ -2027,10 +1987,10 @@ class Plugin(BasePlugin):
         parts: list[str] = []
         kategorien_used: list[str] = []
         total_len = 0
-        for kat, text in treffer:
-            if kat not in kategorien_used:
-                kategorien_used.append(kat)
-            chunk = text.strip()
+        for e in treffer:
+            if e.kategorie not in kategorien_used:
+                kategorien_used.append(e.kategorie)
+            chunk = e.text.strip()
             if total_len + len(chunk) > MAX_CHARS:
                 if not parts:
                     parts.append(chunk[: MAX_CHARS - 3] + "...")

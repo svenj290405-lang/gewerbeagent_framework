@@ -341,3 +341,12 @@ input::placeholder, textarea::placeholder { color: var(--muted); }
 /* Das BETA-Schildchen in der Kopfzeile ist seit der Uebernahme als
    Standard-Design (2026-07-17) entfernt — dieses Stylesheet laeuft jetzt
    auf /app UND /app/beta. */
+
+/* ---------- Tab-Leiste: gezeichnetes Icon neben Emojis ----------
+   Der Assistent-Tab traegt ein SVG (24px), die uebrigen Tabs Emojis
+   (20px) bzw. den Q-Globus (22px-Canvas). Ohne feste Hoehe waere die
+   Assistent-Spalte 4px hoeher als die anderen — dann waechst die ganze
+   Leiste und die Labels stehen nicht mehr auf einer Linie. Die 2px
+   Ueberstand des SVG ragen sichtbar, aber ohne Layout-Wirkung heraus. */
+.tabbar button .ico { height: 22px; }
+.tabbar button .ico svg { display: block; overflow: visible; }

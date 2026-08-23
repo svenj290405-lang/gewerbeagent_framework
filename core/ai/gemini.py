@@ -1648,6 +1648,35 @@ DIALOG_RESPONSE_SCHEMA = {
                 "wurde (fuer Logging)."
             ),
         },
+        "genutztes_wissen": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": (
+                "Welche Angaben aus der Wissensbasis oben hast du in "
+                "DIESER Antwort tatsaechlich verwendet? Je Angabe ein "
+                "kurzer Stichpunkt, z.B. 'Stundensatz Meister 75 EUR' "
+                "oder 'Einzugsgebiet 40 km'. Leere Liste, wenn du nichts "
+                "aus der Wissensbasis gebraucht hast (reiner Termin-"
+                "Vorgang). NICHTS auffuehren, was du nicht wirklich "
+                "benutzt hast — der Betrieb prueft daran, ob deine "
+                "Auskunft gedeckt war."
+            ),
+        },
+        "wissensluecke": {
+            "type": "string",
+            "description": (
+                "NUR ausfuellen, wenn der Kunde eine sachliche Frage "
+                "ueber den Betrieb gestellt hat, deren Antwort NICHT in "
+                "der Wissensbasis oben steht (z.B. Preis, Ablauf, "
+                "Material, Garantie, Anfahrt) und du sie deshalb nicht "
+                "konkret beantworten konntest. Dann hier die Frage in "
+                "einem kurzen, neutralen Satz aus DEINER Sicht "
+                "formulieren, z.B. 'Verlegt der Betrieb auch Vinylboden?'. "
+                "Der Betrieb bekommt sie zum Beantworten vorgelegt. "
+                "LEER lassen bei Terminwuenschen, Absagen, Small Talk "
+                "oder wenn du die Frage beantworten konntest."
+            ),
+        },
     },
     "required": ["reply_text", "next_action", "anrede_form"],
 }
@@ -1710,6 +1739,8 @@ WICHTIGE LEITPLANKEN:
 - Bei einer Buchung (BOOK_SLOT/BOOK_DIRECT) rendert das Template automatisch eine "Termin bestaetigt"-Box UND den Formular-Button unter deinem Text — wiederhole Datum/Uhrzeit also nicht und fordere das Formular nicht selbst im Text an. Ein kurzer Satz wie "ich habe den Termin fuer dich eingetragen" genuegt.
 - KEINE eigene Begruessungszeile ("Hallo X,") und KEINE eigene Signatur — beides macht das Template.
 - Schreibe NUR den eigentlichen Mail-Text. Kurz, ehrlich, direkt.
+- NACHWEIS FUEHREN: Alles, was du aus der Wissensbasis in die Antwort uebernimmst (Preise, Zeiten, Gebiete, Marken), listest du zusaetzlich in genutztes_wissen auf. Nur das, was du wirklich benutzt hast.
+- WISSENSLUECKE MELDEN: Konntest du eine sachliche Frage ueber den Betrieb nicht aus der Wissensbasis beantworten, dann trage sie in das Feld wissensluecke ein (und antworte im reply_text ehrlich, dass du das nachfragst — NICHT raten und NICHTS erfinden). Der Betrieb pflegt die Antwort danach ein, und beim naechsten Mal kannst du sie selbst geben.
 
 Antwort als JSON gemaess Schema (kein Markdown drumherum)."""
 
@@ -1934,6 +1965,8 @@ async def handle_kunde_mail_dialog(
             "kunde_voller_name": None,
             "kunde_telefon": None,
             "reason": f"fallback: {reason}",
+            "wissensluecke": None,
+            "genutztes_wissen": [],
         }
 
     try:
@@ -2058,6 +2091,11 @@ async def handle_kunde_mail_dialog(
             "kunde_voller_name": kunde_voller_name or None,
             "kunde_telefon": kunde_telefon or None,
             "reason": (data.get("reason") or "")[:200],
+            "wissensluecke": (data.get("wissensluecke") or "").strip()[:500] or None,
+            "genutztes_wissen": [
+                str(x).strip()[:200] for x in (data.get("genutztes_wissen") or [])
+                if str(x).strip()
+            ][:8],
         }
     except Exception as e:
         logger.exception(f"handle_kunde_mail_dialog fehler: {e}")
@@ -2209,6 +2247,40 @@ async def update_angebot_from_audio(
 # und bekommen einen kompletten Anschreibe-Text (Briefform, geht im
 # Lexware-PDF in den `introduction`-Block).
 
+async def _wissensbasis_kontext(tenant_id, *, kategorien_filter: bool = False) -> str:
+    """Wissensbasis als Prompt-Text — best-effort.
+
+    ``kategorien_filter=True`` beschraenkt auf das, was in einem Kunden-
+    dokument etwas verloren hat: Besonderheiten, Leistungen, Garantie.
+    Preise bleiben draussen, weil im Angebot die Positionsliste gilt und
+    zwei Preisquellen in einem Dokument nur Widerspruch erzeugen.
+
+    Faellt das Laden aus, kommt ein leerer Kontext zurueck und der Prompt
+    funktioniert wie vorher — kein Grund, ein Angebot scheitern zu lassen.
+    """
+    if not tenant_id:
+        return "(keine Infos hinterlegt)"
+    try:
+        import uuid as _uuid
+
+        from core.models.tenant_knowledge import (
+            KATEGORIE_BESONDERHEITEN, KATEGORIE_LEISTUNGEN,
+        )
+        from core.services import wissen as _wissen
+
+        tid = tenant_id if isinstance(tenant_id, _uuid.UUID) else _uuid.UUID(str(tenant_id))
+        eintraege = await _wissen.lade(tid)
+        if kategorien_filter:
+            erlaubt = {KATEGORIE_BESONDERHEITEN, KATEGORIE_LEISTUNGEN}
+            eintraege = [e for e in eintraege if e.kategorie in erlaubt]
+        if not eintraege:
+            return "(keine Infos hinterlegt)"
+        return "\n".join(f"- [{e.label}] {e.text.strip()}" for e in eintraege[:20])[:2000]
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Wissensbasis-Kontext nicht ladbar: %s", exc)
+        return "(keine Infos hinterlegt)"
+
+
 ANSCHREIBEN_PROMPT_TEMPLATE = """Du bist Assistent fuer einen deutschen Handwerksbetrieb \
 und schreibst das Anschreiben (Einleitungstext) zu einem Angebot.
 
@@ -2222,6 +2294,9 @@ ANGEBOTS-KONTEXT:
 ANWEISUNGEN VOM HANDWERKER:
 {instructions}
 
+WAS DEN BETRIEB AUSMACHT (aus seiner Wissensbasis — nur nutzen, wenn es zum Angebot passt; nichts davon erfinden oder dazuerfinden):
+{wissensbasis}
+
 AUFGABE:
 Schreibe einen kurzen, freundlichen Einleitungstext (max. 5 Saetze, max. 600 Zeichen) \
 fuer das Lexware-Angebot. Der Text steht spaeter im Angebots-PDF \
@@ -2234,6 +2309,12 @@ REGELN:
 - Setze den vom Handwerker gewuenschten Ton um (sachlich/herzlich/kurz/ausfuehrlich).
 - Erwaehne explizit was der Handwerker erwaehnt haben will, falls genannt.
 - KEINE Floskeln wie "es freut uns sehr". Klar und respektvoll.
+- Passt eine Besonderheit des Betriebs zum Auftrag (Garantie, Zertifikat, \
+  Meisterbetrieb, Foerderberatung), darf sie in EINEM Halbsatz vorkommen. \
+  Steht nichts Passendes in der Wissensbasis, lass es weg — lieber kein \
+  Satz als ein erfundener.
+- NENNE KEINE Preise oder Stundensaetze im Text — die Betraege stehen in \
+  der Positionsliste darunter.
 - KEIN Schlusssatz wie "mit freundlichen Gruessen" — das macht Lexware.
 - KEINE Markdown-Symbole, keine HTML-Tags, reines Plaintext.
 
@@ -2288,6 +2369,7 @@ async def generate_angebot_anschreiben(
         positionen_summary=_format_positionen_summary(positionen),
         gesamt=float(gesamt or 0),
         instructions=instructions.strip(),
+        wissensbasis=await _wissensbasis_kontext(tenant_id, kategorien_filter=True),
     )
     try:
         text = await call_gemini(
@@ -2344,6 +2426,7 @@ async def generate_angebot_anschreiben_from_audio(
         positionen_summary=_format_positionen_summary(positionen),
         gesamt=float(gesamt or 0),
         instructions="(siehe angehaengte Sprachnachricht des Handwerkers)",
+        wissensbasis=await _wissensbasis_kontext(tenant_id, kategorien_filter=True),
     )
 
     try:
@@ -2561,6 +2644,7 @@ async def personalize_angebot_with_corrections_from_audio(
     prompt = _build_personalize_prompt(
         extracted,
         instructions="(siehe angehaengte Sprachnachricht des Handwerkers)",
+        wissensbasis=await _wissensbasis_kontext(tenant_id, kategorien_filter=True),
     )
     try:
         client = _get_genai_client(location=GENAI_TEXT_LOCATION)
@@ -3127,6 +3211,7 @@ async def formular_umbauen(
     auftrag: str,
     branche: str = "",
     company_name: str = "",
+    wissensbasis: str = "",
 ) -> dict:
     """Baut das Anfrage-Formular nach einer Anweisung in Alltagssprache um.
 
@@ -3178,6 +3263,17 @@ async def formular_umbauen(
         "und schreib in `erklaerung`, was du nicht verstanden hast.\n\n"
         "`erklaerung`: ein bis zwei Saetze in Du-Form, was du geaendert "
         "hast — so wie du es dem Handwerker sagen wuerdest."
+        # Ohne diesen Block erfindet das Modell bei "mach eine Auswahl mit
+        # unseren Gewerken" Branchen-Standardgewerke statt der Leistungen,
+        # die dieser Betrieb tatsaechlich anbietet.
+        + (
+            "\n\nWAS DIESER BETRIEB TATSAECHLICH ANBIETET (aus seiner "
+            "Wissensbasis). Nutze das fuer Auswahl-Optionen und Formulierungen, "
+            "statt branchenuebliche Standards zu erfinden. Steht dort nichts "
+            "Passendes, frag im `erklaerung`-Text nach, statt zu raten:\n"
+            + wissensbasis
+            if wissensbasis else ""
+        )
     )
 
     prompt = (

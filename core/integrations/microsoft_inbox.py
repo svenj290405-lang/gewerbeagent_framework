@@ -1545,35 +1545,25 @@ async def process_relevant_kunde_mail(
     # signiert generate_anfrage_reply mit "Ihr Team von {tenant_company}".
     tenant_owner_first = extract_first_name(tenant.contact_name or "") or None
 
-    # Wissensbasis als Text laden (best-effort). Quelle: TenantKnowledge,
-    # gepflegt in der App unter Wissen. Die Freitext-Spalte heisst .text —
-    # hier wurde frueher faelschlich .inhalt gelesen, wodurch die Wissens-
-    # basis in der Mail-Pipeline IMMER leer blieb (der Voice-Pfad las
-    # korrekt .text und antwortete deshalb auf Wissensfragen, die Mail nie).
+    # Wissensbasis als Text laden (best-effort) — jetzt ueber den zentralen
+    # Service statt einer dritten Kopie der Ladelogik. Was sich damit aendert:
+    #   * gefiltert auf aktiv + sichtbarkeit=kunde (interne Eintraege
+    #     gingen vorher ungefiltert in Kundenmails)
+    #   * der Leistungskatalog ist mit drin, d.h. der Preis in der Mail
+    #     stammt aus derselben Zeile wie der im Angebot
+    #   * nach Relevanz zur Kundenmail sortiert und an Eintragsgrenzen
+    #     gekuerzt statt hart bei 3000 Zeichen mitten im Satz
+    # (Historie: hier wurde jahrelang .inhalt statt .text gelesen, wodurch
+    # die Wissensbasis in der Mail-Pipeline immer leer blieb.)
     wissensbasis_text = "(noch keine spezifischen Infos hinterlegt)"
     try:
-        from core.models import TenantKnowledge
-        from core.models.tenant_knowledge import KATEGORIE_LABELS
-        async with AsyncSessionLocal() as session:
-            k_res = await session.execute(
-                _sel(TenantKnowledge)
-                .where(TenantKnowledge.tenant_id == tenant_id)
-                .order_by(TenantKnowledge.kategorie, TenantKnowledge.created_at)
-            )
-            entries = k_res.scalars().all()
-            if entries:
-                lines = []
-                for e in entries[:40]:
-                    cat = getattr(e, "kategorie", "") or ""
-                    label = KATEGORIE_LABELS.get(cat, cat)
-                    txt = (getattr(e, "text", "") or "").strip()
-                    if txt:
-                        lines.append(f"- [{label}] {txt[:800]}")
-                if lines:
-                    wissensbasis_text = "\n".join(lines)
-    except ImportError:
-        pass
-    except Exception as e:
+        from core.services import wissen as wissen_service
+        wissensbasis_text = await wissen_service.baue_zeilen(
+            tenant_id,
+            frage=body_text_for_ai,
+            max_chars=3000,
+        )
+    except Exception as e:  # noqa: BLE001
         logger.warning(f"Wissensbasis laden fehler: {e}")
 
     # 3) Dialog-Turn berechnen — Q entscheidet ASK_MORE oder SEND_FORMULAR
@@ -1649,6 +1639,23 @@ async def process_relevant_kunde_mail(
     reply_text = dialog["reply_text"]
     next_action = dialog["next_action"]
     result["next_action"] = next_action
+
+    # Wissensluecke: Q meldet selbst, wenn er eine Sachfrage nicht aus der
+    # Wissensbasis beantworten konnte. Das ist ein deutlich sauberes Signal
+    # als "Suche lieferte nichts" — eine Terminmail trifft die Wissensbasis
+    # naemlich auch nicht, ist aber keine Luecke. Best-effort: ein Fehler
+    # hier darf die Mail-Antwort nicht aufhalten.
+    _luecke = (dialog.get("wissensluecke") or "").strip()
+    if _luecke:
+        try:
+            from core.models.wissensluecke import KANAL_MAIL
+            from core.services import wissen as wissen_service
+            await wissen_service.merke_luecke(
+                tenant_id, _luecke, KANAL_MAIL,
+                kunde=(sender_name or sender_email or None),
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Wissensluecke (Mail) nicht gespeichert: {e}")
 
     # Kontaktdaten fuer die Buchung: voller Name + Telefonnummer sind
     # PFLICHT, bevor ein Termin gesucht/gebucht wird. Der Name kann aus
@@ -2240,6 +2247,8 @@ async def process_relevant_kunde_mail(
                 microsoft_conversation_id=ms_conv_id,
                 q_reply_text=reply_text,
                 subject=reply_subject,
+                # Antwort-Nachweis: gehoert zu genau dieser Antwort.
+                genutztes_wissen=dialog.get("genutztes_wissen") or [],
             )
             result["conv_id"] = str(conv_id)
 

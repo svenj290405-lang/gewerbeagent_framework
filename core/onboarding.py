@@ -30,6 +30,7 @@ from core.features.permissions import ROLLE_INHABER
 from core.models import (
     ALLE_KATEGORIEN,
     Tenant,
+    QUELLE_TEMPLATE,
     TenantKnowledge,
     TenantStatus,
     ToolConfig,
@@ -239,6 +240,12 @@ async def create_tenant_record(
                             tenant_id=tenant_id,
                             kategorie=kat,
                             text=txt[:2000],
+                            # Herkunft festhalten: Vorlagen-Eintraege sind
+                            # Branchen-Durchschnitt, keine Aussage ueber
+                            # DIESEN Betrieb. In der App sind sie deshalb
+                            # als "Branchen-Vorlage" gekennzeichnet, damit
+                            # klar ist, was noch angefasst werden muss.
+                            quelle=QUELLE_TEMPLATE,
                         ))
                         knowledge_loaded += 1
                 await session.commit()

@@ -29,11 +29,17 @@ logger = logging.getLogger(__name__)
 
 # Was Gemini fuer die Kundenmail sehen darf. Bewusst als Konstante, damit
 # beim Erweitern auffaellt, dass man an der Vertraulichkeitsgrenze schraubt.
-MAIL_QUELLEN = ("briefing_kurz", "notizen_lang", "termin")
+MAIL_QUELLEN = ("briefing_kurz", "notizen_lang", "termin", "wissen_ablauf")
+
+# Welche Wissens-Kategorien in die Kundenmail duerfen. Bewusst KEINE
+# Preise: die Mail fasst ein Gespraech zusammen, ueber Geld entscheidet
+# der Betrieb spaeter im Angebot — steht auch so in den Verboten unten.
+WISSEN_KATEGORIEN_MAIL = ("oeffnungszeiten", "anfahrt", "besonderheiten")
 
 
 def _mail_prompt(*, betrieb: str, kunde: str, briefing: str,
-                 notizen: str, termin: str, bilder: int) -> str:
+                 notizen: str, termin: str, bilder: int,
+                 wissen: str = "") -> str:
     return (
         f"Du schreibst im Namen des Handwerksbetriebs „{betrieb}\" eine kurze "
         f"Mail an den Kunden {kunde} — als Nachbereitung des Gespraechs.\n\n"
@@ -53,7 +59,30 @@ def _mail_prompt(*, betrieb: str, kunde: str, briefing: str,
         "- Nichts erfinden: nur was unten steht.\n\n"
         f"Gespraechs-Zusammenfassung:\n{briefing}\n\n"
         f"Weitere Notizen:\n{notizen}\n"
+        + (f"\nAllgemeine Infos zum Betrieb (nur nutzen, wenn sie zum "
+           f"Besprochenen passen — z.B. Erreichbarkeit oder Ablauf; nichts "
+           f"davon erfinden):\n{wissen}\n" if wissen else "")
     )
+
+
+async def _wissen_fuer_mail(tid) -> str:
+    """Die paar Wissens-Kategorien, die in einer Nachbereitungs-Mail helfen.
+
+    Der Filter ist die Vertraulichkeitsgrenze in Codeform: Preise und
+    interne Notizen kommen hier gar nicht erst an, damit sie auch dann
+    nicht in der Mail landen, wenn das Modell die Verbote im Prompt
+    einmal ignoriert.
+    """
+    try:
+        from core.services import wissen as _wissen
+        eintraege = [
+            e for e in await _wissen.lade(tid)
+            if e.kategorie in WISSEN_KATEGORIEN_MAIL
+        ]
+        return "\n".join(f"- {e.text.strip()}" for e in eintraege[:8])[:800]
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Wissen fuer Kundenmail nicht ladbar: %s", exc)
+        return ""
 
 
 def _fallback_text(*, betrieb: str, kunde: str, briefing: str,
@@ -172,7 +201,8 @@ async def baue_kundenmail(
             text = (await call_gemini(
                 _mail_prompt(betrieb=betrieb, kunde=kunde, briefing=briefing,
                              notizen=notizen, termin=termin,
-                             bilder=len(anhaenge)),
+                             bilder=len(anhaenge),
+                             wissen=await _wissen_fuer_mail(tid)),
                 temperature=0.5, max_output_tokens=2048,
                 tenant_id=str(tid), operation_kind="gespraech_mail",
             )).strip()

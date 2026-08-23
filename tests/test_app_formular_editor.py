@@ -461,8 +461,13 @@ async def test_q_liefert_vorschlag_ohne_zu_speichern(monkeypatch):
     _feature(monkeypatch, True)
     gesehen = {}
 
-    async def fake_umbau(*, schema, auftrag, branche="", company_name=""):
-        gesehen.update(schema=schema, auftrag=auftrag, branche=branche)
+    async def fake_umbau(*, schema, auftrag, branche="", company_name="",
+                         wissensbasis=""):
+        # wissensbasis MUSS durchgereicht werden — ohne sie erfindet Q bei
+        # "mach eine Auswahl mit unseren Gewerken" Branchen-Klischees statt
+        # der Leistungen, die dieser Betrieb wirklich anbietet.
+        gesehen.update(schema=schema, auftrag=auftrag, branche=branche,
+                       wissensbasis=wissensbasis)
         return {
             "ok": True, "title": "Deine Anfrage", "subtitle": "",
             "fields": [
@@ -498,6 +503,9 @@ async def test_q_liefert_vorschlag_ohne_zu_speichern(monkeypatch):
     # Q arbeitet auf dem Stand im Editor, nicht auf dem gespeicherten.
     assert gesehen["auftrag"] == "frag noch nach der Raumgröße"
     assert gesehen["branche"] == "Tischler"
+    # Der Parameter muss ankommen (Inhalt haengt vom Tenant ab und ist im
+    # Test leer) — sonst faellt niemandem auf, wenn er wegrefactort wird.
+    assert "wissensbasis" in gesehen
 
 
 @pytest.mark.asyncio
