@@ -936,7 +936,6 @@ async def tenant_set_retention(
     request: Request,
     tenant_id: str,
     data_retention_days: int = Form(...),
-    csrf_token: str = Form(...),
     user: AdminUser = Depends(require_admin),
 ):
     """Phase B4: data_retention_days fuer Tenant aendern.
@@ -970,12 +969,68 @@ async def tenant_set_retention(
     )
 
 
+@router.post("/tenants/{tenant_id}/preis")
+async def tenant_set_preis(
+    request: Request,
+    tenant_id: str,
+    monatspreis_eur: str = Form(""),
+    abrechnung_seit: str = Form(""),
+    user: AdminUser = Depends(require_admin),
+):
+    """Monatspreis des Betriebs pflegen — die Erloesseite der Kostenansicht.
+
+    Leeres Feld = kein Preis hinterlegt (dann zeigt die Kostenseite
+    ausdruecklich "nicht hinterlegt" statt einer 0, die nach Geschenk
+    aussieht).
+    """
+    await require_csrf(request)
+    import decimal
+
+    try:
+        tid = uuid.UUID(tenant_id)
+    except ValueError:
+        raise HTTPException(404, "Tenant nicht gefunden")
+
+    preis = None
+    if monatspreis_eur.strip():
+        try:
+            preis = decimal.Decimal(monatspreis_eur.strip().replace(",", "."))
+        except decimal.InvalidOperation:
+            raise HTTPException(400, "Preis nicht lesbar")
+        if preis < 0 or preis > 100000:
+            raise HTTPException(400, "Preis ausserhalb des sinnvollen Bereichs")
+
+    seit = None
+    if abrechnung_seit.strip():
+        try:
+            seit = dt.date.fromisoformat(abrechnung_seit.strip())
+        except ValueError:
+            raise HTTPException(400, "Datum nicht lesbar")
+
+    async with get_session() as s:
+        tenant = (await s.execute(
+            select(Tenant).where(Tenant.id == tid)
+        )).scalar_one_or_none()
+        if not tenant:
+            raise HTTPException(404, "Tenant nicht gefunden")
+        alt = tenant.monatspreis_eur
+        tenant.monatspreis_eur = preis
+        tenant.abrechnung_seit = seit
+        await audit(
+            user_id=user.id, action="tenant.preis.update",
+            target=tenant.slug, request=request, session=s,
+            details={"alt": str(alt) if alt is not None else None,
+                     "neu": str(preis) if preis is not None else None},
+        )
+        await s.commit()
+    return RedirectResponse(f"/admin/tenants/{tenant_id}", status_code=303)
+
+
 @router.post("/tenants/{tenant_id}/features/{feature_key}/toggle")
 async def tenant_features_toggle(
     request: Request,
     tenant_id: str,
     feature_key: str,
-    csrf_token: str = Form(...),
     user: AdminUser = Depends(require_admin),
 ):
     """Togglet ein einzelnes Feature fuer den Tenant."""
@@ -1102,9 +1157,35 @@ async def costs_global(
             .limit(50)
         )
         by_tenant = [
-            {"company_name": n, "slug": s_slug, "calls": c, "cost": cost}
+            {"company_name": n, "slug": s_slug, "calls": c, "cost": float(cost)}
             for n, s_slug, c, cost in rows
         ]
+
+        # Erloesseite: Monatspreis je Betrieb. Ohne den zeigte die Seite
+        # nur, was wir ausgeben, nie was hereinkommt.
+        preise = {
+            slug: (float(preis) if preis is not None else None)
+            for slug, preis in (await s.execute(
+                select(Tenant.slug, Tenant.monatspreis_eur)
+                .where(Tenant.slug != "_global")
+            )).all()
+        }
+        bekannte_slugs = {z["slug"] for z in by_tenant}
+        for slug, preis in preise.items():
+            if slug not in bekannte_slugs:
+                # Betrieb ohne API-Kosten im Zeitraum — soll trotzdem mit
+                # seinem Preis auftauchen.
+                by_tenant.append({
+                    "company_name": slug, "slug": slug, "calls": 0, "cost": 0.0,
+                })
+        for zeile in by_tenant:
+            zeile["preis"] = preise.get(zeile["slug"])
+            zeile["marge"] = (
+                None if zeile["preis"] is None
+                else zeile["preis"] - zeile["cost"]
+            )
+        erloes_gesamt = sum(p for p in preise.values() if p)
+        marge_gesamt = erloes_gesamt - float(month_c)
 
         await audit(user_id=user.id, action="costs.view", request=request, session=s)
 
@@ -1119,6 +1200,16 @@ async def costs_global(
         },
         "by_provider": by_provider,
         "by_tenant": by_tenant,
+        "erloes_gesamt": erloes_gesamt,
+        "marge_gesamt": marge_gesamt,
+        # Ehrlichkeitshinweis fuer die Seite: die Telefonie-Kosten
+        # (ElevenLabs/Deepgram/Sipgate) sind zwar bepreist, es kommt aber
+        # kein einziger Datensatz an — der call_ended-Webhook wird
+        # offenbar nicht aufgerufen. Eine Marge ohne sie waere geschoent.
+        "kosten_unvollstaendig": not any(
+            z["provider"] in ("elevenlabs", "deepgram", "sipgate")
+            for z in by_provider
+        ),
     })
 
 

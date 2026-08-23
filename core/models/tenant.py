@@ -14,7 +14,7 @@ import uuid
 from enum import Enum
 from typing import TYPE_CHECKING
 
-from sqlalchemy import Integer, LargeBinary, Numeric, String
+from sqlalchemy import Date, Integer, LargeBinary, Numeric, String
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -109,6 +109,18 @@ class Tenant(Base):
     # Phase B4: bisher globaler RETENTION_DAYS=14 — jetzt pro Tenant.
     data_retention_days: Mapped[int] = mapped_column(
         Integer, nullable=False, server_default="90", default=90,
+    )
+
+    # Was der Betrieb im Monat zahlt. Bewusst ein schlichtes Feld statt
+    # eines Abo-Modells: bei einer Handvoll Kunden ist eine Zahl die
+    # ehrliche Antwort, alles andere waere Vorratsarbeit. Erst damit
+    # laesst sich im Admin ueberhaupt eine Marge zeigen — bisher gab es
+    # nur die Kostenseite.
+    monatspreis_eur: Mapped[decimal.Decimal | None] = mapped_column(
+        Numeric(10, 2), nullable=True,
+    )
+    abrechnung_seit: Mapped[dt.date | None] = mapped_column(
+        Date, nullable=True,
     )
 
     # Primärfarbe der WebApp (CSS --primary). Hex-Wert wie "#0066cc".

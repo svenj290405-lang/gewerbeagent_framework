@@ -75,6 +75,8 @@
                 <th>Slug</th>
                 <th class="num">Calls</th>
                 <th class="num">Kosten</th>
+                <th class="num">Preis/Monat</th>
+                <th class="num">Differenz</th>
             </tr>
         </thead>
         <tbody>
@@ -83,12 +85,40 @@
                 <td>{{ r.company_name or 'unbekannt' }}</td>
                 <td class="muted mono">{{ r.slug or '–' }}</td>
                 <td class="num">{{ r.calls }}</td>
-                <td class="num">{{ "%.6f €"|format(r.cost|float) }}</td>
+                <td class="num">{{ "%.4f €"|format(r.cost|float) }}</td>
+                <td class="num">
+                    {% if r.preis is not none %}{{ "%.2f €"|format(r.preis) }}
+                    {% else %}<span class="muted">nicht hinterlegt</span>{% endif %}
+                </td>
+                <td class="num">
+                    {% if r.marge is not none %}
+                        <strong>{{ "%.2f €"|format(r.marge) }}</strong>
+                    {% else %}<span class="muted">–</span>{% endif %}
+                </td>
             </tr>
         {% else %}
-            <tr><td colspan="4" class="muted" style="text-align:center; padding:24px;">Keine Tenant-Aktivitaet.</td></tr>
+            <tr><td colspan="6" class="muted" style="text-align:center; padding:24px;">Keine Tenant-Aktivitaet.</td></tr>
         {% endfor %}
         </tbody>
+        <tfoot>
+            <tr>
+                <td colspan="4"><strong>Plattform gesamt (30 Tage)</strong></td>
+                <td class="num"><strong>{{ "%.2f €"|format(erloes_gesamt) }}</strong></td>
+                <td class="num"><strong>{{ "%.2f €"|format(marge_gesamt) }}</strong></td>
+            </tr>
+        </tfoot>
     </table>
 </div>
+
+<p class="muted" style="margin-top:14px;font-size:13px;line-height:1.6;">
+    <strong>Was die Differenz wert ist:</strong> Preis minus erfasste API-Kosten der letzten
+    30 Tage — nicht mehr. Hosting, Telefonnummer und Arbeitszeit stehen hier nicht drin.
+    {% if kosten_unvollstaendig %}
+    <br><span style="color:#b45309;"><strong>Achtung:</strong> Für Telefonie
+    (ElevenLabs, Deepgram, Sipgate) sind zwar Preise hinterlegt, es kommt aber kein einziger
+    Verbrauchsdatensatz an — der <code>call_ended</code>-Webhook wird offenbar nicht
+    aufgerufen. Der teuerste Teil des Produkts fehlt also in dieser Rechnung.</span>
+    {% endif %}
+    Den Monatspreis pflegst du im jeweiligen Betrieb unter „Tenants".
+</p>
 {% endblock %}

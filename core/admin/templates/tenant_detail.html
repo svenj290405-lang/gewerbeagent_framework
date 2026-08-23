@@ -45,6 +45,26 @@
     </small>
 </form>
 
+<div class="section-title">Abrechnung</div>
+<form method="post"
+      action="/admin/tenants/{{ tenant.id }}/preis"
+      style="display:flex; gap:8px; align-items:center; margin-bottom:24px; flex-wrap:wrap;">
+    <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+    <label style="font-size:13px;color:var(--ink-muted);">Monatspreis</label>
+    <input type="text" name="monatspreis_eur" inputmode="decimal"
+           value="{{ '%.2f'|format(tenant.monatspreis_eur) if tenant.monatspreis_eur is not none else '' }}"
+           placeholder="z.B. 249.00"
+           style="width:110px; padding:6px 8px; border:1px solid var(--border); border-radius:6px;">
+    <span style="font-size:13px;color:var(--ink-muted);">€ · zahlend seit</span>
+    <input type="date" name="abrechnung_seit"
+           value="{{ tenant.abrechnung_seit.isoformat() if tenant.abrechnung_seit else '' }}"
+           style="padding:6px 8px; border:1px solid var(--border); border-radius:6px;">
+    <button type="submit" class="btn">Speichern</button>
+    <small style="margin-left:auto;color:var(--ink-muted);">
+        Leer lassen = kein Preis hinterlegt. Erscheint in der Kostenansicht als Erlös.
+    </small>
+</form>
+
 <div class="stats-grid">
     <div class="stat-card">
         <div class="stat-label">Kontakt</div>
