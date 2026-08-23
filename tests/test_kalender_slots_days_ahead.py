@@ -171,3 +171,61 @@ async def test_heute_keine_vergangenen_slots():
         h, m = map(int, s["uhrzeit"].split(":"))
         slot_dt = jetzt.replace(hour=h, minute=m, second=0, microsecond=0)
         assert slot_dt >= jetzt, f"Slot {s} liegt in der Vergangenheit"
+
+
+# =====================================================================
+# Wunschdatum in der Vergangenheit
+# =====================================================================
+# Live aufgefallen: eine Suche zum 25.05. lieferte am 23.08. bereitwillig
+# sechs Slots — am 25.05., also drei Monate in der Vergangenheit. Q haette
+# einem Kunden Termine angeboten, die laengst vorbei sind. Ein fehlendes
+# Jahr in der Mail ("am 22.05.") oder ein verhoertes Datum am Telefon
+# reicht dafuer aus.
+
+@pytest.mark.asyncio
+async def test_wunschdatum_in_der_vergangenheit_wird_vorgezogen():
+    p = _make_plugin(arbeitstage=(0, 1, 2, 3, 4, 5, 6))
+    vergangen = dt.date.today() - dt.timedelta(days=90)
+    with _patch_adapter(_FakeAdapter()):
+        out = await p._find_free_slots({
+            "datum": vergangen.strftime("%d.%m.%Y"), "uhrzeit": "10:00",
+        })
+
+    assert out["erfolg"] is True
+    assert out["slots"], "Es sollen Slots kommen — nur eben zukuenftige"
+    assert out.get("hinweis_vergangenheit") is True
+    heute = dt.date.today()
+    for s in out["slots"]:
+        tag = dt.datetime.strptime(s["datum"], "%d.%m.%Y").date()
+        assert tag >= heute, f"Slot in der Vergangenheit: {s['datum']}"
+
+
+@pytest.mark.asyncio
+async def test_zukuenftiges_wunschdatum_bleibt_unangetastet():
+    p = _make_plugin(arbeitstage=(0, 1, 2, 3, 4, 5, 6))
+    ziel = dt.date.today() + dt.timedelta(days=10)
+    with _patch_adapter(_FakeAdapter()):
+        out = await p._find_free_slots({
+            "datum": ziel.strftime("%d.%m.%Y"), "uhrzeit": "10:00",
+        })
+
+    assert out["erfolg"] is True
+    assert out.get("hinweis_vergangenheit") is False
+    assert any(s["datum"] == ziel.strftime("%d.%m.%Y") for s in out["slots"]), (
+        "Der gewuenschte Tag selbst sollte unter den Vorschlaegen sein"
+    )
+
+
+@pytest.mark.asyncio
+async def test_buchung_in_der_vergangenheit_wird_abgelehnt():
+    p = _make_plugin(arbeitstage=(0, 1, 2, 3, 4, 5, 6))
+    vergangen = dt.date.today() - dt.timedelta(days=7)
+    with _patch_adapter(_FakeAdapter()):
+        out = await p._book_appointment({
+            "datum": vergangen.strftime("%d.%m.%Y"), "uhrzeit": "10:00",
+            "kunde_name": "Test Kunde", "kunde_telefon": "0651 123",
+            "anliegen": "Beratung",
+        })
+
+    assert out["erfolg"] is False
+    assert out.get("grund") == "termin_in_vergangenheit"

@@ -263,6 +263,20 @@ class Plugin(BasePlugin):
             start = self._parse_datum_uhrzeit(datum, uhrzeit)
             ende = start + timedelta(minutes=dauer)
 
+            # Keine Buchung in der Vergangenheit. Das ist praktisch immer
+            # ein Datumsfehler (fehlende Jahreszahl, Antwort auf eine alte
+            # Mail, verhoertes Datum am Telefon) — und ein Termin, zu dem
+            # niemand mehr kommen kann, ist schlimmer als eine Rueckfrage.
+            if start < datetime.now():
+                return {
+                    "erfolg": False,
+                    "nachricht": (
+                        "Dieser Zeitpunkt liegt in der Vergangenheit. "
+                        "Bitte einen Termin in der Zukunft waehlen."
+                    ),
+                    "grund": "termin_in_vergangenheit",
+                }
+
             employee_id = payload.get("employee_id")
 
             # Idempotency-Check: gibt es bereits ein Booking-Result fuer
@@ -487,9 +501,26 @@ class Plugin(BasePlugin):
             # zeigte IMMER eine leere Slot-Liste.
             days_ahead_raw = payload.get("days_ahead")
 
+            vergangenheit_korrigiert = False
             if wunsch_datum:
                 wunsch = self._parse_datum_uhrzeit(wunsch_datum, wunsch_uhrzeit)
                 anker_zeit = wunsch.time()
+                # Wunschdatum in der VERGANGENHEIT: dort nicht stur weiter
+                # suchen, sonst bekommt der Kunde Termine angeboten, die
+                # laengst vorbei sind. Passiert schneller als man denkt —
+                # eine fehlende Jahreszahl ("am 22.05."), eine Antwort auf
+                # eine alte Mail, ein verhoertes Datum am Telefon. Der Anker
+                # wandert auf heute bzw. den naechsten Arbeitstag, die
+                # gewuenschte UHRZEIT bleibt erhalten.
+                if wunsch.date() < datetime.now().date():
+                    vergangenheit_korrigiert = True
+                    jetzt = datetime.now()
+                    tag = (
+                        jetzt.date()
+                        if jetzt.weekday() in self.config["arbeitstage"]
+                        else self._naechster_werktag(jetzt.date())
+                    )
+                    wunsch = datetime.combine(tag, anker_zeit)
             else:
                 # Kein Wunschtermin: ab heute suchen (bzw. ab dem naechsten
                 # Arbeitstag), ohne Uhrzeit-Anker.
@@ -557,6 +588,7 @@ class Plugin(BasePlugin):
                     "slots": slots,
                     "anzahl": len(slots),
                     "smart_routing": smart_meta,
+                    "hinweis_vergangenheit": vergangenheit_korrigiert,
                 }
 
             # --- Rueckfall: kein Mitarbeiter mit eigenem Kalender ----
@@ -620,6 +652,7 @@ class Plugin(BasePlugin):
                 "slots": slots,
                 "anzahl": len(slots),
                 "smart_routing": smart_meta,
+                "hinweis_vergangenheit": vergangenheit_korrigiert,
             }
 
         except Exception as e:

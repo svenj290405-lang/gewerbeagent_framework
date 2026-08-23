@@ -410,10 +410,14 @@ async def test_kalender_book_appointment_passes_email_to_adapter(monkeypatch):
         },
     )
     plugin = kalender_handler.Plugin(context)
+    # Datum bewusst RELATIV: ein fest eingetragenes Datum wandert
+    # zwangslaeufig in die Vergangenheit, und dort lehnt der Handler eine
+    # Buchung inzwischen ab (siehe test_kalender_slots_days_ahead).
+    naechste_woche = (dt.date.today() + dt.timedelta(days=7)).strftime("%d.%m.%Y")
     result = await plugin._book_appointment({
         "name": "Frau Mueller",
         "anliegen": "Beratung",
-        "datum": "22.05.2026",
+        "datum": naechste_woche,
         "uhrzeit": "14:00",
         "telefon": "+49 30 1234 567",
         "kunde_email": "ICH@EXAMPLE.de",
