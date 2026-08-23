@@ -24,6 +24,11 @@ services:
     container_name: gewerbeagent_framework_dev
     hostname: framework_dev
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
     working_dir: /app
     volumes:
       - ./:/app

@@ -3,6 +3,11 @@ services:
     image: postgres:16-alpine
     container_name: gewerbeagent_postgres
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
     environment:
       POSTGRES_USER: gewerbeagent
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
@@ -21,6 +26,11 @@ services:
     image: python:3.12-slim
     container_name: gewerbeagent_framework
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
     working_dir: /app
     volumes:
       - ./:/app
@@ -45,6 +55,11 @@ services:
     image: caddy:2-alpine
     container_name: gewerbeagent_caddy
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
     ports:
       - "80:80"
       - "443:443"
