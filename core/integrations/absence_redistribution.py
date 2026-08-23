@@ -117,21 +117,75 @@ async def _list_events_for_employee_day(
     return []
 
 
+async def _event_volltext(employee: Employee, event_id: str) -> dict:
+    """Beschreibung + Metadaten eines Events, ungekuerzt.
+
+    Die Tagesliste liefert nur ``body_preview`` (Google 300 Zeichen,
+    Microsoft ~255). Genau am Ende der Beschreibung stehen aber der
+    Drive-Link und die GA-Ref, und die extendedProperties (Kunden-Mail
+    und -Telefon) fehlen in der Liste ganz. Ohne diesen Extra-Aufruf
+    entsteht beim Umziehen eine verstuemmelte Kopie, in der die
+    Storno-Suche den Kunden nicht mehr findet.
+    """
+    provider = (employee.calendar_provider or "").lower()
+    try:
+        if provider == "google":
+            from core.integrations.google_calendar import get_event_details
+            return await get_event_details(
+                employee.tenant_id, event_id,
+                employee_id=employee.id,
+                calendar_id=employee.calendar_id or "primary",
+            )
+        if provider == "microsoft":
+            from core.integrations.microsoft_calendar import get_event_details
+            return await get_event_details(
+                employee.tenant_id, event_id, employee_id=employee.id,
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"_event_volltext({event_id}) fehlgeschlagen: {exc}")
+    return {"description": "", "props": {}}
+
+
 async def _create_event_for_employee(
     employee: Employee, *,
     summary: str, description: str, location: str,
     start: dt.datetime, end: dt.datetime,
+    props: dict | None = None,
 ) -> dict:
-    """Anlegen im Kalender des Mitarbeiters."""
+    """Anlegen im Kalender des Mitarbeiters.
+
+    ``props`` sind die strukturierten Metadaten des Original-Events
+    (kunde_telefon, kunde_email, ga_ref …). Sie MUESSEN mitwandern:
+    ``find_events`` sucht darueber exakt, und ohne sie waere ein
+    umverteilter Termin per Kunden-Mail oder Telefonnummer nicht mehr
+    auffindbar — der Kunde sagt ab und Q findet nichts.
+    """
+    props = props or {}
+    telefon = props.get("kunde_telefon") or None
+    email = props.get("kunde_email") or None
+    ga_ref = props.get("ga_ref") or None
+    # Alles ausser den drei bekannten Keys unveraendert durchreichen
+    # (z.B. ga_mirror), damit spaetere Marker nicht still verlorengehen.
+    zusatz = {
+        k: v for k, v in props.items()
+        if k not in ("kunde_telefon", "kunde_email", "ga_ref") and v
+    }
+
     provider = (employee.calendar_provider or "").lower()
     if provider == "google":
-        from core.integrations.google_calendar import create_event
-        return await create_event(
+        # Ueber den Plugin-Adapter statt core.integrations.google_calendar
+        # .create_event: nur der Adapter schreibt extendedProperties.
+        from plugins.kalender.adapters import GoogleCalendarAdapter
+        adapter = GoogleCalendarAdapter(
             employee.tenant_id,
-            summary=summary, description=description, location=location,
-            start=start, end=end,
-            employee_id=employee.id,
             calendar_id=employee.calendar_id or "primary",
+            employee_id=employee.id,
+        )
+        return await adapter.create_event(
+            summary=summary, description=description, location=location,
+            start=start, end=end, timezone="Europe/Berlin",
+            kunde_telefon_normalized=telefon, kunde_email=email,
+            idempotency_key=ga_ref, zusatz_props=zusatz or None,
         )
     elif provider == "microsoft":
         from core.integrations.microsoft_calendar import create_event
@@ -140,6 +194,8 @@ async def _create_event_for_employee(
             summary=summary, description=description, location=location,
             start=start, end=end,
             employee_id=employee.id,
+            kunde_telefon_normalized=telefon, kunde_email=email,
+            idempotency_key=ga_ref, zusatz_props=zusatz or None,
         )
     raise RuntimeError(
         f"Employee {employee.slug} hat keinen calendar_provider — "
@@ -184,13 +240,29 @@ async def _move_event(
 
     Returns: {"new_event_id": ..., "html_link": ...}
     """
+    # Volltext + Metadaten NACHLADEN. event["body_preview"] aus der
+    # Tagesliste ist gekuerzt; eine Kopie daraus verliert Drive-Link und
+    # Kunden-Metadaten (siehe _event_volltext).
+    voll = await _event_volltext(sick_emp, event.get("event_id") or "")
+    beschreibung = voll.get("description") or event.get("body_preview") or ""
+    props = dict(voll.get("props") or {})
+    # Vermerk, damit im Kalender steht, warum hier jemand anderes drinsteht.
+    hinweis = (
+        f"\n\nUebernommen von {sick_emp.name} "
+        f"(abwesend) — automatisch umverteilt."
+    )
+    if "umverteilt" not in beschreibung.lower():
+        beschreibung = f"{beschreibung}{hinweis}"
+    props["ga_umverteilt_von"] = sick_emp.slug
+
     new_event = await _create_event_for_employee(
         new_emp,
         summary=event.get("subject") or "(Termin)",
-        description=event.get("body_preview") or "",
+        description=beschreibung,
         location=event.get("location") or "",
         start=event["start_dt"],
         end=event["end_dt"],
+        props=props,
     )
     delete_ok = await _delete_event_from_employee(
         sick_emp, event.get("event_id") or "",
@@ -411,10 +483,31 @@ async def _send_report_to_inhaber(tenant: Tenant, report: RedistributionReport):
                 f"tenant={tenant.slug} — skip"
             )
             return
+        # Zahlen gehoeren in den Push: "Zusammenfassung in der App" war
+        # ein leeres Versprechen — die App zeigt keinen Umverteilungs-
+        # Report. Zahlen sind keine Kunden-PII und beantworten die einzige
+        # Frage, die der Inhaber sofort hat: muss ich eingreifen?
+        teile = []
+        if report.reassigned:
+            teile.append(f"{len(report.reassigned)} Termin(e) uebernommen")
+        if report.no_coverage:
+            teile.append(
+                f"{len(report.no_coverage)} OHNE Ersatz — bitte selbst klaeren"
+            )
+        if report.errors:
+            teile.append(f"{len(report.errors)} Fehler")
+        body = "; ".join(teile) or "Nichts zu verteilen."
+        # Bei fehlender Abdeckung ist es kein Report mehr, sondern eine
+        # Aufgabe — der Titel soll das unterscheiden.
+        titel = (
+            f"Krankmeldung {report.sick_emp_name}: Termine offen"
+            if report.no_coverage
+            else f"Termine von {report.sick_emp_name} umverteilt"
+        )
         await notify_tenant(
             tenant.id,
-            title="Umverteilung abgeschlossen",
-            body="Zusammenfassung in der App ansehen.",
+            title=titel,
+            body=body,
             url="/app#termine", tag="umverteilung-report",
             employee_id=default.id,
         )

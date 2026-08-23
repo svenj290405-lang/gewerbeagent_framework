@@ -221,8 +221,24 @@ async def _recent_aufnahmen(tenant_id: uuid.UUID, limit: int = 20) -> list[dict]
     } for k in rows]
 
 
-async def _termine(tenant_id: uuid.UUID, *, only_today: bool, limit: int = 50) -> list[dict]:
-    """Anstehende Termine aus kundengespraeche.termin_datum (lokale Quelle).
+# Wie weit die Termin-Liste in den Kalender schaut. Kurz halten: jeder Tag
+# ist ein API-Aufruf beim Provider.
+_TERMINE_KALENDER_TAGE = 14
+
+
+async def _termine(
+    tenant_id: uuid.UUID, *, only_today: bool, limit: int = 50,
+    employee_id: uuid.UUID | None = None,
+) -> list[dict]:
+    """Anstehende Termine — aus BEIDEN Quellen.
+
+    1. ``kundengespraeche.termin_datum`` (lokal erfasste Gespraeche)
+    2. dem echten Kalender des Mitarbeiters
+
+    Warum beides: Termine, die Q am Telefon oder per Mail bucht, landen
+    NUR im Kalender — es entsteht dabei kein Kundengespraech. Diese
+    Liste zeigte sie deshalb nie an, und im Tagesbriefing fehlten
+    ausgerechnet die Termine, die Q selbst vereinbart hatte.
 
     only_today=True -> nur der heutige Tag; sonst ab jetzt aufwaerts.
     """
@@ -243,13 +259,46 @@ async def _termine(tenant_id: uuid.UUID, *, only_today: bool, limit: int = 50) -
             stmt = stmt.where(Kundengespraech.termin_datum >= now)
         stmt = stmt.order_by(Kundengespraech.termin_datum.asc()).limit(limit)
         rows = (await s.execute(stmt)).scalars().all()
-    return [{
+    aus_gespraechen = [{
         "id": str(k.id),
         "kunde": k.kunde_name,
         "ort": k.termin_ort or "",
         "zeit": _fmt_wanduhr(k.termin_datum),
         "termin_iso": k.termin_datum.isoformat() if k.termin_datum else None,
+        "quelle": "gespraech",
+        "event_id": k.kalender_event_id or "",
     } for k in rows]
+
+    # Kalender dazu — best-effort, die lokale Liste steht auch ohne.
+    belegt = {t["event_id"] for t in aus_gespraechen if t["event_id"]}
+    ende = (
+        dt.datetime(now.year, now.month, now.day) + dt.timedelta(days=1)
+        if only_today else None
+    )
+    aus_kalender: list[dict] = []
+    try:
+        for ev in await _geplante_kalendertermine(
+            tenant_id, employee_id, 1 if only_today else _TERMINE_KALENDER_TAGE,
+        ):
+            if ev["event_id"] and ev["event_id"] in belegt:
+                continue  # haengt schon an einem Gespraech
+            if ende is not None and ev["start"] >= ende:
+                continue
+            aus_kalender.append({
+                "id": "",
+                "kunde": _kunde_aus_betreff(ev["titel"]),
+                "ort": ev["ort"],
+                "zeit": _fmt_wanduhr(ev["start"]),
+                "termin_iso": ev["start"].isoformat(),
+                "quelle": "kalender",
+                "event_id": ev["event_id"],
+            })
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Kalender-Termine nicht ladbar: %s", exc)
+
+    alle = aus_gespraechen + aus_kalender
+    alle.sort(key=lambda t: t["termin_iso"] or "")
+    return alle[:limit]
 
 
 # =====================================================================
@@ -259,8 +308,11 @@ async def _termine(tenant_id: uuid.UUID, *, only_today: bool, limit: int = 50) -
 @router.get("/dashboard")
 async def api_dashboard(request: Request, _e=Depends(require_app_user)) -> JSONResponse:
     tid = current_tenant_id(request)
+    emp_id = getattr(request.state.app_employee, "id", None)
     return JSONResponse({
-        "termine_heute": await _termine(tid, only_today=True),
+        "termine_heute": await _termine(
+            tid, only_today=True, employee_id=emp_id,
+        ),
         "rueckrufe": await _open_rueckrufe(tid),
         "aufnahmen": (await _recent_aufnahmen(tid, limit=5)),
     })
@@ -269,7 +321,11 @@ async def api_dashboard(request: Request, _e=Depends(require_app_user)) -> JSONR
 @router.get("/termine")
 async def api_termine(request: Request, _e=Depends(require_app_user)) -> JSONResponse:
     tid = current_tenant_id(request)
-    return JSONResponse({"termine": await _termine(tid, only_today=False)})
+    # Kalender des eingeloggten Mitarbeiters — jeder sieht seine Termine.
+    emp_id = getattr(request.state.app_employee, "id", None)
+    return JSONResponse({
+        "termine": await _termine(tid, only_today=False, employee_id=emp_id),
+    })
 
 
 @router.get("/aufnahmen")

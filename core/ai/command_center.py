@@ -1077,10 +1077,40 @@ async def _run_anstehende_termine(ctx: Ctx, args: dict) -> dict:
             .where(Kundengespraech.termin_datum < bis)
             .order_by(Kundengespraech.termin_datum.asc()).limit(30)
         )).scalars().all()
-    return {"anzahl": len(rows), "termine": [
+    termine = [
         {"kunde": r.kunde_name,
          "termin": r.termin_datum.isoformat() if r.termin_datum else None,
-         "info": (r.briefing_kurz or "")[:120]} for r in rows]}
+         "info": (r.briefing_kurz or "")[:120],
+         "event_id": r.kalender_event_id or ""}
+        for r in rows
+    ]
+
+    # Der Kalender ist die zweite Quelle — und fuer Q die wichtigere:
+    # Termine, die er selbst am Telefon oder per Mail gebucht hat, legen
+    # KEIN Kundengespraech an. Ohne diesen Zweig fehlten im Tagesbriefing
+    # ausgerechnet die Termine, die Q vereinbart hatte.
+    try:
+        from core.api.app_screens import (
+            _geplante_kalendertermine, _kunde_aus_betreff,
+        )
+        belegt = {t["event_id"] for t in termine if t["event_id"]}
+        grenze = dt.datetime.combine(bis, dt.time.min)
+        for ev in await _geplante_kalendertermine(ctx.tid, ctx.employee.id, tage):
+            if ev["event_id"] and ev["event_id"] in belegt:
+                continue
+            if ev["start"] >= grenze:
+                continue
+            termine.append({
+                "kunde": _kunde_aus_betreff(ev["titel"]),
+                "termin": ev["start"].isoformat(),
+                "info": ev["ort"],
+                "event_id": ev["event_id"],
+            })
+        termine.sort(key=lambda t: t["termin"] or "")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("anstehende_termine: Kalender nicht ladbar: %s", exc)
+
+    return {"anzahl": len(termine), "termine": termine}
 
 
 async def _run_team_status(ctx: Ctx, args: dict) -> dict:

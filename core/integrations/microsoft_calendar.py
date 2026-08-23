@@ -25,6 +25,7 @@ das automatisch refreshed.
 from __future__ import annotations
 
 import datetime as dt
+import re
 import html as _html
 import logging
 from typing import Any
@@ -337,6 +338,63 @@ async def create_event(
         "id": data.get("id"),
         "html_link": data.get("webLink") or "",
     }
+
+
+async def get_event_details(
+    tenant_id: UUID,
+    event_id: str,
+    *,
+    employee_id: UUID | None = None,
+) -> dict[str, Any]:
+    """Holt Beschreibung + strukturierte Metadaten EINES Events.
+
+    Gegenstueck zu google_calendar.get_event_details — siehe dort, warum
+    ``bodyPreview`` aus der Tagesliste dafuer nicht reicht (Graph kuerzt
+    auf ~255 Zeichen, und der Drive-Link steht am Ende).
+
+    Der Body kommt als HTML zurueck (create_event schreibt ihn mit <br>);
+    hier wird er wieder in Klartext mit Zeilenumbruechen gewandelt, damit
+    eine Kopie wie das Original aussieht.
+    """
+    try:
+        token = await get_microsoft_token(tenant_id, employee_id=employee_id)
+        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS) as client:
+            resp = await client.get(
+                f"{GRAPH_API_BASE}/me/events/{event_id}",
+                headers={"Authorization": f"Bearer {token}"},
+                params={
+                    "$select": "id,subject,body",
+                    "$expand": (
+                        "singleValueExtendedProperties($filter="
+                        f"startsWith(id,'String {{{GA_PROPSET_GUID}}}'))"
+                    ),
+                },
+            )
+            if resp.status_code != 200:
+                logger.warning(
+                    f"Microsoft get_event_details {resp.status_code}: "
+                    f"{resp.text[:200]}"
+                )
+                return {"description": "", "props": {}}
+            ev = resp.json()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"Microsoft get_event_details({event_id}) failed: {exc}")
+        return {"description": "", "props": {}}
+
+    roh = ((ev.get("body") or {}).get("content") or "")
+    text = re.sub(r"<br\s*/?>", "\n", roh, flags=re.I)
+    text = re.sub(r"<[^>]+>", "", text)
+    text = _html.unescape(text).strip()
+
+    props: dict[str, str] = {}
+    for p in (ev.get("singleValueExtendedProperties") or []):
+        pid, val = p.get("id") or "", p.get("value")
+        if not val:
+            continue
+        # "String {GUID} Name kunde_email" -> "kunde_email"
+        name = pid.rsplit(" Name ", 1)[-1] if " Name " in pid else pid
+        props[name] = str(val)
+    return {"description": text, "props": props}
 
 
 async def attach_drive_link_to_event(

@@ -9,8 +9,10 @@ Score-Modell (einfach + deterministisch):
   (kein Gemini in Phase 5 — Latenz/Cost; spaeter Phase 6).
 - Distanz-Score (ORS) — nur wenn aktiv konfiguriert + Adresse vorhanden +
   vorgefilterte Kandidatenmenge ≤ 3 (sonst Free-Tier-Risiko).
-- Verfuegbarkeit (Phase-6-Erweiterung) — heute nicht implementiert,
-  Slot-Filter im Kalender-Plugin uebernimmt das ohnehin nochmal.
+- Verfuegbarkeit — ueber `target_datetime` (Abwesenheit + Arbeitstag +
+  Arbeitszeit, inkl. Termin-ENDE wenn `dauer_minuten` mitkommt). Ohne
+  Zeitpunkt greift `nur_heute_verfuegbare`, damit auch zeitlose Vorgaenge
+  (Rueckruf, Anfrage-Formular) nicht bei einem Abwesenden landen.
 - Tie-Break: deterministisch nach slug ASC.
 
 Conversation-Sticky-Routing:
@@ -106,6 +108,38 @@ def extract_skills_from_text(text: str) -> list[str]:
 _extract_skills_from_text = extract_skills_from_text
 
 
+def _falte(text: str) -> str:
+    """Kleinschreibung + Umlaute aufloesen — die Vergleichsform."""
+    t = (text or "").lower().strip()
+    return (t.replace("ä", "ae").replace("ö", "oe")
+             .replace("ü", "ue").replace("ß", "ss"))
+
+
+def skill_formen(skills) -> set[str]:
+    """Vergleichbare Formen der am Mitarbeiter gespeicherten Skills.
+
+    Der Grund: das Eingabefeld in der App ist FREIER TEXT (Platzhalter
+    "z.B. Heizung, Sanitär, Elektro"), der Abgleich lief aber gegen das
+    kanonische Vokabular aus KEYWORD_TO_SKILL — per exaktem Set-Vergleich.
+    Damit traf "Heizung" nie "heizung", "Sanitär" nie "sanitaer" und
+    "Tischlerarbeiten" nie "tischler". Wer den Platzhalter der App woertlich
+    abtippte, bekam null Treffer, und das Routing fiel still auf den
+    Inhaber zurueck.
+
+    Jeder Skill liefert hier zwei Formen:
+      * die gefaltete Rohform ("treppenbau") — trifft die Alltagssprache
+        des Kunden direkt, auch bei Gewerken ausserhalb des Vokabulars
+      * die kanonischen Treffer darin ("Tischlerarbeiten" -> "tischler")
+    """
+    formen: set[str] = set()
+    for roh in (skills or []):
+        gefaltet = _falte(str(roh))
+        if len(gefaltet) >= 3:
+            formen.add(gefaltet)
+        formen.update(extract_skills_from_text(str(roh)))
+    return formen
+
+
 async def choose_employee(
     tenant_id: uuid.UUID,
     *,
@@ -113,7 +147,9 @@ async def choose_employee(
     kunde_adresse: str | None = None,
     existing_conversation=None,
     target_datetime: dt.datetime | None = None,
+    dauer_minuten: int | None = None,
     exclude_employee_ids: list[uuid.UUID] | None = None,
+    nur_heute_verfuegbare: bool = False,
 ) -> RoutingDecision | None:
     """Waehlt den passendsten Mitarbeiter fuer eine eingehende Anfrage.
 
@@ -132,9 +168,18 @@ async def choose_employee(
             Arbeitszeit). Wenn nach Filter 0 Kandidaten: Default-Employee
             als Fallback mit reason='no-coverage' (Signal an Cron/Bot
             zur Eskalation an den Inhaber).
+        dauer_minuten: geplante Termindauer. Nur zusammen mit
+            target_datetime sinnvoll — dann muss auch das Termin-ENDE in
+            die Arbeitszeit fallen.
         exclude_employee_ids: Liste der Mitarbeiter die ausgeschlossen
             werden sollen — typisch bei Umverteilung der Krank-Termine
             (der Erkrankte selbst soll nicht wieder gewaehlt werden).
+        nur_heute_verfuegbare: fuer Vorgaenge OHNE Termin-Zeitpunkt
+            (Rueckruf, Anfrage-Formular). Schliesst aus, wer heute
+            abwesend ist. Ohne das landete eine Rueckrufbitte beim
+            Kollegen, der zwei Wochen im Urlaub ist, und blieb dort
+            liegen — der Skill-Match hatte ihn ausgewaehlt, ohne dass
+            irgendwer die Abwesenheit geprueft haette.
 
     Returns:
         RoutingDecision oder None wenn der Tenant keine aktiven Employees
@@ -193,14 +238,26 @@ async def choose_employee(
     # innerhalb Arbeitszeit) + nicht im exclude-Set.
     excluded = set(exclude_employee_ids or [])
     candidates_after_filter = emps
-    if target_datetime is not None or excluded:
-        from core.models.employee_absence import is_employee_working_at
+    if target_datetime is not None or excluded or nur_heute_verfuegbare:
+        from core.models.employee_absence import (
+            is_employee_absent_on, is_employee_working_at,
+        )
+        heute = dt.date.today()
         filtered = []
         for e in emps:
             if e.id in excluded:
                 continue
             if target_datetime is not None:
-                if not await is_employee_working_at(e.id, target_datetime):
+                if not await is_employee_working_at(
+                    e.id, target_datetime, dauer_minuten=dauer_minuten,
+                ):
+                    continue
+            elif nur_heute_verfuegbare:
+                # Kein Zeitpunkt bekannt: nur die Abwesenheit pruefen,
+                # NICHT Arbeitstag/-zeit. Ein Rueckruf, der abends
+                # reinkommt, soll trotzdem jemandem zugewiesen werden —
+                # er ist eine To-do-Liste, keine Terminbuchung.
+                if await is_employee_absent_on(e.id, heute):
                     continue
             filtered.append(e)
         candidates_after_filter = filtered
@@ -279,15 +336,23 @@ async def choose_employee(
     # 4) Skill-Score (deterministischer Fallback wenn Smart-Routing aus
     #    ist oder Gemini keinen klaren Treffer/Antwort lieferte)
     needed_skills = _extract_skills_from_text(anliegen_text)
+    anliegen_gefaltet = _falte(anliegen_text)
     skill_scores: dict[uuid.UUID, int] = {}
     for e in emps:
-        emp_skills = set((e.skills or []))
-        if needed_skills:
-            hits = sum(1 for sk in needed_skills if sk in emp_skills)
-            skill_scores[e.id] = hits
-        else:
-            # Kein Anliegen-Text → alle Skill-neutral
-            skill_scores[e.id] = 0
+        formen = skill_formen(e.skills)
+        treffer = 0
+        # a) kanonischer Treffer: Anliegen und Skill meinen dasselbe Gewerk
+        treffer += sum(1 for sk in needed_skills if sk in formen)
+        # b) direkter Treffer: der Skill steht so im Anliegen. Faengt
+        #    Gewerke, die das feste Vokabular gar nicht kennt (Treppenbau,
+        #    Trockenbau, Pflasterarbeiten …).
+        if anliegen_gefaltet:
+            treffer += sum(
+                1 for f in formen
+                if f not in needed_skills and len(f) >= 4
+                and f in anliegen_gefaltet
+            )
+        skill_scores[e.id] = treffer
 
     max_skill = max(skill_scores.values())
     if max_skill > 0:

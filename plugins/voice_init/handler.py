@@ -1596,15 +1596,17 @@ class Plugin(BasePlugin):
             )
 
         # Push an den fuer dieses Anliegen passenden Mitarbeiter routen.
-        # Hier kein target_datetime — der Anruf ist gerade jetzt, und der
-        # Kontakt-Speichern-Pfad bucht noch keinen Termin. choose_employee
-        # nutzt Skill-Match + optional Distanz (kunde_adresse ist hier
-        # nicht erfasst, save_contact bekommt sie nicht vom Voice-Agent).
+        # Kein target_datetime — der Kontakt-Speichern-Pfad bucht keinen
+        # Termin. Abwesende trotzdem ausschliessen: der Kontakt ist eine
+        # Aufgabe fuer jemanden, der diese Woche auch da ist.
+        # (kunde_adresse ist hier nicht erfasst, save_contact bekommt sie
+        # nicht vom Voice-Agent.)
         routing = None
         try:
             routing = await choose_employee(
                 tenant_id=tenant_id,
                 anliegen_text=anliegen or "",
+                nur_heute_verfuegbare=True,
             )
         except Exception as e:
             logger.warning(f"save_contact: choose_employee crashed: {e}")
@@ -1694,6 +1696,10 @@ class Plugin(BasePlugin):
             routing = await choose_employee(
                 tenant_id=tenant_id,
                 anliegen_text=anliegen,
+                # Kein Termin-Zeitpunkt, aber die Abwesenheit zaehlt
+                # trotzdem: eine Rueckrufbitte beim Kollegen im Urlaub
+                # bleibt zwei Wochen liegen.
+                nur_heute_verfuegbare=True,
             )
         except Exception as e:
             logger.warning(f"rueckruf: choose_employee crashed: {e}")

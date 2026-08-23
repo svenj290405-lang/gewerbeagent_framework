@@ -275,6 +275,7 @@ async def close_absence(
 
 async def is_employee_working_at(
     employee_id: uuid.UUID, target: dt.datetime,
+    *, dauer_minuten: int | None = None,
 ) -> bool:
     """True wenn der Mitarbeiter am `target`-Zeitpunkt arbeitet.
 
@@ -284,6 +285,9 @@ async def is_employee_working_at(
     3. target.weekday() in arbeitstage (Fallback Mo-Fr [0..4])
     4. target.time() in [arbeitszeiten.start, arbeitszeiten.end]
        (Fallback 08:00-17:00)
+    5. mit ``dauer_minuten``: auch das ENDE muss in die Arbeitszeit
+       fallen. Ohne das galt ein Drei-Stunden-Termin um 16:45 als
+       verfuegbar, obwohl er bis 19:45 laeuft.
 
     Wenn arbeitszeiten/arbeitstage NULL: nutze konservativen
     Default Mo-Fr 8-17. (Tenant-spezifischer Default aus
@@ -314,11 +318,21 @@ async def is_employee_working_at(
     except (ValueError, AttributeError):
         start, end = dt.time(8, 0), dt.time(17, 0)
     t = target.time()
-    return start <= t <= end
+    if not (start <= t <= end):
+        return False
+    if dauer_minuten:
+        ende_dt = target + dt.timedelta(minutes=int(dauer_minuten))
+        # Ueber Mitternacht hinaus ist nie Arbeitszeit.
+        if ende_dt.date() != target.date():
+            return False
+        if ende_dt.time() > end:
+            return False
+    return True
 
 
 async def get_available_employees(
     tenant_id: uuid.UUID, target: dt.datetime,
+    *, dauer_minuten: int | None = None,
 ) -> list["Employee"]:
     """Alle Mitarbeiter eines Tenants die am `target`-Zeitpunkt arbeiten.
     Vorgefilterte Liste fuer den Skill-Router.
@@ -327,6 +341,8 @@ async def get_available_employees(
     all_emps = await get_employees_for_tenant(tenant_id, active_only=True)
     available: list = []
     for emp in all_emps:
-        if await is_employee_working_at(emp.id, target):
+        if await is_employee_working_at(
+            emp.id, target, dauer_minuten=dauer_minuten,
+        ):
             available.append(emp)
     return available

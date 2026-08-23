@@ -442,7 +442,9 @@ async def test_choose_employee_skips_absent_books_available(monkeypatch):
     available = _emp(slug="anna", name="Anna", skills=["heizung"])
     monkeypatch.setattr(er, "AsyncSessionLocal", _session_factory([[absent, available]]))
 
-    async def _working(emp_id, target):
+    async def _working(emp_id, target, *, dauer_minuten=None):
+        # dauer_minuten kam dazu, als der Verfuegbarkeits-Check auch das
+        # Termin-ENDE prueft (16:45 + 3h liegt nach Feierabend).
         return emp_id == available.id  # nur Anna arbeitet
 
     monkeypatch.setattr(
@@ -515,3 +517,137 @@ async def test_choose_employee_no_skill_falls_back_to_default(monkeypatch):
     )
     assert decision.reason == "fallback-default"
     assert decision.employee_slug == "inhaber"
+
+
+# =====================================================================
+# Datenerhalt beim Verschieben
+#
+# Die Tagesliste liefert die Beschreibung nur gekuerzt (Google 300,
+# Microsoft ~255 Zeichen) und ohne die extendedProperties. Eine Kopie
+# daraus verlor den Drive-Link mitten in der URL und die Kunden-
+# Metadaten — danach fand die Storno-Suche den Termin per Mail oder
+# Telefonnummer nicht mehr.
+# =====================================================================
+
+_LANGE_BESCHREIBUNG = (
+    "Betrieb: Schreiberei Jantos\n"
+    "Kunde: Anna Meier\n"
+    "Anliegen: Einbauschrank Wohnzimmer, Aufmass\n"
+    "Adresse: Musterstrasse 12, 34117 Kassel\n"
+    "Telefon: +49 561 1234567\n"
+    "E-Mail: anna.meier@example.de\n"
+    "Zustaendig: Max Mustermann\n"
+    "Unterlagen (Drive): https://drive.google.com/drive/folders/1AbCdEfGhIjKlMnOpQrStUvWxYz\n\n"
+    "Eingetragen via KI-Agent Q (Gewerbeagent Framework)\n"
+    "GA-Ref: mail-3f7a91c2-4b8e-4d1a-9c33-77aa10bb5e22"
+)
+
+
+@pytest.mark.asyncio
+async def test_move_event_holt_volltext_statt_vorschau(monkeypatch):
+    """Der verschobene Termin behaelt die GANZE Beschreibung."""
+    tenant = SimpleNamespace(id=uuid.uuid4(), slug="demo")
+    sick = _emp(slug="max", name="Max", calendar_provider="google", calendar_id="primary")
+    new = _emp(slug="anna", name="Anna", calendar_provider="google", calendar_id="primary")
+    event = _event()
+    event["body_preview"] = _LANGE_BESCHREIBUNG[:300]   # so kommt es aus der Liste
+
+    monkeypatch.setattr(ar, "_event_volltext", AsyncMock(return_value={
+        "description": _LANGE_BESCHREIBUNG,
+        "props": {
+            "kunde_email": "anna.meier@example.de",
+            "kunde_telefon": "+495611234567",
+            "ga_ref": "mail-3f7a91c2",
+        },
+    }))
+    create_mock = AsyncMock(return_value={"new_event_id": "n1"})
+    monkeypatch.setattr(ar, "_create_event_for_employee", create_mock)
+    monkeypatch.setattr(ar, "_delete_event_from_employee", AsyncMock(return_value=True))
+
+    await ar._move_event(tenant, sick, new, event)
+
+    kw = create_mock.await_args.kwargs
+    # Der Drive-Link steht am ENDE — genau er fiel der Kuerzung zum Opfer.
+    assert "1AbCdEfGhIjKlMnOpQrStUvWxYz" in kw["description"]
+    assert "GA-Ref" in kw["description"]
+    # Metadaten wandern mit, sonst ist der Termin nicht mehr auffindbar.
+    assert kw["props"]["kunde_email"] == "anna.meier@example.de"
+    assert kw["props"]["kunde_telefon"] == "+495611234567"
+
+
+@pytest.mark.asyncio
+async def test_move_event_vermerkt_die_uebernahme(monkeypatch):
+    """Im Kalender soll stehen, warum da jemand anderes drin ist."""
+    tenant = SimpleNamespace(id=uuid.uuid4(), slug="demo")
+    sick = _emp(slug="max", name="Max Mustermann", calendar_provider="google")
+    new = _emp(slug="anna", name="Anna", calendar_provider="google")
+    monkeypatch.setattr(ar, "_event_volltext", AsyncMock(
+        return_value={"description": "Kessel tropft", "props": {}}))
+    create_mock = AsyncMock(return_value={"new_event_id": "n1"})
+    monkeypatch.setattr(ar, "_create_event_for_employee", create_mock)
+    monkeypatch.setattr(ar, "_delete_event_from_employee", AsyncMock(return_value=True))
+
+    await ar._move_event(tenant, sick, new, _event())
+
+    kw = create_mock.await_args.kwargs
+    assert "Max Mustermann" in kw["description"]
+    assert "umverteilt" in kw["description"].lower()
+    assert kw["props"]["ga_umverteilt_von"] == "max"
+
+
+@pytest.mark.asyncio
+async def test_move_event_faellt_auf_vorschau_zurueck(monkeypatch):
+    """Kein Volltext abrufbar -> lieber die gekuerzte Fassung als nichts."""
+    tenant = SimpleNamespace(id=uuid.uuid4(), slug="demo")
+    sick = _emp(slug="max", name="Max", calendar_provider="google")
+    new = _emp(slug="anna", name="Anna", calendar_provider="google")
+    monkeypatch.setattr(ar, "_event_volltext", AsyncMock(
+        return_value={"description": "", "props": {}}))
+    create_mock = AsyncMock(return_value={"new_event_id": "n1"})
+    monkeypatch.setattr(ar, "_create_event_for_employee", create_mock)
+    monkeypatch.setattr(ar, "_delete_event_from_employee", AsyncMock(return_value=True))
+
+    await ar._move_event(tenant, sick, new, _event())
+    assert "Kessel tropft" in create_mock.await_args.kwargs["description"]
+
+
+@pytest.mark.asyncio
+async def test_routing_ohne_zeitpunkt_meidet_abwesende(monkeypatch):
+    """Rueckruf und Anfrage-Formular haben keinen Termin-Zeitpunkt.
+
+    Ohne `nur_heute_verfuegbare` lief der Abwesenheits-Filter dort gar
+    nicht: der Skill-Match waehlte den Kollegen, der zwei Wochen im
+    Urlaub ist, und die Rueckrufbitte blieb dort liegen.
+    """
+    tenant_id = uuid.uuid4()
+    abwesend = _emp(slug="max", name="Max", skills=["heizung"])
+    da = _emp(slug="anna", name="Anna", skills=["heizung"])
+    monkeypatch.setattr(er, "AsyncSessionLocal", _session_factory([[abwesend, da]]))
+
+    async def _absent(emp_id, tag):
+        return emp_id == abwesend.id
+
+    monkeypatch.setattr(
+        "core.models.employee_absence.is_employee_absent_on",
+        AsyncMock(side_effect=_absent),
+    )
+    entscheidung = await choose_employee(
+        tenant_id, anliegen_text="Heizung kaputt", nur_heute_verfuegbare=True,
+    )
+    assert entscheidung.employee_slug == "anna"
+
+
+@pytest.mark.asyncio
+async def test_routing_ohne_flag_bleibt_unveraendert(monkeypatch):
+    """Ohne das Flag darf sich nichts aendern — sonst zoege der Filter in
+    Pfade ein, die bewusst jeden Mitarbeiter zulassen sollen."""
+    tenant_id = uuid.uuid4()
+    a = _emp(slug="max", name="Max", skills=["heizung"], is_default=True)
+    monkeypatch.setattr(er, "AsyncSessionLocal", _session_factory([[a]]))
+    absent_mock = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        "core.models.employee_absence.is_employee_absent_on", absent_mock,
+    )
+    entscheidung = await choose_employee(tenant_id, anliegen_text="Heizung kaputt")
+    assert entscheidung.employee_slug == "max"
+    absent_mock.assert_not_awaited()

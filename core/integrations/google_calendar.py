@@ -182,6 +182,53 @@ async def list_events_for_day(
 # bei Krankheit verwendet via core.integrations.absence_redistribution)
 # ---------------------------------------------------------------------
 
+async def get_event_details(
+    tenant_id: UUID,
+    event_id: str,
+    *,
+    employee_id: UUID | None = None,
+    calendar_id: str = "primary",
+) -> dict[str, Any]:
+    """Holt Beschreibung + strukturierte Metadaten EINES Events.
+
+    Warum es das braucht: ``list_events_for_day`` liefert die
+    Beschreibung nur als ``body_preview`` (300 Zeichen). Wer ein Event
+    umzieht — die Krank-Umverteilung tut genau das — wuerde daraus eine
+    gekuerzte Kopie bauen: der Drive-Link steht am Ende der Beschreibung
+    und wird dabei mitten in der URL abgeschnitten, die
+    extendedProperties (Kunden-Mail/-Telefon) fehlen ganz. Danach findet
+    die Storno-Suche den Termin nicht mehr ueber Mail oder Nummer.
+
+    Returns: {"description": str, "props": {name: value}}.
+    Bei Fehler leere Werte — der Aufrufer soll deswegen nicht abbrechen.
+    """
+    oauth_token = await find_oauth_token(tenant_id, "google", employee_id)
+    if oauth_token is None:
+        return {"description": "", "props": {}}
+    try:
+        access_token = await _ensure_fresh_access_token(oauth_token)
+        url = f"{GOOGLE_CAL_BASE}/calendars/{calendar_id}/events/{event_id}"
+        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS) as client:
+            resp = await client.get(
+                url, headers={"Authorization": f"Bearer {access_token}"},
+            )
+            if resp.status_code != 200:
+                logger.warning(
+                    f"Google get_event_details {resp.status_code}: "
+                    f"{resp.text[:200]}"
+                )
+                return {"description": "", "props": {}}
+            ev = resp.json()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"Google get_event_details({event_id}) failed: {exc}")
+        return {"description": "", "props": {}}
+    props = ((ev.get("extendedProperties") or {}).get("private") or {})
+    return {
+        "description": (ev.get("description") or ""),
+        "props": {str(k): str(v) for k, v in props.items() if v},
+    }
+
+
 async def create_event(
     tenant_id: UUID,
     *,

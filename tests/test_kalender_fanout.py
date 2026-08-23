@@ -73,7 +73,8 @@ def _make_plugin():
 def _patch_kandidaten(p, employees, adapter_je_emp):
     """Kandidaten-Ermittlung und Adapter-Factory ersetzen."""
     async def _kandidaten(employee_id, anker):
-        return employees
+        # zweiter Wert = Grund; "ok" heisst normaler Fan-Out
+        return employees, "ok"
 
     async def _adapter(tenant_id, employee_id=None, fallback_calendar_id=None):
         return adapter_je_emp[str(employee_id)]
@@ -143,7 +144,9 @@ async def test_ohne_verbundenen_kalender_kein_fanout():
     p = _make_plugin()
 
     async def _keine(employee_id, anker):
-        return []
+        # leer + "ok" = niemand hat einen Kalender -> Betriebskalender.
+        # (Der Fall "abwesend" darf NICHT ausweichen, siehe eigener Test.)
+        return [], "ok"
 
     async def _adapter(*a, **kw):
         return _FakeAdapter("tenant")
@@ -264,3 +267,28 @@ async def test_spiegel_fehler_bricht_buchung_nicht():
             location="", start=dt.datetime(2026, 9, 1, 10, 0),
             ende=dt.datetime(2026, 9, 1, 11, 0), idempotency_key=None,
         )
+
+
+@pytest.mark.asyncio
+async def test_abwesender_mitarbeiter_bekommt_keine_ersatz_slots():
+    """Ist der ausdruecklich angefragte Mitarbeiter weg, gibt es KEINE Slots.
+
+    Der Rueckfall auf den Betriebskalender ist hier falsch: die Slots
+    kaemen aus einem fremden Kalender, wuerden dem Kunden aber als
+    Termine dieses Mitarbeiters angeboten — mitten in dessen Urlaub.
+    """
+    p = _make_plugin()
+
+    async def _abwesend(employee_id, anker):
+        return [], "abwesend"
+
+    async def _adapter(*a, **kw):
+        raise AssertionError("Es darf gar kein Kalender geoeffnet werden")
+
+    with patch.object(p, "_slot_kandidaten", _abwesend), \
+         patch.object(kal, "get_calendar_adapter", _adapter):
+        out = await p._find_free_slots({"datum": "26.08.2026", "uhrzeit": "10:00"})
+
+    assert out["erfolg"] is True
+    assert out["slots"] == []
+    assert out["grund"] == "mitarbeiter_abwesend"

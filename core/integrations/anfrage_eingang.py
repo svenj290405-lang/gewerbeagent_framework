@@ -209,6 +209,9 @@ async def notify_tenant_anfrage_submitted(token_str: str, antworten: dict) -> No
             routing = await choose_employee(
                 tenant_id=tenant.id,
                 anliegen_text=_anliegen_text_from_antworten(antworten),
+                # Ein ausgefuelltes Anfrage-Formular ist eine Aufgabe fuer
+                # heute — nicht fuer jemanden, der im Urlaub ist.
+                nur_heute_verfuegbare=True,
             )
             employee_id = routing.employee_id if routing else None
         except Exception as e:  # noqa: BLE001

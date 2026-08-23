@@ -306,10 +306,37 @@ class Plugin(BasePlugin):
                 # sieht so direkt, mit welcher Adresse korrespondiert wird.
                 email_text = f"\nE-Mail: {kunde_email}" if kunde_email else ""
 
+                # Wer zustaendig ist + ob bei der Buchung etwas auffiel.
+                # Beides stand vorher nirgends im Termin: im Spiegel beim
+                # Chef ("[Team] …") war deshalb nicht erkennbar, wessen
+                # Termin das ueberhaupt ist.
+                emp_name, emp_hinweise = await self._mitarbeiter_kontext(
+                    employee_id, start, dauer,
+                )
+
                 summary = f"[{betrieb_name}] {anliegen} - {name}"
                 drive_line = (
                     f"\nUnterlagen (Drive): {drive_url}" if drive_url else ""
                 )
+                zustaendig_line = (
+                    f"\nZustaendig: {emp_name}" if emp_name else ""
+                )
+                hinweis_line = (
+                    "\n\nACHTUNG: " + " ".join(emp_hinweise)
+                    if emp_hinweise else ""
+                )
+                # Link zurueck in die App: dort wird aus dem Termin mit
+                # einem Tipp ein Kundengespraech (Diktat/Notizen/Fotos).
+                app_line = ""
+                try:
+                    from config.settings import settings as _settings
+                    if _settings.app_url:
+                        app_line = (
+                            f"\nIn der App oeffnen: {_settings.app_url}"
+                            f"/app#gespraeche"
+                        )
+                except Exception:  # noqa: BLE001
+                    app_line = ""
                 description = (
                     f"Betrieb: {betrieb_name}\n"
                     f"Kunde: {name}\n"
@@ -317,7 +344,10 @@ class Plugin(BasePlugin):
                     f"Adresse: {adresse}"
                     f"{telefon_text}"
                     f"{email_text}"
-                    f"{drive_line}\n\n"
+                    f"{zustaendig_line}"
+                    f"{drive_line}"
+                    f"{app_line}"
+                    f"{hinweis_line}\n\n"
                     f"Eingetragen via KI-Agent Q (Gewerbeagent Framework)"
                 )
                 if idempotency_key:
@@ -350,6 +380,7 @@ class Plugin(BasePlugin):
                 employee_id=employee_id, summary=summary,
                 description=description, location=adresse,
                 start=start, ende=ende, idempotency_key=idempotency_key,
+                mitarbeiter_name=emp_name,
             )
 
             # Push an den fuer den Termin zustaendigen Mitarbeiter (silent
@@ -377,6 +408,11 @@ class Plugin(BasePlugin):
                 ),
                 "event_id": result.get("id"),
                 "link": result.get("html_link") or result.get("htmlLink"),
+                # Zustaendigkeit + Auffaelligkeiten nach oben durchreichen,
+                # damit App und Q sie anzeigen koennen statt sie nur im
+                # Kalendertext zu verstecken.
+                "mitarbeiter": emp_name,
+                "hinweise": emp_hinweise,
             }
 
             if idempotency_key:
@@ -472,11 +508,25 @@ class Plugin(BasePlugin):
             # (get_available_employees prueft Abwesenheit UND
             # Arbeitszeit) — bisher filterten Krankmeldungen nur den
             # Router, nicht die Slot-Suche.
-            kandidaten_emps = await self._slot_kandidaten(
+            kandidaten_emps, kandidaten_grund = await self._slot_kandidaten(
                 employee_id, wunsch,
             )
 
             slots: list[dict] = []
+
+            if kandidaten_grund == "abwesend":
+                # Kein Ausweichen auf den Betriebskalender — sonst waeren
+                # das fremde Slots unter falschem Namen.
+                return {
+                    "erfolg": True,
+                    "slots": [],
+                    "nachricht": (
+                        "Der angefragte Mitarbeiter ist zu dieser Zeit nicht "
+                        "verfuegbar. Bitte einen anderen Termin oder "
+                        "Mitarbeiter waehlen."
+                    ),
+                    "grund": "mitarbeiter_abwesend",
+                }
 
             if kandidaten_emps:
                 slots = await self._slots_ueber_mitarbeiter(
@@ -587,7 +637,7 @@ class Plugin(BasePlugin):
 
     async def _spiegel_termin(
         self, *, employee_id, summary, description, location,
-        start, ende, idempotency_key,
+        start, ende, idempotency_key, mitarbeiter_name=None,
     ) -> None:
         """Legt eine Kopie des Termins im Kalender des Inhabers ab.
 
@@ -610,8 +660,15 @@ class Plugin(BasePlugin):
                 self.tenant_id, employee_id=chef.id,
                 fallback_calendar_id=self.config["calendar_id"],
             )
+            # Der Name gehoert in den TITEL, nicht nur in die Beschreibung:
+            # in der Monatsansicht sieht der Chef nur die Titelzeile, und
+            # "[Team] Heizung warten - Meier" beantwortet nicht, wer faehrt.
+            spiegel_titel = (
+                f"[Team: {mitarbeiter_name}] {summary}"
+                if mitarbeiter_name else f"[Team] {summary}"
+            )
             await adapter.create_event(
-                summary=f"[Team] {summary}",
+                summary=spiegel_titel,
                 description=description,
                 location=location,
                 start=start, end=ende,
@@ -670,11 +727,76 @@ class Plugin(BasePlugin):
     # FAN-OUT ueber Mitarbeiter-Kalender
     # ------------------------------------------------------------------
 
+    async def _mitarbeiter_kontext(self, employee_id, start, dauer):
+        """Name des Zustaendigen + Warnhinweise fuer die Buchung.
+
+        Zwei Dinge, die vorher stillschweigend passierten:
+
+        * Ein Termin konnte auf einen Mitarbeiter gebucht werden, der an
+          dem Tag krank oder im Urlaub ist. Weder App noch Q sagten etwas.
+        * Ein Mitarbeiter OHNE verbundenen Kalender bekommt ueber den
+          Token-Fallback still den Kalender des Inhabers — der Termin
+          landet also woanders, als der Nutzer denkt.
+
+        Blockiert wird nichts: der Inhaber darf wissentlich so buchen
+        (Urlaubsvertretung absprechen, Termin vormerken). Aber er soll
+        es sehen — im Ergebnis und spaeter im Kalendereintrag.
+
+        Returns: (name, [hinweis, ...])
+        """
+        if not employee_id:
+            return None, []
+        from core.models.employee import Employee
+        from core.models.employee_absence import is_employee_working_at
+
+        try:
+            async with AsyncSessionLocal() as session:
+                emp = (await session.execute(
+                    select(Employee)
+                    .where(Employee.id == employee_id)
+                    .where(Employee.tenant_id == self.tenant_id)
+                )).scalar_one_or_none()
+                if emp is not None:
+                    session.expunge(emp)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Mitarbeiter-Kontext nicht ladbar: %s", exc)
+            return None, []
+        if emp is None:
+            return None, []
+
+        hinweise: list[str] = []
+        try:
+            if not await is_employee_working_at(
+                emp.id, start, dauer_minuten=dauer,
+            ):
+                hinweise.append(
+                    f"{emp.name} arbeitet zu dieser Zeit laut Planung nicht "
+                    f"(abwesend oder ausserhalb der Arbeitszeit)."
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Verfuegbarkeits-Hinweis fehlgeschlagen: %s", exc)
+        if not getattr(emp, "calendar_provider", None):
+            hinweise.append(
+                f"{emp.name} hat keinen eigenen Kalender verbunden — der "
+                f"Termin landet im Kalender des Betriebs."
+            )
+        return emp.name, hinweise
+
     async def _slot_kandidaten(self, employee_id, anker_dt):
         """Welche Mitarbeiter kommen fuer die Slot-Suche in Frage?
 
-        Leere Liste = kein Fan-Out moeglich, der Aufrufer faellt auf den
-        Tenant-Default-Kalender zurueck (Verhalten wie vor dem Fan-Out).
+        Returns ``(kandidaten, grund)``. Der Grund trennt zwei Faelle, die
+        beide eine leere Liste liefern, aber gegensaetzlich behandelt
+        werden muessen:
+
+          "ok"       — Fan-Out (ggf. leer, weil niemand einen Kalender
+                       verbunden hat): Aufrufer faellt auf den Tenant-
+                       Default-Kalender zurueck, wie vor dem Fan-Out.
+          "abwesend" — der AUSDRUECKLICH angefragte Mitarbeiter ist zu der
+                       Zeit weg. Hier darf NICHT auf den Betriebskalender
+                       ausgewichen werden: sonst kommen Slots zurueck, die
+                       dem Kunden als Termine dieses Mitarbeiters
+                       angeboten werden, obwohl er im Urlaub ist.
 
         Bedingungen:
           - eigener Kalender verbunden (calendar_provider gesetzt) —
@@ -683,7 +805,9 @@ class Plugin(BasePlugin):
           - arbeitet zum Zielzeitpunkt (Abwesenheit + Arbeitszeit)
         """
         from core.models.employee import Employee
-        from core.models.employee_absence import get_available_employees
+        from core.models.employee_absence import (
+            get_available_employees, is_employee_working_at,
+        )
 
         if employee_id:
             # Tenant-Filter mit in die Query: eine employee_id aus einem
@@ -696,14 +820,35 @@ class Plugin(BasePlugin):
                 )).scalar_one_or_none()
                 if emp is not None:
                     session.expunge(emp)
-            return [emp] if emp is not None else []
+            if emp is None:
+                return [], "unbekannt"
+            # Auch der ausdruecklich angefragte Mitarbeiter muss zu der
+            # Zeit da sein. Vorher lief der Abwesenheits-Filter NUR im
+            # Fan-Out — mit employee_id bot die Slot-Suche munter Termine
+            # mitten im Urlaub an (z.B. bei Sticky-Routing auf eine
+            # bestehende Konversation).
+            try:
+                if not await is_employee_working_at(emp.id, anker_dt):
+                    logger.info(
+                        "Slot-Suche: %s ist am %s nicht verfuegbar — "
+                        "keine Slots", emp.slug, anker_dt.date(),
+                    )
+                    return [], "abwesend"
+            except Exception as exc:  # noqa: BLE001
+                # Im Zweifel weitermachen: eine kaputte Abwesenheits-
+                # Abfrage darf die Terminsuche nicht lahmlegen.
+                logger.warning("Abwesenheits-Check fehlgeschlagen: %s", exc)
+            return [emp], "ok"
 
         try:
             verfuegbar = await get_available_employees(self.tenant_id, anker_dt)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Kandidaten-Ermittlung fehlgeschlagen: %s", exc)
-            return []
-        return [e for e in verfuegbar if getattr(e, "calendar_provider", None)]
+            return [], "fehler"
+        return (
+            [e for e in verfuegbar if getattr(e, "calendar_provider", None)],
+            "ok",
+        )
 
     async def _slots_ueber_mitarbeiter(
         self, employees, wunsch, anker_zeit, dauer, days_ahead_raw,
