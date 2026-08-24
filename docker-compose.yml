@@ -1,3 +1,23 @@
+# DIES IST DER PRODUKTIV-STACK von gewerbeagent.de.
+#
+# Aufruf immer aus /opt/gewerbeagent/framework, ohne -f und ohne -p:
+#   docker compose ps | restart framework | logs -f framework
+# Damit gilt Projektname `framework` und die Volumes heissen
+# framework_postgres_data, framework_caddy_* — genau die, in denen die
+# echten Daten liegen.
+#
+# Vorgeschichte (Audit 2026-08-24): daneben lag ein `docker-compose.prod.yml`
+# mit ANDEREN Volume-Namen (gewerbeagent_postgres_data). Es sah aus wie die
+# Prod-Datei, war aber tote Dokumentation — ein gutgemeintes
+# `docker compose -f docker-compose.prod.yml up -d` haette einen zweiten,
+# LEEREN Stack neben dem laufenden hochgezogen. Die Datei ist deshalb weg;
+# ihr Inhalt steht in der Git-Historie.
+#
+# Der framework-Container installiert seine Abhaengigkeiten beim Start
+# (apt/pip/uv im `command`) — ohne erreichbares PyPI startet Produktion
+# nicht. Bekannt, bewusst noch nicht umgebaut: ein Image-Build braucht
+# einen eigenen Testlauf.
+
 services:
   postgres:
     image: postgres:16-alpine

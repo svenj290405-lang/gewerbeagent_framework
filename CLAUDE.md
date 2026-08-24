@@ -12,7 +12,9 @@ den Betrieb ist die PWA unter /app (der fruehere Telegram-Bot wurde am
 - **DB:** Postgres 16 mit Alembic-Migrations
 - **Deps + Run:** `uv` (nicht pip); im Container unter `/app/.venv/bin/python`
 - **Reverse-Proxy:** Caddy (auto-TLS, ein Caddyfile fuer prod + status + dev)
-- **Container:** Docker Compose; Prod-Stack via `docker-compose.prod.yml`
+- **Container:** Docker Compose; Prod-Stack ist `docker-compose.yml`
+  (Projekt `framework`, Volumes `framework_*`) — aus
+  /opt/gewerbeagent/framework ohne `-f`/`-p` aufrufen
   (Project-Name `prod`), Dev via `docker-compose.dev.yml`
 - **KI:** Gemini (Klassifikation, Extraktion) + Vertex AI; ElevenLabs (Voice)
 - **Externe:** Microsoft Graph (Outlook + Calendar), Google (Calendar,

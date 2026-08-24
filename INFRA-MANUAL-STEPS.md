@@ -89,13 +89,13 @@ cp /opt/gewerbeagent/framework/oauth_client_secret.json /opt/gewerbeagent/framew
 Prod läuft seit Wochen), dann manuell:
 
 ```bash
-docker compose -p prod -f docker-compose.prod.yml exec postgres \
+docker compose -f docker-compose.yml exec postgres \
     psql -U gewerbeagent -c "CREATE DATABASE gewerbeagent_dev OWNER gewerbeagent;"
 ```
 
 Verifizieren:
 ```bash
-docker compose -p prod -f docker-compose.prod.yml exec postgres \
+docker compose -f docker-compose.yml exec postgres \
     psql -U gewerbeagent -l | grep gewerbeagent
 # muss beide DBs zeigen: gewerbeagent + gewerbeagent_dev
 ```
@@ -106,26 +106,32 @@ automatisch beim ersten Start. Bei bestehendem Volume wird der Hook
 
 ---
 
-### 6. Prod-Stack umstellen auf docker-compose.prod.yml
+### 6. Prod-Stack starten
+
+> **Historisch:** dieser Schritt beschrieb eine Umstellung auf eine eigene
+> `docker-compose.prod.yml`. Die hat es nie in den Betrieb geschafft — Prod
+> lief immer aus `docker-compose.yml` (Projekt `framework`). Die Datei mit
+> den abweichenden Volume-Namen ist am 2026-08-25 entfernt worden, weil ein
+> Start damit einen zweiten, LEEREN Stack angelegt haette.
 
 **Achtung — kurze Downtime (~10s):**
 ```bash
 cd /opt/gewerbeagent/framework
 docker compose down                     # alter Stack
-docker compose -p prod -f docker-compose.prod.yml up -d
+docker compose -f docker-compose.yml up -d
 ```
 
 Verifizieren:
 ```bash
-docker compose -p prod -f docker-compose.prod.yml ps
+docker compose -f docker-compose.yml ps
 # alle 3 Container "Up": postgres, framework, caddy
 curl -s https://gewerbeagent.de/health
 # {"status":"healthy"}
 ```
 
-**Networks-Namen:** weil `docker-compose.prod.yml` `name: gewerbeagent_internal`
-bzw. `gewerbeagent_web` setzt, kann der Dev-Stack diese Networks
-referenzieren ohne Project-Prefix.
+**Networks-Namen:** die Netze heissen mit Projekt-Prefix
+`framework_internal` bzw. `framework_web` — ein Dev-Stack muss sie so
+referenzieren.
 
 ---
 
@@ -172,7 +178,7 @@ b) Caddyfile editieren:
 
 c) Caddy neu laden:
 ```bash
-docker compose -p prod -f docker-compose.prod.yml exec caddy \
+docker compose -f docker-compose.yml exec caddy \
     caddy reload --config /etc/caddy/Caddyfile
 ```
 

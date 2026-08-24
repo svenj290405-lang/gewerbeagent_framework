@@ -51,7 +51,7 @@ docker logs gewerbeagent_framework --tail 200
 
 1. **Restart-Versuch:**
    ```bash
-   docker compose -p prod -f /opt/gewerbeagent/framework/docker-compose.prod.yml \
+   docker compose -f /opt/gewerbeagent/framework/docker-compose.yml \
        restart framework
    sleep 10
    curl -s https://gewerbeagent.de/health
@@ -67,7 +67,7 @@ docker logs gewerbeagent_framework --tail 200
    cd /opt/gewerbeagent/framework
    git log --oneline -5
    git reset --hard prod-<vorletzter-tag>
-   docker compose -p prod -f docker-compose.prod.yml restart framework
+   docker compose -f docker-compose.yml restart framework
    ```
 
 3. **DB-Probleme** (asyncpg: connection refused, Migration-Fail):
@@ -90,7 +90,7 @@ docker logs gewerbeagent_postgres --tail 100
 
 1. **Postgres-Restart:**
    ```bash
-   docker compose -p prod -f /opt/gewerbeagent/framework/docker-compose.prod.yml \
+   docker compose -f /opt/gewerbeagent/framework/docker-compose.yml \
        restart postgres
    sleep 15
    docker exec gewerbeagent_postgres pg_isready -U gewerbeagent
@@ -128,7 +128,7 @@ dig +short gewerbeagent.de    # noch der richtige Server?
 
 1. **Caddy reload:**
    ```bash
-   docker compose -p prod -f /opt/gewerbeagent/framework/docker-compose.prod.yml \
+   docker compose -f /opt/gewerbeagent/framework/docker-compose.yml \
        exec caddy caddy reload --config /etc/caddy/Caddyfile
    ```
 
@@ -153,7 +153,7 @@ dig +short gewerbeagent.de    # noch der richtige Server?
 
 1. **Framework stoppen** damit keine neuen Writes reinkommen:
    ```bash
-   docker compose -p prod -f /opt/gewerbeagent/framework/docker-compose.prod.yml \
+   docker compose -f /opt/gewerbeagent/framework/docker-compose.yml \
        stop framework caddy
    ```
 
@@ -190,7 +190,7 @@ dig +short gewerbeagent.de    # noch der richtige Server?
 
 6. **Framework wieder hoch:**
    ```bash
-   docker compose -p prod -f /opt/gewerbeagent/framework/docker-compose.prod.yml \
+   docker compose -f /opt/gewerbeagent/framework/docker-compose.yml \
        start framework caddy
    curl https://gewerbeagent.de/health
    ```
@@ -233,7 +233,7 @@ ENCRYPTION_KEY unter 64 Zeichen → Phase-B-Hardening.
 
 4. **Framework stoppen, echt rotieren, Key tauschen, Framework starten:**
    ```bash
-   docker compose -p prod -f /opt/gewerbeagent/framework/docker-compose.prod.yml \
+   docker compose -f /opt/gewerbeagent/framework/docker-compose.yml \
        stop framework
 
    docker run --rm --network gewerbeagent_internal \
@@ -247,7 +247,7 @@ ENCRYPTION_KEY unter 64 Zeichen → Phase-B-Hardening.
    sed -i "s|^ENCRYPTION_KEY=.*$|ENCRYPTION_KEY=$(cat /tmp/newkey)|" \
        /opt/gewerbeagent/framework/.env
 
-   docker compose -p prod -f /opt/gewerbeagent/framework/docker-compose.prod.yml \
+   docker compose -f /opt/gewerbeagent/framework/docker-compose.yml \
        start framework
    ```
 
@@ -285,7 +285,7 @@ print(json.dumps(get_health_report(), indent=2, default=str))
 
 **Fix:** Framework-Restart bringt alle Crons frisch hoch:
 ```bash
-docker compose -p prod -f /opt/gewerbeagent/framework/docker-compose.prod.yml \
+docker compose -f /opt/gewerbeagent/framework/docker-compose.yml \
     restart framework
 ```
 
@@ -362,7 +362,7 @@ Notwendiges Setup vor Pilot-Live:
 ```
 /opt/gewerbeagent/framework/.env                   Prod-Secrets
 /opt/gewerbeagent/framework/Caddyfile              Reverse-Proxy-Config
-/opt/gewerbeagent/framework/docker-compose.prod.yml
+/opt/gewerbeagent/framework/docker-compose.yml
 /opt/gewerbeagent/framework/INFRA-MANUAL-STEPS.md  Setup-Schritte
 /var/backups/gewerbeagent/                         Tagliche DB-Dumps
 /var/log/gewerbeagent-backup.log                   Backup-Cron-Output

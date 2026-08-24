@@ -15,7 +15,7 @@
 #
 # Rollback (nach fehlerhaftem Deploy):
 #   git reset --hard prod-YYYYMMDD-HHMM
-#   docker compose -p prod -f docker-compose.prod.yml restart framework
+#   docker compose -f docker-compose.yml restart framework
 #
 # Verwendung:
 #   cd /opt/gewerbeagent/framework
