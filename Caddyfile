@@ -24,7 +24,12 @@
         # inline-Styles nutzt. Frame-ancestors 'none' ist Belt-and-
         # Suspenders zu X-Frame-Options. img-src + connect-src bewusst
         # eng gefasst.
-        Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: blob:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'; object-src 'none'"
+        # Seit 2026-08-24 KEIN externer Host mehr in script-/style-/
+        # font-src: Schriften (fetch_fonts.py), Three.js und Chart.js
+        # liegen lokal. Damit ist die Zusage "kein Tracking durch Dritte"
+        # nicht nur eine Behauptung, sondern per Header erzwungen —
+        # ein neu eingeschleustes CDN-Tag wuerde vom Browser geblockt.
+        Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data: blob:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'; object-src 'none'"
         # Server-Header verstecken (verhindert Versions-Disclosure)
         -Server
     }

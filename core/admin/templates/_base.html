@@ -5,9 +5,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{% block title %}Gewerbeagent Admin{% endblock %}</title>
     <meta name="robots" content="noindex,nofollow">
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <!-- Schriften lokal, kein Google-CDN (scripts/fetch_fonts.py) -->
+    <link rel="stylesheet" href="/admin/static/fonts/fonts.css">
     <link rel="stylesheet" href="/admin/static/admin.css">
     {% block head %}{% endblock %}
 </head>
