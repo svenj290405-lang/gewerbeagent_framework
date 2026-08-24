@@ -22,7 +22,7 @@ import datetime as dt
 import logging
 import sys
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 
 from core.database import AsyncSessionLocal
 from core.models import (
@@ -48,6 +48,27 @@ DEFAULT_RETENTION_DAYS = 14
 # STATE_BOOKED fehlt bewusst: dort steht ein Termin im Kalender. Ist sein
 # Datum bekannt, greift der Termin-Zweig; ist es das nicht, waere Loeschen
 # ein Datenverlust bei einem laufenden Vorgang.
+def letzte_aktivitaet():
+    """Wann zuletzt wirklich etwas an dieser Konversation passiert ist.
+
+    Ausdruecklich NICHT ``updated_at``: die Spalte wandert bei jeder
+    Aenderung mit, auch bei technischen. Live nachgesehen am 2026-08-25:
+    vier Konversationen aus Mai und Juni trugen alle denselben
+    ``updated_at`` vom 16.07. — ein Backfill hatte sie an einem Tag
+    angefasst und damit um zwei Monate "verjuengt". Die Loeschfrist
+    haette also erst 90 Tage nach dem BACKFILL gegriffen, nicht 90 Tage
+    nach dem letzten Kontakt mit dem Kunden.
+
+    ``classified_at`` ist der Zeitpunkt, an dem zuletzt eine eingehende
+    Mail eingeordnet wurde — also echte Kundenaktivitaet.
+    """
+    return func.greatest(
+        EmailConversation.created_at,
+        func.coalesce(EmailConversation.classified_at,
+                      EmailConversation.created_at),
+    )
+
+
 LOESCHBARE_ZUSTAENDE = (
     STATE_CLOSED, STATE_STORNIERT, STATE_DELIVERY_FAILED,
     STATE_DIALOG, STATE_PROPOSING_SLOTS, STATE_AWAITING_CONFIRMATION,
@@ -93,7 +114,7 @@ async def cleanup(
         stmt = select(EmailConversation).where(
             (EmailConversation.termin_datum.is_(None))
             & (EmailConversation.state.in_(LOESCHBARE_ZUSTAENDE))
-            & (EmailConversation.updated_at < cutoff_dt)
+            & (letzte_aktivitaet() < cutoff_dt)
         )
         if tenant_id is not None:
             stmt = stmt.where(EmailConversation.tenant_id == tenant_id)
@@ -113,7 +134,8 @@ async def cleanup(
         for c in candidates.values():
             grund = (
                 f"termin {c.termin_datum}" if c.termin_datum
-                else f"{c.state} seit {c.updated_at.date()}"
+                else f"{c.state}, letzte Aktivitaet "
+                     f"{max(c.created_at, c.classified_at or c.created_at).date()}"
             )
             logger.info(
                 f"  - {c.kunde_email} (tenant={c.tenant_id}) "

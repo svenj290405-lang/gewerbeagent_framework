@@ -54,3 +54,32 @@ def test_jeder_zustand_hat_eine_entscheidung():
         f"Ohne Entscheidung: {alle - entschieden}. Entweder in "
         f"LOESCHBARE_ZUSTAENDE aufnehmen oder hier begruenden."
     )
+
+
+# =====================================================================
+# Die Frist misst echte Aktivitaet, nicht `updated_at`
+#
+# Live nachgesehen am 2026-08-25: vier Konversationen aus Mai und Juni
+# trugen alle denselben `updated_at` vom 16.07. — ein Backfill hatte sie
+# an einem Tag angefasst und damit um zwei Monate "verjuengt". Mit
+# `updated_at` als Massstab haette die Loeschfrist erst 90 Tage nach dem
+# BACKFILL gegriffen statt 90 Tage nach dem letzten Kundenkontakt.
+# =====================================================================
+
+def test_frist_haengt_nicht_an_updated_at():
+    from scripts.cleanup_email_conversations import letzte_aktivitaet
+
+    sql = str(letzte_aktivitaet())
+    assert "updated_at" not in sql, (
+        "updated_at wandert bei jeder technischen Aenderung mit und "
+        "verlaengert damit still die Aufbewahrung."
+    )
+
+
+def test_frist_nimmt_den_spaeteren_von_anlage_und_letztem_kontakt():
+    from scripts.cleanup_email_conversations import letzte_aktivitaet
+
+    sql = str(letzte_aktivitaet()).lower()
+    assert "greatest" in sql
+    assert "created_at" in sql
+    assert "classified_at" in sql
