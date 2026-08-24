@@ -34,6 +34,56 @@ NACHFASS_DEFAULT_TAGE = 7
 # (extracting/previewing/creating) ebenfalls — die sind noch kein Beleg.
 OFFENE_RECHNUNG_STATUS = ("drafted", "mail_queued", "mail_sent")
 
+# Umsatzsteuersatz, mit dem eine neue Position vorbelegt wird. War bis zum
+# Audit am 2026-08-24 im ganzen PWA-Weg hart auf 19 verdrahtet — ein
+# Photovoltaik-Betrieb (Nullsteuersatz nach § 12 Abs. 3 UStG) haette damit
+# auf jeder App-Rechnung Steuer ausgewiesen, die er nicht ausweisen darf.
+# Pro Betrieb ueberschreibbar via ToolConfig(lexware).config
+# {"mwst_standard": 0} — wie das Zahlungsziel, ohne eigene Spalte.
+# Wie viele Zeilen die Kennzahlen hoechstens umfassen. Bis zum Audit am
+# 2026-08-24 wurden die Summen ueber die ANGEZEIGTE Liste gerechnet (100
+# Zeilen) — ein Betrieb mit 130 offenen Posten sah dauerhaft und
+# stillschweigend zu wenig offenes Geld. Jetzt zaehlt alles bis zu dieser
+# Grenze; wird sie erreicht, sagt ``posten_gekappt`` es ausdruecklich.
+_KENNZAHL_MAX = 5000
+
+MWST_DEFAULT_PROZENT = 19
+MWST_ERLAUBT = (0, 7, 19)
+
+
+async def mwst_standard(tid: uuid.UUID) -> int:
+    """Standard-Umsatzsteuersatz des Betriebs (0, 7 oder 19).
+
+    Bewusst OHNE Lexware-Aufruf (anders als ``einstellungen``): das hier
+    haengt in jedem Rechnungs- und Angebotsweg und darf nicht von einem
+    langsamen Fremdsystem abhaengen.
+    """
+    from sqlalchemy import select
+
+    from core.database.connection import get_session
+    from core.models import ToolConfig
+
+    try:
+        async with get_session() as s:
+            cfg = (await s.execute(
+                select(ToolConfig.config).where(
+                    ToolConfig.tenant_id == tid,
+                    ToolConfig.tool_name == "lexware",
+                )
+            )).scalar_one_or_none() or {}
+        if isinstance(cfg, dict) and cfg.get("mwst_standard") is not None:
+            satz = int(cfg["mwst_standard"])
+            if satz in MWST_ERLAUBT:
+                return satz
+            logger.warning(
+                "buchhaltung: mwst_standard=%s ist kein gueltiger Satz, "
+                "nutze %s", satz, MWST_DEFAULT_PROZENT)
+    except (TypeError, ValueError):
+        pass
+    except Exception:  # pragma: no cover - DB-Ausfall
+        logger.warning("buchhaltung: mwst_standard nicht lesbar", exc_info=True)
+    return MWST_DEFAULT_PROZENT
+
 
 def _to_float(v) -> float:
     try:
@@ -160,6 +210,7 @@ async def einstellungen(tid: uuid.UUID) -> dict:
         "zahlungsziel_quelle": quelle,
         "skonto": skonto,
         "nachfass_tage": nachfass,
+        "mwst_standard": await mwst_standard(tid),
     }
 
 
@@ -171,7 +222,7 @@ async def uebersicht(tid: uuid.UUID, *, limit: int = 100) -> dict:
       ``offene_posten`` – unbezahlte Rechnungen, aelteste zuerst
       ``nachfassen``    – versendete Angebote ohne Rueckmeldung
     """
-    from sqlalchemy import select
+    from sqlalchemy import func, select
 
     from core.database.connection import get_session
     from core.integrations.lexware import LexwareProvider
@@ -193,7 +244,7 @@ async def uebersicht(tid: uuid.UUID, *, limit: int = 100) -> dict:
                 Rechnung.bezahlt_am.is_(None),
             )
             .order_by(Rechnung.created_at.asc())
-            .limit(limit)
+            .limit(_KENNZAHL_MAX)
         )).scalars().all()
         bezahlt = (await s.execute(
             select(Rechnung)
@@ -210,7 +261,7 @@ async def uebersicht(tid: uuid.UUID, *, limit: int = 100) -> dict:
                 Angebot.status == ANGEBOT_STATUS_MAIL_SENT,
             )
             .order_by(Angebot.created_at.asc())
-            .limit(limit)
+            .limit(_KENNZAHL_MAX)
         )).scalars().all()
 
     posten: list[dict] = []
@@ -271,14 +322,22 @@ async def uebersicht(tid: uuid.UUID, *, limit: int = 100) -> dict:
         "angebote_offen_anzahl": len(angebote_offen),
         "nachfassen_anzahl": len(nachfassen),
     }
+    # Die Kennzahlen zaehlen jetzt ALLE Posten, die Liste zeigt weiter nur
+    # ``limit`` Zeilen — und sagt, wie viele sie verschweigt. Sortiert ist
+    # nach Dringlichkeit (ueberfaellig zuerst, dann die aeltesten), gekappt
+    # wird also am harmlosen Ende.
+    gekappt = max(0, len(posten) - limit)
+    posten = posten[:limit]
 
     return {
         "zahlungsziel_tage": ziel,
         "zahlungsziel_quelle": einst.get("zahlungsziel_quelle", "standard"),
         "skonto": einst.get("skonto"),
         "nachfass_tage": nachfass_tage,
+        "mwst_standard": einst.get("mwst_standard", MWST_DEFAULT_PROZENT),
         "kennzahlen": kennzahlen,
         "offene_posten": posten,
+        "posten_gekappt": gekappt,
         "nachfassen": nachfassen,
     }
 
@@ -334,9 +393,15 @@ async def ausgaben(tid: uuid.UUID, *, limit: int = 25) -> dict:
     posten.sort(key=lambda p: p["tage"])
     letzte_30t = [p for p in posten if p["tage"] <= 30]
     offen = [p for p in posten if p["offen"]]
+    # Die Kennzahlen rechnen ueber alles Geladene (bis zu 2x limit), die Liste
+    # zeigt nur ``limit`` Zeilen — das sagen wir hier auch, statt es die
+    # Oberflaeche stillschweigend als "alles" darstellen zu lassen. Lexware
+    # liefert seitenweise; mehr als die erste Seite je Status holen wir
+    # bewusst nicht (Rate-Limit).
     return {
         "ok": True,
         "posten": posten[:limit],
+        "posten_gekappt": max(0, len(posten) - limit),
         "kennzahlen": {
             "ausgaben_30t_eur": round(sum(p["betrag_eur"] for p in letzte_30t), 2),
             "ausgaben_30t_anzahl": len(letzte_30t),

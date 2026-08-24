@@ -1306,7 +1306,8 @@ async def _run_auftrag_status(ctx: Ctx, args: dict) -> dict:
     from core.models.angebot import (
         Angebot, AUFTRAG_LIFECYCLE, AUFTRAG_LIFECYCLE_LABELS,
         ANGEBOT_STATUS_ACCEPTED, ANGEBOT_STATUS_WORK_IN_PROGRESS,
-        ANGEBOT_STATUS_WORK_DONE, ANGEBOT_STATUS_ABGEBROCHEN)
+        ANGEBOT_STATUS_WORK_DONE, ANGEBOT_STATUS_ABGEBROCHEN,
+        ANGEBOT_STATUS_RECHNUNG_GESENDET)
     from sqlalchemy import select
 
     settable = {ANGEBOT_STATUS_ACCEPTED, ANGEBOT_STATUS_WORK_IN_PROGRESS,
@@ -1319,7 +1320,11 @@ async def _run_auftrag_status(ctx: Ctx, args: dict) -> dict:
             "abgebrochen sein. (Rechnung-raus läuft separat.)")}
     if len(name) < 2:
         return {"ok": False, "error": "Bitte den Kundennamen nennen."}
-    relevante = set(AUFTRAG_LIFECYCLE) | {ANGEBOT_STATUS_ABGEBROCHEN}
+    # Ohne den Abzug fand Q auch abgerechnete Auftraege und setzte sie auf
+    # "fertig" zurueck — danach war der Weg zu einer zweiten Rechnungsnummer
+    # offen (Audit 2026-08-24). Ein abgerechneter Auftrag ist kein laufender.
+    relevante = ((set(AUFTRAG_LIFECYCLE) | {ANGEBOT_STATUS_ABGEBROCHEN})
+                 - {ANGEBOT_STATUS_RECHNUNG_GESENDET})
     async with get_session() as s:
         rows = (await s.execute(
             select(Angebot)

@@ -12,6 +12,11 @@ const App = {
   view: document.getElementById("view"),
   current: "aktuelles",
   lastScreen: null,
+  // Umsatzsteuersatz, mit dem eine neue Position vorbelegt wird. Kommt vom
+  // Server (/app/api/buchhaltung), bis dahin der uebliche Satz. Bis zum
+  // 24.08.2026 war 19 % hier und im Backend fest verdrahtet — ein
+  // Photovoltaik-Betrieb konnte gar keine Rechnung mit 0 % schreiben.
+  mwstStandard: 19,
 };
 
 // ---------- Brand-Color ----------
@@ -629,7 +634,7 @@ const SCREENS = {
     document.getElementById("an-back").addEventListener("click", () => navigate("auftraege_page"));
     _renderPositionen();
     document.getElementById("pos-add").addEventListener("click", () => {
-      _composerPositionen.push({ name: "", menge: 1, einheit: "Stueck", preis_brutto_eur: 0 });
+      _composerPositionen.push({ name: "", menge: 1, einheit: "Stueck", preis_brutto_eur: 0, mwst_prozent: App.mwstStandard });
       _renderPositionen();
     });
     _bindKiExtract("/app/api/angebote/extrahieren", (ex) => {
@@ -639,7 +644,7 @@ const SCREENS = {
           name: p.name || "", beschreibung: p.beschreibung || "",
           menge: p.menge || 1, einheit: p.einheit || "Stueck",
           preis_brutto_eur: p.preis_brutto_eur || 0,
-          mwst_prozent: p.mwst_prozent || 19,
+          mwst_prozent: p.mwst_prozent != null ? p.mwst_prozent : App.mwstStandard,
         }));
         _renderPositionen();
       }
@@ -874,6 +879,7 @@ const SCREENS = {
       document.getElementById("back-db").addEventListener("click", () => navigate("aktuelles"));
       return;
     }
+    if (d.mwst_standard != null) App.mwstStandard = d.mwst_standard;
     const k = d.kennzahlen || {};
     const posten = d.offene_posten || [];
     const nachfassen = d.nachfassen || [];
@@ -4437,6 +4443,13 @@ function _composerPositionRow(p, idx) {
             style="flex:1;min-width:0;padding:8px;border:1px solid var(--line);border-radius:8px;font-size:14px" placeholder="Einheit" />
           <input type="number" data-fld="preis_brutto_eur" value="${esc(p.preis_brutto_eur || '')}" step="0.01" min="0"
             style="flex:1.2;min-width:0;padding:8px;border:1px solid var(--line);border-radius:8px;font-size:14px" placeholder="EUR brutto" />
+          <select data-fld="mwst_prozent" title="Umsatzsteuer"
+            style="flex:0 0 74px;min-width:0;padding:8px;border:1px solid var(--line);border-radius:8px;font-size:14px">
+            ${[19, 7, 0].map((sz) => {
+              const gewaehlt = (p.mwst_prozent != null ? p.mwst_prozent : App.mwstStandard) === sz;
+              return `<option value="${sz}"${gewaehlt ? " selected" : ""}>${sz} %</option>`;
+            }).join("")}
+          </select>
         </div>
       </div>
       <button class="btn-sm btn-ghost" data-del-pos="${idx}" style="padding:4px 8px;margin-left:6px" title="Entfernen">✕</button>
@@ -4458,14 +4471,18 @@ function _renderPositionen() {
   // Input-Sync zurück in _composerPositionen
   wrap.querySelectorAll("[data-pos]").forEach((card) => {
     const idx = parseInt(card.dataset.pos, 10);
-    card.querySelectorAll("[data-fld]").forEach((inp) =>
-      inp.addEventListener("input", () => {
+    card.querySelectorAll("[data-fld]").forEach((inp) => {
+      const uebernehmen = () => {
         const k = inp.dataset.fld;
         let v = inp.value;
         if (k === "menge" || k === "preis_brutto_eur") v = parseFloat(v) || 0;
+        else if (k === "mwst_prozent") v = parseInt(v, 10);
         _composerPositionen[idx][k] = v;
         _updateSumme();
-      }));
+      };
+      inp.addEventListener("input", uebernehmen);
+      inp.addEventListener("change", uebernehmen);
+    });
   });
   _updateSumme();
 }
@@ -4558,7 +4575,7 @@ function showAngebotForm() {
   App.lastScreen = null;
   _renderPositionen();
   document.getElementById("pos-add").addEventListener("click", () => {
-    _composerPositionen.push({ name: "", menge: 1, einheit: "Stueck", preis_brutto_eur: 0 });
+    _composerPositionen.push({ name: "", menge: 1, einheit: "Stueck", preis_brutto_eur: 0, mwst_prozent: App.mwstStandard });
     _renderPositionen();
   });
 
@@ -4569,7 +4586,7 @@ function showAngebotForm() {
         name: p.name || "", beschreibung: p.beschreibung || "",
         menge: p.menge || 1, einheit: p.einheit || "Stueck",
         preis_brutto_eur: p.preis_brutto_eur || 0,
-        mwst_prozent: p.mwst_prozent || 19,
+        mwst_prozent: p.mwst_prozent != null ? p.mwst_prozent : App.mwstStandard,
       }));
       _renderPositionen();
     }
@@ -4685,7 +4702,7 @@ function showRechnungForm() {
 
   const addBtn = document.getElementById("pos-add");
   if (addBtn) addBtn.addEventListener("click", () => {
-    _composerPositionen.push({ name: "", menge: 1, einheit: "Stueck", preis_brutto_eur: 0 });
+    _composerPositionen.push({ name: "", menge: 1, einheit: "Stueck", preis_brutto_eur: 0, mwst_prozent: App.mwstStandard });
     _renderPositionen();
   });
 
@@ -6384,6 +6401,18 @@ async function showAuftragDetail(id, zurueck) {
     aktionen = `<div class="card"><h2>Nächster Schritt</h2><div style="display:flex;gap:8px;flex-wrap:wrap">${btns.join("")}</div></div>`;
   }
 
+  // Zuständigkeit: für wen der Auftrag sichtbar ist, hängt genau daran.
+  // Ohne diese Zeile gab es keinen Weg, einen Auftrag jemandem zu geben —
+  // die Route dafür existierte, wurde aber nirgends aufgerufen.
+  const zustaendig = (d.zuweisbar && d.zuweisbar.length)
+    ? `<div class="row"><span>Zuständig</span>
+         <select id="auftrag-zuweisen" style="max-width:60%;padding:6px;border:1px solid var(--line);border-radius:8px;font-size:14px">
+           <option value="">— niemand —</option>
+           ${d.zuweisbar.map((e) => `<option value="${esc(e.slug)}"${
+             e.slug === d.zugewiesen_slug ? " selected" : ""}>${esc(e.name)}</option>`).join("")}
+         </select></div>`
+    : zeile("Zuständig", d.zugewiesen_an);
+
   App.view.innerHTML =
     `<button class="btn-sm btn-ghost" id="back-auftrag" style="margin-bottom:10px">← Zurück</button>` +
     `<h1 style="font-size:22px;margin:4px 4px 2px">${esc(d.kunde)}</h1>` +
@@ -6392,6 +6421,7 @@ async function showAuftragDetail(id, zurueck) {
        ${fortschrittsRegler(d, true)}</div>` +
     `<div class="card"><h2>Auftrag</h2>` +
       zeile("Kunde", d.kunde) + zeile("Anschrift", d.adresse) + zeile("E-Mail", d.email) +
+      zustaendig +
       zeile("Betrag (brutto)", d.betrag) + zeile("Angebotsnummer", d.angebot_nr) +
       zeile("Angelegt", d.zeit) + zeile("Angebot versendet", d.angebot_versendet) +
       zeile("Angenommen", d.angenommen_am) + zeile("Abgeschlossen", d.abgeschlossen_am) +
@@ -6400,6 +6430,17 @@ async function showAuftragDetail(id, zurueck) {
 
   document.getElementById("back-auftrag").addEventListener("click",
     () => navigate(zurueck || "auftraege_page"));
+  const zuwSel = document.getElementById("auftrag-zuweisen");
+  if (zuwSel) zuwSel.addEventListener("change", async () => {
+    zuwSel.disabled = true;
+    const r = await api("/app/api/auftraege/" + encodeURIComponent(id) + "/zuweisen",
+      { method: "POST", body: JSON.stringify({ employee_slug: zuwSel.value }) });
+    const j = r && r.ok ? await r.json() : null;
+    zuwSel.disabled = false;
+    if (!j || !j.ok) { toast("Zuweisung fehlgeschlagen.", "err"); return; }
+    d.zugewiesen_slug = zuwSel.value;
+    toast(j.zugewiesen_an ? `Zuständig: ${j.zugewiesen_an}` : "Zuweisung entfernt");
+  });
   bindFortschrittsRegler(() => openRechnungInQ(d.id));
   // Nach einer Buchung die Karte neu zeichnen — Aufschlüsselung UND
   // Einzelbuchungen ändern sich, dafür reicht die Zeile unter dem Feld nicht.

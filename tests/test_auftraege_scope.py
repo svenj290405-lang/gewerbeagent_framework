@@ -84,3 +84,52 @@ def test_filter_ist_gegen_angebot_gebaut():
     links = bedingungen[0].left
     assert links.name == "assigned_employee_id"
     assert links.table.name == "angebote"
+
+
+# =====================================================================
+# Wer neu anlegt, bekommt den Auftrag auch zugewiesen
+#
+# Audit 2026-08-24: ``POST /app/api/angebote/anlegen`` war der einzige der
+# drei Anlege-Wege ohne ``assigned_employee_id``. Der Filter oben ist
+# fail-closed — ein so angelegter Auftrag war fuer jeden ohne
+# ``auftraege.alle_sehen`` unsichtbar, dauerhaft.
+# =====================================================================
+
+@pytest.mark.asyncio
+async def test_neues_angebot_bekommt_einen_besitzer(monkeypatch):
+    import json
+
+    from core.api import app_screens
+    from core.services import document_flow
+
+    anleger = uuid.uuid4()
+    aufruf: dict = {}
+
+    async def _create(tid, **kw):
+        aufruf.update(kw)
+        return {"ok": True, "id": "x"}
+    monkeypatch.setattr(document_flow, "create_angebot", _create)
+
+    async def _feature(tid, key):
+        return True
+    import core.features.check as check
+    monkeypatch.setattr(check, "is_feature_enabled", _feature)
+
+    tid = uuid.uuid4()
+    body = {"kunde_name": "Meier", "positionen": [{"name": "X", "menge": 1,
+                                                   "preis_brutto_eur": 10}]}
+
+    async def _json():
+        return body
+    req = SimpleNamespace(
+        json=_json,
+        state=SimpleNamespace(app_employee=SimpleNamespace(id=anleger),
+                              app_tenant=SimpleNamespace(id=tid)),
+    )
+    monkeypatch.setattr(app_screens, "current_tenant_id", lambda r: tid)
+
+    resp = await app_screens.api_angebot_anlegen(request=req, _e=None, _c=None)
+
+    assert resp.status_code == 200
+    assert json.loads(resp.body)["ok"] is True
+    assert aufruf["assigned_employee_id"] == anleger

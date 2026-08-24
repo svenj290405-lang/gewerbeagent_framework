@@ -604,7 +604,10 @@ def _normalize_rechnung_extraction(data: dict) -> dict:
                 preis = float(preis.replace(",", ".").strip())
             else:
                 preis = float(preis or 0)
-            mwst = int(p.get("mwst_prozent") or 19)
+            # Nicht `or 19`: Gemini liefert bei Photovoltaik korrekt 0,
+            # und `0 or 19` haette daraus still 19 % gemacht.
+            _m = p.get("mwst_prozent")
+            mwst = int(_m) if _m is not None else 19
             cleaned.append({
                 "name": name,
                 "beschreibung": p.get("beschreibung"),
@@ -941,7 +944,8 @@ def _normalize_gespraech_extraction(data: dict) -> dict:
                 "menge": menge,
                 "einheit": (raw.get("einheit") or "Stueck").strip(),
                 "preis_brutto_eur": preis,
-                "mwst_prozent": int(raw.get("mwst_prozent") or 19),
+                "mwst_prozent": (int(raw["mwst_prozent"])
+                                 if raw.get("mwst_prozent") is not None else 19),
             })
 
     # Pflicht-Check

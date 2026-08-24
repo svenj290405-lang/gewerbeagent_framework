@@ -30,6 +30,8 @@ def _make_get_session(results):
             val = queue.pop(0) if queue else None
             return SimpleNamespace(
                 scalar_one_or_none=lambda: val,
+                scalar_one=lambda: val,
+                scalar=lambda: val,
                 scalars=lambda: SimpleNamespace(
                     all=lambda: (val if isinstance(val, list)
                                  else ([] if val is None else [val]))),
@@ -554,10 +556,20 @@ async def test_angebot_ohne_lexware_entwurf_laeuft_weiter(monkeypatch):
 # --------------------------------------------------------------------------
 
 class _RechnungProvider:
-    def __init__(self, pdf=b"%PDF-1.4 test"):
+    def __init__(self, pdf=b"%PDF-1.4 test", voucher_status="draft"):
         self.pdf = pdf
         self.angelegt = []
         self.geloescht = []
+        # Was Lexware zu einer bereits gemerkten Rechnungs-Id sagt.
+        # "draft" = noch ein Entwurf (darf ersetzt werden), "open" = echte
+        # ausgestellte Rechnung (darf NICHT noch einmal gezogen werden).
+        self.voucher_status = voucher_status
+        self.abgefragt = []
+
+    async def get_invoice(self, invoice_id):
+        self.abgefragt.append(invoice_id)
+        return {"id": str(invoice_id), "voucherStatus": self.voucher_status,
+                "voucherNumber": "RE-2026-010"}
 
     async def create_invoice_draft(self, **kw):
         self.angelegt.append(kw)
@@ -688,3 +700,154 @@ async def test_rechnung_ohne_empfaenger_bricht_ab(monkeypatch):
 
     res = await df.finalize_and_send_rechnung(TID, rechnung_id=r.id)
     assert res["ok"] is False and "Empfaenger" in res["error"]
+
+
+# --------------------------------------------------------------------------
+# Idempotenz: eine Rechnung wird genau EINMAL gezogen
+#
+# Audit 2026-08-24: weder der Auftrags- noch der Formular-Weg hat geprueft,
+# ob er seine Arbeit schon getan hat. Der haeufige Fall ist ein gescheiterter
+# Mailversand — der Auftrag bleibt auf "fertig", der Knopf bleibt stehen, und
+# der zweite Klick zog eine ZWEITE echte Rechnungsnummer.
+# --------------------------------------------------------------------------
+
+def _auftrag(status="arbeit_fertig", invoice_id=None):
+    return SimpleNamespace(
+        id=uuid.uuid4(), kunde_name="Meier", kunde_email="meier@example.de",
+        kunde_strasse="Weg 1", kunde_plz="45127", kunde_ort="Essen",
+        status=status, lexware_invoice_id=invoice_id, rechnung_id=None)
+
+
+def _patch_auftragsrechnung(monkeypatch, ang, positions, prov):
+    """Faked den ganzen Weg um finalize_and_send_invoice herum."""
+    _patch_session(monkeypatch, [ang, positions, ang, ang])
+
+    async def _prov(tid):
+        return prov
+    monkeypatch.setattr(df, "_lexware_provider", _prov)
+
+    async def _spiegel(*a, **kw):
+        return uuid.uuid4()
+    monkeypatch.setattr(df, "_spiegle_rechnung", _spiegel)
+
+    async def _markiere(*a, **kw):
+        return None
+    monkeypatch.setattr(df, "_rechnung_als_versendet_markieren", _markiere)
+
+    gesendet = {}
+
+    async def _send(**kw):
+        gesendet.update(kw)
+        return {"success": True}
+    import core.integrations.angebot_mail as am
+    monkeypatch.setattr(am, "send_rechnung_to_customer", _send)
+
+    import core.services.auftrag_archiv as aa
+    monkeypatch.setattr(aa, "archiviere_im_hintergrund", lambda *a, **kw: None)
+    return gesendet
+
+
+@pytest.mark.asyncio
+async def test_abgerechneter_auftrag_wird_nicht_zweimal_abgerechnet(monkeypatch):
+    """Status `rechnung_gesendet` = fertig. Kein Lexware-Call, kein Versand."""
+    inv = uuid.uuid4()
+    ang = _auftrag(status="rechnung_gesendet", invoice_id=inv)
+    _patch_session(monkeypatch, [ang, []])
+
+    def _explodiere(tid):
+        raise AssertionError("Lexware haette gar nicht gefragt werden duerfen")
+    monkeypatch.setattr(df, "_lexware_provider", _explodiere)
+
+    res = await df.finalize_and_send_invoice(TID, angebot_id=ang.id)
+
+    assert res["ok"] is True and res["unveraendert"] is True
+    assert res["mail_sent"] is False
+    assert str(inv) in res["invoice_deeplink"]
+
+
+@pytest.mark.asyncio
+async def test_auftragsrechnung_nutzt_die_bereits_ausgestellte_rechnung(monkeypatch):
+    """Rechnung liegt schon ausgestellt in Lexware (Mail war gescheitert):
+    keine zweite Nummer, aber der Versand wird nachgeholt."""
+    inv = uuid.uuid4()
+    ang = _auftrag(invoice_id=inv)
+    prov = _RechnungProvider(voucher_status="open")
+    gesendet = _patch_auftragsrechnung(monkeypatch, ang, [_position(1, 595)], prov)
+
+    res = await df.finalize_and_send_invoice(TID, angebot_id=ang.id)
+
+    assert res["ok"] is True and res["mail_sent"] is True
+    assert prov.angelegt == []          # nichts neu gezogen
+    assert prov.abgefragt == [inv]      # aber nachgesehen
+    assert prov.geloescht == []         # und nichts geloescht
+    assert ang.lexware_invoice_id == inv
+    assert gesendet["to_email"] == "meier@example.de"
+
+
+@pytest.mark.asyncio
+async def test_stummes_lexware_bricht_ab_statt_doppelt_zu_stellen(monkeypatch):
+    """Wenn wir den Status nicht pruefen koennen, wird NICHT gezogen."""
+    ang = _auftrag(invoice_id=uuid.uuid4())
+
+    class _StummerProvider(_RechnungProvider):
+        async def get_invoice(self, invoice_id):
+            raise RuntimeError("Lexware antwortet nicht")
+
+    prov = _StummerProvider()
+    _patch_auftragsrechnung(monkeypatch, ang, [_position(1, 595)], prov)
+
+    res = await df.finalize_and_send_invoice(TID, angebot_id=ang.id)
+
+    assert res["ok"] is False
+    assert "NICHT" in res["error"]
+    assert prov.angelegt == []
+
+
+@pytest.mark.asyncio
+async def test_geloeschte_lexware_rechnung_wird_neu_gestellt(monkeypatch):
+    """404 heisst: in Lexware ist nichts mehr da. Dann ist neu ziehen richtig."""
+    from core.integrations.accounting_base import AccountingError
+
+    ang = _auftrag(invoice_id=uuid.uuid4())
+
+    class _WegProvider(_RechnungProvider):
+        async def get_invoice(self, invoice_id):
+            raise AccountingError("weg", status_code=404)
+
+    prov = _WegProvider()
+    _patch_auftragsrechnung(monkeypatch, ang, [_position(1, 595)], prov)
+
+    res = await df.finalize_and_send_invoice(TID, angebot_id=ang.id)
+
+    assert res["ok"] is True
+    assert len(prov.angelegt) == 1 and prov.angelegt[0]["finalize"] is True
+
+
+@pytest.mark.asyncio
+async def test_formular_rechnung_wird_nicht_zweimal_gezogen(monkeypatch):
+    """Die Nummer, die der Kunde in der Hand haelt, darf nicht ueberschrieben
+    werden — vorher zeigte die DB danach auf eine ANDERE Rechnung."""
+    inv = uuid.uuid4()
+    r = _rechnung(entwurf=inv)
+    prov, gesendet, _ = _patch_rechnungsversand(
+        monkeypatch, r, [_position(1, 595, name="Bad sanieren")])
+    prov.voucher_status = "open"
+
+    res = await df.finalize_and_send_rechnung(TID, rechnung_id=r.id)
+
+    assert res["ok"] is True
+    assert prov.angelegt == []
+    assert prov.geloescht == []
+    assert r.lexware_invoice_id == inv
+    assert gesendet["to_email"] == "meier@example.de"
+
+
+@pytest.mark.asyncio
+async def test_versendete_formular_rechnung_bleibt_unangetastet(monkeypatch):
+    r = _rechnung(entwurf=uuid.uuid4())
+    r.status = "mail_sent"
+    _patch_rechnungsversand(monkeypatch, r, [_position(1, 595)])
+
+    res = await df.finalize_and_send_rechnung(TID, rechnung_id=r.id)
+
+    assert res["ok"] is True and res["unveraendert"] is True

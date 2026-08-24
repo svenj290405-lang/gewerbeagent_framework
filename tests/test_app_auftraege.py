@@ -269,6 +269,37 @@ async def test_status_progress_does_not_touch_accepted_at(monkeypatch):
     assert ang.accepted_at == existing_ts   # unveraendert
 
 
+@pytest.mark.asyncio
+async def test_abgerechneter_auftrag_bleibt_abgerechnet(monkeypatch):
+    """Audit 2026-08-24: geprueft wurde nur der ZIEL-Status. Ein abgerechneter
+    Auftrag liess sich auf "fertig" zuruecksetzen — danach stand der Knopf
+    "Rechnung stellen" wieder da, ein Klick = zweite Rechnungsnummer."""
+    ang = SimpleNamespace(status="rechnung_gesendet", accepted_at=None)
+    sess = _FakeObjSession(ang)
+    monkeypatch.setattr(app_screens, "get_session", lambda: sess)
+    resp = await app_screens.api_auftrag_status(
+        angebot_id=str(uuid.uuid4()),
+        request=_req({"status": "arbeit_fertig"}), _e=None, _c=None,
+    )
+    assert resp.status_code == 400
+    assert ang.status == "rechnung_gesendet"
+    assert sess.committed is False
+
+
+@pytest.mark.asyncio
+async def test_abgebrochener_auftrag_bleibt_reaktivierbar(monkeypatch):
+    """Ein Fehlklick auf "Abbrechen" muss sich reparieren lassen — nur der
+    Geld-Pfad ist endgueltig."""
+    ang = SimpleNamespace(status="abgebrochen", accepted_at=None)
+    monkeypatch.setattr(app_screens, "get_session", lambda: _FakeObjSession(ang))
+    resp = await app_screens.api_auftrag_status(
+        angebot_id=str(uuid.uuid4()),
+        request=_req({"status": "arbeit_laeuft"}), _e=None, _c=None,
+    )
+    assert resp.status_code == 200
+    assert ang.status == "arbeit_laeuft"
+
+
 # =====================================================================
 # POST /auftraege/neu — Auftrag von Hand
 # =====================================================================

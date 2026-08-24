@@ -34,11 +34,71 @@ async def _lexware_provider(tid: uuid.UUID):
     return await _build_lexware_provider(tid)
 
 
-def _positionen_to_line_items(positionen: list[dict]):
+async def _bereits_ausgestellte_rechnung(provider, invoice_id):
+    """Liegt unter ``invoice_id`` in Lexware schon eine AUSGESTELLTE Rechnung?
+
+    Vorgeschichte (Audit 2026-08-24): weder ``finalize_and_send_invoice`` noch
+    ``finalize_and_send_rechnung`` haben geprueft, ob sie ihre Arbeit schon
+    getan haben. Der haeufige Fall ist nicht Boeswilligkeit, sondern ein
+    gescheiterter Mailversand: der Auftrag bleibt auf `arbeit_fertig`, der
+    Knopf bleibt stehen, der zweite Klick zog eine ZWEITE echte
+    Rechnungsnummer — beide beim Kunden, eine davon muss storniert werden.
+
+    Returns:
+        InvoiceDraft — Rechnung existiert und ist ausgestellt: wiederverwenden,
+        NICHT neu ziehen. Der Versand darf trotzdem nachgeholt werden.
+        None — kein Beleg (404) oder noch Entwurf: normal weiterarbeiten.
+
+    Raises:
+        AccountingError — Lexware antwortet nicht. Der Aufrufer MUSS dann
+        abbrechen: eine Rechnung zu ziehen, ohne zu wissen ob schon eine
+        existiert, ist genau der Fehler, den diese Pruefung verhindert.
+    """
+    from core.integrations.accounting_base import AccountingError, InvoiceDraft
+    from core.integrations.lexware import LexwareProvider
+
+    if not invoice_id:
+        return None
+    try:
+        roh = await provider.get_invoice(invoice_id)
+    except AccountingError as exc:
+        if exc.status_code == 404:
+            return None          # in Lexware geloescht — neu ausstellen ist richtig
+        raise
+    if "draft" in (roh.get("voucherStatus") or "").lower():
+        return None
+    return InvoiceDraft(
+        invoice_id=invoice_id,
+        voucher_number=roh.get("voucherNumber"),
+        deeplink_view=LexwareProvider.invoice_deeplink_view(invoice_id),
+        deeplink_edit=LexwareProvider.invoice_deeplink_edit(invoice_id),
+        raw_response=roh)
+
+
+def _mwst_oder(wert, standard: int) -> int:
+    """Umsatzsteuersatz aus einem Feld lesen, das auch 0 sein darf.
+
+    Klingt banal, war aber ein echter Fehler: ueberall stand
+    ``int(x or 19)`` — und ``0 or 19`` ist 19. Der Nullsteuersatz nach
+    § 12 Abs. 3 UStG (Photovoltaik) waere damit auf jeder Rechnung still
+    zu 19 % geworden, obwohl der Betrieb ihn nirgends ausweisen darf.
+    """
+    if wert is None:
+        return standard
+    try:
+        return int(wert)
+    except (TypeError, ValueError):
+        return standard
+
+
+def _positionen_to_line_items(positionen: list[dict], standard_mwst: int = 19):
     """Wandelt App-/Extraktions-Positionen in Lexware-LineItems + Summe.
 
     Position-Felder: name, beschreibung?, menge, einheit, preis_brutto_eur,
     mwst_prozent?. Gibt (line_items, gesamt_brutto, fehler|None) zurueck.
+
+    ``standard_mwst`` ist der Satz des Betriebs (``buchhaltung.mwst_standard``)
+    und greift nur, wenn die Position selbst keinen mitbringt.
     """
     from core.integrations.accounting_base import InvoiceLineItem
 
@@ -54,7 +114,10 @@ def _positionen_to_line_items(positionen: list[dict]):
         except Exception:  # noqa: BLE001
             return None, None, f"Position {i}: ungueltige Zahl."
         einheit = (p.get("einheit") or "Stueck").strip() or "Stueck"
-        mwst = int(p.get("mwst_prozent") or 19)
+        # ACHTUNG: nicht `or` — 0 % ist ein gueltiger Satz (Photovoltaik)
+        # und wuerde damit still zu 19 % werden.
+        roh_mwst = p.get("mwst_prozent")
+        mwst = int(roh_mwst) if roh_mwst is not None else standard_mwst
         besch = (p.get("beschreibung") or "").strip() or None
         line_items.append(InvoiceLineItem(
             name=name, quantity=float(menge), unit_name=einheit,
@@ -90,7 +153,9 @@ async def create_angebot(
         return {"ok": False, "error": "Kundenname ist Pflicht."}
     if not positionen:
         return {"ok": False, "error": "Mindestens 1 Position."}
-    line_items, gesamt, err = _positionen_to_line_items(positionen)
+    from core.services.buchhaltung import mwst_standard
+    satz = await mwst_standard(tid)
+    line_items, gesamt, err = _positionen_to_line_items(positionen, satz)
     if err:
         return {"ok": False, "error": err}
     if not line_items:
@@ -130,7 +195,7 @@ async def create_angebot(
                 angebot_id=ang.id, position_nr=i, name=name,
                 beschreibung=(p.get("beschreibung") or "").strip() or None,
                 menge=menge, einheit=(p.get("einheit") or "Stueck").strip() or "Stueck",
-                preis_brutto_eur=preis, mwst_prozent=int(p.get("mwst_prozent") or 19),
+                preis_brutto_eur=preis, mwst_prozent=_mwst_oder(p.get("mwst_prozent"), satz),
             ))
         ang.gesamtbetrag_brutto_eur = gesamt
         await s.commit()
@@ -234,7 +299,9 @@ async def create_auftrag_manuell(
 
     if not positionen:
         return {"ok": False, "error": "Mindestens 1 Position."}
-    _items, gesamt, err = _positionen_to_line_items(positionen)
+    from core.services.buchhaltung import mwst_standard
+    satz = await mwst_standard(tid)
+    _items, gesamt, err = _positionen_to_line_items(positionen, satz)
     if err:
         return {"ok": False, "error": err}
     if not _items:
@@ -280,7 +347,7 @@ async def create_auftrag_manuell(
                 beschreibung=(p.get("beschreibung") or "").strip() or None,
                 menge=menge,
                 einheit=_kurz(p.get("einheit"), _MAX_EINHEIT) or "Stueck",
-                preis_brutto_eur=preis, mwst_prozent=int(p.get("mwst_prozent") or 19),
+                preis_brutto_eur=preis, mwst_prozent=_mwst_oder(p.get("mwst_prozent"), satz),
             ))
         await s.commit()
         ang_id = ang.id
@@ -318,6 +385,8 @@ async def create_rechnung(
 
     leistung_titel = (leistung_titel or "").strip()
     leistung_beschr = (leistung_beschreibung or "").strip() or None
+    from core.services.buchhaltung import mwst_standard
+    satz = await mwst_standard(tid)
     line_items: list[InvoiceLineItem] = []
     if betrag_brutto_eur and leistung_titel:
         try:
@@ -327,9 +396,9 @@ async def create_rechnung(
         line_items.append(InvoiceLineItem(
             name=leistung_titel, quantity=1.0, unit_name="Stueck",
             unit_price_gross=float(betrag), description=leistung_beschr,
-            tax_rate_percent=19))
+            tax_rate_percent=satz))
     elif positionen:
-        items, _g, err = _positionen_to_line_items(positionen)
+        items, _g, err = _positionen_to_line_items(positionen, satz)
         if err:
             return {"ok": False, "error": err}
         line_items = items
@@ -372,7 +441,7 @@ async def create_rechnung(
                 menge=Decimal(str(li.quantity)),
                 einheit=li.unit_name or "Stueck",
                 preis_brutto_eur=Decimal(str(li.unit_price_gross)),
-                mwst_prozent=int(li.tax_rate_percent or 19)))
+                mwst_prozent=_mwst_oder(li.tax_rate_percent, 19)))
         await s.commit()
         await s.refresh(r)
         rid = r.id
@@ -470,7 +539,7 @@ async def _angebot_finalisieren(tid: uuid.UUID, *, angebot_id: uuid.UUID) -> dic
         InvoiceLineItem(
             name=p.name, quantity=float(p.menge), unit_name=p.einheit or "Stueck",
             unit_price_gross=float(p.preis_brutto_eur), description=p.beschreibung,
-            tax_rate_percent=int(p.mwst_prozent or 19))
+            tax_rate_percent=_mwst_oder(p.mwst_prozent, 19))
         for p in positions]
     one_time_address = {"name": kunde_name, "countryCode": "DE"}
     if kunde_strasse:
@@ -601,12 +670,29 @@ async def finalize_and_send_rechnung(
             "strasse": r.kunde_strasse, "plz": r.kunde_plz, "ort": r.kunde_ort,
             "alter_entwurf": r.lexware_invoice_id,
             "bezahlt_am": r.bezahlt_am,
+            "status": r.status,
+            "nummer": r.lexware_voucher_number,
         }
 
     if not ziel:
         return {"ok": False, "error": "Keine Empfaenger-Mail hinterlegt."}
     if daten["bezahlt_am"] is not None:
         return {"ok": False, "error": "Diese Rechnung ist bereits bezahlt."}
+    # Idempotenz (Audit 2026-08-24): war der Versand schon durch, wird nichts
+    # neu gezogen. Vorher ueberschrieb ein zweiter Klick
+    # ``lexware_invoice_id`` — die Nummer, die beim Kunden liegt, war danach
+    # in unserer DB nicht mehr auffindbar, und der Bezahl-Monitor pollte die
+    # falsche Rechnung.
+    if daten["status"] == RECHNUNG_STATUS_MAIL_SENT:
+        from core.integrations.lexware import LexwareProvider
+        return {
+            "ok": True, "unveraendert": True,
+            "invoice_deeplink": (
+                LexwareProvider.invoice_deeplink_view(daten["alter_entwurf"])
+                if daten["alter_entwurf"] else None),
+            "nummer": daten["nummer"],
+            "hinweis": "Diese Rechnung ist bereits verschickt.",
+        }
 
     provider = await _lexware_provider(tid)
     if provider is None:
@@ -619,15 +705,17 @@ async def finalize_and_send_rechnung(
                 unit_name=p.einheit or "Stueck",
                 unit_price_gross=float(p.preis_brutto_eur),
                 description=p.beschreibung,
-                tax_rate_percent=int(p.mwst_prozent or 19))
+                tax_rate_percent=_mwst_oder(p.mwst_prozent, 19))
             for p in positions]
     elif daten["betrag"]:
         # Aeltere Rechnungen haben keine gespeicherten Positionen — dann
         # eine Sammelposition aus Titel und Betrag.
+        from core.services.buchhaltung import mwst_standard
         line_items = [InvoiceLineItem(
             name=daten["titel"], quantity=1.0, unit_name="Stueck",
             unit_price_gross=float(daten["betrag"]),
-            description=daten["beschreibung"], tax_rate_percent=19)]
+            description=daten["beschreibung"],
+            tax_rate_percent=await mwst_standard(tid))]
     else:
         return {"ok": False, "error": "Rechnung hat weder Positionen noch Betrag."}
 
@@ -640,14 +728,32 @@ async def finalize_and_send_rechnung(
         one_time_address["city"] = daten["ort"]
 
     try:
-        invoice = await provider.create_invoice_draft(
-            line_items=line_items, one_time_address=one_time_address,
-            title=f"Rechnung {daten['kunde_name']}".strip(),
-            introduction=(
-                f"Sehr geehrte/r {daten['kunde_name']},\n\nvielen Dank fuer "
-                f"Ihren Auftrag."),
-            remark="Bitte begleichen Sie den Rechnungsbetrag fristgerecht.",
-            tax_type="gross", finalize=True)
+        invoice = await _bereits_ausgestellte_rechnung(
+            provider, daten["alter_entwurf"])
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "finalize_and_send_rechnung: Lexware-Status von %s nicht pruefbar "
+            "(%s) — Abbruch statt Risiko einer zweiten Rechnung",
+            daten["alter_entwurf"], exc)
+        return {"ok": False,
+                "error": ("Lexware antwortet gerade nicht. Bitte gleich noch "
+                          "einmal versuchen — die Rechnung wurde NICHT "
+                          "doppelt gestellt.")}
+    if invoice is not None:
+        logger.info(
+            "finalize_and_send_rechnung: Rechnung %s ist bereits ausgestellt "
+            "— nur der Versand wird nachgeholt", invoice.invoice_id)
+
+    try:
+        if invoice is None:
+            invoice = await provider.create_invoice_draft(
+                line_items=line_items, one_time_address=one_time_address,
+                title=f"Rechnung {daten['kunde_name']}".strip(),
+                introduction=(
+                    f"Sehr geehrte/r {daten['kunde_name']},\n\nvielen Dank fuer "
+                    f"Ihren Auftrag."),
+                remark="Bitte begleichen Sie den Rechnungsbetrag fristgerecht.",
+                tax_type="gross", finalize=True)
     except Exception as exc:  # noqa: BLE001
         logger.exception("finalize_and_send_rechnung: Lexware: %s", exc)
         return {"ok": False,
@@ -883,6 +989,23 @@ async def finalize_and_send_invoice(
         kunde_name = ang.kunde_name
         kunde_email = ang.kunde_email
         kunde_strasse, kunde_plz, kunde_ort = ang.kunde_strasse, ang.kunde_plz, ang.kunde_ort
+        auftrag_status = ang.status
+        vorhandene_invoice_id = ang.lexware_invoice_id
+
+    # Idempotenz, Stufe 1: ein abgerechneter Auftrag wird nicht noch einmal
+    # abgerechnet. Ohne diese Zeilen genuegte ein zweiter Klick (oder ein Q,
+    # das den Status zurueckgesetzt hat) fuer eine zweite Rechnungsnummer.
+    if auftrag_status == ANGEBOT_STATUS_RECHNUNG_GESENDET:
+        from core.integrations.lexware import LexwareProvider
+        return {
+            "ok": True, "unveraendert": True, "mail_sent": False,
+            "invoice_deeplink": (
+                LexwareProvider.invoice_deeplink_view(vorhandene_invoice_id)
+                if vorhandene_invoice_id else None),
+            "email_used": kunde_email, "email_from_lexware": False,
+            "status": ANGEBOT_STATUS_RECHNUNG_GESENDET, "kunde": kunde_name,
+            "hinweis": "Für diesen Auftrag ist die Rechnung bereits raus.",
+        }
 
     if kunde_email_override and kunde_email_override.strip():
         kunde_email = kunde_email_override.strip()
@@ -896,7 +1019,7 @@ async def finalize_and_send_invoice(
         InvoiceLineItem(
             name=p.name, quantity=float(p.menge), unit_name=p.einheit or "Stueck",
             unit_price_gross=float(p.preis_brutto_eur), description=p.beschreibung,
-            tax_rate_percent=int(p.mwst_prozent or 19))
+            tax_rate_percent=_mwst_oder(p.mwst_prozent, 19))
         for p in positions]
     one_time_address = {"name": kunde_name, "countryCode": "DE"}
     if kunde_strasse:
@@ -910,12 +1033,36 @@ async def finalize_and_send_invoice(
         "Sehr geehrte Damen und Herren,\n\nvielen Dank fuer Ihren Auftrag "
         "und das entgegengebrachte Vertrauen. Wie vereinbart stellen wir "
         "Ihnen die erbrachten Leistungen nachstehend in Rechnung.")
+    # Idempotenz, Stufe 2: liegt in Lexware unter der gemerkten Id schon eine
+    # ausgestellte Rechnung, wird sie WIEDERVERWENDET statt eine zweite zu
+    # ziehen. Der Versand darf trotzdem noch einmal laufen — genau dafuer
+    # klickt der Handwerker ja erneut, wenn die Mail beim ersten Mal
+    # steckengeblieben ist.
     try:
-        invoice = await provider.create_invoice_draft(
-            line_items=line_items, one_time_address=one_time_address,
-            title=f"Rechnung {kunde_name}", introduction=intro_text,
-            remark="Bitte begleichen Sie den Rechnungsbetrag innerhalb von 14 Tagen.",
-            tax_type="gross", finalize=True)
+        invoice = await _bereits_ausgestellte_rechnung(
+            provider, vorhandene_invoice_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "finalize_and_send_invoice: Lexware-Status von %s nicht pruefbar "
+            "(%s) — Abbruch statt Risiko einer zweiten Rechnung",
+            vorhandene_invoice_id, exc)
+        return {"ok": False, "status": ANGEBOT_STATUS_WORK_DONE,
+                "kunde": kunde_name,
+                "error": ("Lexware antwortet gerade nicht. Bitte gleich noch "
+                          "einmal versuchen — die Rechnung wurde NICHT "
+                          "doppelt gestellt.")}
+    if invoice is not None:
+        logger.info(
+            "finalize_and_send_invoice: Rechnung %s ist bereits ausgestellt "
+            "— nur der Versand wird nachgeholt", invoice.invoice_id)
+
+    try:
+        if invoice is None:
+            invoice = await provider.create_invoice_draft(
+                line_items=line_items, one_time_address=one_time_address,
+                title=f"Rechnung {kunde_name}", introduction=intro_text,
+                remark="Bitte begleichen Sie den Rechnungsbetrag innerhalb von 14 Tagen.",
+                tax_type="gross", finalize=True)
     except Exception as exc:  # noqa: BLE001
         logger.exception("finalize_and_send_invoice Finalisierung gescheitert: %s", exc)
         async with get_session() as s:

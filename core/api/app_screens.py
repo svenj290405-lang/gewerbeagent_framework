@@ -460,7 +460,9 @@ async def api_buchhaltung(request: Request, _e=Depends(require_app_user)) -> JSO
         "zahlungsziel_tage": geld["zahlungsziel_tage"],
         "zahlungsziel_quelle": geld.get("zahlungsziel_quelle", "standard"),
         "skonto": geld.get("skonto"),
+        "mwst_standard": geld.get("mwst_standard", 19),
         "offene_posten": geld["offene_posten"],
+        "posten_gekappt": geld.get("posten_gekappt", 0),
         "nachfassen": geld["nachfassen"],
         "angebote": angebote,
         "rechnungen": rechnungen,
@@ -569,6 +571,16 @@ _AUFTRAG_SETTABLE = {
     ANGEBOT_STATUS_ABGEBROCHEN,
 }
 
+# Und aus DIESEN Zustaenden heraus geht es nicht mehr zurueck. Bisher wurde
+# nur der Ziel-Status geprueft: ein abgerechneter Auftrag liess sich auf
+# "fertig" zuruecksetzen, danach stand der Knopf "Rechnung stellen" wieder
+# da — ein Klick, eine zweite Rechnungsnummer (Audit 2026-08-24).
+# Abgebrochene bleiben bewusst reaktivierbar (ein Fehlklick soll sich
+# reparieren lassen) — abgerechnete nicht.
+_AUFTRAG_ENDZUSTAENDE = {
+    ANGEBOT_STATUS_RECHNUNG_GESENDET,
+}
+
 
 async def _load_auftrag(session, tid, aid, scope):
     """Einen Auftrag laden — tenant- UND zeilen-gescoped.
@@ -664,6 +676,7 @@ def _auftrag_zeile(a: Angebot) -> dict:
         # eine Query pro Zeile.
         "assigned_employee_id": str(a.assigned_employee_id) if a.assigned_employee_id else None,
         "zugewiesen_an": "",
+        "zugewiesen_slug": "",
     }
 
 
@@ -677,12 +690,14 @@ async def _zuweisung_anreichern(tid: uuid.UUID, zeilen: list[dict]) -> None:
         return
     async with get_session() as s:
         rows = (await s.execute(
-            select(Employee.id, Employee.name)
+            select(Employee.id, Employee.name, Employee.slug)
             .where(Employee.tenant_id == tid)
         )).all()
-    namen = {str(i): n for i, n in rows}
+    namen = {str(i): (n, sl) for i, n, sl in rows}
     for z in zeilen:
-        z["zugewiesen_an"] = namen.get(z.get("assigned_employee_id") or "", "")
+        name, slug = namen.get(z.get("assigned_employee_id") or "", ("", ""))
+        z["zugewiesen_an"] = name
+        z["zugewiesen_slug"] = slug
 
 
 def _historie_zeile(a: Angebot) -> dict:
@@ -792,6 +807,12 @@ async def api_auftrag_status(
         a = await _load_auftrag(s, tid, aid, auftrag_scope(request))
         if a is None:
             return JSONResponse({"ok": False, "error": "Auftrag nicht gefunden."}, status_code=404)
+        if a.status in _AUFTRAG_ENDZUSTAENDE and a.status != new_status:
+            return JSONResponse(
+                {"ok": False, "error": ("Der Auftrag ist bereits abgerechnet — "
+                                        "der Status lässt sich nicht mehr ändern.")},
+                status_code=400,
+            )
         a.status = new_status
         if new_status == ANGEBOT_STATUS_ACCEPTED and not a.accepted_at:
             a.accepted_at = dt.datetime.now(dt.timezone.utc)
@@ -1378,9 +1399,26 @@ async def api_auftrag_detail(
 
     stunden_daten = await stunden_uebersicht(tid, aid)
 
+    zeile = _auftrag_zeile(a)
+    await _zuweisung_anreichern(tid, [zeile])
+
+    # Wer Auftraege fuehren darf, bekommt die Mitarbeiterliste mit: bis zum
+    # Audit am 2026-08-24 gab es die Zuweisungs-Route zwar, aber keinen
+    # einzigen Aufrufer — ein Auftrag ohne Zuweisung (oder einer, dessen
+    # Monteur ausgeschieden ist) war damit fuer eingeschraenkte Nutzer
+    # unsichtbar und blieb es.
+    from core.features.permission_check import hat_recht
+    zuweisbar: list[dict] = []
+    if await hat_recht(request.state.app_employee, "auftraege.fuehren"):
+        zuweisbar = [
+            {"slug": e.slug, "name": e.name}
+            for e in await get_employees_for_tenant(tid, active_only=True)
+        ]
+
     return JSONResponse({
         "ok": True,
-        **_auftrag_zeile(a),
+        **zeile,
+        "zuweisbar": zuweisbar,
         "adresse": adresse,
         "email": a.kunde_email or "",
         "angebot_nr": a.lexware_voucher_number or "",
@@ -4533,13 +4571,22 @@ async def api_angebot_anlegen(
     from core.services.document_flow import create_angebot
     tid = current_tenant_id(request)
     body = await request.json()
+    # Zuweisung wie bei ``api_auftrag_neu`` und beim Q-Tool: entweder
+    # ausdruecklich ein Mitarbeiter, sonst der Anlegende. Fehlte das hier,
+    # blieb ``assigned_employee_id`` NULL — und der Zeilen-Scope ist
+    # fail-closed (core/security/app_scope.py): ein so angelegter Auftrag war
+    # fuer jeden ohne `auftraege.alle_sehen` unsichtbar, dauerhaft und ohne
+    # Weg, ihn jemandem zuzuweisen (Audit 2026-08-24).
+    ziel_slug = (body.get("employee_slug") or "").strip()
+    ziel = (await _get_employee_by_slug(tid, ziel_slug)) if ziel_slug else None
+    ziel_id = ziel.id if ziel is not None else request.state.app_employee.id
     result = await create_angebot(
         tid, kunde_name=(body.get("kunde_name") or ""),
         positionen=body.get("positionen") or [],
         kunde_strasse=body.get("kunde_strasse"), kunde_plz=body.get("kunde_plz"),
         kunde_ort=body.get("kunde_ort"), kunde_email=body.get("kunde_email"),
         intro_text=body.get("intro_text"), remark_text=body.get("remark_text"),
-        quelle="web")
+        quelle="web", assigned_employee_id=ziel_id)
     return JSONResponse(result, status_code=200 if result.get("ok") else 400)
 
 
