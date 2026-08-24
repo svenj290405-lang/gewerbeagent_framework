@@ -140,6 +140,13 @@ _REDACTION_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     # es aber, weil der Parametername sie ankuendigt.
     (re.compile(r"(?i)([?&](?:kunde|kunde_name|name|suche|q|email|telefon)=)"
                 r"[^&\s\"']+"), r"\1<redacted>"),
+    # Dieselben Namen, aber als Format-Argument interpoliert:
+    # "PWA-Archiv-Upload: … kunde=Henrik Anton …". Der Filter oben verlangt
+    # ein vorangehendes ?/& und liess genau diese Zeilen durch
+    # (Audit 2026-08-24). Die Log-Stellen selbst sind entschaerft, das hier
+    # ist das Netz darunter.
+    (re.compile(r"(?i)\b(kunde|kunde_name|kundenname|mitarbeiter_name)="
+                r"(?:'[^']*'|\"[^\"]*\"|[^\s,;)]+)"), r"\1=<redacted>"),
 )
 
 

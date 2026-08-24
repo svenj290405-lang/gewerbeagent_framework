@@ -106,3 +106,29 @@ def test_uvicorn_logger_schreibt_ueber_den_root():
         log = logging.getLogger(name)
         assert log.propagate is True, f"{name} leitet nicht an den Root weiter"
         assert not log.handlers, f"{name} hat noch eigene Handler"
+
+
+def test_interpolierter_kundenname_wird_maskiert():
+    """Audit 2026-08-24: der Filter verlangte ein vorangehendes ?/& — Namen,
+    die als Format-Argument in die Zeile kamen, standen im Klartext im Log."""
+    from core.logging_context import _redact_secrets
+
+    raus = _redact_secrets("PWA-Archiv-Upload: tenant=abc kunde=Henrik Anton mime=image/jpeg")
+    assert "Henrik" not in raus
+    assert "<redacted>" in raus
+
+
+def test_kundenname_in_anfuehrungszeichen_wird_maskiert():
+    from core.logging_context import _redact_secrets
+
+    raus = _redact_secrets("Formular-Link: kunde='Marco Jantos' valid_days=14")
+    assert "Jantos" not in raus
+    assert "valid_days=14" in raus
+
+
+def test_query_string_bleibt_maskiert():
+    """Der alte Weg darf durch das neue Muster nicht kaputtgehen."""
+    from core.logging_context import _redact_secrets
+
+    raus = _redact_secrets('GET /app/api/archiv/dateien?kunde=Meier HTTP/1.1')
+    assert "Meier" not in raus

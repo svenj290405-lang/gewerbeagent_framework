@@ -3606,7 +3606,7 @@ async def api_archiv_upload(
         logger.exception("PWA-Archiv-Upload fehlgeschlagen: %s", e)
         return JSONResponse({"ok": False, "error": "Drive-Upload fehlgeschlagen. Bitte erneut versuchen."}, status_code=502)
 
-    logger.info("PWA-Archiv-Upload: tenant=%s mitarbeiter=%s kunde=%s mime=%s", tid, emp.id, kunde_name, mime)
+    logger.info("PWA-Archiv-Upload: tenant=%s mitarbeiter=%s mime=%s", tid, emp.id, mime)
     return JSONResponse({
         "ok": True,
         "folder_url": result.get("kunde_folder_url"),
@@ -5373,6 +5373,17 @@ _EXPORT_TABU = {
     "api_usage_log", "app_usage_events",
 }
 
+# Einzelne Spalten, die auch in erlaubten Tabellen nichts im Export zu
+# suchen haben. Aufgefallen im Audit am 2026-08-24: die Mitarbeiter-Tabelle
+# haengt am Tenant, wanderte also mit — samt der bcrypt-Hashes aller
+# PWA-Passwoerter. Die Zeilen selbst gehoeren dem Betrieb, die Geheimnisse
+# darin nicht. Gleiches gilt fuer noch gueltige Formular-Links.
+_EXPORT_GEHEIM_SPALTEN = {
+    "app_password_hash", "password_hash", "token", "csrf_token",
+    "refresh_token_encrypted", "access_token_encrypted", "api_key_encrypted",
+    "webhook_secret",
+}
+
 
 @router.get("/einstellungen/export")
 async def api_datenexport(
@@ -5411,7 +5422,8 @@ async def api_datenexport(
                 # CSV sind sie unbrauchbar (abgeschnittenes base64) und
                 # blaehen die Datei um ein Vielfaches auf. Die Zeile bleibt
                 # mit allen Metadaten drin, nur das Feld ist ersetzt.
-                spalten = [c for c in tabelle.columns]
+                spalten = [c for c in tabelle.columns
+                           if c.name not in _EXPORT_GEHEIM_SPALTEN]
                 blob_namen = {
                     c.name for c in spalten
                     if any(kennwort in str(c.type).upper()
@@ -6524,9 +6536,12 @@ async def api_formular_link_generieren(
         token_obj.expires_at.strftime("%d.%m.%Y")
         if token_obj.expires_at else ""
     )
+    # Kein Kundenname im Log: der Redaction-Filter greift nur bei
+    # Query-Strings (?kunde=…), interpolierte Namen laufen daran vorbei
+    # (Audit 2026-08-24). Zum Nachvollziehen reicht der Token.
     logger.info(
-        "PWA-Formular-Link generiert: typ=%s tenant=%s kunde=%r valid_days=%d",
-        anfrage_typ, tid, kunde_name, valid_days,
+        "PWA-Formular-Link generiert: typ=%s tenant=%s token=%s valid_days=%d",
+        anfrage_typ, tid, token_obj.token[:8], valid_days,
     )
     return JSONResponse({
         "ok": True,

@@ -106,3 +106,38 @@ async def test_zugangsdaten_bleiben_draussen(monkeypatch):
     for tabu in ("oauth_tokens", "app_sessions", "tool_configs",
                  "app_login_tokens"):
         assert f"{tabu}.csv" not in namen, f"{tabu} darf nicht exportiert werden"
+
+
+@pytest.mark.asyncio
+async def test_passwort_hashes_stehen_in_keiner_csv(monkeypatch):
+    """Audit 2026-08-24: ``employees`` haengt am Tenant und wanderte damit
+    mit — samt der bcrypt-Hashes aller PWA-Passwoerter. Die Mitarbeiter-
+    zeilen gehoeren dem Betrieb, die Geheimnisse darin nicht."""
+    tid = uuid.uuid4()
+    session = _FakeSession(tid)
+    _patch(monkeypatch, session, tid)
+
+    resp = await app_screens.api_datenexport(_request(tid))
+
+    with zipfile.ZipFile(io.BytesIO(resp.body)) as z:
+        for name in z.namelist():
+            if not name.endswith(".csv"):
+                continue
+            kopfzeile = z.read(name).decode("utf-8").splitlines()[0]
+            spalten = set(kopfzeile.split(";"))
+            verboten = spalten & app_screens._EXPORT_GEHEIM_SPALTEN
+            assert not verboten, f"{name} enthaelt {verboten}"
+
+
+@pytest.mark.asyncio
+async def test_mitarbeiter_sind_trotzdem_im_export(monkeypatch):
+    """Die Sperre gilt der Spalte, nicht der Tabelle — sonst faende der
+    Betrieb sein eigenes Team nicht im Export."""
+    tid = uuid.uuid4()
+    session = _FakeSession(tid)
+    _patch(monkeypatch, session, tid)
+
+    resp = await app_screens.api_datenexport(_request(tid))
+
+    with zipfile.ZipFile(io.BytesIO(resp.body)) as z:
+        assert "employees.csv" in z.namelist()

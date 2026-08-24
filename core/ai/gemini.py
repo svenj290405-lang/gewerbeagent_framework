@@ -799,9 +799,9 @@ async def _gemini_extract_rechnung(parts: list, mode: str) -> dict:
 
     normalized = _normalize_rechnung_extraction(data)
     logger.info(
-        "extract_rechnung OK (%s): kunde=%r positionen=%d gesamt=%s conf=%s missing=%s",
+        "extract_rechnung OK (%s): kunde_erkannt=%s positionen=%d gesamt=%s conf=%s missing=%s",
         mode,
-        normalized.get("kunde_name"),
+        bool(normalized.get("kunde_name")),
         len(normalized.get("positionen") or []),
         normalized.get("gesamtbetrag_brutto_eur"),
         normalized.get("extraction_confidence"),
@@ -1017,9 +1017,9 @@ async def _gemini_analyse_gespraech(parts: list, mode: str) -> dict:
 
     normalized = _normalize_gespraech_extraction(data)
     logger.info(
-        "analyse_gespraech OK (%s): kunde=%r positionen=%d todos=%d termin=%s conf=%s",
+        "analyse_gespraech OK (%s): kunde_erkannt=%s positionen=%d todos=%d termin=%s conf=%s",
         mode,
-        normalized.get("kunde_name"),
+        bool(normalized.get("kunde_name")),
         len(normalized.get("positionen") or []),
         len(normalized.get("todos") or []),
         normalized.get("termin_datum"),

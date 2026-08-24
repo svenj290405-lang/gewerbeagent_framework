@@ -2248,8 +2248,27 @@ const SCREENS = {
         <div class="row"><span>Paket</span><span class="sub">${esc(d.package_tier || "—")}</span></div>
         <div class="row"><span>Daten-Retention</span><span class="sub">${esc(String(d.data_retention_days || ""))} Tage</span></div>
         <p class="muted" style="margin-top:8px">Microsoft, Google, Lexware und die Telefonnummer (Sipgate) verwalte über den Setup-Bereich auf gewerbeagent.de.</p>
-      </div>`;
+      </div>` +
+      // Der Export war gebaut, aber aus der App nicht erreichbar — obwohl
+      // die Website ihn ausdrücklich verspricht ("alle deine Daten als
+      // Export"). Ohne Knopf ist ein Versprechen keins.
+      (can("einstellungen.verwalten") ? `<div class="card"><h2>Deine Daten</h2>
+        <p class="muted" style="margin:0 0 10px">Alle Daten deines Betriebs als ZIP — je eine Tabelle als CSV. Ohne Zugangsdaten; Dateien liegen in deinem eigenen Drive.</p>
+        <button class="btn-sm" id="daten-export" style="width:100%">⬇️ Alle Daten exportieren</button>
+      </div>` : "");
     document.getElementById("back-einst").addEventListener("click", () => navigate("einstellungen"));
+    const exportBtn = document.getElementById("daten-export");
+    if (exportBtn) exportBtn.addEventListener("click", () => {
+      exportBtn.disabled = true;
+      exportBtn.textContent = "Wird erstellt …";
+      // Direkt navigieren statt fetch: der Browser schreibt die Datei dann
+      // selbst weg, ohne dass das ganze ZIP durch den Speicher der App muss.
+      window.location.href = "/app/api/einstellungen/export";
+      setTimeout(() => {
+        exportBtn.disabled = false;
+        exportBtn.textContent = "⬇️ Alle Daten exportieren";
+      }, 4000);
+    });
   },
 
   async einstellungen_verbindungen() {

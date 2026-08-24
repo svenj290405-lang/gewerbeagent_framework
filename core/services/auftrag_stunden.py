@@ -155,8 +155,8 @@ async def buche_stunden(
         await s.flush()
         neue_id = eintrag.id
         await s.commit()
-    logger.info("Stunden gebucht: auftrag=%s tenant=%s %s h von %r",
-                angebot_id, tenant_id, stunden, employee_name)
+    logger.info("Stunden gebucht: auftrag=%s tenant=%s %s h von mitarbeiter=%s",
+                angebot_id, tenant_id, stunden, employee_id)
     return neue_id
 
 
