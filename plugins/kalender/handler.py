@@ -1396,6 +1396,14 @@ class Plugin(BasePlugin):
             anker_dt = datetime.combine(target_date, wunsch_uhrzeit_anker)
             kandidaten.sort(key=lambda c: abs((c - anker_dt).total_seconds()))
 
+        # Kein Slot mehr uebrig (typisch: abends fuer heute gesucht, der
+        # Rest-Tag ist kuerzer als die Termindauer). Dann ist auch die
+        # FreeBusy-Abfrage sinnlos — Google quittiert ein leeres oder
+        # verkehrtes Intervall mit HTTP 400 'timeRangeEmpty', wir haben
+        # den Fehler nur gefangen und geloggt und trotzdem bezahlt.
+        if not kandidaten or slot_start_dt >= tag_ende_dt:
+            return []
+
         # FreeBusy-Range fuer den Tag holen (1 API-Call statt n).
         # Provider-agnostisch via Adapter: Google nutzt freebusy().query(),
         # Microsoft nutzt /me/calendar/getSchedule.
