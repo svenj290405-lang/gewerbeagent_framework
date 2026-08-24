@@ -565,11 +565,19 @@ async def create_anfrage_token(
         token_obj = AnfrageToken(
             tenant_id=tenant_id,
             kunde_email=kunde_email.lower(),
-            kunde_name=kunde_name,
+            # Auf die Spaltenbreiten kuerzen (255 / 500). Beides kommt aus
+            # der eingehenden Mail und ist damit vom Absender frei
+            # bestimmbar; ein ueberlanger Anzeigename liess das INSERT
+            # platzen — im Mail-Buchungspfad NACH dem Kalendereintrag
+            # (Audit 2026-08-24).
+            kunde_name=(kunde_name[:255] if kunde_name else kunde_name),
             kunde_telefon=telefon_norm,
             anfrage_typ=anfrage_typ,
-            original_subject=original_subject,
-            original_message_id=original_message_id,
+            original_subject=(original_subject[:500] if original_subject
+                              else original_subject),
+            original_message_id=(original_message_id[:500]
+                                 if original_message_id
+                                 else original_message_id),
             expires_at=expires_at,
         )
         session.add(token_obj)

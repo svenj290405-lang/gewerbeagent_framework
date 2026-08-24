@@ -1803,6 +1803,10 @@ async def process_relevant_kunde_mail(
     termin_post_state: str | None = None
     booked_event_id: str | None = None
     booked_termin_datum = None
+    # Wurde die Konversation schon beim Buchen angelegt (statt erst nach dem
+    # Mailversand)? Dann ist sie unten trotzdem "neu" — der Inhaber soll
+    # seinen Push ueber die neue Anfrage bekommen.
+    conv_vorab_angelegt = False
     booked_drive_url: str | None = None
     # Nach erfolgreicher Buchung schicken wir das Anfrage-Formular gleich
     # mit (neuer Flow: erst Termin, dann Formular). Wird in der Buchungs-
@@ -2024,6 +2028,39 @@ async def process_relevant_kunde_mail(
                 termin_post_state = STATE_BOOKED
                 # Slot-Vorschlaege loeschen — Buchung ist durch.
                 slots_to_persist = []
+                # Zaehlmarke fuer den Mengen-Deckel SOFORT setzen. Sie stand
+                # frueher am Ende der Versandkette — warf irgendetwas
+                # dazwischen (ein ueberlanger Absendername in
+                # `create_anfrage_token` genuegte), stand der Termin im
+                # Kalender, wurde aber nie gezaehlt. Es entstand dann auch
+                # keine Konv-Zeile, an der das "kein zweiter Termin"-Gate
+                # haette greifen koennen: dieselbe Adresse konnte beliebig
+                # oft buchen (Audit 2026-08-24). Ab hier existiert der
+                # Kalendereintrag — also wird er ab hier gezaehlt.
+                try:
+                    from core.integrations.mail_pipeline import (
+                        create_conversation as _create_conv,
+                        markiere_buchung as _markiere_buchung,
+                    )
+                    if existing_conv is None:
+                        existing_conv = await _create_conv(
+                            tenant_id=tenant_id,
+                            sender_email=sender_email,
+                            sender_name=sender_name,
+                            subject=subject,
+                            state=STATE_BOOKED,
+                            gcal_event_id=booked_event_id,
+                            termin_datum=booked_termin_datum,
+                        )
+                        conv_vorab_angelegt = True
+                    await _markiere_buchung(existing_conv.id)
+                except Exception as e:  # noqa: BLE001
+                    # Die Buchung selbst steht — daran aendert ein Fehler
+                    # hier nichts. Aber er muss sichtbar sein: ohne Marke
+                    # zaehlt der Deckel zu wenig.
+                    logger.exception(
+                        f"Buchung nicht vermerkt (Termin steht trotzdem!): {e}"
+                    )
                 # Kundenordner-Link klickbar ins Event eintragen (vor dem
                 # Footer). Best-effort. Wird unten auch an der Konv
                 # persistiert, damit Folge-Buchungen/Formular ihn finden.
@@ -2207,7 +2244,7 @@ async def process_relevant_kunde_mail(
         target_state = STATE_AWAITING_CONFIRMATION
     else:
         target_state = STATE_DIALOG
-    is_new_conv = existing_conv is None
+    is_new_conv = existing_conv is None or conv_vorab_angelegt
     conv_id = None
     if result["sent"]:
         try:
@@ -2217,7 +2254,7 @@ async def process_relevant_kunde_mail(
             )
             ms_conv_id = sent_meta.get("conversation_id")
             outbound_imsg_id = sent_meta.get("internet_message_id")
-            if is_new_conv:
+            if existing_conv is None:
                 conv = await create_conversation(
                     tenant_id=tenant_id,
                     sender_email=sender_email,
@@ -2254,32 +2291,6 @@ async def process_relevant_kunde_mail(
                             if booked_termin_datum:
                                 _c.termin_datum = booked_termin_datum
                             await _s.commit()
-            # Zaehlmarke fuer den Mengen-Deckel (termin_throttle): eine
-            # Zeile pro Termin, den Q OHNE Rueckfrage aus einer Mail
-            # heraus gebucht hat. Gilt fuer beide Pfade oben (neue Konv
-            # wie Folge-Mail). Bewusst hier und nicht direkt nach dem
-            # Buchen: vorher gibt es bei einer neuen Konversation noch
-            # keine Zeile, an die der Zeitstempel gehoert. Faellt der
-            # Mailversand aus, bleibt die Marke aus — ein Angreifer kann
-            # das nicht steuern, und die Zaehlung bleibt ehrlich am
-            # tatsaechlich abgeschlossenen Vorgang.
-            if booked_event_id and conv_id:
-                try:
-                    from core.database import AsyncSessionLocal as _ASL2
-                    from core.models import EmailConversation as _EC2
-                    from sqlalchemy import select as _sel2
-                    import datetime as _dt2
-                    async with _ASL2() as _s2:
-                        _r2 = await _s2.execute(
-                            _sel2(_EC2).where(_EC2.id == conv_id)
-                        )
-                        _c2 = _r2.scalar_one_or_none()
-                        if _c2 is not None:
-                            _c2.booked_at = _dt2.datetime.now(_dt2.timezone.utc)
-                            await _s2.commit()
-                except Exception as e:  # noqa: BLE001
-                    logger.warning(f"booked_at setzen fehlgeschlagen: {e}")
-
             # Kundenordner-URL an der Konv vermerken (bei der Buchung
             # gerade angelegt) — Folge-Mails + Formular-Eingang finden den
             # Ordner darueber wieder.

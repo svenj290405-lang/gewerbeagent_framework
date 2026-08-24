@@ -97,6 +97,40 @@ async def _send_alert(
         return False
 
 
+async def notify_termin_deckel(*, tenant_id: UUID, grund: str) -> None:
+    """Der Mengen-Deckel fuer Mail-Buchungen hat gegriffen.
+
+    Bewusst ueber diese Pipeline und nicht direkt per Push: der Deckel
+    greift bei JEDER weiteren Mail, und ohne Cooldown haette ein
+    Angreifer mit 60 Wegwerf-Adressen 56 Pushes beim Inhaber ausgeloest —
+    der Schutzmechanismus waere selbst zum Stoerkanal geworden
+    (Audit 2026-08-24).
+    """
+    alert_kind = "termin_deckel"
+    if await _was_recently_alerted(tenant_id=tenant_id, alert_kind=alert_kind):
+        return
+    fenster = "der letzten Stunde" if grund == "stunden-deckel" else "24 Stunden"
+    sent = False
+    try:
+        from core.integrations.push_notifier import send_push_to_tenant
+        sent = bool(await send_push_to_tenant(
+            tenant_id,
+            title="Ungewöhnlich viele Termine per Mail",
+            body=(
+                f"In {fenster} wurden auffällig viele Termine automatisch "
+                f"aus Kundenmails gebucht. Weitere Mail-Buchungen sind "
+                f"vorerst gestoppt — bitte kurz in den Kalender schauen."
+            ),
+            url="/app#anfragen", tag="termin-deckel", inhaber_only=True,
+        ))
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"termin-deckel: Push an Inhaber fehlgeschlagen: {e}")
+    await _record_alert(
+        tenant_id=tenant_id, alert_kind=alert_kind, success=sent,
+        details={"grund": grund},
+    )
+
+
 async def notify_oauth_revoked(
     *, tenant_id: UUID, provider: str,
     employee_id: UUID | None = None,

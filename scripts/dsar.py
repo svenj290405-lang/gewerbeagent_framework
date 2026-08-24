@@ -130,6 +130,10 @@ async def collect(
                     "state": r.state,
                     "termin_datum": r.termin_datum,
                     "created_at": getattr(r, "created_at", None),
+                    # Wann Q selbst einen Termin gebucht hat. Gehoert in die
+                    # Auskunft nach Art. 15 — es ist ein automatisierter
+                    # Verarbeitungsvorgang zur Person (Audit 2026-08-24).
+                    "automatisch_gebucht_am": getattr(r, "booked_at", None),
                 })
                 out["_ids"]["email_conversations"].append(r.id)
 

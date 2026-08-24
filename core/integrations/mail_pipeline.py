@@ -236,7 +236,12 @@ async def create_conversation(
         conv = EmailConversation(
             tenant_id=tenant_id,
             kunde_email=(sender_email or "").strip().lower(),
-            kunde_name=(sender_name or None),
+            # Auf die Spaltenbreite kuerzen. Ein ueberlanger Anzeigename im
+            # From-Header (der Absender bestimmt ihn frei) liess das INSERT
+            # mit "value too long for character varying(255)" platzen —
+            # mitten im Buchungspfad, nach dem Kalendereintrag
+            # (Audit 2026-08-24).
+            kunde_name=((sender_name or None) and sender_name[:255]),
             last_subject=(subject or None) and subject[:500],
             microsoft_conversation_id=microsoft_conversation_id,
             state=state or STATE_AWAITING_CONFIRMATION,
@@ -258,6 +263,27 @@ async def create_conversation(
         f"event_id={(gcal_event_id or '')[:20]}"
     )
     return conv
+
+
+async def markiere_buchung(conv_id: uuid.UUID) -> None:
+    """Vermerkt: an dieser Konversation hat Q selbst einen Termin gebucht.
+
+    Zaehlquelle fuer den Mengen-Deckel (``core.integrations.termin_throttle``).
+    Wird SOFORT nach der erfolgreichen Buchung gerufen, nicht erst nach dem
+    Mailversand — der Kalendereintrag existiert ab der Buchung, und genau der
+    soll gezaehlt werden.
+    """
+    import datetime as dt
+
+    async with AsyncSessionLocal() as s:
+        conv = (await s.execute(
+            select(EmailConversation).where(EmailConversation.id == conv_id)
+        )).scalar_one_or_none()
+        if conv is None:
+            logger.warning(f"markiere_buchung: Konversation {conv_id} weg")
+            return
+        conv.booked_at = dt.datetime.now(dt.timezone.utc)
+        await s.commit()
 
 
 async def find_conversation_by_outbound_message_id(

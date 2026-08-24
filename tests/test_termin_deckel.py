@@ -187,3 +187,95 @@ def test_deckel_schwellwerte_sind_code_konstanten():
         tt.MAX_MAIL_BOOKINGS_PER_TENANT_PER_HOUR
         < tt.MAX_MAIL_BOOKINGS_PER_TENANT_PER_DAY
     )
+
+
+# =====================================================================
+# Die Zaehlmarke haengt an der BUCHUNG, nicht am Mailversand
+#
+# Audit 2026-08-24: `booked_at` wurde erst am Ende der Versandkette
+# gesetzt. Warf etwas dazwischen — ein ueberlanger Absendername im
+# From-Header genuegte —, stand der Termin im Kalender, wurde aber nie
+# gezaehlt, und es entstand auch keine Konv-Zeile, an der das
+# "kein zweiter Termin"-Gate haette greifen koennen.
+# =====================================================================
+
+@pytest.mark.asyncio
+async def test_markiere_buchung_setzt_den_zeitstempel(monkeypatch):
+    from types import SimpleNamespace
+    from contextlib import asynccontextmanager
+
+    import core.integrations.mail_pipeline as mp
+
+    conv = SimpleNamespace(id=uuid.uuid4(), booked_at=None)
+
+    class _S:
+        async def execute(self, stmt):
+            return SimpleNamespace(scalar_one_or_none=lambda: conv)
+
+        async def commit(self):
+            pass
+
+    @asynccontextmanager
+    async def _sess():
+        yield _S()
+
+    monkeypatch.setattr(mp, "AsyncSessionLocal", _sess)
+    await mp.markiere_buchung(conv.id)
+
+    assert conv.booked_at is not None
+    assert conv.booked_at.tzinfo is not None
+
+
+def test_ueberlanger_absendername_sprengt_die_spalte_nicht():
+    """Der Anzeigename im From-Header ist vom Absender frei waehlbar.
+    Beide Ziele sind String(255) — gekuerzt wird beim Schreiben."""
+    from core.models.anfrage import AnfrageToken
+    from core.models.email_conversation import EmailConversation
+
+    for modell, feld in ((AnfrageToken, "kunde_name"),
+                         (EmailConversation, "kunde_name")):
+        breite = modell.__table__.columns[feld].type.length
+        assert breite == 255
+        assert len(("X" * 400)[:breite]) == 255
+
+
+@pytest.mark.asyncio
+async def test_deckel_warnung_laeuft_ueber_die_alert_pipeline(monkeypatch):
+    """Ohne Cooldown wuerde eine Mailflut eine Push-Flut ausloesen."""
+    import core.integrations.termin_throttle as tt
+
+    gerufen = {}
+
+    async def _notify(*, tenant_id, grund):
+        gerufen["tenant_id"] = tenant_id
+        gerufen["grund"] = grund
+
+    import core.integrations.tenant_alert as ta
+    monkeypatch.setattr(ta, "notify_termin_deckel", _notify)
+
+    tid = uuid.uuid4()
+    await tt.warn_inhaber_ueber_deckel(
+        tenant_id=tid, grund="stunden-deckel", kunde_email="x@example.de")
+
+    assert gerufen == {"tenant_id": tid, "grund": "stunden-deckel"}
+
+
+@pytest.mark.asyncio
+async def test_zweite_warnung_im_cooldown_bleibt_stumm(monkeypatch):
+    import core.integrations.tenant_alert as ta
+
+    pushes = []
+
+    async def _schon_gewarnt(**kw):
+        return True
+    monkeypatch.setattr(ta, "_was_recently_alerted", _schon_gewarnt)
+
+    import core.integrations.push_notifier as pn
+
+    async def _push(*a, **kw):
+        pushes.append(kw)
+        return True
+    monkeypatch.setattr(pn, "send_push_to_tenant", _push)
+
+    await ta.notify_termin_deckel(tenant_id=uuid.uuid4(), grund="tages-deckel")
+    assert pushes == []

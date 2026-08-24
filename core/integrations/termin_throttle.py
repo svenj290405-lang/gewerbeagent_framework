@@ -49,8 +49,14 @@ async def count_mail_bookings(
     window_hours: int,
 ) -> int:
     """Zaehlt die Termine, die Q im Zeitfenster selbst aus Mails gebucht
-    hat. Quelle ist ``email_conversations.booked_at`` — gesetzt genau
-    dann, wenn eine Buchung wirklich im Kalender gelandet ist."""
+    hat. Quelle ist ``email_conversations.booked_at`` — gesetzt direkt nach
+    der Buchung (``mail_pipeline.markiere_buchung``), nicht erst nach dem
+    Mailversand.
+
+    Gezaehlt werden Konversationen, nicht Buchungen: bucht derselbe Kunde
+    im Fenster erneut (nach einem Storno), wandert der Zeitstempel auf
+    derselben Zeile weiter und zaehlt einmal. Fuer einen Missbrauchsschutz,
+    der Wegwerf-Adressen im Blick hat, ist das die richtige Einheit."""
     since = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=window_hours)
     async with get_session() as s:
         stmt = (
@@ -89,29 +95,22 @@ async def should_throttle_booking(
 async def warn_inhaber_ueber_deckel(
     *, tenant_id: UUID, grund: str, kunde_email: str,
 ) -> None:
-    """Push an den Inhaber, wenn der Deckel gegriffen hat.
+    """Meldet dem Inhaber, dass der Deckel gegriffen hat.
 
-    Failsafe: schlaegt der Push fehl, laeuft die Mail-Verarbeitung
+    Laeuft ueber ``tenant_alert`` — die Pipeline hat den 6h-Cooldown und den
+    Audit-Marker. Frueher ging der Push direkt raus: der Deckel greift bei
+    JEDER weiteren Mail, 60 Wegwerf-Adressen haetten also 56 Pushes
+    ausgeloest (Audit 2026-08-24).
+
+    Failsafe: schlaegt die Meldung fehl, laeuft die Mail-Verarbeitung
     trotzdem weiter — der Deckel selbst haelt ja bereits.
     """
-    fenster = "der letzten Stunde" if grund == "stunden-deckel" else "24 Stunden"
     try:
-        from core.integrations.push_notifier import send_push_to_tenant
+        from core.integrations.tenant_alert import notify_termin_deckel
 
-        await send_push_to_tenant(
-            tenant_id,
-            title="Ungewöhnlich viele Termine per Mail",
-            body=(
-                f"In {fenster} wurden auffällig viele Termine automatisch "
-                f"aus Kundenmails gebucht. Weitere Mail-Buchungen sind "
-                f"vorerst gestoppt — bitte kurz in den Kalender schauen."
-            ),
-            url="/app#anfragen",
-            tag="termin-deckel",
-            inhaber_only=True,
-        )
+        await notify_termin_deckel(tenant_id=tenant_id, grund=grund)
     except Exception as e:  # noqa: BLE001
-        logger.warning(f"termin-deckel: Push an Inhaber fehlgeschlagen: {e}")
+        logger.warning(f"termin-deckel: Meldung an den Inhaber fehlgeschlagen: {e}")
 
     logger.warning(
         "termin-deckel (%s) greift fuer tenant=%s — Buchung aus Mail von %s "
