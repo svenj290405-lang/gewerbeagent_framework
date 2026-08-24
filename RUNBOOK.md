@@ -414,3 +414,35 @@ Bot, blockiert nur ein Feature.
 3. **Backup, Backup, Backup.** Vor jeder DB-Aenderung. Ueberlebt jeden
    Fehler.
 4. **Notfall-Eskalation:** Sven (svenj290405@gmail.com).
+
+---
+
+## Restore-Test (zuletzt: 2026-08-25)
+
+Der Dump-und-Einspiel-Weg ist geprüft: `pg_dump` der Produktivdatenbank in
+eine Wegwerf-DB eingespielt, 52 Tabellen und alle Zählstände identisch
+(3 Betriebe, 10 Aufträge, 20 Kunden, 5 Mitarbeiter, Alembic-Head
+`n6q9t2u5x8z3`), danach wieder gelöscht.
+
+```bash
+docker exec gewerbeagent_postgres psql -U gewerbeagent -d postgres \
+    -c "CREATE DATABASE restore_test OWNER gewerbeagent;"
+docker exec gewerbeagent_postgres bash -c \
+    "pg_dump -U gewerbeagent -d gewerbeagent | psql -U gewerbeagent -d restore_test -q"
+# vergleichen, dann:
+docker exec gewerbeagent_postgres psql -U gewerbeagent -d postgres \
+    -c "DROP DATABASE restore_test;"
+```
+
+**Was damit NICHT geprüft ist — und nur Sven prüfen kann:** die
+Entschlüsselung der nächtlichen Backups. Sie sind asymmetrisch mit GPG
+verschlüsselt, der private Schlüssel liegt bewusst offline (Fingerprint
+`0D46A7C2…`). Auf dem Server lässt sich nur feststellen, dass die Dateien
+gültige GPG-Pakete für den richtigen Schlüssel sind (`gpg --list-packets`,
+täglich, je ~28 MB, 8 Stück in der 7-Tage-Retention).
+
+Der eigentliche Ernstfall-Test ist deshalb einmal von Hand fällig:
+ein Backup auf den Rechner mit dem privaten Schlüssel holen,
+`gpg --decrypt … | gunzip | psql` in eine leere lokale DB, Zählstände
+vergleichen. Bis das gelaufen ist, ist "wir haben Backups" eine Annahme,
+keine Tatsache.
