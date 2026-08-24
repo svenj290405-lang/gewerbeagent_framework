@@ -163,15 +163,15 @@ def render_field(field: dict) -> str:
             <div class="masse-grid">
                 <div>
                     <span class="masse-sub">Höhe (cm)</span>
-                    <input type="number" name="masse_hoehe" placeholder="100" class="field-input" min="0">
+                    <input type="number" name="masse_hoehe" placeholder="100" class="field-input" min="0" {req_attr}>
                 </div>
                 <div>
                     <span class="masse-sub">Breite (cm)</span>
-                    <input type="number" name="masse_breite" placeholder="100" class="field-input" min="0">
+                    <input type="number" name="masse_breite" placeholder="100" class="field-input" min="0" {req_attr}>
                 </div>
                 <div>
                     <span class="masse-sub">Tiefe (cm)</span>
-                    <input type="number" name="masse_tiefe" placeholder="40" class="field-input" min="0">
+                    <input type="number" name="masse_tiefe" placeholder="40" class="field-input" min="0" {req_attr}>
                 </div>
             </div>
         </div>'''

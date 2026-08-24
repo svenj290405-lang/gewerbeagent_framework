@@ -1247,13 +1247,21 @@ async def api_auftrag_fortschritt(
 # in core/models/auftrag_stunden.py.
 # =====================================================================
 
-async def _auftrag_fuer_stunden(tid: uuid.UUID, aid: uuid.UUID) -> bool:
-    """Gibt es den Auftrag in DIESEM Betrieb? Mehr braucht die Buchung
-    nicht zu wissen."""
+async def _auftrag_fuer_stunden(tid: uuid.UUID, aid: uuid.UUID, scope) -> bool:
+    """Darf dieser Nutzer auf DIESEN Auftrag buchen?
+
+    Prueft Tenant UND Zeilen-Scope. Vorher stand hier nur der Tenant, mit
+    dem Argument, mehr brauche die Buchung nicht zu wissen — damit konnte
+    ein Monteur ohne `auftraege.alle_sehen` auf jeden fremden Auftrag
+    seines Betriebs Stunden buchen, wenn er die Id kannte. Alle anderen
+    Auftrags-Routen gehen ueber `_load_auftrag(..., auftrag_scope(request))`
+    (Audit 2026-08-24).
+    """
     async with get_session() as s:
         treffer = (await s.execute(
             select(func.count(Angebot.id))
             .where(Angebot.id == aid, Angebot.tenant_id == tid)
+            .where(*auftrag_filter(scope))
         )).scalar() or 0
     return bool(treffer)
 
@@ -1308,7 +1316,7 @@ async def api_auftrag_stunden_buchen(
                 {"ok": False, "error": "Stunden für die Zukunft gibt es nicht."},
                 status_code=400)
 
-    if not await _auftrag_fuer_stunden(tid, aid):
+    if not await _auftrag_fuer_stunden(tid, aid, auftrag_scope(request)):
         return JSONResponse({"ok": False, "error": "Auftrag nicht gefunden."},
                             status_code=404)
 
@@ -1455,7 +1463,8 @@ async def api_auftrag_schritt(
     erledigt = bool((body or {}).get("erledigt"))
 
     ok = await setze_schritt_erledigt(
-        tid, aid, sid, erledigt=erledigt, employee_id=getattr(e, "id", None))
+        tid, aid, sid, erledigt=erledigt, employee_id=getattr(e, "id", None),
+        zeilen_filter=auftrag_filter(auftrag_scope(request)))
     if not ok:
         return JSONResponse({"ok": False, "error": "Schritt nicht gefunden."},
                             status_code=404)
@@ -5026,10 +5035,29 @@ async def api_rechnungen_pruefen(
     })
 
 
+# Feature-Gate fuer den Material-Bereich. Der Admin-Schalter
+# "Material-Bestellungen" war bis zum Audit am 2026-08-24 wirkungslos: es
+# gab im ganzen Code keine einzige Pruefung darauf — Abschalten aenderte in
+# der App gar nichts, Q bestellte weiter.
+async def _material_aktiv(request: Request) -> bool:
+    from core.features.check import is_feature_enabled
+    return await is_feature_enabled(current_tenant_id(request), "material")
+
+
+def _material_aus() -> JSONResponse:
+    return JSONResponse(
+        {"ok": False,
+         "error": "Material-Bestellungen sind für diesen Betrieb nicht aktiv."},
+        status_code=403,
+    )
+
+
 @router.get("/material")
 async def api_material_list(
     request: Request, _e=Depends(require_app_user),
 ) -> JSONResponse:
+    if not await _material_aktiv(request):
+        return _material_aus()
     tid = current_tenant_id(request)
     from core.models.tenant_material import TenantMaterial
     async with get_session() as s:
@@ -5065,6 +5093,8 @@ async def api_material_anlegen(
 
     Body: { name, bestell_link, lieferant?, einheit?, standard_menge?, notes? }
     """
+    if not await _material_aktiv(request):
+        return _material_aus()
     tid = current_tenant_id(request)
     body = await request.json()
     name = (body.get("name") or "").strip()[:200]
@@ -5128,6 +5158,8 @@ async def api_material_toggle(
 ) -> JSONResponse:
     """Toggelt aktiv-Flag. Material wird nicht geloescht — bleibt als
     Historie in Voice-Auto-Bestellungen referenzierbar."""
+    if not await _material_aktiv(request):
+        return _material_aus()
     tid = current_tenant_id(request)
     try:
         mid_uuid = uuid.UUID(mid)
@@ -5167,6 +5199,8 @@ async def api_material_bestellen(
         TenantMaterial, MaterialBestellung, BESTELL_ART_LINK,
     )
 
+    if not await _material_aktiv(request):
+        return _material_aus()
     tid = current_tenant_id(request)
     try:
         mid_uuid = uuid.UUID(mid)
@@ -5181,6 +5215,13 @@ async def api_material_bestellen(
         menge = int(body.get("menge") or 0)
     except (TypeError, ValueError):
         menge = 0
+    # Die Spalte ist Integer — ohne Deckel gab eine Fantasiezahl (> 2^31)
+    # einen 500er statt einer ehrlichen Absage.
+    if not 0 <= menge <= 10000:
+        return JSONResponse(
+            {"ok": False, "error": "Menge muss zwischen 0 und 10000 liegen."},
+            status_code=400,
+        )
 
     async with get_session() as s:
         m = (await s.execute(
@@ -5220,6 +5261,8 @@ async def api_material_bestellungen(
 ) -> JSONResponse:
     """Bestellhistorie (letzte 20), tenant-gescoped. Spiegelt
     /bestellungen."""
+    if not await _material_aktiv(request):
+        return _material_aus()
     from core.models.tenant_material import MaterialBestellung
     tid = current_tenant_id(request)
     async with get_session() as s:
@@ -6255,9 +6298,12 @@ async def api_formular_get(
         return JSONResponse({"ok": False, "error": "Die Anfrage-Formular-Funktion ist nicht aktiv."}, status_code=403)
     schema = await get_schema_for_tenant(tid, anfrage_typ)
     tenant = request.state.app_tenant
+    from core.integrations.anfrage_forms import preview_signatur
+
     preview_url = (
         f"{settings.public_url.rstrip('/')}"
         f"/anfrage/preview/{tenant.slug}/{anfrage_typ}"
+        f"?sig={preview_signatur(tenant.slug, anfrage_typ)}"
     )
     return JSONResponse({
         "ok": True,

@@ -149,7 +149,12 @@ async def tenant_new_form(
     user: AdminUser = Depends(require_admin),
 ):
     """Formular: neuen Betrieb anlegen."""
-    return templates.TemplateResponse("tenant_new.html", {
+    # Neuer Starlette-Stil (request als erstes Argument). Der alte Aufruf
+    # warf "TypeError: unhashable type: 'dict'" — diese Seite war damit tot
+    # und es liess sich KEIN neuer Betrieb anlegen (Audit 2026-08-24). Alle
+    # anderen Admin-Seiten waren am 23.08. umgestellt worden, diese eine
+    # blieb uebrig, weil kein Rauchtest sie abdeckte.
+    return templates.TemplateResponse(request, "tenant_new.html", {
         "request": request,
         "user": user,
         "active": "tenants",

@@ -231,6 +231,15 @@ async def summen_je_auftrag(
     }
 
 
+# Wie viele Buchungen die SUMME umfasst. Vorher stand hier 200 — und die
+# Gesamtstunden wurden ueber genau diese Liste gerechnet: bei einem lange
+# laufenden Auftrag waren sowohl die Gesamtsumme als auch der Abgleich mit
+# den angebotenen Stunden stillschweigend zu niedrig (Audit 2026-08-24).
+# Die ANGEZEIGTE Liste bleibt kurz, die Summe stimmt.
+_STUNDEN_MAX = 2000
+_STUNDEN_ANZEIGE = 200
+
+
 async def stunden_uebersicht(
     tenant_id: uuid.UUID, angebot_id: uuid.UUID,
 ) -> dict:
@@ -243,7 +252,7 @@ async def stunden_uebersicht(
             .where(AuftragStunden.angebot_id == angebot_id)
             .order_by(AuftragStunden.datum.desc(),
                       AuftragStunden.created_at.desc())
-            .limit(200)
+            .limit(_STUNDEN_MAX)
         )).scalars().all())
 
     je_mitarbeiter: dict[str, dict] = {}
@@ -273,7 +282,8 @@ async def stunden_uebersicht(
             "text": fmt_stunden(e.stunden),
             "datum": e.datum.strftime("%d.%m.%Y") if e.datum else "",
             "notiz": e.notiz or "",
-        } for e in eintraege],
+        } for e in eintraege[:_STUNDEN_ANZEIGE]],
+        "eintraege_gekappt": max(0, len(eintraege) - _STUNDEN_ANZEIGE),
     }
 
 

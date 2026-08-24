@@ -1994,14 +1994,14 @@ _REGISTRY: list[ToolSpec] = [
             "required": ["name"]},
         run=_run_kunde_suchen),
     ToolSpec(
-        name="material_liste", kind="read",
+        name="material_liste", kind="read", feature="material",
         description="Listet das hinterlegte Material des Betriebs (mit IDs). "
                     "Vor einer Bestellung aufrufen, um die richtige material_id zu finden.",
         parameters={"type": "OBJECT", "properties": {
             "suche": {"type": _S, "description": "Optionaler Namensfilter."}}},
         run=_run_material_liste),
     ToolSpec(
-        name="material_bestellungen", kind="read",
+        name="material_bestellungen", kind="read", feature="material",
         description="Zeigt die zuletzt ausgelösten Material-Bestellungen des "
                     "Betriebs (was wurde wann in welcher Menge bestellt).",
         parameters={"type": "OBJECT", "properties": {
@@ -2076,7 +2076,7 @@ _REGISTRY: list[ToolSpec] = [
             "required": ["kunde_name", "kunde_telefon"]},
         run=_run_rueckruf_anlegen, summarize=_summary_rueckruf),
     ToolSpec(
-        name="material_bestellen", kind="write",
+        name="material_bestellen", kind="write", feature="material",
         description="Bestellt Material aus dem Katalog (per material_id aus "
                     "material_liste, oder eindeutigem Namen).",
         parameters={"type": "OBJECT", "properties": {
@@ -2212,6 +2212,7 @@ _REGISTRY: list[ToolSpec] = [
         run=_run_auftrag_status, summarize=_summary_auftrag_status),
     ToolSpec(
         name="material_anlegen", kind="write", permission="material.verwalten",
+        feature="material",
         description="Legt einen neuen Material-Eintrag im Bestell-Katalog an "
                     "(braucht Name und Bestell-Link). Nur für den Inhaber.",
         parameters={"type": "OBJECT", "properties": {

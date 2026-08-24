@@ -1181,13 +1181,10 @@ class LexwareProvider(AccountingProvider):
             self._raise_for_status(r, "download_quotation_pdf")
             return r.content
 
-    @staticmethod
-    def quotation_deeplink_view(quotation_id: UUID) -> str:
-        return f"{LEXWARE_APP_BASE}/permalink/quotations/view/{quotation_id}"
-
-    @staticmethod
-    def quotation_deeplink_edit(quotation_id: UUID) -> str:
-        return f"{LEXWARE_APP_BASE}/permalink/quotations/edit/{quotation_id}"
+    # `quotation_deeplink_view`/`_edit` standen hier ein zweites Mal,
+    # wortgleich zur Definition weiter oben. Folgenlos, solange beide
+    # identisch sind — aber ein Fix an der oberen Kopie waere wirkungslos
+    # geblieben (die zweite ueberschreibt sie). Entfernt am 2026-08-25.
 
     # Lexware-spezifische Helper (nicht in Basis-Klasse)
     # ------------------------------------------------------------------

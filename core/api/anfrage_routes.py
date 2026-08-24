@@ -170,15 +170,29 @@ async def render_anfrage_preview(
     Submit ist im Preview-Modus deaktiviert.
 
     Rate-Limit identisch zum normalen Anfrage-GET (60/h pro IP).
-    Tenant-Lookup via slug — wir leaken keine Token, nur die
-    oeffentliche Schema-Struktur die der Tenant ohnehin via QR-Code
-    teilt.
+
+    Seit dem Audit am 2026-08-24 mit Signatur (``?sig=``): vorher genuegte
+    der Slug, und der ist kurz und ratbar — Firmenname und der komplette
+    Formularaufbau eines fremden Betriebs waren damit oeffentlich. Der Link
+    bleibt teilbar und laeuft nicht ab, er ist nur nicht mehr zu erraten.
     """
     if not _check_anfrage_rate_limit(request, kind="preview", max_per_hour=60):
         return HTMLResponse(
             content="<h1>Zu viele Versuche</h1>"
                     "<p>Bitte einen Moment warten.</p>",
             status_code=429,
+        )
+
+    # Signatur zuerst — vor jedem DB-Zugriff, und mit derselben Antwort wie
+    # ein unbekannter Betrieb. Sonst verriete allein der Unterschied
+    # zwischen 404 und "Signatur fehlt", welche Slugs existieren.
+    from core.integrations.anfrage_forms import preview_signatur_gueltig
+
+    if not preview_signatur_gueltig(
+        tenant_slug.lower(), anfrage_typ, request.query_params.get("sig"),
+    ):
+        return HTMLResponse(
+            content=render_invalid_token_page(), status_code=404,
         )
 
     from sqlalchemy import select as _select
@@ -395,6 +409,18 @@ async def submit_anfrage_form(token: str, request: Request):
             "(token=%s… ip=%s): %s",
             len(verworfen), token[:10], _client_ip_anfrage(request),
             verworfen[:10])
+
+    # Pflichtfelder: `required` im HTML haelt nur den Browser auf.
+    from core.integrations.anfrage_forms import fehlende_pflichtfelder
+
+    fehlt = fehlende_pflichtfelder(schema, antworten)
+    if fehlt:
+        return HTMLResponse(
+            content=render_submit_error_page(
+                "Bitte fülle noch aus: " + ", ".join(fehlt[:5])
+            ),
+            status_code=400,
+        )
 
     # DSGVO: Einwilligung ist Pflicht (Art. 6/7). Der Browser sendet
     # `_consent` nur, wenn die Checkbox angehakt ist — fehlt sie, brechen

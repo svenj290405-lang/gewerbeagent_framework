@@ -21,6 +21,16 @@ import pytest
 from core.api import app_screens
 
 
+@pytest.fixture(autouse=True)
+def _material_freigeschaltet(monkeypatch):
+    """Der Bereich haengt seit dem Audit am 2026-08-24 am Feature-Schalter
+    "material" — vorher war der Schalter wirkungslos. Fuer die Tests hier
+    ist er an; dass er wirkt, prueft der Test ganz unten."""
+    async def _an(_request):
+        return True
+    monkeypatch.setattr(app_screens, "_material_aktiv", _an)
+
+
 class _FakeMatSession:
     def __init__(self, material):
         self.material = material
@@ -276,3 +286,22 @@ async def test_q_bestellhistorie_liefert_eintraege(monkeypatch):
     assert [b["material"] for b in res["bestellungen"]] == ["Spax", "Dübel"]
     assert res["bestellungen"][0]["zeit"].startswith("2026-08-21")
     assert res["bestellungen"][1]["zeit"] is None
+
+
+@pytest.mark.asyncio
+async def test_abgeschaltetes_material_ist_wirklich_abgeschaltet(monkeypatch):
+    """Der Admin-Schalter "Material-Bestellungen" bewirkte gar nichts: es
+    gab im ganzen Code keine Pruefung darauf. In der App aenderte sich beim
+    Abschalten nichts, und Q bestellte weiter."""
+    async def _aus(_request):
+        return False
+    monkeypatch.setattr(app_screens, "_material_aktiv", _aus)
+
+    request = _req()
+    for aufruf in (
+        app_screens.api_material_list(request=request, _e=None),
+        app_screens.api_material_bestellungen(request=request, _e=None),
+    ):
+        antwort = await aufruf
+        assert antwort.status_code == 403
+        assert "nicht aktiv" in json.loads(antwort.body)["error"]

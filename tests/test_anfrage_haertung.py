@@ -395,3 +395,91 @@ def test_poller_nutzt_beide_deckel():
     quelle = open("core/integrations/microsoft_inbox.py").read()
     assert "should_throttle_reply" in quelle
     assert "count_recent_replies_to" not in quelle
+
+
+# =====================================================================
+# Vorschau-Link: teilbar, aber nicht ratbar
+#
+# Audit 2026-08-24: /anfrage/preview/{slug}/{typ} war allein ueber den
+# Slug erreichbar — und Slugs sind kurz (`pilot`, `demotour`). Wer einen
+# erriet, bekam Firmenname und kompletten Formularaufbau eines fremden
+# Betriebs. Live bestaetigt mit HTTP 200.
+# =====================================================================
+
+def test_signatur_haengt_an_betrieb_und_typ():
+    from core.integrations.anfrage_forms import preview_signatur
+
+    a = preview_signatur("pilot", "allgemein")
+    assert a != preview_signatur("demotour", "allgemein")
+    assert a != preview_signatur("pilot", "tischler")
+    assert a == preview_signatur("pilot", "allgemein"), "muss stabil bleiben"
+
+
+def test_ohne_signatur_kein_zugang():
+    from core.integrations.anfrage_forms import preview_signatur_gueltig
+
+    assert preview_signatur_gueltig("pilot", "allgemein", None) is False
+    assert preview_signatur_gueltig("pilot", "allgemein", "") is False
+    assert preview_signatur_gueltig("pilot", "allgemein", "0" * 16) is False
+
+
+def test_fremde_signatur_oeffnet_nichts():
+    """Der Link des einen Betriebs darf den des anderen nicht aufsperren."""
+    from core.integrations.anfrage_forms import (
+        preview_signatur, preview_signatur_gueltig)
+
+    fremd = preview_signatur("demotour", "allgemein")
+    assert preview_signatur_gueltig("pilot", "allgemein", fremd) is False
+
+
+def test_eigene_signatur_oeffnet():
+    from core.integrations.anfrage_forms import (
+        preview_signatur, preview_signatur_gueltig)
+
+    sig = preview_signatur("pilot", "allgemein")
+    assert preview_signatur_gueltig("pilot", "allgemein", sig) is True
+
+
+# =====================================================================
+# Pflichtfelder gelten auch ohne Browser
+# =====================================================================
+
+def _schema(*felder):
+    return {"title": "Anfrage", "fields": list(felder)}
+
+
+def test_leeres_pflichtfeld_wird_erkannt():
+    from core.integrations.anfrage_forms import fehlende_pflichtfelder
+
+    schema = _schema({"name": "wunsch", "label": "Ihr Wunsch",
+                      "type": "text", "required": True})
+    assert fehlende_pflichtfelder(schema, {}) == ["Ihr Wunsch"]
+    assert fehlende_pflichtfelder(schema, {"wunsch": "   "}) == ["Ihr Wunsch"]
+    assert fehlende_pflichtfelder(schema, {"wunsch": "Regal"}) == []
+
+
+def test_freiwillige_felder_bleiben_freiwillig():
+    from core.integrations.anfrage_forms import fehlende_pflichtfelder
+
+    schema = _schema({"name": "notiz", "label": "Notiz", "type": "text"})
+    assert fehlende_pflichtfelder(schema, {}) == []
+
+
+def test_masse_braucht_alle_drei_werte():
+    """Der Typ `masse` rendert drei Eingaben — eine davon reicht nicht."""
+    from core.integrations.anfrage_forms import fehlende_pflichtfelder
+
+    schema = _schema({"name": "masse", "label": "Maße", "type": "masse",
+                      "required": True})
+    assert fehlende_pflichtfelder(schema, {"masse_hoehe": "100"}) == ["Maße"]
+    assert fehlende_pflichtfelder(schema, {
+        "masse_hoehe": "100", "masse_breite": "50", "masse_tiefe": "40"}) == []
+
+
+def test_mehrfachauswahl_ohne_haken_ist_leer():
+    from core.integrations.anfrage_forms import fehlende_pflichtfelder
+
+    schema = _schema({"name": "gewerke", "label": "Gewerke",
+                      "type": "checkbox", "required": True})
+    assert fehlende_pflichtfelder(schema, {"gewerke": []}) == ["Gewerke"]
+    assert fehlende_pflichtfelder(schema, {"gewerke": ["Elektro"]}) == []

@@ -23,14 +23,20 @@ from core.api import app_screens
 from core.services import auftrag_stunden as svc
 
 
-def _req(body=None, tenant_id=None, is_inhaber=False):
+def _req(body=None, tenant_id=None, is_inhaber=False, employee_id=None,
+         darf_alle_auftraege=False):
     req = SimpleNamespace()
 
     async def _json():
         return body if body is not None else {}
     req.json = _json
+    # Die Buchung prueft seit dem Audit am 2026-08-24 auch den Zeilen-Scope
+    # (auftrag_scope liest app_employee + app_permissions aus dem State).
     req.state = SimpleNamespace(
         app_tenant=SimpleNamespace(id=tenant_id or uuid.uuid4()),
+        app_employee=SimpleNamespace(id=employee_id or uuid.uuid4()),
+        app_permissions=frozenset(
+            {"auftraege.alle_sehen"} if darf_alle_auftraege else set()),
         app_is_inhaber=is_inhaber)
     return req
 
@@ -74,7 +80,7 @@ def test_stunden_formatieren_deutsch():
 
 @pytest.mark.asyncio
 async def test_buchung_braucht_gueltige_stunden(monkeypatch):
-    async def _gibts(tid, aid):
+    async def _gibts(tid, aid, scope=None):
         raise AssertionError("Auftrag darf gar nicht erst geladen werden")
     monkeypatch.setattr(app_screens, "_auftrag_fuer_stunden", _gibts)
 
@@ -92,7 +98,7 @@ async def test_buchung_laeuft_auf_den_angemeldeten_mitarbeiter(monkeypatch):
     emp = SimpleNamespace(id=uuid.uuid4(), name="Henrik")
     gesehen = {}
 
-    async def _gibts(tid, a):
+    async def _gibts(tid, a, scope=None):
         return True
     monkeypatch.setattr(app_screens, "_auftrag_fuer_stunden", _gibts)
 
@@ -133,7 +139,7 @@ async def test_buchung_verweigert_zukunft(monkeypatch):
 async def test_buchung_auf_fremden_auftrag_ist_nicht_gefunden(monkeypatch):
     """Tenant-Isolation: ein Auftrag eines anderen Betriebs existiert
     fuer diesen Mitarbeiter schlicht nicht."""
-    async def _gibts(tid, aid):
+    async def _gibts(tid, aid, scope=None):
         return False
     monkeypatch.setattr(app_screens, "_auftrag_fuer_stunden", _gibts)
 
@@ -340,3 +346,34 @@ def test_abgleich_summiert_mehrere_stundenpositionen():
     r = stunden_abgleich([_pos(4, "Std"), _pos(4, "Stunden"), _pos(2, "Stueck")], 8)
     # 4 + 4 Stunden angeboten (Stueck zaehlt nicht), 8 gebucht -> Gleichstand
     assert r["hinweis"] is None
+
+
+@pytest.mark.asyncio
+async def test_stundenbuchung_prueft_auch_die_zeilen_sicht(monkeypatch):
+    """Audit 2026-08-24: die Buchung pruefte nur den Tenant. Ein Monteur
+    ohne `auftraege.alle_sehen` konnte damit auf jeden fremden Auftrag
+    seines Betriebs Stunden buchen, dessen Id er kannte."""
+    import contextlib
+
+    gesehen = {}
+
+    class _S:
+        async def execute(self, stmt):
+            gesehen["sql"] = str(stmt)
+            return SimpleNamespace(scalar=lambda: 0)
+
+    @contextlib.asynccontextmanager
+    async def _sess():
+        yield _S()
+    monkeypatch.setattr(app_screens, "get_session", _sess)
+
+    from core.security.app_scope import AuftragScope
+
+    eingeschraenkt = AuftragScope(alle=False, employee_id=uuid.uuid4())
+    assert await app_screens._auftrag_fuer_stunden(
+        uuid.uuid4(), uuid.uuid4(), eingeschraenkt) is False
+    assert "assigned_employee_id" in gesehen["sql"]
+
+    voll = AuftragScope(alle=True, employee_id=uuid.uuid4())
+    await app_screens._auftrag_fuer_stunden(uuid.uuid4(), uuid.uuid4(), voll)
+    assert "assigned_employee_id" not in gesehen["sql"]

@@ -278,3 +278,49 @@ async def test_kostenseite_rendert_und_warnt_vor_luecke(client, angemeldet):
         antwort = await c.get("/admin/costs")
 
     assert antwort.status_code == 200, antwort.text[:400]
+
+
+# =====================================================================
+# Alle uebrigen Admin-Seiten
+#
+# Audit 2026-08-24: der Rauchtest oben deckte vier Seiten ab —
+# `/admin/tenants/new` war nicht dabei und stand seit dem 23.08. auf 500
+# (alter TemplateResponse-Stil). Es liess sich also kein neuer Betrieb
+# anlegen, und nichts hat es gemeldet. Jetzt laeuft jede Seite durch.
+# =====================================================================
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pfad", [
+    "/admin/tenants",
+    "/admin/tenants/new",
+    "/admin/metrics",
+    "/admin/audit",
+    "/admin/pricing",
+])
+async def test_jede_admin_seite_rendert(client, angemeldet, monkeypatch, pfad):
+    from core.admin import onboarding_routes
+
+    monkeypatch.setattr(onboarding_routes, "get_session", _leere_session,
+                        raising=False)
+
+    async with client as c:
+        antwort = await c.get(pfad)
+
+    assert antwort.status_code == 200, (
+        f"{pfad} antwortet {antwort.status_code} statt 200: "
+        f"{antwort.text[:400]}"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pfad", [
+    "/admin/tenants", "/admin/tenants/new", "/admin/metrics",
+    "/admin/audit", "/admin/pricing",
+])
+async def test_auch_die_uebrigen_seiten_verlangen_eine_sitzung(
+    client, ohne_db, pfad,
+):
+    async with client as c:
+        antwort = await c.get(pfad)
+    assert antwort.status_code == 303, f"{pfad}: {antwort.status_code}"
+    assert antwort.headers["location"] == "/admin/login"

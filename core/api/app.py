@@ -177,8 +177,13 @@ app.include_router(track_router)
 app.include_router(app_router)
 app.include_router(app_screens_router)
 mount_app_static(app)
-app.include_router(admin_router)
+# Onboarding ZUERST: es bringt `/admin/tenants/new` mit, und der
+# Admin-Router hat `/admin/tenants/{tenant_id}`. Andersherum fing der
+# Platzhalter das Wort "new" ab und antwortete "Tenant nicht gefunden" —
+# die Seite zum Anlegen eines neuen Betriebs war damit nie erreichbar
+# (Audit 2026-08-24; der Rauchtest ueber alle Admin-Seiten haelt es fest).
 app.include_router(admin_onboarding_router)
+app.include_router(admin_router)
 mount_admin_static(app)
 
 # Phase B6: Status-Page Routes (/status + /api/status). Oeffentlich

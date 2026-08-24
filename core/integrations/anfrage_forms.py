@@ -249,6 +249,39 @@ SUBMIT_MAX_LIST_ITEMS = 30      # Mehrfachauswahl
 SUBMIT_MAX_TOTAL_CHARS = 20_000  # Summe aller Textantworten
 
 
+def preview_signatur(tenant_slug: str, anfrage_typ: str) -> str:
+    """Signatur fuer den Vorschau-Link eines Betriebs.
+
+    Der Link ist zum Weitergeben gedacht ("so sieht das Formular aus"), war
+    aber bis zum Audit am 2026-08-24 allein ueber den Slug erreichbar — und
+    Slugs sind kurz und ratbar (`pilot`, `demotour`). Wer einen erriet,
+    bekam Firmennamen und den vollstaendigen Formularaufbau eines fremden
+    Betriebs.
+
+    Bewusst ohne Ablauf: ein kopierter Link soll morgen noch funktionieren.
+    Er ist nur nicht mehr zu erraten.
+    """
+    import hashlib
+    import hmac
+
+    from config.settings import settings
+
+    roh = f"preview:{tenant_slug}:{anfrage_typ}"
+    return hmac.new(
+        settings.secret_key.encode(), roh.encode(), hashlib.sha256,
+    ).hexdigest()[:16]
+
+
+def preview_signatur_gueltig(
+    tenant_slug: str, anfrage_typ: str, sig: str | None,
+) -> bool:
+    import hmac
+
+    if not sig:
+        return False
+    return hmac.compare_digest(sig, preview_signatur(tenant_slug, anfrage_typ))
+
+
 def formular_zeitstempel() -> str:
     """Signierter Zeitstempel, der beim Rendern ins Formular wandert.
 
@@ -297,6 +330,40 @@ def zeitstempel_plausibel(
         return False
     alter = int(time.time()) - int(ts_str)
     return min_sekunden <= alter <= max_sekunden
+
+
+def fehlende_pflichtfelder(schema: dict, antworten: dict) -> list[str]:
+    """Welche als Pflicht markierten Felder sind leer geblieben?
+
+    Das ``required``-Attribut im HTML ist reine Browser-Bequemlichkeit —
+    wer das Formular per curl abschickt, umgeht es. Bis zum Audit am
+    2026-08-24 pruefte der Server gar nicht nach, und beim Feldtyp
+    ``masse`` fehlte das Attribut sogar im HTML.
+
+    Returns die LABEL der fehlenden Felder (fuer die Fehlerseite).
+    """
+    fehlt: list[str] = []
+    for feld in (schema.get("fields") or []):
+        if not feld.get("required"):
+            continue
+        name = (feld.get("name") or "").strip()
+        if not name:
+            continue
+        label = (feld.get("label") or name).strip()
+        if feld.get("type") == "masse":
+            # Drei Eingaben, feste Namen — eine reicht als Angabe nicht.
+            if not all(str(antworten.get(f"masse_{teil}") or "").strip()
+                       for teil in ("hoehe", "breite", "tiefe")):
+                fehlt.append(label)
+            continue
+        wert = antworten.get(name)
+        if isinstance(wert, list):
+            leer = not [w for w in wert if str(w).strip()]
+        else:
+            leer = not str(wert or "").strip()
+        if leer:
+            fehlt.append(label)
+    return fehlt
 
 
 def filter_antworten_gegen_schema(

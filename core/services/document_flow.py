@@ -388,6 +388,13 @@ async def create_rechnung(
     from core.services.buchhaltung import mwst_standard
     satz = await mwst_standard(tid)
     line_items: list[InvoiceLineItem] = []
+    # Beides gesetzt hiess bisher: Pauschale gewinnt, die Positionen werden
+    # ohne ein Wort verworfen. Ueber die App nicht erreichbar (die Modi
+    # schliessen sich dort aus), ueber einen direkten API-Aufruf schon —
+    # und dann steht ein anderer Betrag auf der Rechnung als gemeint.
+    if betrag_brutto_eur and leistung_titel and positionen:
+        return {"ok": False, "error": (
+            "Entweder Pauschalbetrag ODER Positionen — nicht beides.")}
     if betrag_brutto_eur and leistung_titel:
         try:
             betrag = Decimal(str(betrag_brutto_eur))

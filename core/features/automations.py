@@ -173,6 +173,7 @@ AUTOMATIONS: dict[str, Automation] = {
         label="Material",
         description="Q bestellt Material und legt neue Artikel an.",
         tools=("material_bestellen", "material_anlegen"),
+        feature="material",
         manuell_hint="Material bestellst du selbst — ich sage dir nur, was im Katalog ist.",
         group=_GRUPPE_ASSISTENT,
     ),

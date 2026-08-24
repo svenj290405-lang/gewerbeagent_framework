@@ -241,14 +241,22 @@ async def setze_schritt_erledigt(
     *,
     erledigt: bool,
     employee_id: uuid.UUID | None = None,
+    zeilen_filter: list | None = None,
 ) -> bool:
     """Hakt einen eigenen Schritt fuer einen Auftrag ab (oder nimmt den
     Haken weg). Returns True bei Erfolg, False wenn Auftrag oder Schritt
-    nicht zum Tenant gehoeren."""
+    nicht zum Tenant gehoeren — oder nicht in die Sicht des Aufrufers.
+
+    ``zeilen_filter`` kommt aus ``core.security.app_scope.auftrag_filter``.
+    Ohne ihn zaehlte nur der Tenant, und ein Monteur konnte an jedem
+    fremden Auftrag Schritte abhaken, dessen Id er kannte
+    (Audit 2026-08-24).
+    """
     async with get_session() as s:
         gehoert_dazu = (await s.execute(
             select(Angebot.id)
             .where(Angebot.id == angebot_id, Angebot.tenant_id == tenant_id)
+            .where(*(zeilen_filter or []))
         )).scalar_one_or_none()
         if gehoert_dazu is None:
             return False

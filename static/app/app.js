@@ -1282,6 +1282,16 @@ const SCREENS = {
               <div><b>${esc(f.name)}</b></div>
               <div class="sub"><code>${esc(f.formel)}</code> → ${esc(f.einheit)}</div>
               ${f.variablen.length ? `<div class="sub">fragt ab: ${f.variablen.map(esc).join(", ")}</div>` : ""}
+              <!-- Probelauf: die Route dafür gab es längst, sie wurde nur
+                   nirgends aufgerufen. Wer eine Formel schreibt, will sie
+                   einmal ausrechnen sehen, bevor Q sie einem Kunden am
+                   Telefon vorrechnet. -->
+              <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:6px" data-k-probe="${esc(f.id)}">
+                ${f.variablen.map((v) => `<input data-kvar="${esc(v)}" type="number" step="any" placeholder="${esc(v)}"
+                  style="flex:1;min-width:70px;padding:6px;border:1px solid var(--line);border-radius:8px;font-size:14px">`).join("")}
+                ${f.variablen.length ? `<button class="btn-sm btn-ghost" data-k-run="${esc(f.id)}" style="padding:6px 10px">= rechnen</button>` : ""}
+              </div>
+              <div class="sub" data-k-ergebnis="${esc(f.id)}" style="margin-top:4px"></div>
             </div>
             ${darfPflegen ? `<button class="btn-sm btn-ghost" data-k-del="${esc(f.id)}">✕</button>` : ""}
           </div>`).join("") : emptyRow("Noch keine Formel.")}
@@ -1468,6 +1478,25 @@ const SCREENS = {
       try { msg = (await r.json()).error || msg; } catch (_) { /* Body kein JSON */ }
       alert(msg);
     });
+    document.querySelectorAll("[data-k-run]").forEach((b) =>
+      b.addEventListener("click", async () => {
+        const id = b.dataset.kRun;
+        const feld = document.querySelector(`[data-k-probe="${id}"]`);
+        const ziel = document.querySelector(`[data-k-ergebnis="${id}"]`);
+        const werte = {};
+        feld.querySelectorAll("[data-kvar]").forEach((i) => {
+          if (i.value !== "") werte[i.dataset.kvar] = parseFloat(i.value);
+        });
+        b.disabled = true;
+        const r = await api(`/app/api/kalkulationen/${encodeURIComponent(id)}/rechnen`,
+          { method: "POST", body: JSON.stringify({ werte }) });
+        b.disabled = false;
+        const j = r && r.ok ? await r.json() : null;
+        if (!j) { ziel.textContent = "Konnte nicht rechnen."; return; }
+        ziel.textContent = j.ok
+          ? `${j.ergebnis} ${j.einheit || ""} — ${j.formel}`
+          : (j.error || "Konnte nicht rechnen.");
+      }));
     document.querySelectorAll("[data-k-del]").forEach((b) =>
       b.addEventListener("click", async () => {
         if (!confirm("Formel löschen?")) return;
@@ -2899,7 +2928,10 @@ const SCREENS = {
     const feats = new Set(m.features || []);
     const schnell = [];
     schnell.push(`<button class="row menu-item" data-go="kunden"><span>🔍 Kunden suchen</span><span class="sub">›</span></button>`);
-    schnell.push(`<button class="row menu-item" data-go="material"><span>🧰 Material</span><span class="sub">›</span></button>`);
+    // Wie bei der Visualisierung darunter: der Menüpunkt folgt dem
+    // Feature-Schalter. Vorher stand er bedingungslos da, auch wenn der
+    // Bereich für den Betrieb gar nicht freigeschaltet war.
+    if (feats.has("material")) schnell.push(`<button class="row menu-item" data-go="material"><span>🧰 Material</span><span class="sub">›</span></button>`);
     if (feats.has("visualisierung")) schnell.push(`<button class="row menu-item" data-go="visualisierung"><span>🎨 Visualisierung</span><span class="sub">›</span></button>`);
     schnell.push(`<button class="row menu-item" data-go="wissen"><span>📚 Wissensdatenbank</span><span class="sub">›</span></button>`);
     const einst = [];
@@ -3857,7 +3889,7 @@ const SCREENS = {
       { ico: "📞", label: "Rückruf anlegen",     intent: "Ich möchte einen Rückruf anlegen." },
       { ico: "📁", label: "Drive-Ordner anlegen", intent: "Ich möchte einen Drive-Ordner für einen Kunden anlegen.", feature: "drive_archiv" },
       { ico: "📝", label: "Notiz in Drive ablegen", intent: "Ich möchte eine Notiz für einen Kunden in Drive ablegen.", feature: "drive_archiv" },
-      { ico: "🧰", label: "Material bestellen",  intent: "Ich möchte Material bestellen." },
+      { ico: "🧰", label: "Material bestellen",  intent: "Ich möchte Material bestellen.", feature: "material" },
       { ico: "📚", label: "Wissen merken",       intent: "Ich möchte mir etwas in der Wissensdatenbank merken.", perm: "wissen.pflegen" },
       { ico: "🔍", label: "Kunde nachschlagen",  intent: "Ich möchte einen Kunden nachschlagen." },
       { ico: "✉️", label: "Anfrage beantworten", intent: "Ich möchte eine Kundenanfrage beantworten.",  feature: "mail_intake", perm: "anfragen.bearbeiten" },
