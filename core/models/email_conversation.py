@@ -14,7 +14,7 @@ Hard-Delete Cleanup: Konversationen bei denen termin_datum laenger als
 import datetime as dt
 import uuid
 
-from sqlalchemy import Date, DateTime, ForeignKey, Index, String, Text, func
+from sqlalchemy import Date, DateTime, ForeignKey, Index, String, Text, func, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -61,6 +61,10 @@ class EmailConversation(Base):
         Index("ix_email_conv_message_id", "last_message_id"),
         Index("ix_email_conv_termin_datum", "termin_datum"),
         Index("ix_email_conv_ms_conv_id", "microsoft_conversation_id"),
+        Index(
+            "ix_email_conv_booked_at", "tenant_id", "booked_at",
+            postgresql_where=text("booked_at IS NOT NULL"),
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -88,6 +92,13 @@ class EmailConversation(Base):
     # Aktueller Termin (falls schon eingetragen)
     gcal_event_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     termin_datum: Mapped[dt.date | None] = mapped_column(Date, nullable=True)
+    # Wann Q diesen Termin OHNE Rueckfrage aus einer Mail heraus gebucht
+    # hat. Zaehlgrundlage fuer den Mengen-Deckel in
+    # core.integrations.termin_throttle — nicht ueber updated_at zaehlen,
+    # das wandert bei jeder Folge-Mail weiter.
+    booked_at: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
 
     # Threading: letzte versendete Q-Mail-Message-ID (RFC-Format
     # "<random@domain>"). Eingehende Replies haben In-Reply-To = dieser

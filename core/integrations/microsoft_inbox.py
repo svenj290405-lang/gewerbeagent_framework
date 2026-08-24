@@ -1691,6 +1691,23 @@ async def process_relevant_kunde_mail(
     #   (III) SEND_FORMULAR trotz Formular   -> ASK_MORE (kein Doppel)
     # Storno (CANCEL_TERMIN) ist immer ausgenommen.
     _termin_actions = {"PROPOSE_SLOTS", "BOOK_SLOT", "BOOK_DIRECT"}
+    # Nur diese beiden schreiben wirklich in den Kalender — der
+    # Mengen-Deckel gilt deshalb auch nur fuer sie. PROPOSE_SLOTS darf
+    # weiterlaufen: Vorschlaege fassen den Kalender nicht an.
+    _booking_actions = {"BOOK_SLOT", "BOOK_DIRECT"}
+    _booking_throttled = False
+    _booking_grund: str | None = None
+    if next_action in _booking_actions:
+        try:
+            from core.integrations.termin_throttle import should_throttle_booking
+            _booking_throttled, _booking_grund = await should_throttle_booking(
+                tenant_id=tenant_id,
+            )
+        except Exception as e:  # noqa: BLE001
+            # Fail-open wie beim Spam-Throttle: ein Ausfall der Zaehlung
+            # darf keine ECHTE Kundenbuchung verhindern. Der Missbrauchs-
+            # fall ist selten, der Normalfall ist es nicht.
+            logger.warning(f"Termin-Deckel-Check fehlgeschlagen (egal): {e}")
     _form_status = (anfrage_status or {}).get("status")  # submitted|open|expired|None
     _has_existing_termin = (
         existing_conv is not None
@@ -1727,6 +1744,31 @@ async def process_relevant_kunde_mail(
             "brauche ich nur noch " + " und ".join(fehlend) + " — dann "
             "suche ich dir direkt einen passenden Termin heraus."
         )
+    elif _booking_throttled:
+        # Mengen-Deckel: zu viele Termine sind in kurzer Zeit automatisch
+        # aus Mails gebucht worden. Wir buchen nicht weiter, sagen dem
+        # Kunden ehrlich, dass sich jemand meldet, und wecken den Inhaber.
+        logger.warning(
+            f"VOR-GATE: next_action={next_action} aber Termin-Deckel "
+            f"({_booking_grund}) greift -> ASK_MORE (keine Buchung)"
+        )
+        next_action = "ASK_MORE"
+        result["next_action"] = next_action
+        result["termin_deckel"] = _booking_grund
+        reply_text = (
+            "danke für deine Nachricht. Deinen Wunschtermin trage ich "
+            "gerade nicht selbst ein — jemand aus dem Betrieb schaut "
+            "sich deine Anfrage persönlich an und meldet sich bei dir."
+        )
+        try:
+            from core.integrations.termin_throttle import warn_inhaber_ueber_deckel
+            await warn_inhaber_ueber_deckel(
+                tenant_id=tenant_id,
+                grund=_booking_grund or "deckel",
+                kunde_email=sender_email,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Termin-Deckel: Inhaber-Warnung fehlgeschlagen: {e}")
     elif next_action == "SEND_FORMULAR" and _form_status in ("open", "submitted"):
         logger.info(
             f"VOR-GATE: SEND_FORMULAR aber Formular bereits {_form_status} "
@@ -2212,6 +2254,32 @@ async def process_relevant_kunde_mail(
                             if booked_termin_datum:
                                 _c.termin_datum = booked_termin_datum
                             await _s.commit()
+            # Zaehlmarke fuer den Mengen-Deckel (termin_throttle): eine
+            # Zeile pro Termin, den Q OHNE Rueckfrage aus einer Mail
+            # heraus gebucht hat. Gilt fuer beide Pfade oben (neue Konv
+            # wie Folge-Mail). Bewusst hier und nicht direkt nach dem
+            # Buchen: vorher gibt es bei einer neuen Konversation noch
+            # keine Zeile, an die der Zeitstempel gehoert. Faellt der
+            # Mailversand aus, bleibt die Marke aus — ein Angreifer kann
+            # das nicht steuern, und die Zaehlung bleibt ehrlich am
+            # tatsaechlich abgeschlossenen Vorgang.
+            if booked_event_id and conv_id:
+                try:
+                    from core.database import AsyncSessionLocal as _ASL2
+                    from core.models import EmailConversation as _EC2
+                    from sqlalchemy import select as _sel2
+                    import datetime as _dt2
+                    async with _ASL2() as _s2:
+                        _r2 = await _s2.execute(
+                            _sel2(_EC2).where(_EC2.id == conv_id)
+                        )
+                        _c2 = _r2.scalar_one_or_none()
+                        if _c2 is not None:
+                            _c2.booked_at = _dt2.datetime.now(_dt2.timezone.utc)
+                            await _s2.commit()
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(f"booked_at setzen fehlgeschlagen: {e}")
+
             # Kundenordner-URL an der Konv vermerken (bei der Buchung
             # gerade angelegt) — Folge-Mails + Formular-Eingang finden den
             # Ordner darueber wieder.
