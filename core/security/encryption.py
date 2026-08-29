@@ -3,10 +3,14 @@ Symmetrische Verschluesselung fuer sensible Daten in der DB.
 """
 import base64
 import hashlib
+import logging
 
 from cryptography.fernet import Fernet
 
 from config.settings import settings
+
+
+logger = logging.getLogger(__name__)
 
 
 def _get_fernet() -> Fernet:
@@ -38,10 +42,25 @@ def try_decrypt(value: str | None) -> str | None:
     globale Bot-Token). So kann ein Lesepfad sofort auf verschluesselte
     Speicherung umgestellt werden, ohne dass eine Daten-Migration noetig
     ist. Ein echter Klartext-Wert ist kein gueltiges Fernet-Token (kein
-    passender HMAC unter unserem Key) -> decrypt() wirft -> Fallback."""
+    passender HMAC unter unserem Key) -> decrypt() wirft -> Fallback.
+
+    Der Fallback ist bewusst still WIRKSAM, aber nicht mehr still SICHTBAR:
+    nach einer misslungenen Schluessel-Rotation sieht er wie Alt-Bestand
+    aus und wuerde Ciphertext als Klartext-Token an eine Fremd-API geben.
+    Das gehoert ins Log, damit es einmal jemand sieht — abbrechen wollen
+    wir hier nicht, sonst waere eine halb migrierte Tabelle sofort ein
+    Ausfall."""
     if not value:
         return None
     try:
         return decrypt(value) or None
     except Exception:
+        # Sieht der Wert wie ein Fernet-Token aus (Version 0x80, base64url),
+        # war es KEIN Alt-Bestand, sondern ein Schluesselproblem.
+        if value.startswith("gAAAAA"):
+            logger.error(
+                "try_decrypt: Wert sieht verschluesselt aus, laesst sich aber "
+                "nicht entschluesseln — falscher ENCRYPTION_KEY? Der Rohwert "
+                "wird durchgereicht.",
+            )
         return value

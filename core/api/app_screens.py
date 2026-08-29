@@ -3769,10 +3769,23 @@ async def api_archiv_datei_proxy(
     # cachen, damit ein zweiter Besuch der Galerie gar nicht erst zu Drive
     # muss. Originale bleiben bei 1h.
     max_age = 86400 if thumb else 3600
+    # Nur was die Galerie wirklich anzeigt, wird inline gerendert. Der
+    # Upload-Weg der App laesst ohnehin nur diese Typen zu — aber in den
+    # Drive-Ordner kann auch direkt etwas hineingelegt werden, und der
+    # MIME-Typ kommt ungeprueft aus den Drive-Metadaten. Eine .html waere
+    # damit auf der App-Origin gelandet, und die CSP erlaubt dort
+    # script-src 'unsafe-inline' — also Zugriff auf die Session. Alles
+    # andere geht als Download raus statt in den Renderer.
+    _INLINE_OK = {
+        "image/jpeg", "image/png", "image/webp", "image/gif", "application/pdf",
+    }
+    kopf = {"Cache-Control": f"private, max-age={max_age}"}
+    if (mime or "").split(";")[0].strip().lower() not in _INLINE_OK:
+        kopf["Content-Disposition"] = "attachment"
     return Response(
         content=data,
         media_type=mime,
-        headers={"Cache-Control": f"private, max-age={max_age}"},
+        headers=kopf,
     )
 
 
@@ -7488,8 +7501,13 @@ async def api_verbindung_test(
         try:
             # Erst Service holen (testet Token-Refresh-Pfad), dann eine
             # leichtgewichtige Listing-Funktion aufrufen.
-            await get_drive_service(token)
-            kunden_dirs = await list_tenant_kunde_drives(tenant)
+            #
+            # Beide erwarten eine tenant_id. Hier standen frueher das
+            # Token-Objekt und der Tenant — der Aufruf krachte damit
+            # zuverlaessig in den except-Zweig, und der Drive-Test konnte
+            # nie gruen werden, egal wie gesund die Anbindung war.
+            await get_drive_service(tid, emp.id)
+            kunden_dirs = await list_tenant_kunde_drives(tid)
         except Exception as exc:  # noqa: BLE001
             logger.exception("drive test crash: %s", exc)
             return JSONResponse({"ok": False, "error": f"Drive-API: {str(exc)[:200]}"}, status_code=502)
