@@ -618,7 +618,9 @@ async def get_calendar_adapter(
     tenant_id: uuid.UUID,
     employee_id: uuid.UUID | None = None,
     fallback_calendar_id: str = "primary",
-) -> CalendarAdapter:
+    *,
+    strict: bool = False,
+) -> CalendarAdapter | None:
     """Liefert den passenden Adapter fuer einen Mitarbeiter.
 
     employee_id None → Default-Employee des Tenants. Wenn der
@@ -626,6 +628,15 @@ async def get_calendar_adapter(
     (Backward-Compat). calendar_id-Hierarchie:
     1. employee.calendar_id (wenn gesetzt)
     2. fallback_calendar_id (Plugin-Config: 'primary' oder spezifisch)
+
+    ``strict=True`` liefert ``None``, wenn der gemeinte Mitarbeiter
+    keinen EIGENEN Token fuer den Provider hat. Ohne das faellt der
+    Token-Lookup lautlos auf den Inhaber zurueck, und ``cal_id`` auf
+    dessen Primaerkalender — ein Mitarbeiter ohne verbundenen Kalender
+    liest damit die Betreffs und Orte des Chefs. Zum LESEN ist "kein
+    eigener Kalender" deshalb eine leere Liste, kein Rueckfall. Beim
+    SCHREIBEN bleibt der Rueckfall bewusst (der Termin gehoert dann in
+    den Betriebskalender), darum ist der Default False.
     """
     from core.models.employee import (
         Employee,
@@ -658,21 +669,31 @@ async def get_calendar_adapter(
     # Wenn der gewaehlte Employee keinen OAuth-Token fuer den Provider
     # hat, faellt der Lookup automatisch auf den Default-Employee zurueck
     # (siehe core/security/oauth_token_lookup.py — 3-stufiger Fallback).
-    # Wir koennen das hier vorab pruefen und ggf. eine Info loggen damit
-    # der Owner spaeter im Audit-Log sieht warum ein Termin im falschen
-    # Kalender landet.
-    try:
+    # Im strikten Modus ist genau das der Fehlerfall: dann gibt es keinen
+    # Adapter, statt still den Kalender eines anderen zu liefern.
+    if emp_id is not None:
         from core.security.oauth_token_lookup import find_oauth_token
-        if emp_id is not None:
-            token = await find_oauth_token(tenant_id, provider, emp_id)
-            if token is not None and token.employee_id != emp_id:
+        if strict:
+            eigener = await find_oauth_token(
+                tenant_id, provider, emp_id, strict=True,
+            )
+            if eigener is None:
                 logger.info(
-                    f"Adapter-Fallback: Employee {emp.slug if emp else '?'} hat "
-                    f"keinen eigenen {provider}-Token — nutzt Default-Token von "
-                    f"employee_id={token.employee_id}"
+                    "Kein eigener %s-Kalender fuer employee=%s — strikt, "
+                    "kein Rueckfall auf den Inhaber.", provider, emp_id,
                 )
-    except Exception:
-        pass
+                return None
+        else:
+            try:
+                token = await find_oauth_token(tenant_id, provider, emp_id)
+                if token is not None and token.employee_id != emp_id:
+                    logger.info(
+                        f"Adapter-Fallback: Employee {emp.slug if emp else '?'} hat "
+                        f"keinen eigenen {provider}-Token — nutzt Default-Token von "
+                        f"employee_id={token.employee_id}"
+                    )
+            except Exception:
+                pass
 
     if provider == CALENDAR_PROVIDER_MICROSOFT:
         return MicrosoftCalendarAdapter(

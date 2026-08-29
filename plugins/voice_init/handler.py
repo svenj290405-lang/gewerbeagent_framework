@@ -109,6 +109,95 @@ def _consume_stornier_token(
 
 
 # ----------------------------------------------------------------------
+# Anruf-Tenant-Bindung
+# ----------------------------------------------------------------------
+# Der Betrieb eines Anrufs steht EINMAL fest: bei `initiation`, abgeleitet
+# aus der angerufenen Nummer. Alles danach — jeder Tool-Aufruf des
+# Voice-Agenten — kam frueher mit einem frei gewaehlten `tenant_slug` im
+# Payload zurueck, und der Handler hat ihn geglaubt. Slugs sind kurz und
+# ratbar (`pilot`, `demotour`), und der Wert reist als *dynamic variable*
+# durch ein Sprachmodell, das ein Anrufer im Gespraech umstimmen kann.
+# Damit liessen sich fremde Termine lesen und stornieren, in fremde
+# Kalender buchen und fremde Wissensbasen abfragen.
+#
+# Stattdessen bekommt der Agent bei `initiation` ein unratbares Token und
+# reicht DAS zurueck. Ein Anrufer kann kein gueltiges Token fuer einen
+# anderen Betrieb erfinden.
+#
+# Gleiche single-worker-Begruendung wie bei den Stornier-Tokens: in-process
+# dict reicht, weil uvicorn ohne --workers laeuft. Ein Neustart mitten im
+# Gespraech verliert die Bindung — der Anruf endet dann mit einer Fehler-
+# meldung statt im falschen Betrieb, was die richtige Richtung ist.
+CALL_TENANT_TTL_SECONDS = 4 * 60 * 60   # ein Anruf ist Minuten, 4 h ist grosszuegig
+CALL_TENANT_MAX_ENTRIES = 1000
+
+_CALL_TENANTS: dict[str, dict[str, Any]] = {}
+
+
+def _gc_call_tenants() -> None:
+    """Raeumt abgelaufene Anruf-Bindungen. Wie _gc_stornier_tokens."""
+    now = datetime.now(timezone.utc)
+    stale = [
+        tok for tok, entry in _CALL_TENANTS.items()
+        if (now - entry["created_at"]).total_seconds() > CALL_TENANT_TTL_SECONDS
+    ]
+    for tok in stale:
+        _CALL_TENANTS.pop(tok, None)
+    if len(_CALL_TENANTS) > CALL_TENANT_MAX_ENTRIES:
+        aeltest = sorted(_CALL_TENANTS.items(), key=lambda kv: kv[1]["created_at"])
+        for tok, _ in aeltest[: len(_CALL_TENANTS) - CALL_TENANT_MAX_ENTRIES]:
+            _CALL_TENANTS.pop(tok, None)
+
+
+def _create_call_tenant_token(tenant_slug: str) -> str:
+    """Bindet einen Anruf an den Betrieb, der zur angerufenen Nummer gehoert."""
+    _gc_call_tenants()
+    token = secrets.token_urlsafe(24)
+    _CALL_TENANTS[token] = {
+        "tenant_slug": tenant_slug,
+        "created_at": datetime.now(timezone.utc),
+    }
+    return token
+
+
+def _tenant_slug_fuer_aufruf(payload: dict) -> tuple[str, str | None]:
+    """Der Betrieb dieses Tool-Aufrufs. Liefert ``(slug, fehler)``.
+
+    Massgeblich ist allein das bei `initiation` ausgegebene Token. Ein
+    zusaetzlich mitgeschickter `tenant_slug` wird nur noch dazu benutzt,
+    einen Widerspruch zu ERKENNEN — er entscheidet nichts mehr.
+    """
+    token = (payload.get("tenant_token") or "").strip()
+    behauptet = (payload.get("tenant_slug") or "").strip()
+
+    if not token:
+        logger.error(
+            "Voice-Tool ohne tenant_token (behaupteter slug=%r). Der Agent muss "
+            "die dynamic variable {{tenant_token}} aus der initiation-Antwort in "
+            "jedem Tool-Aufruf mitschicken — siehe INFRA-MANUAL-STEPS.md.",
+            behauptet,
+        )
+        return "", "Dieser Anruf ist keinem Betrieb zugeordnet."
+
+    _gc_call_tenants()
+    entry = _CALL_TENANTS.get(token)
+    if entry is None:
+        logger.warning("Voice-Tool mit unbekanntem/abgelaufenem tenant_token.")
+        return "", "Die Sitzung ist abgelaufen. Bitte neu anrufen."
+
+    slug = entry["tenant_slug"]
+    if behauptet and behauptet != slug:
+        # Kein stiller Fix: das ist entweder ein Konfigurationsfehler oder
+        # ein Versuch, den Betrieb zu wechseln. Beides gehoert gesehen.
+        logger.error(
+            "Voice-Tool: tenant_slug=%r widerspricht der Anruf-Bindung (%r). "
+            "Aufruf abgelehnt.", behauptet, slug,
+        )
+        return "", "Dieser Anruf ist keinem Betrieb zugeordnet."
+    return slug, None
+
+
+# ----------------------------------------------------------------------
 # Terminsuche-Job-Store (asynchrone Voice-Pipeline)
 # ----------------------------------------------------------------------
 # checke_kalender (Gemini-Skill-Routing + Kalender-API) dauert bis ~9s.
@@ -499,6 +588,10 @@ class Plugin(BasePlugin):
         return {
             "type": "conversation_initiation_client_data",
             "dynamic_variables": {
+                # Das Token ist der Ausweis dieses Anrufs. Der Agent muss es
+                # in JEDEM Tool-Aufruf zurueckgeben; `tenant_slug` bleibt nur
+                # noch als lesbare Beschriftung stehen und entscheidet nichts.
+                "tenant_token": _create_call_tenant_token(tenant.slug),
                 "tenant_slug": tenant.slug,
                 "tenant_company_name": tenant.company_name or "",
                 "tenant_branche": tenant.branche or "Handwerk",
@@ -529,9 +622,9 @@ class Plugin(BasePlugin):
         """
         from core.plugin_system import get_plugin_for_tenant
 
-        tenant_slug = (payload.get("tenant_slug") or "").strip()
-        if not tenant_slug:
-            return {"erfolg": False, "nachricht": "tenant_slug fehlt"}
+        tenant_slug, _tenant_fehler = _tenant_slug_fuer_aufruf(payload)
+        if _tenant_fehler:
+            return {"erfolg": False, "nachricht": _tenant_fehler}
 
         async with AsyncSessionLocal() as s:
             tenant = (await s.execute(
@@ -638,9 +731,9 @@ class Plugin(BasePlugin):
         """
         from core.plugin_system import get_plugin_for_tenant
 
-        tenant_slug = (payload.get("tenant_slug") or "").strip()
-        if not tenant_slug:
-            return {"erfolg": False, "nachricht": "tenant_slug fehlt"}
+        tenant_slug, _tenant_fehler = _tenant_slug_fuer_aufruf(payload)
+        if _tenant_fehler:
+            return {"erfolg": False, "nachricht": _tenant_fehler}
 
         async with AsyncSessionLocal() as s:
             tenant = (await s.execute(
@@ -669,6 +762,9 @@ class Plugin(BasePlugin):
             "created_at": datetime.now(timezone.utc),
             "status": "laeuft",
             "result": None,
+            # Der Betrieb wandert mit: das Ergebnis traegt Mitarbeiternamen
+            # und freie Zeiten, es darf nur an denselben Anruf zurueck.
+            "tenant_slug": tenant_slug,
         }
 
         async def _worker():
@@ -715,12 +811,24 @@ class Plugin(BasePlugin):
           plus "status": "fertig".
         - Unbekannt/abgelaufen -> {"erfolg": False, "status": "unbekannt"}.
         """
+        tenant_slug, _tenant_fehler = _tenant_slug_fuer_aufruf(payload)
+        if _tenant_fehler:
+            return {"erfolg": False, "nachricht": _tenant_fehler}
+
         job_id = (payload.get("job_id") or "").strip()
         if not job_id:
             return {"erfolg": False, "nachricht": "job_id fehlt"}
 
         _gc_terminsuche_jobs()
         entry = _TERMINSUCHE_JOBS.get(job_id)
+        # Der Docstring versprach diese Pruefung, der Code machte sie nicht:
+        # ein fremdes Ergebnis sieht fuer den Abrufer aus wie ein eigenes.
+        if entry is not None and entry.get("tenant_slug") != tenant_slug:
+            logger.error(
+                "hole_terminvorschlaege: job gehoert zu %r, Aufruf kam von %r.",
+                entry.get("tenant_slug"), tenant_slug,
+            )
+            entry = None
         if entry is None:
             return {
                 "erfolg": False,
@@ -769,9 +877,9 @@ class Plugin(BasePlugin):
         from core.plugin_system import get_plugin_for_tenant
         import uuid as _uuid
 
-        tenant_slug = (payload.get("tenant_slug") or "").strip()
-        if not tenant_slug:
-            return {"erfolg": False, "nachricht": "tenant_slug fehlt"}
+        tenant_slug, _tenant_fehler = _tenant_slug_fuer_aufruf(payload)
+        if _tenant_fehler:
+            return {"erfolg": False, "nachricht": _tenant_fehler}
 
         slot_id = (payload.get("slot_id") or "").strip()
         try:
@@ -1174,9 +1282,9 @@ class Plugin(BasePlugin):
         """
         from core.plugin_system import get_plugin_for_tenant
 
-        tenant_slug = (payload.get("tenant_slug") or "").strip()
-        if not tenant_slug:
-            return {"erfolg": False, "nachricht": "tenant_slug fehlt"}
+        tenant_slug, _tenant_fehler = _tenant_slug_fuer_aufruf(payload)
+        if _tenant_fehler:
+            return {"erfolg": False, "nachricht": _tenant_fehler}
 
         telefon = (payload.get("kunde_telefon") or "").strip()
         email = (payload.get("kunde_email") or "").strip()
@@ -1265,9 +1373,9 @@ class Plugin(BasePlugin):
         """
         from core.plugin_system import get_plugin_for_tenant
 
-        tenant_slug = (payload.get("tenant_slug") or "").strip()
-        if not tenant_slug:
-            return {"erfolg": False, "nachricht": "tenant_slug fehlt"}
+        tenant_slug, _tenant_fehler = _tenant_slug_fuer_aufruf(payload)
+        if _tenant_fehler:
+            return {"erfolg": False, "nachricht": _tenant_fehler}
 
         token = (payload.get("stornier_token") or "").strip()
         if not token:
@@ -1441,13 +1549,13 @@ class Plugin(BasePlugin):
         phone = (payload.get("phone") or "").strip() or None
         email = (payload.get("email") or "").strip() or None
         anliegen = (payload.get("anliegen") or "").strip() or None
-        tenant_slug = (payload.get("tenant_slug") or "").strip()
+        tenant_slug, _tenant_fehler = _tenant_slug_fuer_aufruf(payload)
+        if _tenant_fehler:
+            return {"success": False, "error": _tenant_fehler}
 
-        if not name or not tenant_slug:
-            logger.warning(
-                f"save_contact: name oder tenant_slug fehlt: name={name!r} slug={tenant_slug!r}"
-            )
-            return {"success": False, "error": "name und tenant_slug sind Pflicht"}
+        if not name:
+            logger.warning(f"save_contact: name fehlt: name={name!r}")
+            return {"success": False, "error": "name ist Pflicht"}
 
         # Schutz gegen Leere-Anrufe: Anrufer hat nichts gesagt, Q hat
         # 'unbekannt'/'(silent)'/'.' als Namen. Kein Lexware-Eintrag,
@@ -1635,7 +1743,7 @@ class Plugin(BasePlugin):
         kunde_telefon = (payload.get("kunde_telefon") or "").strip()
         anliegen = (payload.get("anliegen") or "").strip()
         kunde_email = (payload.get("kunde_email") or "").strip() or None
-        tenant_slug = (payload.get("tenant_slug") or "").strip()
+        tenant_slug, _tenant_fehler = _tenant_slug_fuer_aufruf(payload)
 
         # Pflichtfelder. Anders als bei save_contact wenden wir KEINEN
         # aggressiven "suspicious name"-Skip an: eine Rueckrufbitte mit
@@ -1643,9 +1751,8 @@ class Plugin(BasePlugin):
         # der Name vom Agent unsauber erfasst wurde — die wollen wir nicht
         # still verwerfen. Fehlt aber Telefon ODER Anliegen, ist der
         # Rueckruf nutzlos.
-        if not tenant_slug:
-            logger.warning("rueckruf: tenant_slug fehlt")
-            return {"success": False, "error": "tenant_slug ist Pflicht"}
+        if _tenant_fehler:
+            return {"success": False, "error": _tenant_fehler}
         if not kunde_telefon or not anliegen:
             logger.warning(
                 f"rueckruf: telefon/anliegen fehlt slug={tenant_slug!r} "
@@ -1838,15 +1945,13 @@ class Plugin(BasePlugin):
                     ToolConfig.tool_name == "lexware",
                 )
             )).scalar_one_or_none()
-            if not tc:
-                tc_global = (await s.execute(
-                    select(ToolConfig)
-                    .join(Tenant, ToolConfig.tenant_id == Tenant.id)
-                    .where(Tenant.slug == "_global", ToolConfig.tool_name == "lexware")
-                )).scalar_one_or_none()
-                if tc_global:
-                    tc = tc_global
-            if not tc:
+            # KEIN Rueckfall auf den _global-Key: `upsert_customer_contact`
+            # sucht zuerst per Namen, damit landeten Endkunden mehrerer
+            # Betriebe in einem Buchhaltungskonto und konnten sich
+            # gegenseitig ueberschreiben. Ohne eigene Anbindung wird nichts
+            # geschrieben. `enabled` zaehlt wie in den vier anderen
+            # Lexware-Factories (Vorlage: app_screens._build_lexware_provider).
+            if not tc or not tc.enabled:
                 return None
             cfg = tc.config or {}
             encrypted = cfg.get("encrypted_api_key")
@@ -1895,9 +2000,9 @@ class Plugin(BasePlugin):
         from core.models.wissensluecke import KANAL_VOICE
         from core.services import wissen as wissen_service
 
-        tenant_slug = (payload.get("tenant_slug") or "").strip()
-        if not tenant_slug:
-            return {"erfolg": False, "antwort": "tenant_slug fehlt", "anzahl_treffer": 0}
+        tenant_slug, _tenant_fehler = _tenant_slug_fuer_aufruf(payload)
+        if _tenant_fehler:
+            return {"erfolg": False, "antwort": _tenant_fehler, "anzahl_treffer": 0}
 
         frage = (payload.get("frage") or "").strip()
         kategorie = (payload.get("kategorie") or "").strip().lower()
@@ -2031,7 +2136,10 @@ class Plugin(BasePlugin):
           - Deepgram seconds (Anruf-Dauer fuer Transcription)
           - Sipgate inbound seconds (kostenfrei in DE)
         """
-        tenant_slug = (payload.get("tenant_slug") or "").strip()
+        # Nur die Anruf-Bindung oder die angerufene Nummer zaehlen. Ein
+        # blanker `tenant_slug` im Payload wuerde sonst reichen, um die
+        # Telefonie-Kosten einem fremden Betrieb anzuhaengen.
+        tenant_slug, _ = _tenant_slug_fuer_aufruf(payload)
         called_number = payload.get("called_number") or payload.get("to_number")
         duration_s = float(payload.get("duration_seconds") or 0)
         char_count = int(payload.get("char_count") or 0)

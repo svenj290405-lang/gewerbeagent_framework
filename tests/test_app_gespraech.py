@@ -395,7 +395,7 @@ async def test_geplante_termine_ueberspringen_vergangenes(monkeypatch):
 
     import plugins.kalender.adapters as adapters
 
-    async def _adapter(tid, emp=None, fallback_calendar_id="primary"):
+    async def _adapter(tid, emp=None, fallback_calendar_id="primary", strict=False):
         return _Adapter()
     monkeypatch.setattr(adapters, "get_calendar_adapter", _adapter)
 

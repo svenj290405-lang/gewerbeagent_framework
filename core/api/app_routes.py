@@ -484,11 +484,19 @@ async def app_push_unsubscribe(
     _emp=Depends(require_app_user),
     _csrf=Depends(require_app_csrf),
 ) -> JSONResponse:
+    tenant_id = current_tenant_id(request)
     body = await request.json()
     endpoint = (body or {}).get("endpoint")
     if endpoint:
         async with get_session() as s:
+            # Nur das eigene Abo abmelden. `endpoint` ist global eindeutig,
+            # ohne Tenant-Praedikat koennte ein Betrieb das Geraet eines
+            # anderen stumm schalten. Das Gegenstueck (subscribe) zieht die
+            # Grenze schon, hier fehlte sie.
             await s.execute(
-                delete(PushSubscription).where(PushSubscription.endpoint == endpoint)
+                delete(PushSubscription).where(
+                    PushSubscription.endpoint == endpoint,
+                    PushSubscription.tenant_id == tenant_id,
+                )
             )
     return JSONResponse({"ok": True})

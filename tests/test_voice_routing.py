@@ -28,6 +28,17 @@ from plugins.voice_init import handler as voice_handler
 # =====================================================================
 
 
+def _tok(slug: str) -> str:
+    """Anruf-Bindung wie sie `initiation` ausgibt.
+
+    Seit der Betrieb nicht mehr aus dem Payload kommt, braucht jeder
+    Tool-Aufruf das bei der Anrufannahme vergebene Token — ein blanker
+    `tenant_slug` wird abgelehnt.
+    """
+    from plugins.voice_init.handler import _create_call_tenant_token
+    return _create_call_tenant_token(slug)
+
+
 class _FakeResult:
     def __init__(self, obj):
         self._obj = obj
@@ -290,7 +301,7 @@ async def test_checke_kalender_passes_employee_id_and_returns_routing(monkeypatc
 
     plugin = _make_plugin()
     result = await plugin._handle_checke_kalender({
-        "tenant_slug": "demo",
+        "tenant_slug": "demo", "tenant_token": _tok("demo"),
         "wunschzeit": "2026-05-20T14:00",
         "anliegen": "Kuechenmontage Tischler",
         "kunde_adresse": "Musterstr 1",
@@ -319,7 +330,7 @@ async def test_checke_kalender_tenant_not_found(monkeypatch):
 
     plugin = _make_plugin()
     result = await plugin._handle_checke_kalender({
-        "tenant_slug": "ghost",
+        "tenant_slug": "ghost", "tenant_token": _tok("ghost"),
         "wunschzeit": "2026-05-20T14:00",
     })
     assert result["erfolg"] is False
@@ -350,7 +361,7 @@ async def test_buche_termin_uses_payload_employee_id(monkeypatch):
 
     plugin = _make_plugin()
     result = await plugin._handle_buche_termin({
-        "tenant_slug": "demo",
+        "tenant_slug": "demo", "tenant_token": _tok("demo"),
         "slot_id": "20.05.2026|14:00|90",
         "employee_id": str(emp_id),
         "kunde_name": "Frau Mueller",
@@ -392,7 +403,7 @@ async def test_buche_termin_reroutes_when_employee_id_missing(monkeypatch):
 
     plugin = _make_plugin()
     result = await plugin._handle_buche_termin({
-        "tenant_slug": "demo",
+        "tenant_slug": "demo", "tenant_token": _tok("demo"),
         "slot_id": "20.05.2026|14:00|90",
         # employee_id fehlt absichtlich
         "kunde_name": "Frau Mueller",
@@ -432,7 +443,7 @@ async def test_buche_termin_invalid_employee_id_falls_back_to_rerouting(monkeypa
 
     plugin = _make_plugin()
     result = await plugin._handle_buche_termin({
-        "tenant_slug": "demo",
+        "tenant_slug": "demo", "tenant_token": _tok("demo"),
         "slot_id": "20.05.2026|14:00|90",
         "employee_id": "not-a-uuid",  # ungueltig
         "kunde_name": "Frau Mueller",
@@ -472,7 +483,7 @@ async def test_buche_termin_no_coverage_does_not_book(monkeypatch):
 
     plugin = _make_plugin()
     result = await plugin._handle_buche_termin({
-        "tenant_slug": "demo",
+        "tenant_slug": "demo", "tenant_token": _tok("demo"),
         "slot_id": "20.05.2026|14:00|90",
         # employee_id fehlt → reroute → no-coverage
         "kunde_name": "Frau Mueller",
@@ -490,7 +501,7 @@ async def test_buche_termin_invalid_slot_id():
     """Kaputte slot_id → frueher Fail mit aussagekraeftiger Nachricht."""
     plugin = _make_plugin()
     result = await plugin._handle_buche_termin({
-        "tenant_slug": "demo",
+        "tenant_slug": "demo", "tenant_token": _tok("demo"),
         "slot_id": "kaputt",
         "kunde_name": "X",
     })
@@ -529,7 +540,7 @@ async def test_call_ended_dedups_by_conversation_id(monkeypatch):
 
     plugin = _make_plugin()
     payload = {
-        "tenant_slug": "demo",
+        "tenant_slug": "demo", "tenant_token": _tok("demo"),
         "duration_seconds": 142,
         "conversation_id": "conv-abc-123",
     }
@@ -581,7 +592,7 @@ async def test_starte_terminsuche_returns_jobid_immediately_and_hole_delivers(
 
     plugin = _make_plugin()
     start = await plugin._handle_starte_terminsuche({
-        "tenant_slug": "demo",
+        "tenant_slug": "demo", "tenant_token": _tok("demo"),
         "wunschzeit": "2026-05-20T14:00",
         "anliegen": "Kuechenmontage Tischler",
     })
@@ -594,7 +605,8 @@ async def test_starte_terminsuche_returns_jobid_immediately_and_hole_delivers(
     # weiter waehrend der Agent redet).
     await voice_handler._TERMINSUCHE_JOBS[job_id]["task"]
 
-    done = await plugin._handle_hole_terminvorschlaege({"job_id": job_id})
+    done = await plugin._handle_hole_terminvorschlaege(
+        {"job_id": job_id, "tenant_token": _tok("demo")})
     assert done["erfolg"] is True
     assert done["status"] == "fertig"
     assert len(done["slots"]) == 1
@@ -617,7 +629,7 @@ async def test_starte_terminsuche_tenant_not_found(monkeypatch):
 
     plugin = _make_plugin()
     result = await plugin._handle_starte_terminsuche({
-        "tenant_slug": "ghost", "wunschzeit": "2026-05-20T14:00",
+        "tenant_slug": "ghost", "tenant_token": _tok("ghost"), "wunschzeit": "2026-05-20T14:00",
     })
     assert result["erfolg"] is False
     assert "ghost" in result["nachricht"]
@@ -630,7 +642,8 @@ async def test_hole_terminvorschlaege_unknown_job():
     """Unbekannte/abgelaufene job_id → erfolg=False, status=unbekannt."""
     voice_handler._TERMINSUCHE_JOBS.clear()
     plugin = _make_plugin()
-    result = await plugin._handle_hole_terminvorschlaege({"job_id": "gibtsnicht"})
+    result = await plugin._handle_hole_terminvorschlaege(
+        {"job_id": "gibtsnicht", "tenant_token": _tok("demo")})
     assert result["erfolg"] is False
     assert result["status"] == "unbekannt"
 
@@ -643,9 +656,11 @@ async def test_hole_terminvorschlaege_still_running():
         "created_at": dt.datetime.now(dt.timezone.utc),
         "status": "laeuft",
         "result": None,
+        "tenant_slug": "demo",
     }
     plugin = _make_plugin()
-    result = await plugin._handle_hole_terminvorschlaege({"job_id": "job-x"})
+    result = await plugin._handle_hole_terminvorschlaege(
+        {"job_id": "job-x", "tenant_token": _tok("demo")})
     assert result["erfolg"] is True
     assert result["status"] == "laeuft"
     assert "slots" not in result
@@ -670,12 +685,13 @@ async def test_starte_terminsuche_worker_failure_is_reported(monkeypatch):
 
     plugin = _make_plugin()
     start = await plugin._handle_starte_terminsuche({
-        "tenant_slug": "demo", "wunschzeit": "2026-05-20T14:00",
+        "tenant_slug": "demo", "tenant_token": _tok("demo"), "wunschzeit": "2026-05-20T14:00",
     })
     job_id = start["job_id"]
     await voice_handler._TERMINSUCHE_JOBS[job_id]["task"]
 
-    done = await plugin._handle_hole_terminvorschlaege({"job_id": job_id})
+    done = await plugin._handle_hole_terminvorschlaege(
+        {"job_id": job_id, "tenant_token": _tok("demo")})
     assert done["status"] == "fertig"
     assert done["erfolg"] is False
     assert "fehlgeschlagen" in done["nachricht"]

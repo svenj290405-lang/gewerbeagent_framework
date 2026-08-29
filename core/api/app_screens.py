@@ -2869,12 +2869,21 @@ async def _geplante_kalendertermine(
     Provider-agnostisch über den Kalender-Adapter (Google ODER Outlook).
     Failsafe: ohne Kalender-Verbindung kommt eine leere Liste zurück —
     die Gesprächsliste funktioniert auch ohne.
+
+    ``strict=True`` ist hier sicherheitskritisch: das ist der EINZIGE
+    Lesepfad, über den Termin-Betreffs und -Orte in die App kommen
+    (/app/api/termine, /dashboard, /gespraeche/geplant, /briefing hängen
+    alle daran). Ohne ihn fällt der Token-Lookup auf den Inhaber zurück,
+    und ein Mitarbeiter ohne verbundenen Kalender läse dessen kompletten
+    Primärkalender — im Auslieferungszustand also jeder.
     """
     try:
         from plugins.kalender.adapters import get_calendar_adapter
-        adapter = await get_calendar_adapter(tid, employee_id)
+        adapter = await get_calendar_adapter(tid, employee_id, strict=True)
     except Exception as exc:  # noqa: BLE001
         logger.info("Geplante Gespräche: kein Kalender-Adapter (%s)", exc)
+        return []
+    if adapter is None:
         return []
 
     heute = dt.datetime.now().date()

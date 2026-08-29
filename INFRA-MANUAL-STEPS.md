@@ -365,3 +365,49 @@ docker stop gewerbeagent_framework
 docker start gewerbeagent_framework
 # nächster Check → "wieder online"
 ```
+
+---
+
+## ElevenLabs: `tenant_token` in jeden Tool-Aufruf (PFLICHT vor dem naechsten Anruf)
+
+Der Betrieb eines Anrufs wird nicht mehr aus dem Payload gelesen. Bis
+2026-08-29 schickte der Voice-Agent in jedem Tool-Aufruf ein Feld
+`tenant_slug` zurueck, und der Server glaubte es. Der Wert reist als
+*dynamic variable* durch ein Sprachmodell, das ein Anrufer im Gespraech
+umstimmen kann, und die Slugs sind kurz und ratbar (`pilot`, `demotour`).
+Damit liessen sich fremde Termine lesen und stornieren, in fremde
+Kalender buchen und fremde Wissensbasen abfragen.
+
+Stattdessen gibt `initiation` jetzt eine **Anruf-Bindung** aus:
+
+```json
+"dynamic_variables": {
+  "tenant_token": "<zufaellig, 32 Zeichen>",
+  "tenant_slug": "pilot",
+  ...
+}
+```
+
+**Was im Dashboard zu tun ist:** in JEDEM der neun Tools
+(`checke_kalender`, `starte_terminsuche`, `hole_terminvorschlaege`,
+`buche_termin`, `finde_termine`, `storniere_termin`, `save_contact`,
+`rueckruf_anfordern`, `wissensbasis`) den Body um
+
+```json
+"tenant_token": "{{tenant_token}}"
+```
+
+ergaenzen. `tenant_slug` darf stehenbleiben — es entscheidet nichts mehr
+und wird nur noch benutzt, um einen Widerspruch zu erkennen.
+
+**Fail-closed:** ohne Token antwortet jedes Tool mit „Dieser Anruf ist
+keinem Betrieb zugeordnet." Das ist Absicht — ein Voice-Agent, der beim
+falschen Betrieb bucht, ist schlimmer als einer, der nicht bucht. Der
+erste Testanruf nach der Umstellung diagnostiziert sich also selbst; die
+Logzeile nennt den fehlenden Wert beim Namen.
+
+**Grenze:** die Bindung liegt im Prozessspeicher (wie die Stornier-Tokens
+und die Terminsuche-Jobs, gleiche single-worker-Begruendung). Ein
+Framework-Neustart mitten im Gespraech laesst den Anruf mit einer
+Fehlermeldung enden statt im falschen Betrieb. Bei Multi-Worker: auf
+Redis umstellen.

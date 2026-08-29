@@ -24,6 +24,17 @@ from plugins.voice_init import handler as voice_handler
 # Test-Doubles
 # =====================================================================
 
+def _tok(slug: str) -> str:
+    """Anruf-Bindung wie sie `initiation` ausgibt.
+
+    Seit der Betrieb nicht mehr aus dem Payload kommt, braucht jeder
+    Tool-Aufruf das bei der Anrufannahme vergebene Token — ein blanker
+    `tenant_slug` wird abgelehnt.
+    """
+    from plugins.voice_init.handler import _create_call_tenant_token
+    return _create_call_tenant_token(slug)
+
+
 class _FakeResult:
     def __init__(self, obj):
         self._obj = obj
@@ -213,7 +224,7 @@ async def test_buche_termin_uses_token_email_when_phone_matches(monkeypatch):
 
     plugin = _make_plugin()
     result = await plugin._handle_buche_termin({
-        "tenant_slug": "demo",
+        "tenant_slug": "demo", "tenant_token": _tok("demo"),
         "slot_id": "22.05.2026|14:00|60",
         "kunde_name": "Frau Mueller",
         "kunde_telefon": "+49 30 1234 567",
@@ -238,7 +249,7 @@ async def test_buche_termin_no_token_no_payload_no_email(monkeypatch):
 
     plugin = _make_plugin()
     result = await plugin._handle_buche_termin({
-        "tenant_slug": "demo",
+        "tenant_slug": "demo", "tenant_token": _tok("demo"),
         "slot_id": "22.05.2026|14:00|60",
         "kunde_name": "Frau Mueller",
         "kunde_telefon": "+49 30 1234 567",
@@ -263,7 +274,7 @@ async def test_buche_termin_payload_email_fallback(monkeypatch):
 
     plugin = _make_plugin()
     result = await plugin._handle_buche_termin({
-        "tenant_slug": "demo",
+        "tenant_slug": "demo", "tenant_token": _tok("demo"),
         "slot_id": "22.05.2026|14:00|60",
         "kunde_name": "Frau Mueller",
         "kunde_telefon": "+49 30 1234 567",
@@ -294,7 +305,7 @@ async def test_buche_termin_token_wins_over_payload(monkeypatch):
 
     plugin = _make_plugin()
     result = await plugin._handle_buche_termin({
-        "tenant_slug": "demo",
+        "tenant_slug": "demo", "tenant_token": _tok("demo"),
         "slot_id": "22.05.2026|14:00|60",
         "kunde_name": "Frau Mueller",
         "kunde_telefon": "+49 30 1234 567",
@@ -357,7 +368,7 @@ async def test_buche_termin_falls_back_when_lookup_returns_none(monkeypatch):
 
     plugin = _make_plugin()
     await plugin._handle_buche_termin({
-        "tenant_slug": "demo",
+        "tenant_slug": "demo", "tenant_token": _tok("demo"),
         "slot_id": "22.05.2026|14:00|60",
         "kunde_name": "Frau Mueller",
         "kunde_telefon": "+49 30 1234 567",

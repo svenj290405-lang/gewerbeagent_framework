@@ -28,6 +28,17 @@ from core.models.rueckruf import RUECKRUF_STATUS_OFFEN
 # Test-Doubles
 # =====================================================================
 
+def _tok(slug: str) -> str:
+    """Anruf-Bindung wie sie `initiation` ausgibt.
+
+    Seit der Betrieb nicht mehr aus dem Payload kommt, braucht jeder
+    Tool-Aufruf das bei der Anrufannahme vergebene Token — ein blanker
+    `tenant_slug` wird abgelehnt.
+    """
+    from plugins.voice_init.handler import _create_call_tenant_token
+    return _create_call_tenant_token(slug)
+
+
 class _FakeResult:
     def __init__(self, obj):
         self._obj = obj
@@ -106,7 +117,7 @@ def _valid_payload(**over):
         "kunde_name": "Frau Mueller",
         "kunde_telefon": "+49 651 12345",
         "anliegen": "Reklamation Kuechenfront",
-        "tenant_slug": "pilot",
+        "tenant_slug": "pilot", "tenant_token": _tok("pilot"),
     }
     p.update(over)
     return p
@@ -148,11 +159,42 @@ async def test_rueckruf_happy_path_persists_and_pushes(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_rueckruf_missing_tenant_slug(monkeypatch):
+async def test_rueckruf_ohne_anruf_bindung(monkeypatch):
+    """Ein blanker tenant_slug reicht nicht mehr.
+
+    Frueher bestimmte das Payload-Feld den Betrieb. Wer es setzen konnte,
+    legte Rueckrufe in einem fremden Betrieb an.
+    """
     captured, push = _patch_voice(monkeypatch, tenant=_make_tenant())
     plugin = _make_plugin()
     result = await plugin._handle_rueckruf_anfordern(
-        _valid_payload(tenant_slug="")
+        _valid_payload(tenant_token="")
+    )
+    assert result["success"] is False
+    assert "added" not in captured
+    assert push.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_rueckruf_slug_darf_der_bindung_nicht_widersprechen(monkeypatch):
+    """Token sagt pilot, Payload behauptet demotour -> abgelehnt."""
+    captured, push = _patch_voice(monkeypatch, tenant=_make_tenant())
+    plugin = _make_plugin()
+    result = await plugin._handle_rueckruf_anfordern(
+        _valid_payload(tenant_slug="demotour")
+    )
+    assert result["success"] is False
+    assert "added" not in captured
+    assert push.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_rueckruf_abgelaufene_bindung(monkeypatch):
+    """Unbekanntes/abgelaufenes Token -> kein Rueckfall auf den Slug."""
+    captured, push = _patch_voice(monkeypatch, tenant=_make_tenant())
+    plugin = _make_plugin()
+    result = await plugin._handle_rueckruf_anfordern(
+        _valid_payload(tenant_token="gibtsnicht")
     )
     assert result["success"] is False
     assert "added" not in captured
