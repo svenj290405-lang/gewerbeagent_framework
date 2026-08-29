@@ -272,11 +272,21 @@ async def overview(
     month_ago = today - dt.timedelta(days=30)
 
     async with get_session() as s:
-        # Tenant-Counts
+        # Tenant-Counts — ohne `_global`. Das ist das Plattformkonto
+        # (Mailversand, Alarme), kein Kunde. Es war der EINZIGE Tenant mit
+        # Status `active`, waehrend die zwei echten Betriebe auf
+        # `onboarding` stehen: die Startseite meldete "1 aktiv / 3 gesamt"
+        # und zaehlte damit genau falsch herum. Zwei andere Stellen
+        # (Kundenampel, Erloesseite) filtern `_global` laengst heraus.
+        kunden_tenants = Tenant.slug != "_global"
         active_tenants = (await s.execute(
-            select(func.count(Tenant.id)).where(Tenant.status == TenantStatus.ACTIVE.value)
+            select(func.count(Tenant.id))
+            .where(kunden_tenants)
+            .where(Tenant.status == TenantStatus.ACTIVE.value)
         )).scalar() or 0
-        total_tenants = (await s.execute(select(func.count(Tenant.id)))).scalar() or 0
+        total_tenants = (await s.execute(
+            select(func.count(Tenant.id)).where(kunden_tenants)
+        )).scalar() or 0
 
         # Anfragen
         anfragen_today = (await s.execute(

@@ -68,7 +68,8 @@ tests/                   pytest (Unit + Smoke); Integration kommt Beta-2
 - `INFRA-MANUAL-STEPS.md` — Setup-Checkliste fuer Dev-Stack +
   Backup-Cron + Admin-Bot
 - `.env.prod.example` — alle env-Vars dokumentiert (Sentry, Brevo etc.)
-- `Caddyfile` — drei Sites (gewerbeagent.de, status., dev.)
+- `Caddyfile` — sechs Bloecke (gewerbeagent.de, www., app., status.,
+  dev., quant.); fuer app./status./quant. fehlt bis heute der A-Record
 
 ## Smoke-Test-Pattern
 
@@ -89,7 +90,8 @@ asyncio.run(go())
 
 ## Cron-Welt
 
-6 Background-Tasks, gestartet in `core/api/app.py:lifespan`:
+9 Background-Tasks, gestartet in `core/api/app.py:lifespan`
+(`core/integrations/cron_health.py` kennt die Soll-Liste):
 
 | Cron | Intervall | Zweck |
 |---|---|---|
@@ -121,7 +123,11 @@ Confirm-String "deploy prod". Macht `git merge --ff-only origin/develop`,
 
 - Lies dieses File + `RUNBOOK.md` zuerst
 - Tests laufen mit `docker exec gewerbeagent_framework bash -c "cd /app
-  && /app/.venv/bin/python -m pytest tests/ -q"`
+  && /app/.venv/bin/python -m pytest tests/ -q"`. `tests/conftest.py`
+  biegt die Verbindung dabei auf `gewerbeagent_test` um und legt die DB
+  beim ersten Lauf an — ohne die Datei liefe die Suite gegen **Produktion**
+  (so war es bis 2026-08-29). Laesst sich die Test-DB nicht erreichen,
+  bricht der Lauf ab, statt auf Prod auszuweichen.
 - Bei Plan-Mode: pruef ob ein Bestands-Modul schon existiert bevor
   neues schreiben — Doku ist verteilt
 - Nicht `pip install`; immer `uv add <pkg>` + Image-Rebuild

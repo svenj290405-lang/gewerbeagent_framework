@@ -1,0 +1,32 @@
+services:
+  freeswitch:
+    image: dheaps/freeswitch:latest
+    container_name: gewerbeagent_freeswitch
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+    network_mode: host
+    privileged: true
+    # Der Healthcheck des Images ruft `fs_cli` mit dem Werks-Passwort
+    # `ClueCon`. Seit die ESL-Haertung vom 2026-08-25 ein eigenes Passwort
+    # setzt, schlaegt er dauerhaft fehl (25961 Fehlversuche in Folge =
+    # 4,5 Tage), waehrend der Dienst gesund ist — `sofia status` meldet
+    # `external::sipgate REGED`. Ein dauerhaft rotes `docker ps` ist
+    # schlimmer als keines: ein echter Telefonie-Ausfall geht darin unter.
+    # Wir pruefen darum das, was zaehlt: lauscht der SIP-Port noch.
+    healthcheck:
+      test: ["CMD-SHELL", "netstat -lun | grep -q ':5060' || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    volumes:
+      - freeswitch_conf:/etc/freeswitch
+      - freeswitch_logs:/var/log/freeswitch
+
+volumes:
+  freeswitch_conf:
+  freeswitch_logs:
