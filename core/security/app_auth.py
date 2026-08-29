@@ -115,7 +115,21 @@ async def check_login_rate_limit(ip: str, *, session: AsyncSession) -> bool:
 async def find_employee_by_email(
     email: str, *, session: AsyncSession,
 ) -> Optional[Employee]:
-    """Aktiver Employee mit dieser Kontakt-Mail (case-insensitive)."""
+    """Aktiver Employee mit dieser Kontakt-Mail (case-insensitive).
+
+    Die Suche geht bewusst ueber ALLE Betriebe — die Mailadresse ist der
+    einzige Anhaltspunkt, den der Login hat. Es gibt aber keinen
+    Unique-Index darauf. Frueher stand hier ``.first()`` ohne Ordnung:
+    bei zwei Mitarbeitern verschiedener Betriebe mit derselben Adresse
+    entschied die Speicherreihenfolge von Postgres, in welchem Betrieb
+    jemand landet — und wessen Passwort ueberhaupt passt.
+
+    Zwei Treffer heissen darum jetzt: niemand kommt rein, und es gibt
+    einen Alarm. Fail-closed ist hier das Richtige, weil die App keinen
+    Betriebs-Umschalter hat; ein raten waere ein Login im falschen
+    Betrieb. Angelegt werden kann der Zustand nicht mehr (siehe
+    ``kontakt_mail_frei``), er kann nur aus Altbestand stammen.
+    """
     norm = email.strip().lower()
     if "@" not in norm or len(norm) > 255:
         return None
@@ -123,8 +137,42 @@ async def find_employee_by_email(
         select(Employee)
         .where(Employee.is_active.is_(True))
         .where(func.lower(Employee.contact_email) == norm)
+        .order_by(Employee.created_at.asc())
+        .limit(2)
     )
-    return (await session.execute(stmt)).scalars().first()
+    treffer = (await session.execute(stmt)).scalars().all()
+    if len(treffer) > 1:
+        logger.error(
+            "Mailadresse ist in mehreren Betrieben vergeben — Login "
+            "abgelehnt. Betroffene tenant_ids: %s",
+            [str(e.tenant_id) for e in treffer],
+        )
+        return None
+    return treffer[0] if treffer else None
+
+
+async def kontakt_mail_frei(
+    email: str, *, employee_id: uuid.UUID | None, session: AsyncSession,
+) -> bool:
+    """Ist diese Adresse noch keinem anderen aktiven Mitarbeiter zugeordnet?
+
+    Muss vor jedem Setzen von ``contact_email`` gefragt werden. Ohne das
+    konnte sich ein eingeladener Mitarbeiter die Adresse des Inhabers
+    eines FREMDEN Betriebs geben — Besitznachweis gab es keinen — und den
+    dortigen Login damit unbrauchbar machen.
+    """
+    norm = (email or "").strip().lower()
+    if not norm:
+        return True
+    stmt = (
+        select(Employee)
+        .where(Employee.is_active.is_(True))
+        .where(func.lower(Employee.contact_email) == norm)
+    )
+    for anderer in (await session.execute(stmt)).scalars().all():
+        if employee_id is None or anderer.id != employee_id:
+            return False
+    return True
 
 
 async def verify_app_login(

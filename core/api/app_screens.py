@@ -1075,7 +1075,17 @@ async def _build_briefing_text(ctx) -> str:
     )
     auftraege = await _aktuelle_auftraege(ctx.tid, briefing_scope)
     beratung = await _beratung_leads(ctx.tid)
-    team = await _run_team_status(ctx, {})
+    # Direkter Aufruf statt ueber _available_tools — das Recht haengt aber
+    # an der ToolSpec (team_status: permission="team.sehen"), und der
+    # Gate-Filter sitzt in _available_tools. Ohne diese Zeile lieferte das
+    # Briefing (OFFEN) einem Monteur die Namen aller heute Kranken, also
+    # Gesundheitsdaten — waehrend /app/api/team genau dieselbe Information
+    # hinter team.sehen haelt.
+    team = (
+        await _run_team_status(ctx, {})
+        if "team.sehen" in (ctx.permissions or frozenset())
+        else {"team": []}
+    )
     from core.services import wissen as wissen_service
     luecken = await wissen_service.offene_luecken(ctx.tid, limit=5)
     anfragen = {"anzahl": 0, "anfragen": []}

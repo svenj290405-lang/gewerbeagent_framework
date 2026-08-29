@@ -33,11 +33,24 @@ class AuftragScope:
     employee_id: uuid.UUID
 
 
+def auftrag_scope_fuer(employee_id: uuid.UUID, permissions) -> AuftragScope:
+    """Scope aus Identitaet + Rechten — ohne Request.
+
+    Q ist der zweite Weg zu denselben Auftraegen und hat keinen Request.
+    Ohne diesen Einstieg haette der Command-Center seinen eigenen Filter
+    gebaut, und genau davor warnt der Modul-Docstring.
+    """
+    return AuftragScope(
+        alle="auftraege.alle_sehen" in (permissions or frozenset()),
+        employee_id=employee_id,
+    )
+
+
 def auftrag_scope(request: Request) -> AuftragScope:
     """Scope aus der laufenden Session ableiten."""
     emp = request.state.app_employee
     perms = getattr(request.state, "app_permissions", frozenset())
-    return AuftragScope(alle="auftraege.alle_sehen" in perms, employee_id=emp.id)
+    return auftrag_scope_fuer(emp.id, perms)
 
 
 def auftrag_filter(scope: AuftragScope) -> list[ColumnElement[bool]]:

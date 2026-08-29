@@ -173,6 +173,19 @@ async def create_tenant_record(
                 f"Ein Betrieb mit dem Slug '{slug}' existiert bereits."
             )
 
+        # Der App-Login kennt nur die Mailadresse und hat keinen
+        # Betriebs-Umschalter. Zwei Betriebe mit derselben Inhaber-Adresse
+        # sperren sich darum gegenseitig aus (find_employee_by_email
+        # lehnt eine mehrdeutige Adresse fail-closed ab). Lieber hier
+        # sagen als spaeter beim ersten Login raten.
+        from core.security.app_auth import kontakt_mail_frei
+        if not await kontakt_mail_frei(email, employee_id=None, session=session):
+            raise OnboardingError(
+                f"Die Mailadresse '{email}' gehoert schon zu einem anderen "
+                "Betrieb. Der App-Login unterscheidet Betriebe nur ueber "
+                "die Adresse — bitte eine eigene fuer diesen Betrieb nehmen."
+            )
+
         tenant = Tenant(
             slug=slug,
             company_name=name,

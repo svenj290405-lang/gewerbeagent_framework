@@ -32,6 +32,53 @@ from core.onboarding import (
 
 logger = logging.getLogger(__name__)
 
+
+# ----------------------------------------------------------------------
+# Einmal-Meldungen (statt Klartext im Query-String)
+# ----------------------------------------------------------------------
+# Die Erfolgsmeldung enthaelt den vollstaendigen Aktivierungs-Link samt
+# Token. Als `?msg=` landete der in Caddys Zugriffslog (Aufbewahrung
+# 336 h) und in der Browser-History des Admins. Der Token ist 14 Tage
+# gueltig und one-time — wer den Log liest, uebernimmt den Zugang des
+# Betriebs, bevor der Kunde ihn einloest.
+#
+# Jetzt reist nur eine zufaellige Quittungsnummer durch die URL; der Text
+# bleibt auf dem Server und wird beim ersten Abruf verbraucht.
+# In-Process-Dict wie bei den Voice-Tokens (uvicorn ohne --workers); ein
+# Neustart kostet hoechstens eine Meldung.
+import secrets as _secrets  # noqa: E402
+import time as _time  # noqa: E402
+
+_FLASH_TTL_SECONDS = 5 * 60
+_FLASH_MAX = 100
+_FLASHES: dict[str, tuple[float, str]] = {}
+
+
+def _flash_setzen(text: str) -> str:
+    jetzt = _time.time()
+    for k, (ts, _) in list(_FLASHES.items()):
+        if jetzt - ts > _FLASH_TTL_SECONDS:
+            _FLASHES.pop(k, None)
+    if len(_FLASHES) > _FLASH_MAX:
+        for k, _ in sorted(_FLASHES.items(), key=lambda kv: kv[1][0])[:20]:
+            _FLASHES.pop(k, None)
+    quittung = _secrets.token_urlsafe(12)
+    _FLASHES[quittung] = (jetzt, text)
+    return quittung
+
+
+def _flash_holen(quittung: str | None) -> str | None:
+    """Einmal-Abruf: danach ist die Meldung weg."""
+    if not quittung:
+        return None
+    eintrag = _FLASHES.pop(quittung, None)
+    if eintrag is None:
+        return None
+    ts, text = eintrag
+    if _time.time() - ts > _FLASH_TTL_SECONDS:
+        return None
+    return text
+
 router = APIRouter(prefix="/admin", tags=["admin-onboarding"])
 
 GLOBAL_TENANT_SLUG = "_global"
@@ -160,7 +207,10 @@ async def tenant_new_form(
         "active": "tenants",
         "csrf_token": request.state.admin_csrf,
         "branches": list_available_branches(),
-        "msg": request.query_params.get("msg"),
+        "msg": (
+            _flash_holen(request.query_params.get("flash"))
+            or request.query_params.get("msg")
+        ),
         "err": request.query_params.get("err"),
     })
 
@@ -254,7 +304,9 @@ async def tenant_new_submit(
         parts.append(f"Aktivierungs-Link: {activate_url}")
     else:
         parts.append("ACHTUNG: Aktivierungs-Link konnte nicht erzeugt werden.")
+    # Nur die Quittungsnummer wandert durch die URL — der Text (und mit
+    # ihm der Aktivierungs-Link) bleibt auf dem Server.
     return RedirectResponse(
-        f"/admin/tenants/new?msg={quote('  ·  '.join(parts))}",
+        f"/admin/tenants/new?flash={_flash_setzen('  ·  '.join(parts))}",
         status_code=303,
     )

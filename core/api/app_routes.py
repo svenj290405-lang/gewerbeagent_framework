@@ -301,6 +301,20 @@ async def app_activate_set(
         )).scalar_one_or_none()
         if emp is None or not emp.is_active:
             return RedirectResponse("/app/activate?fehler=link", status_code=303)
+        # Die Adresse ist der einzige Anhaltspunkt des Logins, und einen
+        # Besitznachweis gibt es hier nicht. Ohne diese Pruefung konnte
+        # ein Eingeladener die Adresse des Inhabers eines FREMDEN Betriebs
+        # eintragen und dessen Login unbrauchbar machen.
+        from core.security.app_auth import kontakt_mail_frei
+        if not await kontakt_mail_frei(email, employee_id=emp.id, session=s):
+            logger.warning(
+                "Aktivierung abgelehnt: Mailadresse ist bereits vergeben "
+                "(employee=%s)", emp.id,
+            )
+            return RedirectResponse(
+                f"/app/activate?token={token}&fehler=mail_vergeben",
+                status_code=303,
+            )
         emp.contact_email = email
         set_app_password_hash(emp, password)
         await s.flush()

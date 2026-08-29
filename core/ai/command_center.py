@@ -1344,12 +1344,23 @@ async def _run_auftrag_status(ctx: Ctx, args: dict) -> dict:
     # offen (Audit 2026-08-24). Ein abgerechneter Auftrag ist kein laufender.
     relevante = ((set(AUFTRAG_LIFECYCLE) | {ANGEBOT_STATUS_ABGEBROCHEN})
                  - {ANGEBOT_STATUS_RECHNUNG_GESENDET})
+    # Q ist der zweite Weg zu denselben Auftraegen. Das HTTP-Pendant
+    # (api_auftrag_status) filtert ueber _load_auftrag(..., auftrag_scope);
+    # hier fehlte der Filter, also konnte ein Nutzer ohne
+    # `auftraege.alle_sehen` per Chat Auftraege lesen UND aendern, die er
+    # in der App nicht einmal sieht. Derselbe eine Filter, kein zweiter.
+    from core.security.app_scope import auftrag_filter, auftrag_scope_fuer
+
+    scope = auftrag_scope_fuer(
+        getattr(ctx.employee, "id", None), ctx.permissions,
+    )
     async with get_session() as s:
         rows = (await s.execute(
             select(Angebot)
             .where(Angebot.tenant_id == ctx.tid)
             .where(Angebot.kunde_name.ilike(f"%{name}%"))
-            .where(Angebot.status.in_(relevante)).limit(2)
+            .where(Angebot.status.in_(relevante))
+            .where(*auftrag_filter(scope)).limit(2)
         )).scalars().all()
         if not rows:
             return {"ok": False, "error": f"Kein laufender Auftrag für '{name}' gefunden."}

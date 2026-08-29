@@ -45,6 +45,7 @@
     const fehler = params.get("fehler");
     if (fehler === "eingabe") msg.textContent = "Bitte gültige E-Mail und Passwort (mind. 8 Zeichen) eingeben.";
     else if (fehler === "link") msg.textContent = "Der Einladungs-Link ist abgelaufen oder schon benutzt.";
+    else if (fehler === "mail_vergeben") msg.textContent = "Diese E-Mail-Adresse ist schon in Benutzung. Bitte eine andere nehmen.";
 
     async function init() {
       if (!token) { showInvalid(); return; }
