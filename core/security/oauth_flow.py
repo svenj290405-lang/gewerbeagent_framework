@@ -353,6 +353,86 @@ async def _resolve_employee_id(
     return emp.id if emp else None
 
 
+# ----------------------------------------------------------------------
+# Signierter Einstieg fuer den oeffentlichen GET /oauth/start
+# ----------------------------------------------------------------------
+# Der GET-Einstieg hat keine Session — er wird von Hand verschickt, wenn
+# ein Betrieb sein Google-/Outlook-Konto zum ersten Mal verbindet. Bis
+# 2026-08-29 reichte dafuer der Tenant-Slug, und `_reject_hijack` unten
+# laesst die ERST-Verbindung bewusst durch. Wer einen Slug erriet (sie
+# sind kurz und sprechend) und einen noch unverbundenen Mitarbeiter-Slug
+# dazu, haengte damit sein EIGENES Konto an einen fremden Betrieb: dessen
+# Kundenmails gingen danach ueber sein Postfach raus, dessen Kundenfotos
+# in sein Drive. Die Callback-Seite verriet obendrein, welche Slugs es
+# gibt.
+#
+# Der Link traegt jetzt eine Signatur mit Ablauf. Er bleibt teilbar (Mail,
+# WhatsApp), aber er ist nicht mehr zu erraten. Erzeugt wird er mit
+# scripts/oauth_connect_link.py; der authentifizierte Weg aus der App
+# (POST /app/api/oauth/start) bleibt unberuehrt.
+CONNECT_LINK_TTL_SECONDS = 7 * 24 * 60 * 60  # eine Woche
+
+
+def _connect_signatur(
+    tenant_slug: str, provider: str, employee_slug: str | None, exp: int,
+) -> str:
+    import hashlib
+    import hmac
+
+    from config.settings import settings
+
+    roh = f"connect:{tenant_slug}:{provider}:{employee_slug or ''}:{exp}"
+    return hmac.new(
+        settings.secret_key.encode(), roh.encode(), hashlib.sha256,
+    ).hexdigest()[:32]
+
+
+def make_connect_link(
+    tenant_slug: str,
+    provider: str = "google",
+    employee_slug: str | None = None,
+    *,
+    base_url: str | None = None,
+    ttl_seconds: int = CONNECT_LINK_TTL_SECONDS,
+) -> str:
+    """Signierter Einmal-Einstieg in den OAuth-Flow eines Betriebs."""
+    import time
+    from urllib.parse import urlencode
+
+    from config.settings import settings
+
+    exp = int(time.time()) + ttl_seconds
+    params = {"tenant": tenant_slug, "provider": provider, "exp": exp}
+    if employee_slug:
+        params["employee"] = employee_slug
+    params["sig"] = _connect_signatur(tenant_slug, provider, employee_slug, exp)
+    basis = (base_url or getattr(settings, "public_url", "") or "").rstrip("/")
+    return f"{basis}/oauth/start?{urlencode(params)}"
+
+
+def connect_link_gueltig(
+    tenant_slug: str,
+    provider: str,
+    employee_slug: str | None,
+    exp: str | int | None,
+    sig: str | None,
+) -> bool:
+    """Prueft Signatur und Ablauf. Fail-closed bei allem Unerwarteten."""
+    import hmac
+    import time
+
+    if not sig or exp is None:
+        return False
+    try:
+        exp_i = int(exp)
+    except (TypeError, ValueError):
+        return False
+    if exp_i < int(time.time()):
+        return False
+    erwartet = _connect_signatur(tenant_slug, provider, employee_slug, exp_i)
+    return hmac.compare_digest(sig, erwartet)
+
+
 class OAuthRebindRejected(Exception):
     """Callback wollte eine bereits verbundene Anbindung auf ein anderes
     Konto umbiegen, ohne dazu berechtigt zu sein (Hijack-Schutz)."""
@@ -376,10 +456,25 @@ def _reject_hijack(
     """
     if allow_rebind:
         return
+    from sqlalchemy import inspect as _sa_inspect
+
     existing_email = (oauth_token.account_email or "").strip().casefold()
-    already_connected = bool((oauth_token.refresh_token or "").strip())
-    if not already_connected or not existing_email:
-        return  # Erst-Verbindung — unkritisch
+    # "Schon verbunden" heisst: die Zeile lag bereits in der DB — nicht
+    # "sie hat einen refresh_token". Ein abgebrochener Flow hinterlaesst
+    # eine Zeile mit leerem Token bzw. leerer Mail; damit fiel die
+    # Pruefung frueher auf "Erst-Verbindung" zurueck und liess genau den
+    # Wechsel durch, den sie verhindern soll.
+    schon_da = _sa_inspect(oauth_token).persistent
+    if not schon_da:
+        return  # wirklich die erste Verbindung — unkritisch
+    if not existing_email:
+        # Zeile da, aber nie fertig verbunden: der oeffentliche Flow darf
+        # sie abschliessen, aber wir sehen es im Log.
+        logger.info(
+            "OAuth: unvollstaendige Anbindung wird vervollstaendigt "
+            "(tenant=%s provider=%s)", tenant_slug, provider,
+        )
+        return
     if existing_email == (new_email or "").strip().casefold():
         return  # Reauth desselben Kontos — ok
     logger.warning(

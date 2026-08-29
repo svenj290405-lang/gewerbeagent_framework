@@ -341,13 +341,22 @@ async def oauth_start(
         description="Optionaler Mitarbeiter-Slug (Phase 1 Multi-OAuth). "
                     "Ohne diesen Param landet der Token beim Default-Employee.",
     ),
+    exp: str | None = Query(None, description="Ablauf des signierten Links"),
+    sig: str | None = Query(None, description="HMAC des signierten Links"),
 ) -> RedirectResponse:
     """
     Startet den OAuth-Flow: leitet Nutzer zu Google/Microsoft-Login weiter.
 
-    Hardening: Tenant- und Employee-Slug-Format wird strikt validiert
-    bevor sie an die OAuth-Funktion gehen — keine sonderzeichen-basierten
-    Bypasses.
+    Dieser Einstieg hat keine Session — er wird von Hand verschickt, wenn
+    ein Betrieb sein Konto zum ersten Mal verbindet. Deshalb muss der Link
+    signiert sein: mit blossem Slug haette jeder, der einen erraet, sein
+    eigenes Google-Konto an einen fremden Betrieb haengen koennen (der
+    Hijack-Schutz greift erst ab der ZWEITEN Verbindung). Erzeugt wird der
+    Link mit scripts/oauth_connect_link.py.
+
+    Slug-Format wird weiterhin strikt validiert — und zwar VOR der
+    Signaturpruefung, damit ein kaputter Link nicht als "unsigniert"
+    durchgeht.
     """
     import re
     if not re.fullmatch(r"[a-z0-9_-]{1,50}", tenant):
@@ -356,6 +365,20 @@ async def oauth_start(
         raise HTTPException(status_code=400, detail="Ungueltiger Employee-Slug")
     if provider not in ("google", "microsoft"):
         raise HTTPException(status_code=400, detail="Unbekannter OAuth-Provider")
+
+    from core.security.oauth_flow import connect_link_gueltig
+    if not connect_link_gueltig(tenant, provider, employee, exp, sig):
+        # Bewusst dieselbe Antwort fuer "nicht signiert", "falsch signiert"
+        # und "abgelaufen": sonst verraet der Unterschied, welche Slugs es
+        # gibt (die Callback-Seite war schon ein solches Orakel).
+        logger.warning(
+            "OAuth-Start ohne gueltige Signatur abgelehnt (provider=%s)",
+            provider,
+        )
+        raise HTTPException(
+            status_code=404,
+            detail="Dieser Verbindungs-Link ist ungueltig oder abgelaufen.",
+        )
     try:
         auth_url = await generate_auth_url(
             tenant_slug=tenant, provider=provider, employee_slug=employee,
