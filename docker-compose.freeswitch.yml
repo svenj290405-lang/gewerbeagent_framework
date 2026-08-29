@@ -3,6 +3,14 @@ services:
     image: dheaps/freeswitch:latest
     container_name: gewerbeagent_freeswitch
     restart: unless-stopped
+    # ACHTUNG: Docker uebernimmt LogConfig nur beim ERZEUGEN eines
+    # Containers. Der laufende `gewerbeagent_freeswitch` stammt vom
+    # 2026-08-03 und hat darum bis heute `LogConfig: {}` — der Deckel hier
+    # ist Papier, bis der Container einmal neu erzeugt wird. Die drei
+    # anderen Container haben ihn wirksam. Akut harmlos (926 KB in 26
+    # Tagen), aber genau die Sorte Einstellung, die man fuer erledigt
+    # haelt. Wird beim naechsten Recreate von selbst richtig — dieselbe
+    # Gelegenheit wie fuer den Healthcheck unten und `privileged`.
     logging:
       driver: json-file
       options:
@@ -23,6 +31,11 @@ services:
       timeout: 5s
       retries: 3
       start_period: 60s
+    # Beim selben Wartungsfenster mit erledigen: `mod_signalwire` ist aus
+    # der Werkseinstellung des Images geladen, wird nie benutzt und
+    # schreibt alle 15 Minuten zwei Zeilen. 4031 von 4064 Logzeilen (99 %)
+    # stammen daher — echte Befunde gehen darin unter. Ausbauen ueber
+    # modules.conf.xml im Volume.
     volumes:
       - freeswitch_conf:/etc/freeswitch
       - freeswitch_logs:/var/log/freeswitch
