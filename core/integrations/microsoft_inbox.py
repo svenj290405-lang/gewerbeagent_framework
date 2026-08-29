@@ -60,6 +60,41 @@ BOUNCE_SENDER_PREFIXES = (
 )
 
 
+def absender_authentisch(msg: dict) -> tuple[bool | None, str]:
+    """Hat der empfangende Server die Absenderdomain bestaetigt?
+
+    Liest ``Authentication-Results`` aus den Internet-Headern. Diese Zeile
+    schreibt Microsoft beim Empfang — ein Absender kann sie nicht
+    faelschen oder entfernen.
+
+    Rueckgabe: ``True`` (bestaetigt), ``False`` (nachweislich gefaelscht),
+    ``None`` (keine Aussage moeglich, z.B. weil die Header nicht geholt
+    wurden). ``None`` ist bewusst von ``False`` getrennt: nur ein
+    NACHWEISLICHES Scheitern darf eine Aktion blockieren, fehlende
+    Information nicht — sonst zerlegt ein Graph-Ausfall den Normalbetrieb.
+    """
+    headers_obj = msg.get("internetMessageHeaders") or []
+    zeilen = [
+        (h.get("value") or "").lower()
+        for h in headers_obj
+        if (h.get("name") or "").lower() == "authentication-results"
+    ]
+    if not zeilen:
+        return None, "keine Authentication-Results"
+
+    text = " ".join(zeilen)
+    if "dmarc=pass" in text:
+        return True, "dmarc=pass"
+    if "dmarc=fail" in text:
+        return False, "dmarc=fail"
+    # Kein DMARC-Urteil: DKIM allein reicht als Domain-Nachweis.
+    if "dkim=pass" in text:
+        return True, "dkim=pass"
+    if "dkim=fail" in text and "spf=fail" in text:
+        return False, "dkim=fail spf=fail"
+    return None, "kein eindeutiges Urteil"
+
+
 def is_bounce_or_autoreply(msg: dict) -> tuple[bool, str]:
     """True + Grund wenn die Mail nicht beantwortet werden soll.
 
@@ -1136,6 +1171,58 @@ async def _handle_storno_intent(
         record_outbound_q_reply, set_conversation_state,
     )
     from core.models import STATE_STORNIERT
+
+    # 0. Absender bestaetigen, BEVOR etwas geloescht wird.
+    #
+    # Der einzige "Ausweis" einer Absage ist die From-Adresse, und
+    # `cancel_kunde_termine` sucht die Termine genau ueber diese Adresse.
+    # Wer sie faelscht, storniert also die Termine des echten Kunden. Der
+    # empfangende Server hat das Urteil aber schon gefaellt und in
+    # `Authentication-Results` geschrieben — wir muessen es nur lesen. Die
+    # Header stehen nicht im Poll-Select, darum hier einmal nachladen; das
+    # kostet einen Graph-Call auf einem seltenen Pfad.
+    #
+    # Nur ein NACHWEISLICHES Scheitern blockt. Kein Urteil laesst durch —
+    # sonst haette ein Graph-Ausfall jede echte Absage verschluckt.
+    echt, grund = absender_authentisch({})
+    if message_id:
+        try:
+            voll = await fetch_full_message(
+                tenant_id, message_id, employee_id=employee_id,
+            )
+            if voll:
+                echt, grund = absender_authentisch(voll)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("storno-intent: Header-Nachladen fehlgeschlagen: %s", e)
+
+    if echt is False:
+        logger.error(
+            "storno-intent: Absender nicht bestaetigt (%s) tenant=%s — "
+            "es wird NICHTS storniert, der Betrieb entscheidet.",
+            grund, tenant.slug,
+        )
+        try:
+            from core.integrations.mail_pipeline import (
+                push_tenant_new_anfrage_notification,
+            )
+            await push_tenant_new_anfrage_notification(
+                tenant,
+                sender_email=sender_email, sender_name=sender_name,
+                subject=f"Absage nicht bestaetigt: {subject}",
+                body_preview=(
+                    "Diese Absage kam von einer Adresse, die der Mailserver "
+                    "nicht bestaetigen konnte. Es wurde nichts storniert — "
+                    "bitte selbst pruefen."
+                ),
+                employee_id=employee_id,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("storno-intent: Push nach Fehlschlag: %s", e)
+        return {
+            "success": True,
+            "action": "storno_abgelehnt_absender_ungeprueft",
+            "cancelled": 0,
+        }
 
     # 1. Termine stornieren (auch wenn KEINE conv existiert — Kunde
     # koennte per Telefon gebucht haben und jetzt erstmals mailen)

@@ -516,8 +516,27 @@ async def run_command(text: str, ctx: Ctx, history: list | None = None, screen_c
             # Adresse leer, ist Senden unmöglich — dann kommt der Entwurf
             # doch in die App, statt eine Mail ins Nichts zu schicken.
             entwurf = await _build_email_entwurf(ctx, args)
-            if (ctx.mode_for(spec.name) != MODE_AUTOMATISCH
-                    or not (entwurf.get("empfaenger") or "").strip()):
+            aus_stamm = entwurf.pop("_aus_kundenstamm", False)
+            # Ohne Freigabe geht eine Mail nur an eine Adresse, die im
+            # eigenen Kundenstamm steht. Sonst waere der Weg offen von
+            # "Kunde schreibt praeparierte Mail" ueber die Read-Tools
+            # (offene_anfragen, archiv_suchen, wissen_suchen liefern
+            # Fremdtext in dieselbe Gemini-Schleife) zu "Betrieb mailt
+            # Kundendaten samt Drive-Anhaengen an eine Fremdadresse".
+            # In 'assistiert' sieht ein Mensch die Adresse im Entwurf —
+            # in 'automatisch' niemand.
+            automatisch = ctx.mode_for(spec.name) == MODE_AUTOMATISCH
+            hat_adresse = bool((entwurf.get("empfaenger") or "").strip())
+            if not automatisch or not hat_adresse or not aus_stamm:
+                # Der Hinweis nur da, wo er etwas erklaert: der Betrieb hat
+                # 'automatisch' eingestellt und bekommt trotzdem eine
+                # Rueckfrage. In 'assistiert' liest ohnehin ein Mensch mit.
+                if automatisch and hat_adresse and not aus_stamm:
+                    entwurf["hinweis"] = (
+                        entwurf.get("hinweis")
+                        or "Diese Adresse steht nicht im Kundenstamm — "
+                           "bitte einmal prüfen und freigeben."
+                    )
                 entwurf["frage"] = say or None
                 return entwurf
             args = {k: v for k, v in entwurf.items()
@@ -1726,8 +1745,19 @@ async def _build_email_entwurf(ctx: Ctx, args: dict) -> dict:
     kunde = (args.get("kunde_name") or "").strip()
     empfaenger = (args.get("empfaenger") or "").strip()
     hinweis = None
+    # Woher die Adresse stammt, entscheidet spaeter darueber, ob ohne
+    # Freigabe gesendet werden darf. Gemini bekommt Kundenmails und
+    # importierte Website-Texte als Tool-Ergebnisse zu sehen; eine Adresse,
+    # die von dort kommt, ist von einem Fremden gewaehlt.
+    aus_kundenstamm = False
     if not empfaenger and kunde:
         empfaenger = await lookup_kunde_email(ctx.tid, kunde) or ""
+        aus_kundenstamm = bool(empfaenger)
+    elif empfaenger and kunde:
+        bekannt = await lookup_kunde_email(ctx.tid, kunde)
+        aus_kundenstamm = bool(
+            bekannt and bekannt.strip().casefold() == empfaenger.casefold()
+        )
     if not empfaenger:
         hinweis = "Ich habe keine Adresse gefunden — bitte trag sie ein."
     elif not EMAIL_RE.match(empfaenger):
@@ -1760,6 +1790,7 @@ async def _build_email_entwurf(ctx: Ctx, args: dict) -> dict:
                       "name": a.get("name") or "Anhang"}
                      for a in anhaenge if a.get("quelle") == "drive"],
         "hinweis": hinweis,
+        "_aus_kundenstamm": aus_kundenstamm,
     }
 
 
